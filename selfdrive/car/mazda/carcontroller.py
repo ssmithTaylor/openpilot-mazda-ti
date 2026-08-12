@@ -1,9 +1,11 @@
+import json
+
 from cereal import car
 from opendbc.can.packer import CANPacker
 from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_steer_torque_limits
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
-from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
+from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -30,6 +32,42 @@ class CarController(CarControllerBase):
     self.long_active_last = False
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
+    self.reset_ti_stats()
+
+  def reset_ti_stats(self):
+    self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "driver_limited",
+                                    "at_clip", "peak_cmd", "peak_bias", "not_run", "viol", "ramp")}
+
+  def record_ti_stats(self, CS, desired, sent):
+    # Counters for A/B-ing a tuning change over a chosen stretch of road. "short" is how often the
+    # command openpilot wanted got cut, and rate_limited/driver_limited attribute why -- that split
+    # is what says whether to touch the ramp rate or the driver-torque backoff.
+    s = self.ti_stats
+    s["engaged"] += 1
+    if abs(desired) - abs(sent) > 5:
+      s["short"] += 1
+      if abs(abs(sent) - abs(self.ti_apply_steer_last)) >= self.ccp.TI_STEER_DELTA_UP:
+        s["rate_limited"] += 1
+      if abs(CS.out.steeringTorque) > self.ccp.TI_STEER_DRIVER_ALLOWANCE:
+        s["driver_limited"] += 1
+    if abs(sent) >= self.ccp.TI_STEER_MAX:
+      s["at_clip"] += 1
+    s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
+    s["peak_bias"] = max(s["peak_bias"], abs(int(CS.eps_torque_sensor - CS.out.steeringTorque)))
+    if CS.ti_state != TI_STATE.RUN:
+      s["not_run"] += 1
+    if CS.ti_violation:
+      s["viol"] = int(CS.ti_violation)
+    if CS.ti_ramp_down:
+      s["ramp"] += 1
+
+  def publish_ti_stats(self):
+    # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
+    if self.params.get_bool("ClearTiStats"):
+      self.params.put_bool("ClearTiStats", False)
+      self.params.put_nonblocking("TiTuningStatsPrevious", json.dumps(self.ti_stats))
+      self.reset_ti_stats()
+    self.params.put_nonblocking("TiTuningStats", json.dumps(self.ti_stats))
 
   def apply_ti_tuning(self, frogpilot_toggles):
     # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
@@ -60,6 +98,7 @@ class CarController(CarControllerBase):
           ti_new_steer = int(round(CC.actuators.steer * self.ccp.TI_STEER_MAX))
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
                                                     CS.out.steeringTorque, self.ccp)
+          self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
 
@@ -190,6 +229,9 @@ class CarController(CarControllerBase):
     else:
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX
       new_actuators.steerOutputCan = apply_steer
+
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and self.frame % 100 == 0:
+      self.publish_ti_stats()
 
     self.frame += 1
     Timer.tick()

@@ -466,6 +466,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TacoTuneHacks", "0", 2, "0"),
   ("TetheringEnabled", "0", 0, "0"),
   ("ThemesDownloaded", "", 0, ""),
+  ("ClearTiStats", "0", 3, "0"),
   ("ResetTorqueParams", "0", 3, "0"),
   ("TinygradUpdateAvailable", "0", 1, "0"),
   ("TorqueInterceptorTune", "0", 3, "0"),

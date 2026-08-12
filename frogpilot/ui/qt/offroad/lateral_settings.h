@@ -29,6 +29,8 @@ private:
   QSet<QString> laneChangeKeys = {"LaneChangeTime", "LaneDetectionWidth", "MinimumLaneChangeSpeed", "NudgelessLaneChange", "OneLaneChange"};
   QSet<QString> lateralTuneKeys = {"NNFF", "NNFFLite", "TurnDesires"};
   QSet<QString> qolKeys = {"PauseLateralSpeed"};
+  QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown", "TiSteerDriverAllowance",
+                                         "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams", "ClearTiStats"};
 
   QSet<QString> parentKeys;
 

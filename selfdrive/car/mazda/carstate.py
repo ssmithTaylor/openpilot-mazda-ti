@@ -33,6 +33,7 @@ class CarState(CarStateBase):
     self.ti_violation = 0
     self.ti_error = 0
     self.ti_lkas_allowed = False
+    self.eps_torque_sensor = 0
 
     self.shifting = False
     self.torque_converter_lock = True
@@ -83,6 +84,10 @@ class CarState(CarStateBase):
       self.ti_error = cp_body.vl["TI_FEEDBACK"]["ERROR"] # 0 = no error
       if self.ti_version > 1:
         self.ti_ramp_down = (cp_body.vl["TI_FEEDBACK"]["RAMP_DOWN"] == 1)
+
+      # What the EPS reads off the torque sensor, i.e. driver torque plus whatever bias the TI is
+      # injecting. Subtracting TI_TORQUE_SENSOR from it gives the bias actually reaching the car.
+      self.eps_torque_sensor = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
 
       ti_steer_threshold = getattr(frogpilot_variables, "ti_steer_threshold", LKAS_LIMITS.TI_STEER_THRESHOLD)
       ret.steeringPressed = abs(ret.steeringTorque) > ti_steer_threshold

@@ -24,18 +24,21 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   FrogPilotListWidget *laneChangeList = new FrogPilotListWidget(this);
   FrogPilotListWidget *lateralTuneList = new FrogPilotListWidget(this);
   FrogPilotListWidget *qolList = new FrogPilotListWidget(this);
+  FrogPilotListWidget *torqueInterceptorList = new FrogPilotListWidget(this);
 
   ScrollView *advancedLateralTunePanel = new ScrollView(advancedLateralTuneList, this);
   ScrollView *aolPanel = new ScrollView(aolList, this);
   ScrollView *laneChangePanel = new ScrollView(laneChangeList, this);
   ScrollView *lateralTunePanel = new ScrollView(lateralTuneList, this);
   ScrollView *qolPanel = new ScrollView(qolList, this);
+  ScrollView *torqueInterceptorPanel = new ScrollView(torqueInterceptorList, this);
 
   lateralLayout->addWidget(advancedLateralTunePanel);
   lateralLayout->addWidget(aolPanel);
   lateralLayout->addWidget(laneChangePanel);
   lateralLayout->addWidget(lateralTunePanel);
   lateralLayout->addWidget(qolPanel);
+  lateralLayout->addWidget(torqueInterceptorPanel);
 
   const std::vector<std::tuple<QString, QString, QString, QString>> lateralToggles {
     {"AdvancedLateralTune", tr("Advanced Lateral Tuning"), tr("<b>Advanced steering control changes to fine-tune how openpilot drives.</b>"), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
@@ -47,6 +50,16 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"ForceAutoTune", tr("Force Auto-Tune On"), tr("<b>Force-enable openpilot's live auto-tuning for \"Friction\" and \"Lateral Acceleration\".</b>"), ""},
     {"ForceAutoTuneOff", tr("Force Auto-Tune Off"), tr("<b>Force-disable openpilot's live auto-tuning for \"Friction\" and \"Lateral Acceleration\" and use the set value instead.</b>"), ""},
     {"ForceTorqueController", tr("Force Torque Controller"), tr("<b>Use torque-based steering control instead of angle-based control for smoother lane keeping, especially in curves.</b>"), ""},
+    {"ResetTorqueParams", tr("Reset Learned Steering Values"), tr("<b>Throw away what openpilot has learned about your steering and start over.</b> Do this after changing anything that affects how much the car turns for a given command, otherwise it keeps using values learned from the old behaviour. Switches itself back off once done."), ""},
+
+    {"TorqueInterceptorTune", tr("Torque Interceptor Tuning"), tr("<b>Adjust how the Torque Interceptor delivers steering.</b> Only affects cars fitted with a TI."), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
+    {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor ignores anything above 600."), ""},
+    {"TiSteerDeltaUp", tr("Ramp-Up Rate"), tr("<b>How quickly steering effort is allowed to build.</b> Raise for sharper response entering corners. Too high and the interceptor treats it as unsafe and cuts assist to zero. Default 6 takes one second to reach full."), ""},
+    {"TiSteerDeltaDown", tr("Ramp-Down Rate"), tr("<b>How quickly steering effort is allowed to release.</b> Raise to hand control back faster when openpilot backs off; lower for smoother corner exits."), ""},
+    {"TiSteerDriverAllowance", tr("Driver Torque Allowance"), tr("<b>How firmly you can hold the wheel before openpilot starts easing off.</b> Raise if assist fades just from resting a hand on the wheel; lower to hand over control sooner."), ""},
+    {"TiSteerDriverMultiplier", tr("Driver Torque Backoff"), tr("<b>How sharply assist drops once you push past the allowance.</b> Lower it if steering gives up on you mid-corner; raise it to hand over control more readily. At the default of 40, assist is gone almost immediately."), ""},
+    {"TiSteerThreshold", tr("Steering Pressed Threshold"), tr("<b>How much pressure on the wheel counts as you taking over.</b> Raise if bumps and road feedback falsely trigger a takeover; lower to have openpilot notice your input sooner."), ""},
+    {"ClearTiStats", tr("Start A New Measurement"), tr("<b>Zero the tuning counters so the next stretch of road is measured on its own.</b> The previous run's figures are kept for comparison. Turn this on just before the corner or road you want to judge a change on."), ""},
 
     {"AlwaysOnLateral", tr("Always On Lateral"), tr("<b>openpilot's steering remains active even when the accelerator or brake pedals are pressed.</b>"), "../../frogpilot/assets/toggle_icons/icon_always_on_lateral.png"},
     {"AlwaysOnLateralMain", tr("Enable With Cruise Control"), tr("<b>Enable \"Always On Lateral\" whenever \"Cruise Control\" is on, even when openpilot is not engaged.</b>"), ""},
@@ -93,6 +106,25 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     } else if (param == "SteerRatio") {
       std::vector<QString> steerRatioButton{"Reset"};
       lateralToggle = new FrogPilotParamValueButtonControl(param, title, desc, icon, parent->steerRatio * 0.5, parent->steerRatio * 1.5, QString(), std::map<float, QString>(), 0.01, false, {}, steerRatioButton, false, false);
+
+    } else if (param == "TorqueInterceptorTune") {
+      FrogPilotManageControl *torqueInterceptorToggle = new FrogPilotManageControl(param, title, desc, icon);
+      QObject::connect(torqueInterceptorToggle, &FrogPilotManageControl::manageButtonClicked, [lateralLayout, torqueInterceptorPanel]() {
+        lateralLayout->setCurrentWidget(torqueInterceptorPanel);
+      });
+      lateralToggle = torqueInterceptorToggle;
+    } else if (param == "TiSteerMax") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+    } else if (param == "TiSteerDeltaUp") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 30, QString(), std::map<float, QString>(), 1, true);
+    } else if (param == "TiSteerDeltaDown") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 50, QString(), std::map<float, QString>(), 1, true);
+    } else if (param == "TiSteerDriverAllowance") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 60, QString(), std::map<float, QString>(), 1, true);
+    } else if (param == "TiSteerDriverMultiplier") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 60, QString(), std::map<float, QString>(), 1, true);
+    } else if (param == "TiSteerThreshold") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 40, QString(), std::map<float, QString>(), 1, true);
 
     } else if (param == "AlwaysOnLateral") {
       FrogPilotManageControl *aolToggle = new FrogPilotManageControl(param, title, desc, icon);
@@ -154,6 +186,8 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       lateralTuneList->addItem(lateralToggle);
     } else if (qolKeys.contains(param)) {
       qolList ->addItem(lateralToggle);
+    } else if (torqueInterceptorKeys.contains(param)) {
+      torqueInterceptorList->addItem(lateralToggle);
     } else {
       lateralList->addItem(lateralToggle);
 
