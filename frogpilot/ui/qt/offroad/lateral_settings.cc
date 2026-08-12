@@ -40,6 +40,19 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   lateralLayout->addWidget(qolPanel);
   lateralLayout->addWidget(torqueInterceptorPanel);
 
+  // Live counters at the top of the TI panel, so a change can be judged on the spot rather than by
+  // pulling an rlog afterwards. Populated by updateTorqueInterceptorStats().
+  lateralLayoutRef = lateralLayout;
+  torqueInterceptorPanelRef = torqueInterceptorPanel;
+  tiCommandCutLabel = new LabelControl(tr("Command Cut"), "—", tr("How often openpilot sent less than it wanted to. Lower is better."));
+  tiLimitedByLabel = new LabelControl(tr("Limited By"), "—", tr("Which limiter did the cutting. Rate points at Ramp-Up Rate; driver points at Driver Torque Backoff."));
+  tiOutputLabel = new LabelControl(tr("Output"), "—", tr("Peak bias actually reaching the EPS, and time spent pinned at the interceptor's 600 clip."));
+  tiHealthLabel = new LabelControl(tr("Interceptor Health"), "—", tr("Frames where the TI left RUN or ramped itself down. Both should stay at zero."));
+  torqueInterceptorList->addItem(tiCommandCutLabel);
+  torqueInterceptorList->addItem(tiLimitedByLabel);
+  torqueInterceptorList->addItem(tiOutputLabel);
+  torqueInterceptorList->addItem(tiHealthLabel);
+
   const std::vector<std::tuple<QString, QString, QString, QString>> lateralToggles {
     {"AdvancedLateralTune", tr("Advanced Lateral Tuning"), tr("<b>Advanced steering control changes to fine-tune how openpilot drives.</b>"), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
     {"SteerDelay", parent->steerActuatorDelay != 0 ? QString(tr("Actuator Delay (Default: %1)")).arg(QString::number(parent->steerActuatorDelay, 'f', 2)) : tr("Actuator Delay"), tr("<b>The time between openpilot's steering command and the vehicle's response.</b> Increase if the vehicle reacts late; decrease if it feels jumpy. Auto-learned by default."), ""},
@@ -300,6 +313,56 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
   if (!isVisible()) return;
 
   started = s.scene.started;
+
+  if (lateralLayoutRef != nullptr && lateralLayoutRef->currentWidget() == torqueInterceptorPanelRef) {
+    // Hold off the inactivity timeout while this panel is open. It would otherwise drop back to
+    // the driving view precisely when you are watching the counters rather than touching anything.
+    device()->resetInteractiveTimeout();
+
+    // The counters are only written once a second, so reading the param file at the full UI rate
+    // would buy nothing.
+    if (++tiStatsTick >= 20) {
+      tiStatsTick = 0;
+      updateTorqueInterceptorStats();
+    }
+  }
+}
+
+void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
+  QJsonObject cur = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStats")).toUtf8()).object();
+  QJsonObject prev = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStatsPrevious")).toUtf8()).object();
+
+  auto pct = [](const QJsonObject &o, const QString &key) {
+    double engaged = o.value("engaged").toDouble();
+    return engaged > 0.0 ? 100.0 * o.value(key).toDouble() / engaged : -1.0;
+  };
+  auto fmt = [](double v) { return v < 0.0 ? QString("—") : QString::number(v, 'f', 1) + "%"; };
+
+  if (cur.value("engaged").toDouble() <= 0.0) {
+    tiCommandCutLabel->setText(tr("no engaged driving recorded yet"));
+  } else {
+    QString text = fmt(pct(cur, "short"));
+    double was = pct(prev, "short");
+    if (was >= 0.0) {
+      text += QString(tr(" (was %1)")).arg(fmt(was));
+    }
+    tiCommandCutLabel->setText(text);
+  }
+
+  tiLimitedByLabel->setText(QString(tr("rate %1, driver %2"))
+                            .arg(fmt(pct(cur, "rate_limited")), fmt(pct(cur, "driver_limited"))));
+  tiOutputLabel->setText(QString(tr("peak bias %1, %2 at clip"))
+                         .arg(QString::number(cur.value("peak_bias").toInt()), fmt(pct(cur, "at_clip"))));
+
+  int notRun = cur.value("not_run").toInt();
+  int ramp = cur.value("ramp").toInt();
+  int viol = cur.value("viol").toInt();
+  if (notRun == 0 && ramp == 0 && viol == 0) {
+    tiHealthLabel->setText(tr("RUN, no violations"));
+  } else {
+    tiHealthLabel->setText(QString(tr("%1 not in RUN, %2 ramping, violation 0x%3"))
+                           .arg(notRun).arg(ramp).arg(viol, 2, 16, QChar('0')));
+  }
 }
 
 void FrogPilotLateralPanel::updateMetric(bool metric, bool bootRun) {

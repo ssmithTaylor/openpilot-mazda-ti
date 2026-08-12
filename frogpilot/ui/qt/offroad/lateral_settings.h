@@ -40,6 +40,16 @@ private:
   FrogPilotParamValueButtonControl *steerKPToggle;
   FrogPilotParamValueButtonControl *steerRatioToggle;
 
+  void updateTorqueInterceptorStats();
+
+  QStackedLayout *lateralLayoutRef = nullptr;
+  QWidget *torqueInterceptorPanelRef = nullptr;
+  LabelControl *tiCommandCutLabel = nullptr;
+  LabelControl *tiLimitedByLabel = nullptr;
+  LabelControl *tiOutputLabel = nullptr;
+  LabelControl *tiHealthLabel = nullptr;
+  int tiStatsTick = 0;
+
   FrogPilotSettingsWindow *parent;
 
   QJsonObject frogpilotToggleLevels;
