@@ -178,8 +178,18 @@ class CarController(CarControllerBase):
     ))
 
     new_actuators = CC.actuators.as_builder()
-    new_actuators.steer = apply_steer / self.ccp.STEER_MAX
-    new_actuators.steerOutputCan = apply_steer
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CS.ti_lkas_allowed:
+      # While the TI is in RUN it is the actuator that actually steers the car, so report its
+      # command rather than the stock LKAS one. torqued fits its model to actuatorsOutput.steer,
+      # and the two commands are limited differently (TI_STEER_DELTA_UP vs STEER_DELTA_UP, driver
+      # multiplier 40 vs 1), so reporting the stock command trains it on a signal the car is not
+      # following. Falls back to the stock command whenever the TI is bypassed, which is correct
+      # because the stock LKAS path is then the only thing steering.
+      new_actuators.steer = ti_apply_steer / self.ccp.TI_STEER_MAX
+      new_actuators.steerOutputCan = ti_apply_steer
+    else:
+      new_actuators.steer = apply_steer / self.ccp.STEER_MAX
+      new_actuators.steerOutputCan = apply_steer
 
     self.frame += 1
     Timer.tick()

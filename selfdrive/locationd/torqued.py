@@ -253,6 +253,18 @@ def main(demo=False):
       msg = estimator.get_msg(valid=sm.all_checks(), with_points=True, frogpilot_toggles=frogpilot_toggles)
       params.put_nonblocking("LiveTorqueParameters", msg.to_bytes())
 
+    # Clear learned torque parameters on request, checked at 1Hz. The cache is fitted to whatever
+    # command limits were in force while it was learned, so it is stale after changing anything
+    # that alters the command-to-response relationship (the Torque Interceptor limits, for one).
+    # get_restore_key() does not cover those, so nothing invalidates the cache automatically.
+    # Rebuilding the estimator after removing the cache restarts it from the car's static values.
+    if sm.frame % 20 == 0 and params.get_bool("ResetTorqueParams"):
+      params.put_bool("ResetTorqueParams", False)
+      params.remove("LiveTorqueParameters")
+      with car.CarParams.from_bytes(params.get("CarParams", block=True)) as CP_fresh:
+        estimator = TorqueEstimator(CP_fresh, decimated=not frogpilot_toggles.liveValid)
+      cloudlog.warning("torqued: learned torque parameters cleared on request")
+
     # Update FrogPilot variables
     if sm['frogpilotPlan'].togglesUpdated:
       frogpilot_toggles = get_frogpilot_toggles()

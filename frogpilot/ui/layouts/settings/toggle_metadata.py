@@ -1657,6 +1657,13 @@ STEERING_TOGGLES = (
     tuning_level=3,
   ),
   ToggleDefinition(
+    title=("Reset Learned Steering Values"),
+    param="ResetTorqueParams",
+    description=("<b>Throw away what openpilot has learned about your steering and start over.</b> Do this after changing anything that affects how much the car turns for a given command, otherwise it keeps using values learned from the old behaviour. Switches itself back off once done; relearning takes some driving."),
+    parent_param="AdvancedLateralTune",
+    tuning_level=3,
+  ),
+  ToggleDefinition(
     title=("Torque Interceptor Tuning"),
     param="TorqueInterceptorTune",
     description=("<b>Adjust how the Torque Interceptor delivers steering.</b> Only affects cars fitted with a TI. Leave off to use the stock values."),

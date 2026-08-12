@@ -565,6 +565,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TetheringEnabled", PERSISTENT},
     {"ThemeDownloadProgress", CLEAR_ON_MANAGER_START},
     {"ThemesDownloaded", PERSISTENT},
+    {"ResetTorqueParams", PERSISTENT},
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},
