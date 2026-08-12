@@ -84,7 +84,8 @@ class CarState(CarStateBase):
       if self.ti_version > 1:
         self.ti_ramp_down = (cp_body.vl["TI_FEEDBACK"]["RAMP_DOWN"] == 1)
 
-      ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.TI_STEER_THRESHOLD
+      ti_steer_threshold = getattr(frogpilot_variables, "ti_steer_threshold", LKAS_LIMITS.TI_STEER_THRESHOLD)
+      ret.steeringPressed = abs(ret.steeringTorque) > ti_steer_threshold
       self.ti_lkas_allowed = not self.ti_ramp_down and self.ti_state == TI_STATE.RUN
     else:
       ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]

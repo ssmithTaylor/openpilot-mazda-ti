@@ -31,9 +31,21 @@ class CarController(CarControllerBase):
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
 
+  def apply_ti_tuning(self, frogpilot_toggles):
+    # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
+    # writing them here takes effect immediately. Falls back to the compiled-in value whenever a
+    # toggle is absent, which keeps older FrogPilot params files working.
+    self.ccp.TI_STEER_MAX = getattr(frogpilot_toggles, "ti_steer_max", self.ccp.TI_STEER_MAX)
+    self.ccp.TI_STEER_DELTA_UP = getattr(frogpilot_toggles, "ti_steer_delta_up", self.ccp.TI_STEER_DELTA_UP)
+    self.ccp.TI_STEER_DELTA_DOWN = getattr(frogpilot_toggles, "ti_steer_delta_down", self.ccp.TI_STEER_DELTA_DOWN)
+    self.ccp.TI_STEER_DRIVER_ALLOWANCE = getattr(frogpilot_toggles, "ti_steer_driver_allowance", self.ccp.TI_STEER_DRIVER_ALLOWANCE)
+    self.ccp.TI_STEER_DRIVER_MULTIPLIER = getattr(frogpilot_toggles, "ti_steer_driver_multiplier", self.ccp.TI_STEER_DRIVER_MULTIPLIER)
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
+
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      self.apply_ti_tuning(frogpilot_toggles)
 
     apply_steer = 0
     ti_apply_steer = 0

@@ -467,6 +467,13 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TetheringEnabled", "0", 0, "0"),
   ("ThemesDownloaded", "", 0, ""),
   ("TinygradUpdateAvailable", "0", 1, "0"),
+  ("TorqueInterceptorTune", "0", 3, "0"),
+  ("TiSteerDeltaDown", "15", 3, "15"),
+  ("TiSteerDeltaUp", "6", 3, "6"),
+  ("TiSteerDriverAllowance", "15", 3, "15"),
+  ("TiSteerDriverMultiplier", "40", 3, "40"),
+  ("TiSteerMax", "600", 3, "600"),
+  ("TiSteerThreshold", "6", 3, "6"),
   ("ToyotaDoors", "1", 0, "0"),
   ("TrafficFollow", "0.5", 2, "0.5"),
   ("TrafficJerkAcceleration", "50", 3, "50"),
@@ -666,6 +673,18 @@ class FrogPilotVariables:
     toggle.use_custom_latAccelFactor = bool(round(toggle.latAccelFactor, 2) != round(latAccelFactor, 2)) and is_torque_car and not toggle.force_auto_tune or toggle.force_auto_tune_off
     toggle.steerRatio = np.clip(params.get_float("SteerRatio"), steerRatio * 0.5, steerRatio * 1.5) if advanced_lateral_tuning and toggle.tuning_level >= level["SteerRatio"] else steerRatio
     toggle.use_custom_steerRatio = bool(round(toggle.steerRatio, 2) != round(steerRatio, 2)) and not toggle.force_auto_tune or toggle.force_auto_tune_off
+
+    # Torque Interceptor limits. Defaults match the hard-coded CarControllerParams values so an
+    # untouched install behaves identically. TiSteerMax is capped at 600 because the TI clips the
+    # LKAS request there in hardware; anything above is silently discarded by the unit.
+    ti_tune = params.get_bool("TorqueInterceptorTune") if toggle.tuning_level >= level["TorqueInterceptorTune"] else default.get_bool("TorqueInterceptorTune")
+    toggle.ti_tune = ti_tune
+    toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 600)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
+    toggle.ti_steer_delta_up = int(np.clip(params.get_float("TiSteerDeltaUp"), 1, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUp"] else int(default.get_float("TiSteerDeltaUp"))
+    toggle.ti_steer_delta_down = int(np.clip(params.get_float("TiSteerDeltaDown"), 1, 50)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaDown"] else int(default.get_float("TiSteerDeltaDown"))
+    toggle.ti_steer_driver_allowance = int(np.clip(params.get_float("TiSteerDriverAllowance"), 5, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverAllowance"] else int(default.get_float("TiSteerDriverAllowance"))
+    toggle.ti_steer_driver_multiplier = int(np.clip(params.get_float("TiSteerDriverMultiplier"), 1, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverMultiplier"] else int(default.get_float("TiSteerDriverMultiplier"))
+    toggle.ti_steer_threshold = int(np.clip(params.get_float("TiSteerThreshold"), 1, 40)) if ti_tune and toggle.tuning_level >= level["TiSteerThreshold"] else int(default.get_float("TiSteerThreshold"))
 
     advanced_longitudinal_tuning = toggle.openpilot_longitudinal and (params.get_bool("AdvancedLongitudinalTune") if toggle.tuning_level >= level["AdvancedLongitudinalTune"] else default.get_bool("AdvancedLongitudinalTune"))
     toggle.longitudinalActuatorDelay = np.clip(params.get_float("LongitudinalActuatorDelay"), 0, 1) if advanced_longitudinal_tuning and toggle.tuning_level >= level["LongitudinalActuatorDelay"] else longitudinalActuatorDelay
