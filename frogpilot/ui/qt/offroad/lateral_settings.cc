@@ -531,6 +531,8 @@ void FrogPilotLateralPanel::updateToggles() {
         toggles["LateralTune"]->setVisible(true);
       } else if (qolKeys.contains(key)) {
         toggles["QOLLateral"]->setVisible(true);
+      } else if (torqueInterceptorKeys.contains(key)) {
+        toggles["TorqueInterceptorTune"]->setVisible(true);
       }
     }
   }

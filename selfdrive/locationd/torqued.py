@@ -248,11 +248,6 @@ def main(demo=False):
     if sm.frame % 5 == 0:
       pm.send('liveTorqueParameters', estimator.get_msg(valid=sm.all_checks(), with_points=False, frogpilot_toggles=frogpilot_toggles))
 
-    # Cache points every 60 seconds while onroad
-    if sm.frame % 240 == 0:
-      msg = estimator.get_msg(valid=sm.all_checks(), with_points=True, frogpilot_toggles=frogpilot_toggles)
-      params.put_nonblocking("LiveTorqueParameters", msg.to_bytes())
-
     # Clear learned torque parameters on request, checked at 1Hz. The cache is fitted to whatever
     # command limits were in force while it was learned, so it is stale after changing anything
     # that alters the command-to-response relationship (the Torque Interceptor limits, for one).
@@ -262,8 +257,17 @@ def main(demo=False):
       params.put_bool("ResetTorqueParams", False)
       params.remove("LiveTorqueParameters")
       with car.CarParams.from_bytes(params.get("CarParams", block=True)) as CP_fresh:
-        estimator = TorqueEstimator(CP_fresh, decimated=not frogpilot_toggles.liveValid)
+        # decimated=True unconditionally: the cache was just discarded, so this is a from-scratch
+        # estimator and should get the same fast-relearn path a fresh install gets. Deriving it
+        # from frogpilot_toggles.liveValid would read a flag computed from the cache we deleted.
+        estimator = TorqueEstimator(CP_fresh, decimated=True)
       cloudlog.warning("torqued: learned torque parameters cleared on request")
+
+    # Cache points every 60 seconds while onroad. Ordered after the reset check so a clear landing
+    # on a cache frame cannot be undone by an in-flight async write of the old estimator's points.
+    if sm.frame % 240 == 0:
+      msg = estimator.get_msg(valid=sm.all_checks(), with_points=True, frogpilot_toggles=frogpilot_toggles)
+      params.put_nonblocking("LiveTorqueParameters", msg.to_bytes())
 
     # Update FrogPilot variables
     if sm['frogpilotPlan'].togglesUpdated:

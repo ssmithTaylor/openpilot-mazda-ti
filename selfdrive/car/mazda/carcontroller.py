@@ -44,28 +44,43 @@ class CarController(CarControllerBase):
     # is what says whether to touch the ramp rate or the driver-torque backoff.
     s = self.ti_stats
     s["engaged"] += 1
-    if abs(desired) - abs(sent) > 5:
-      s["short"] += 1
-      if abs(abs(sent) - abs(self.ti_apply_steer_last)) >= self.ccp.TI_STEER_DELTA_UP:
-        s["rate_limited"] += 1
-      if abs(CS.out.steeringTorque) > self.ccp.TI_STEER_DRIVER_ALLOWANCE:
-        s["driver_limited"] += 1
-    if abs(sent) >= self.ccp.TI_STEER_MAX:
-      s["at_clip"] += 1
-    s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
-    s["peak_bias"] = max(s["peak_bias"], abs(int(CS.eps_torque_sensor - CS.out.steeringTorque)))
+
+    # Health first, and unconditionally -- these are the frames where the TI stopped cooperating.
     if CS.ti_state != TI_STATE.RUN:
       s["not_run"] += 1
     if CS.ti_violation:
       s["viol"] = int(CS.ti_violation)
     if CS.ti_ramp_down:
       s["ramp"] += 1
+    s["peak_bias"] = max(s["peak_bias"], abs(int(CS.eps_torque_sensor - CS.out.steeringTorque)))
+
+    # Command-side attribution only means something while the TI is actually taking commands.
+    if not CS.ti_lkas_allowed:
+      return
+
+    if abs(desired) - abs(sent) > 5:
+      s["short"] += 1
+      # Compare the signed step so a sign crossing still registers, and only call it rate limiting
+      # when the command was climbing -- a command collapsing under driver torque moves at
+      # DELTA_DOWN, which would otherwise be miscounted as a rate limit and point at the wrong knob.
+      if abs(sent) > abs(self.ti_apply_steer_last) and \
+         abs(sent - self.ti_apply_steer_last) >= self.ccp.TI_STEER_DELTA_UP:
+        s["rate_limited"] += 1
+      if abs(CS.out.steeringTorque) > self.ccp.TI_STEER_DRIVER_ALLOWANCE:
+        s["driver_limited"] += 1
+    if abs(sent) >= self.ccp.TI_STEER_MAX:
+      s["at_clip"] += 1
+    s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
 
   def publish_ti_stats(self):
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
     if self.params.get_bool("ClearTiStats"):
       self.params.put_bool("ClearTiStats", False)
-      self.params.put_nonblocking("TiTuningStatsPrevious", json.dumps(self.ti_stats))
+      # Snapshot the persisted figures rather than the in-memory ones. This process restarts every
+      # ignition cycle, so clearing while parked would otherwise stash a set of zeros as "previous"
+      # and lose the run the user actually wanted to compare against.
+      persisted = self.params.get("TiTuningStats")
+      self.params.put_nonblocking("TiTuningStatsPrevious", persisted or json.dumps(self.ti_stats))
       self.reset_ti_stats()
     self.params.put_nonblocking("TiTuningStats", json.dumps(self.ti_stats))
 
@@ -94,11 +109,15 @@ class CarController(CarControllerBase):
       apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last,
                                                      CS.out.steeringTorque, self.ccp)
       if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+        ti_new_steer = 0
         if CS.ti_lkas_allowed:
           ti_new_steer = int(round(CC.actuators.steer * self.ccp.TI_STEER_MAX))
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
                                                     CS.out.steeringTorque, self.ccp)
-          self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
+        # Recorded outside the ti_lkas_allowed gate on purpose: that flag is false precisely when
+        # the TI has left RUN or is ramping down, which are the frames the health counters exist
+        # to catch. Gating on it would make them structurally unreachable.
+        self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
 
