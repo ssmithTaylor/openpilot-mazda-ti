@@ -16,6 +16,11 @@ def notcar(started: bool, params: Params, CP: car.CarParams, classic_model, tiny
 def iscar(started: bool, params: Params, CP: car.CarParams, classic_model, tinygrad_model, frogpilot_toggles) -> bool:
   return started and not CP.notCar
 
+def ti_mcp(started: bool, params: Params, CP: car.CarParams, classic_model, tinygrad_model, frogpilot_toggles) -> bool:
+  # Deliberately not gated on `started`: the counters are worth querying while parked, which is
+  # when you would sit and compare two runs.
+  return params.get_bool("TiMcpEnabled")
+
 def logging(started, params, CP: car.CarParams, classic_model, tinygrad_model, frogpilot_toggles) -> bool:
   run = (not CP.notCar) or not params.get_bool("DisableLogging")
   return started and run
@@ -66,6 +71,7 @@ procs = [
   NativeProcess("camerad", "system/camerad", ["./camerad"], driverview),
   NativeProcess("logcatd", "system/logcatd", ["./logcatd"], allow_logging),
   NativeProcess("proclogd", "system/proclogd", ["./proclogd"], allow_logging),
+  PythonProcess("ti_mcp", "frogpilot.system.ti_mcp.ti_mcp_server", ti_mcp),
   PythonProcess("logmessaged", "system.logmessaged", allow_logging),
   PythonProcess("micd", "system.micd", iscar),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),

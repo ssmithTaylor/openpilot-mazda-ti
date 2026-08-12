@@ -470,6 +470,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("ResetTorqueParams", "0", 3, "0"),
   ("TinygradUpdateAvailable", "0", 1, "0"),
   ("TorqueInterceptorTune", "0", 3, "0"),
+  ("TiMcpEnabled", "1", 3, "1"),
   ("TiSteerDeltaDown", "15", 3, "15"),
   ("TiSteerDeltaUp", "6", 3, "6"),
   ("TiSteerDriverAllowance", "15", 3, "15"),

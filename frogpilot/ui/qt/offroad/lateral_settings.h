@@ -30,7 +30,8 @@ private:
   QSet<QString> lateralTuneKeys = {"NNFF", "NNFFLite", "TurnDesires"};
   QSet<QString> qolKeys = {"PauseLateralSpeed"};
   QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown", "TiSteerDriverAllowance",
-                                         "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams", "ClearTiStats"};
+                                         "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
+                                         "ClearTiStats", "TiMcpEnabled"};
 
   QSet<QString> parentKeys;
 

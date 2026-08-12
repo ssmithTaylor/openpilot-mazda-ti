@@ -11,12 +11,15 @@ to be installed on the device. Point an MCP client at http://<device>:8756/mcp.
 
   python -m frogpilot.system.ti_mcp.ti_mcp_server
 
+Started automatically by the manager when TiMcpEnabled is set, on and offroad.
+
 Environment:
-  TI_MCP_HOST  bind address, default 127.0.0.1 (use 0.0.0.0 to reach it from another machine)
+  TI_MCP_HOST  bind address, default 0.0.0.0 (all interfaces)
   TI_MCP_PORT  bind port, default 8756
 
-Binding to 0.0.0.0 exposes the telemetry to anyone on the network. It is read-only, but it does
-reveal driving state, so prefer an SSH tunnel or a private network over an open bind.
+There is no authentication. Anyone who can reach the port can read driving state -- speed,
+steering, engagement. That is an accepted trade for a read-only service on a trusted home network;
+on an untrusted or public network, turn the toggle off or set TI_MCP_HOST=127.0.0.1 and tunnel.
 """
 import json
 import os
@@ -364,13 +367,11 @@ def publish_address(bind_host, port):
 
 
 def main():
-  host = os.getenv("TI_MCP_HOST", "127.0.0.1")
+  host = os.getenv("TI_MCP_HOST", "0.0.0.0")
   port = int(os.getenv("TI_MCP_PORT", "8756"))
   threading.Thread(target=snapshot.run, daemon=True).start()
   threading.Thread(target=publish_address, args=(host, port), daemon=True).start()
   print(f"ti-tuning MCP (read-only) on http://{host}:{port}/mcp")
-  if not host.startswith("0.0.0.0"):
-    print("bound to localhost; set TI_MCP_HOST=0.0.0.0 to reach it from another machine")
   ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
