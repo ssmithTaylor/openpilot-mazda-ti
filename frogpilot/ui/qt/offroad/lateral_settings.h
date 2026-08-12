@@ -48,6 +48,7 @@ private:
   LabelControl *tiLimitedByLabel = nullptr;
   LabelControl *tiOutputLabel = nullptr;
   LabelControl *tiHealthLabel = nullptr;
+  LabelControl *tiMcpLabel = nullptr;
   int tiStatsTick = 0;
 
   FrogPilotSettingsWindow *parent;

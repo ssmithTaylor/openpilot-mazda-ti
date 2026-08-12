@@ -1,3 +1,5 @@
+#include <QDateTime>
+
 #include "frogpilot/ui/qt/offroad/lateral_settings.h"
 
 FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : FrogPilotListWidget(parent), parent(parent) {
@@ -51,7 +53,9 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   torqueInterceptorList->addItem(tiCommandCutLabel);
   torqueInterceptorList->addItem(tiLimitedByLabel);
   torqueInterceptorList->addItem(tiOutputLabel);
+  tiMcpLabel = new LabelControl(tr("Telemetry Address"), tr("not running"), tr("Read-only telemetry service. Point an MCP client at this address to query tuning data from a laptop on the same network."));
   torqueInterceptorList->addItem(tiHealthLabel);
+  torqueInterceptorList->addItem(tiMcpLabel);
 
   const std::vector<std::tuple<QString, QString, QString, QString>> lateralToggles {
     {"AdvancedLateralTune", tr("Advanced Lateral Tuning"), tr("<b>Advanced steering control changes to fine-tune how openpilot drives.</b>"), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
@@ -353,6 +357,17 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
                             .arg(fmt(pct(cur, "rate_limited")), fmt(pct(cur, "driver_limited"))));
   tiOutputLabel->setText(QString(tr("peak bias %1, %2 at clip"))
                          .arg(QString::number(cur.value("peak_bias").toInt()), fmt(pct(cur, "at_clip"))));
+
+  // Address is republished every 5s, so anything older than 15s means the service is not running.
+  QJsonObject mcp = QJsonDocument::fromJson(QString::fromStdString(params.get("TiMcpAddress")).toUtf8()).object();
+  qint64 age = QDateTime::currentSecsSinceEpoch() - (qint64)mcp.value("heartbeat").toDouble();
+  if (mcp.isEmpty() || age > 15) {
+    tiMcpLabel->setText(tr("not running"));
+  } else if (!mcp.value("reachable_remotely").toBool()) {
+    tiMcpLabel->setText(tr("localhost only — set TI_MCP_HOST=0.0.0.0"));
+  } else {
+    tiMcpLabel->setText(mcp.value("url").toString());
+  }
 
   int notRun = cur.value("not_run").toInt();
   int ramp = cur.value("ramp").toInt();

@@ -20,6 +20,8 @@ reveal driving state, so prefer an SSH tunnel or a private network over an open 
 """
 import json
 import os
+import socket
+import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -331,11 +333,44 @@ class Handler(BaseHTTPRequestHandler):
                   "error": {"code": -32601, "message": f"unknown method: {method}"}})
 
 
+def lan_ip():
+  """Best guess at the address this device is reachable on. Opening a UDP socket toward a public
+  address sends nothing but makes the kernel pick the interface it would route out of, which is
+  the one a laptop on the same network can reach."""
+  try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+      s.settimeout(0.2)
+      s.connect(("8.8.8.8", 53))
+      return s.getsockname()[0]
+  except Exception:
+    return None
+
+
+def publish_address(bind_host, port):
+  """Write the connect URL where the settings panel can display it. The device's address is not
+  something the driver can be expected to know, and it changes between networks."""
+  ip = lan_ip() if bind_host in ("0.0.0.0", "::") else bind_host
+  reachable = bind_host not in ("127.0.0.1", "localhost")
+  url = f"http://{ip or bind_host}:{port}/mcp"
+  while True:
+    params.put_nonblocking("TiMcpAddress", json.dumps({
+      "url": url,
+      "bind": bind_host,
+      "port": port,
+      "reachable_remotely": reachable,
+      "heartbeat": int(time.time()),
+    }))
+    time.sleep(5)
+
+
 def main():
-  threading.Thread(target=snapshot.run, daemon=True).start()
   host = os.getenv("TI_MCP_HOST", "127.0.0.1")
   port = int(os.getenv("TI_MCP_PORT", "8756"))
+  threading.Thread(target=snapshot.run, daemon=True).start()
+  threading.Thread(target=publish_address, args=(host, port), daemon=True).start()
   print(f"ti-tuning MCP (read-only) on http://{host}:{port}/mcp")
+  if not host.startswith("0.0.0.0"):
+    print("bound to localhost; set TI_MCP_HOST=0.0.0.0 to reach it from another machine")
   ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
