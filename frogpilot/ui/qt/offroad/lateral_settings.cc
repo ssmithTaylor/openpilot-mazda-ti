@@ -144,6 +144,25 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     } else if (param == "TiSteerThreshold") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 40, QString(), std::map<float, QString>(), 1, true);
 
+    } else if (param == "ResetTorqueParams") {
+      // An action, not a state. The backend consumes the param and clears it, so a switch would
+      // flip itself back and read as a failed toggle.
+      ButtonControl *resetTorqueButton = new ButtonControl(title, tr("RESET"), desc);
+      QObject::connect(resetTorqueButton, &ButtonControl::clicked, [this, resetTorqueButton]() {
+        if (FrogPilotConfirmationDialog::yesorno(tr("Discard everything openpilot has learned about your steering? Relearning takes some driving."), this)) {
+          params.putBool("ResetTorqueParams", true);
+          resetTorqueButton->setText(tr("CLEARED"));
+        }
+      });
+      lateralToggle = resetTorqueButton;
+    } else if (param == "ClearTiStats") {
+      ButtonControl *clearStatsButton = new ButtonControl(title, tr("START"), desc);
+      QObject::connect(clearStatsButton, &ButtonControl::clicked, [this, clearStatsButton]() {
+        params.putBool("ClearTiStats", true);
+        clearStatsButton->setText(tr("STARTED"));
+      });
+      lateralToggle = clearStatsButton;
+
     } else if (param == "AlwaysOnLateral") {
       FrogPilotManageControl *aolToggle = new FrogPilotManageControl(param, title, desc, icon);
       QObject::connect(aolToggle, &FrogPilotManageControl::manageButtonClicked, [lateralLayout, aolPanel]() {
