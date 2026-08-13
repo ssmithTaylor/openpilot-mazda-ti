@@ -18,6 +18,12 @@ ScreenRefreshOverlay::ScreenRefreshOverlay(int seconds, QWidget *parent)
   setCursor(Qt::BlankCursor);
   elapsed.start();
 
+  // The fills are already fully saturated, so brightness is what decides whether this exercises
+  // the emitters or just shows coloured rectangles. Offroad brightness sits well below full, and
+  // wear evens out at the drive current the worn pixels were aged at -- which was screen-on
+  // brightness during drives, not the dimmed idle level.
+  device()->setOffroadBrightness(100);
+
   QTimer *ticker = new QTimer(this);
   QObject::connect(ticker, &QTimer::timeout, [this]() {
     if (elapsed.elapsed() >= total_ms) {
@@ -75,6 +81,9 @@ void ScreenRefreshOverlay::mousePressEvent(QMouseEvent *event) {
 }
 
 void ScreenRefreshOverlay::closeEvent(QCloseEvent *event) {
+  // Hand the screen back at its normal idle level, however we got here.
+  device()->setOffroadBrightness(BACKLIGHT_OFFROAD);
+
   if (on_finished) {
     on_finished(int(std::min<qint64>(elapsed.elapsed(), total_ms) / 1000));
     on_finished = nullptr;  // closeEvent can fire more than once; only bank the time once.
