@@ -67,7 +67,11 @@ class CarController(CarControllerBase):
       if abs(sent) > abs(self.ti_apply_steer_last) and \
          abs(sent - self.ti_apply_steer_last) >= self.ccp.TI_STEER_DELTA_UP:
         s["rate_limited"] += 1
-      if abs(CS.out.steeringTorque) > self.ccp.TI_STEER_DRIVER_ALLOWANCE:
+      # Only torque OPPOSING the command narrows the cap -- openpilot's driver-torque limit is
+      # signed, and torque in the command's own direction widens the bound instead. Counting both
+      # directions would blame the driver term for frames it had nothing to do with.
+      if abs(CS.out.steeringTorque) > self.ccp.TI_STEER_DRIVER_ALLOWANCE and \
+         (CS.out.steeringTorque * desired) < 0:
         s["driver_limited"] += 1
     if abs(sent) >= self.ccp.TI_STEER_MAX:
       s["at_clip"] += 1

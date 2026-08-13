@@ -282,7 +282,15 @@ def _segment_dirs():
     if not names:
       diags.append(f"{root}: exists but holds no segments")
     found += [(root, n) for n in names]
-  found.sort(key=lambda rn: rn[1], reverse=True)
+  # Sort by route then segment NUMBER. Lexical order puts "--10" between "--1" and "--2", which
+  # silently mis-orders any drive longer than ten segments.
+  def key(rn):
+    parts = rn[1].rsplit("--", 1)
+    try:
+      return (parts[0], int(parts[1]))
+    except (IndexError, ValueError):
+      return (rn[1], -1)
+  found.sort(key=key, reverse=True)
   return found, diags
 
 
@@ -344,6 +352,16 @@ def tool_analyze_segment(args):
   last_sig = None
   truncated = False
 
+  # Shortfall and the limiter split are recomputed here rather than read from the live counters,
+  # which retain only two runs and cannot be recovered for an old segment. Limits come from the
+  # params as they are NOW -- if they were changed since the drive, the attribution is off.
+  steer_max = _param_int("TiSteerMax") or 600
+  delta_up = _param_int("TiSteerDeltaUp") or 6
+  allowance = _param_int("TiSteerDriverAllowance") or 15
+  cmd_frames = short = rate_lim = drv_lim = at_clip = 0
+  peak_cmd = 0
+  last_steer, last_lat, last_drv, last_sent = 0.0, False, 0.0, 0
+
   events = capnp_log.Event.read_multiple_bytes(raw)
   t0 = None
   while True:
@@ -358,13 +376,17 @@ def tool_analyze_segment(args):
       t0 = msg.logMonoTime
     ts = (msg.logMonoTime - t0) / 1e9
     w = msg.which()
-    if w == "carControl" and msg.carControl.latActive:
-      engaged += 1
+    if w == "carControl":
+      last_lat = bool(msg.carControl.latActive)
+      last_steer = float(msg.carControl.actuators.steer)
+      if last_lat:
+        engaged += 1
     elif w == "controlsState":
       c = msg.controlsState
       curv_err.append(abs(float(getattr(c, "desiredCurvature", 0.0)) - float(c.curvature)))
     elif w == "carState":
       speeds.append(float(msg.carState.vEgo))
+      last_drv = float(msg.carState.steeringTorque)
     elif w == "can":
       for f in msg.can:
         if f.src == 0 and f.address == TI_FEEDBACK:
@@ -382,7 +404,25 @@ def tool_analyze_segment(args):
       for f in msg.sendcan:
         if f.address == TI_STEER:
           d = bytes(f.dat)
-          ti_req.append(((d[0] << 8 | d[1]) & 0x0FFF) - 2048)
+          req = ((d[0] << 8 | d[1]) & 0x0FFF) - 2048
+          ti_req.append(req)
+          if last_lat:
+            cmd_frames += 1
+            peak_cmd = max(peak_cmd, abs(req))
+            if abs(req) >= steer_max:
+              at_clip += 1
+            desired = int(round(last_steer * steer_max))
+            if abs(desired) - abs(req) > 5:
+              short += 1
+              # Rate limiting only counts while the command is climbing; a command collapsing under
+              # driver torque moves at DELTA_DOWN and would otherwise be blamed on the ramp rate.
+              if abs(req) > abs(last_sent) and abs(req - last_sent) >= delta_up:
+                rate_lim += 1
+              # Only torque OPPOSING the command narrows the cap. openpilot's driver-torque limit
+              # is signed: the bound in the driver's own direction widens instead.
+              if abs(last_drv) > allowance and (last_drv * desired) < 0:
+                drv_lim += 1
+          last_sent = req
 
   def pct(vals, p):
     return round(sorted(vals)[min(len(vals) - 1, int(len(vals) * p))], 6) if vals else None
@@ -399,6 +439,19 @@ def tool_analyze_segment(args):
                      "at_clip": sum(1 for r in ti_req if abs(r) >= 600)} if ti_req else None,
     "curvature_error": {"mean": round(sum(curv_err) / len(curv_err), 6),
                         "p95": pct(curv_err, 0.95), "n": len(curv_err)} if curv_err else None,
+    "command": {
+      "frames": cmd_frames,
+      "short_of_requested_pct": round(100.0 * short / cmd_frames, 1),
+      "rate_limited_pct": round(100.0 * rate_lim / cmd_frames, 1),
+      "driver_torque_limited_pct": round(100.0 * drv_lim / cmd_frames, 1),
+      "at_clip_pct": round(100.0 * at_clip / cmd_frames, 1),
+      "peak_command": peak_cmd,
+      "limits_used": {"TiSteerMax": steer_max, "TiSteerDeltaUp": delta_up,
+                      "TiSteerDriverAllowance": allowance},
+      "caveat": "Limits are the CURRENT param values; if they changed since this drive the "
+                "attribution is wrong. driver_torque_limited counts only torque opposing the "
+                "command, since same-direction torque widens the cap rather than narrowing it.",
+    } if cmd_frames else None,
     "speed_ms": {"mean": round(sum(speeds) / len(speeds), 2), "max": round(max(speeds), 2)} if speeds else None,
     "state_changes": transitions[:40],
     "baselines": BASELINE,
