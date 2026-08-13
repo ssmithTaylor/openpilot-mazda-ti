@@ -65,6 +65,21 @@ TI_VIOL = {
 
 TI_STEER = 0x249     # openpilot -> TI, carries LKAS_REQUEST plus the discovery key
 TI_FEEDBACK = 0x24A  # TI -> openpilot, byte 3 mode, byte 4 violation, byte 6 ramp-down
+STEER_TORQUE = 0x240  # car -> openpilot, byte 0 is the EPS torque sensor
+
+# Both torque sensors are declared identically in mazda_2017.dbc -- 8|0+ (1,-127), range [-85,85]
+# -- so they are directly comparable and their difference is a real bias in sensor counts.
+# STEER_TORQUE_SENSOR is what the EPS reads (driver plus whatever the TI is injecting);
+# TI_TORQUE_SENSOR is the driver alone. That identity is the whole basis of this analysis.
+TORQUE_SENSOR_OFFSET = 127
+TORQUE_SENSOR_LIMIT = 85  # DBC range edge; readings pinned here are saturated, not measured
+
+# Speeds at which the stock Mazda LKAS drops out and wakes up (values.py LKAS_LIMITS, kph).
+# Above the enable speed the stock CAM_LKAS request is acted on as well as the TI's, so the plant
+# sees two actuators; below the disable speed it sees only the TI. Comparing the fitted slope
+# either side of that band is what tells us whether the dual path is real.
+LKAS_DISABLE_MS = 45 / 3.6
+LKAS_ENABLE_MS = 52 / 3.6
 
 TUNING_PARAMS = ("TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown",
                  "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold")
@@ -920,6 +935,212 @@ def tool_segment_diagnostics(args):
   }
 
 
+def _fit_through_origin(cmd, bias, np):
+  """The physical relationship has no offset: zero command must mean zero injected bias. Fitting an
+  intercept anyway and reporting it is still worth doing -- a non-zero one means either a sensor
+  offset or that something other than the TI is moving the difference."""
+  denom = float(cmd @ cmd)
+  if denom <= 0:
+    return None
+  slope = float(cmd @ bias) / denom
+  resid = bias - slope * cmd
+  ss_tot = float(((bias - bias.mean()) ** 2).sum())
+  return {
+    "slope": round(slope, 5),
+    "r2": round(1.0 - float((resid ** 2).sum()) / ss_tot, 4) if ss_tot > 0 else None,
+    "n": int(len(cmd)),
+    "command_range": [int(cmd.min()), int(cmd.max())],
+  }
+
+
+def tool_ti_response(args):
+  """Characterise how the interceptor's command actually turns into torque at the EPS."""
+  segment = args.get("segment")
+  if not segment:
+    return {"error": "segment required; call list_segments first"}
+  refusal = _refuse_if_onroad("ti_response")
+  if refusal is not None:
+    return refusal
+  path = _rlog_path(segment)
+  if path is None:
+    return {"error": f"no rlog found for {segment}"}
+
+  try:
+    import bz2
+    import numpy as np
+    from cereal import log as capnp_log
+  except Exception as e:
+    return {"error": f"cannot load decoder: {e}"}
+
+  raw = open(path, "rb").read()
+  if path.endswith(".bz2"):
+    raw = bz2.decompress(raw)
+
+  rows = []
+  srcs = collections.Counter()
+  eps = ti = vego = None
+  mode = ramp = None
+  lat_active = False
+  sat_eps = sat_ti = 0
+  over_600 = 0
+  truncated = False
+
+  events = capnp_log.Event.read_multiple_bytes(raw)
+  t0 = None
+  while True:
+    try:
+      msg = next(events)
+    except StopIteration:
+      break
+    except Exception:
+      truncated = True
+      break
+    if t0 is None:
+      t0 = msg.logMonoTime
+    ts = (msg.logMonoTime - t0) / 1e9
+    w = msg.which()
+
+    if w == "carState":
+      vego = float(msg.carState.vEgo)
+    elif w == "carControl":
+      lat_active = bool(msg.carControl.latActive)
+    elif w == "can":
+      for f in msg.can:
+        if f.address == STEER_TORQUE:
+          srcs[f"eps_bus{f.src}"] += 1
+          eps = bytes(f.dat)[0] - TORQUE_SENSOR_OFFSET
+          sat_eps += abs(eps) >= TORQUE_SENSOR_LIMIT
+        elif f.address == TI_FEEDBACK:
+          srcs[f"ti_bus{f.src}"] += 1
+          d = bytes(f.dat)
+          ti = d[0] - TORQUE_SENSOR_OFFSET
+          sat_ti += abs(ti) >= TORQUE_SENSOR_LIMIT
+          mode, ramp = d[3], bool(d[6])
+    elif w == "sendcan":
+      # Sampled at the command's cadence against the most recent sensor readings, the same
+      # last-value alignment analyze_segment uses. Both sensors arrive at 50-100Hz, so the
+      # staleness is under a frame, and the lag search below is what actually resolves timing.
+      for f in msg.sendcan:
+        if f.address != TI_STEER:
+          continue
+        d = bytes(f.dat)
+        cmd = ((d[0] << 8 | d[1]) & 0x0FFF) - 2048
+        if abs(cmd) > 600:
+          over_600 += 1
+        if lat_active and eps is not None and ti is not None and vego is not None:
+          rows.append((ts, cmd, eps - ti, vego, mode, ramp))
+
+  usable = [r for r in rows if r[4] == 3 and not r[5]]
+  result = {
+    "segment": segment,
+    "truncated": truncated,
+    "frames_engaged": len(rows),
+    "frames_usable": len(usable),
+    "sources_seen": dict(srcs),
+    "commands_above_600": over_600,
+    "eps_sensor_saturated_frames": sat_eps,
+    "ti_sensor_saturated_frames": sat_ti,
+  }
+  if len(usable) < 200:
+    result["verdict"] = ("NOT ENOUGH DATA: fewer than 200 frames with the TI in RUN, lateral "
+                         "active and both sensors present. This segment cannot characterise "
+                         "anything; pick one with sustained engaged driving.")
+    return result
+
+  arr = np.array([(c, b, v) for (_, c, b, v, _, _) in usable], dtype=float)
+  cmd, bias, spd = arr[:, 0], arr[:, 1], arr[:, 2]
+
+  overall = _fit_through_origin(cmd, bias, np)
+  result["response"] = overall
+  # An intercept is not physical here, but reporting it catches a sensor offset or a second thing
+  # moving the difference, either of which would bias the slope.
+  try:
+    m, c0 = np.polyfit(cmd, bias, 1)
+    result["with_intercept"] = {"slope": round(float(m), 5), "intercept": round(float(c0), 3)}
+  except Exception:
+    pass
+
+  # Lag: how many 10ms frames after a command change the bias follows. Correlating the command
+  # against progressively delayed bias and taking the peak is the same idea lagd uses for the
+  # steering actuator, and it is the number that says whether the ramp is starving the controller.
+  best = {"lag_frames": None, "correlation": None}
+  for lag in range(0, 26):
+    a, b = cmd[:len(cmd) - lag or None], bias[lag:]
+    if len(a) < 200:
+      break
+    if a.std() == 0 or b.std() == 0:
+      continue
+    corr = float(np.corrcoef(a, b)[0, 1])
+    if best["correlation"] is None or corr > best["correlation"]:
+      best = {"lag_frames": lag, "lag_ms": lag * 10, "correlation": round(corr, 4)}
+  result["command_to_bias_lag"] = best
+
+  # Per-speed slope. The stock LKAS request is sent every frame regardless of the TI, but the EPS
+  # only acts on it above the enable speed -- so if the plant really is seeing two actuators up
+  # there, the slope should step at the band rather than drift smoothly through it.
+  bins, edges = [], [0, LKAS_DISABLE_MS, LKAS_ENABLE_MS, 20.0, 25.0, 99.0]
+  for lo, hi in zip(edges, edges[1:]):
+    sel = (spd >= lo) & (spd < hi)
+    if int(sel.sum()) < 150:
+      continue
+    fit = _fit_through_origin(cmd[sel], bias[sel], np)
+    if fit:
+      bins.append({"speed_ms": [round(lo, 1), round(hi, 1)], **fit})
+  result["by_speed"] = bins
+
+  below = (spd < LKAS_DISABLE_MS)
+  above = (spd >= LKAS_ENABLE_MS)
+  lo_fit = _fit_through_origin(cmd[below], bias[below], np) if int(below.sum()) >= 150 else None
+  hi_fit = _fit_through_origin(cmd[above], bias[above], np) if int(above.sum()) >= 150 else None
+  dual = {"ti_only_below_45kph": lo_fit, "ti_plus_stock_above_52kph": hi_fit}
+  if lo_fit and hi_fit and lo_fit["slope"]:
+    ratio = hi_fit["slope"] / lo_fit["slope"]
+    dual["slope_ratio_above_over_below"] = round(ratio, 3)
+    dual["reading"] = (
+      "Materially above 1.0 means the stock CAM_LKAS request is contributing real torque above the "
+      "enable speed, i.e. two actuators, and torqued is fitting one line through both regimes. "
+      "Near 1.0 means the TI accounts for the response on its own and the stock path is inert."
+      if abs(ratio - 1.0) > 0.15 else
+      "Close to 1.0: no evidence of a second actuator contributing above the enable speed.")
+  else:
+    dual["reading"] = ("This segment does not span both regimes with enough engaged frames. Needs "
+                       "a drive with sustained time both below 45kph and above 52kph.")
+  result["dual_actuator_check"] = dual
+
+  # Frames where a large command did not produce the bias the fit predicts. This is the signature
+  # the whole exercise is looking for -- but sensor saturation produces the same shape, so those
+  # frames are counted separately rather than being allowed to masquerade as a fault.
+  if overall and overall["slope"] > 0:
+    predicted = overall["slope"] * np.abs(cmd)
+    actual = np.abs(bias)
+    big = np.abs(cmd) >= max(100.0, 0.6 * float(np.abs(cmd).max()))
+    shortfall = big & (actual < 0.5 * predicted)
+    idx = np.where(shortfall)[0]
+    worst = sorted(idx, key=lambda i: float(predicted[i] - actual[i]), reverse=True)[:10]
+    result["anomalies"] = {
+      "high_command_frames": int(big.sum()),
+      "bias_below_half_predicted": int(shortfall.sum()),
+      "pct_of_high_command_frames": round(100.0 * int(shortfall.sum()) / max(int(big.sum()), 1), 1),
+      "worst": [{"t": round(usable[i][0], 2), "command": int(cmd[i]), "bias": int(bias[i]),
+                 "predicted_bias": round(float(predicted[i]), 1),
+                 "speed_ms": round(float(spd[i]), 1)} for i in worst],
+      "caveat": ("Sensor saturation looks identical to a decoder fault here. Check "
+                 "eps_sensor_saturated_frames: if those are numerous the shortfall is the [-85,85] "
+                 "DBC range running out, not the interceptor misbehaving."),
+    }
+
+  result["how_to_read"] = (
+    "response.slope is bias counts per count of command -- the conversion the whole tuning problem "
+    "rests on, and multiplying it by TiSteerMax gives the most bias this setup can ever deliver. "
+    "r2 near 1 means the relationship is linear over the range driven; a low r2 with a healthy n "
+    "is the first real evidence of the nonlinearity we have been assuming. command_to_bias_lag is "
+    "how long the EPS takes to follow. by_speed and dual_actuator_check test whether the stock "
+    "LKAS path is contributing torque above 52kph, which would mean torqued has been fitting one "
+    "line through two different plants. anomalies is the decoder-glitch search; read its caveat "
+    "before believing it. commands_above_600 tests whether anything above the clip was ever sent.")
+  return result
+
+
 TOOLS = [
   {"name": "ti_status",
    "description":
@@ -1023,6 +1244,26 @@ TOOLS = [
      "limit": {"type": "integer", "description": "Max records of each kind (default 25)"}},
      "required": ["segment"]},
    "fn": tool_segment_diagnostics},
+
+  {"name": "ti_response",
+   "description":
+     "Characterises what the interceptor's command actually DOES: fits bias (the EPS torque sensor "
+     "minus the TI's driver-only sensor, both declared in identical DBC units) against the 0x249 "
+     "command. Returns counts-of-bias-per-count-of-command with an r2 for linearity, the "
+     "command-to-bias lag in frames, the slope broken down by speed, and the frames where a large "
+     "command failed to produce the bias the fit predicts -- the signature of the high-torque "
+     "unreliability this fork exists to chase, reported next to a sensor-saturation count because "
+     "saturation looks identical and must not be mistaken for it. Also tests whether the stock "
+     "Mazda LKAS request contributes torque above its 52kph enable speed, which would mean the car "
+     "has two actuators and torqued has been fitting one line through both plants. Use this to "
+     "establish the plant BEFORE changing limits; use ti_stats and analyze_segment to measure the "
+     "effect afterwards. Needs sustained engaged driving, ideally spanning both below 45kph and "
+     "above 52kph. Refuses to run onroad.",
+   "inputSchema": {"type": "object", "properties": {
+     "segment": {"type": "string",
+                 "description": "Segment name exactly as returned by list_segments"}},
+     "required": ["segment"]},
+   "fn": tool_ti_response},
 ]
 
 
