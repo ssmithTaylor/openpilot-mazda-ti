@@ -219,6 +219,15 @@ class CarController(CarControllerBase):
     # drive. One write per tap is nothing, unlike the per-second counters.
     self.params.put_nonblocking("TiFlaggedMoments", json.dumps(existing[-FLAG_HISTORY:]))
 
+  def maybe_refresh_route(self):
+    """Read CurrentRoute once, not every second.
+
+    loggerd only rewrites it at an onroad transition, and this process is restarted at every
+    ignition cycle -- so one read per process lifetime is all the information there is. Doing it
+    at 1Hz put a /data read inside the 100Hz realtime thread for a string that never changes."""
+    if not self.ti_route:
+      self.refresh_route()
+
   def refresh_route(self):
     """Identity for everything recorded this second. loggerd writes CurrentRoute at every onroad
     transition, so stamping it is what ties a saved run, or a flagged moment, back to the segments
@@ -235,8 +244,12 @@ class CarController(CarControllerBase):
   def publish_ti_stats(self):
     payload = self.ti_payload()
 
-    # Live copy on tmpfs. Free -- /dev/shm never reaches flash -- so this one can stay at 1Hz.
-    self.params_memory.put_nonblocking("TiTuningStats", payload)
+    # Live copy on tmpfs, written BLOCKING on purpose. put_nonblocking hands the write to a
+    # background thread, and Params spawns that thread through std::async on nearly every call --
+    # which is the expensive part here, not the write. A tmpfs write is a memcpy and its fsync is a
+    # no-op, so doing it inline is cheaper than creating a thread to avoid it. put_nonblocking is
+    # still right for the flash copy below, where the write genuinely is slow.
+    self.params_memory.put("TiTuningStats", payload)
 
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
     # Same reasoning as the flag trigger: ephemeral, so tmpfs, so no journal commit in the control
@@ -268,7 +281,7 @@ class CarController(CarControllerBase):
         pass
       self.reset_ti_stats()
       cleared = self.ti_payload()
-      self.params_memory.put_nonblocking("TiTuningStats", cleared)
+      self.params_memory.put("TiTuningStats", cleared)
       self.params.put_nonblocking("TiTuningStats", cleared)
       return
 
@@ -477,10 +490,22 @@ class CarController(CarControllerBase):
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX
       new_actuators.steerOutputCan = apply_steer
 
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and self.frame % 100 == 0:
-      self.refresh_route()
-      self.check_flag_request(CS, CC, ti_apply_steer)
-      self.publish_ti_stats()
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      # Trigger polls stay at 1Hz -- they are tmpfs reads costing microseconds, and the flag button
+      # needs to feel responsive.
+      if self.frame % 100 == 0:
+        self.maybe_refresh_route()
+        self.check_flag_request(CS, CC, ti_apply_steer)
+
+      # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
+      # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a
+      # new thread's stack has to be allocated and faulted in. At 1Hz that cost landed in the
+      # 100Hz thread that builds the steering frame once a second, on a fixed phase -- visible in
+      # the logs as a skipped carState frame at exactly 1Hz, which then made the 20Hz consumers
+      # polling carState fail their all_checks and flag their own output invalid, which controlsd
+      # reports as commIssue. Five seconds of staleness costs the counters nothing.
+      if self.frame % 500 == 0:
+        self.publish_ti_stats()
 
     self.frame += 1
     Timer.tick()
