@@ -95,6 +95,11 @@ private:
 
   qint64 offroad_since = 0;
   bool drove_this_cycle = false;
+  // Both cached at the offroad transition rather than read in the idle loop, which otherwise runs
+  // at UI_FREQ for as long as the device sits parked. idle_window_s is how long the device will
+  // stay awake before its shutdown timer fires, which is what the refresh has to fit inside.
+  bool auto_refresh_enabled = false;
+  qint64 idle_window_s = 0;
   ScreenRefreshOverlay *auto_refresh = nullptr;
 
 private slots:

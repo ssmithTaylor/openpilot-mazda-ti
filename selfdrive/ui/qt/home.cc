@@ -1,5 +1,7 @@
 #include "selfdrive/ui/qt/home.h"
 
+#include <algorithm>
+
 #include <QDateTime>
 #include <QHBoxLayout>
 #include <QMouseEvent>
@@ -33,6 +35,17 @@ namespace {
   constexpr qint64 AUTO_REFRESH_DELAY_S = 5 * 60;
   constexpr qint64 AUTO_REFRESH_DURATION_S = 5 * 60;
   constexpr qint64 AUTO_REFRESH_INTERVAL_S = 7 * 24 * 60 * 60;
+  // Left unused at the end of the idle window, so a pass is not racing the power-down it was
+  // scheduled around, and below which a pass is not worth starting at all.
+  constexpr qint64 AUTO_REFRESH_MARGIN_S = 60;
+  constexpr qint64 AUTO_REFRESH_MIN_RUN_S = 60;
+
+  // FrogPilot's offroad shutdown setting, in the same shape frogpilot_variables computes it:
+  // (setting - 3) hours from 4 up, setting * 15 minutes below. Setting 0 means the device powers
+  // down as soon as it goes offroad, so there is no idle window to work in.
+  qint64 idleWindowSeconds(int setting) {
+    return setting >= 4 ? (qint64)(setting - 3) * 3600 : (qint64)setting * 15 * 60;
+  }
 }
 
 void HomeWindow::updatePixelShift() {
@@ -113,15 +126,28 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
     return;
   }
 
-  if (auto_refresh != nullptr || offroad_since == 0 || !params.getBool("AutoScreenRefresh")) {
+  // auto_refresh_enabled and idle_window_s are read once at the offroad transition rather than
+  // here: this runs at UI_FREQ for the whole time the device sits parked, and neither value can
+  // change without a transition.
+  if (auto_refresh != nullptr || offroad_since == 0 || !auto_refresh_enabled || idle_window_s <= 0) {
+    return;
+  }
+
+  // Fit inside however long the device will actually stay awake. device_shutdown_time is
+  // (setting - 3) hours from setting 4 up, and setting * 15 minutes below it -- so at setting 0 it
+  // powers down immediately offroad and there is no window at all, and at setting 1 there are
+  // fifteen minutes. A fixed five-minute wait plus a five-minute pass silently never completed in
+  // the small settings; now the wait shrinks to fit and the pass takes what is left.
+  const qint64 delay = std::min<qint64>(AUTO_REFRESH_DELAY_S, idle_window_s / 3);
+  const qint64 usable = idle_window_s - delay - AUTO_REFRESH_MARGIN_S;
+  if (usable < AUTO_REFRESH_MIN_RUN_S) {
     return;
   }
 
   const qint64 now = QDateTime::currentSecsSinceEpoch();
-  // Wait a couple of minutes so this never fires while you are still parked at a light with the
-  // ignition briefly off, and keep it to five minutes so it finishes before the device powers
-  // down rather than holding it awake off the car battery.
-  if (now - offroad_since < AUTO_REFRESH_DELAY_S) {
+  // Wait so this never fires while you are still parked at a light with the ignition briefly off,
+  // and so the whole thing happens after you have walked away.
+  if (now - offroad_since < delay) {
     return;
   }
   // Weekly, like a TV's compensation cycle. Running a bright full-screen pass after every drive
@@ -138,6 +164,9 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   if (remaining <= 0 || remaining > AUTO_REFRESH_DURATION_S) {
     remaining = AUTO_REFRESH_DURATION_S;
   }
+  // Never start more than the idle window can finish. A pass cut short by power-down banks its
+  // progress like any other interruption, but there is no reason to plan one that cannot complete.
+  remaining = std::min<int>(remaining, (int)usable);
 
   drove_this_cycle = false;
   auto_refresh = new ScreenRefreshOverlay(remaining);
@@ -193,6 +222,12 @@ void HomeWindow::offroadTransition(bool offroad) {
   // on boot too, and taking over the screen two minutes after switching the device on, having
   // driven nowhere, is not what "after a drive" means.
   offroad_since = (offroad && drove_this_cycle) ? QDateTime::currentSecsSinceEpoch() : 0;
+  if (offroad_since != 0) {
+    // Cached here so the idle loop does not re-read them at UI_FREQ for however long the device
+    // sits parked. Neither can change without another transition through this function.
+    auto_refresh_enabled = params.getBool("AutoScreenRefresh");
+    idle_window_s = idleWindowSeconds(params.getInt("DeviceShutdown"));
+  }
 
   body->setEnabled(false);
   sidebar->setVisible(offroad || params.getBool("Sidebar") || frogpilotUIState()->frogpilot_toggles.value("debug_mode").toBool());

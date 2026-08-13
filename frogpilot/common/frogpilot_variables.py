@@ -469,6 +469,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("ClearTiStats", "0", 3, "0"),
   ("TiFlagMoment", "0", 3, "0"),
   ("TiFlaggedMoments", "", 3, ""),
+  ("TiTuningStatsHistory", "", 3, ""),
   ("AutoScreenRefresh", "1", 0, "1"),
   ("LastScreenRefresh", "0", 0, "0"),
   ("ScreenRefreshRemaining", "0", 0, "0"),

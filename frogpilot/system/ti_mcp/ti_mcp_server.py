@@ -117,7 +117,7 @@ class Snapshot:
       return
 
     sm = messaging.SubMaster(["carState", "carControl", "controlsState",
-                              "liveTorqueParameters", "liveParameters"])
+                              "liveTorqueParameters", "liveParameters", "liveDelay"])
     while True:
       try:
         sm.update(1000)
@@ -141,6 +141,14 @@ class Snapshot:
           "learned_bucket_points": float(ltp.totalBucketPoints),
           "learned_decay": round(float(ltp.decay), 1),
           "learned_steer_ratio": round(float(lp.steerRatio), 3),
+          # lagd's live estimate of steering actuator delay. The rate limiter looks exactly like
+          # actuator lag from the controller's point of view, so a learned delay well above the
+          # car port's static 0.1s is quantified evidence the ramp is starving the controller --
+          # and it should re-converge downward if raising the ramp rate genuinely helps.
+          "learned_lateral_delay": round(float(sm["liveDelay"].lateralDelay), 4),
+          "learned_lateral_delay_estimate": round(float(sm["liveDelay"].lateralDelayEstimate), 4),
+          "lateral_delay_status": str(sm["liveDelay"].status),
+          "lateral_delay_valid_blocks": int(sm["liveDelay"].validBlocks),
         })
       except Exception as e:
         self.set({"available": False, "reason": str(e)})
@@ -253,9 +261,13 @@ def tool_ti_stats(_args):
     }
 
   cur, prev = summarise(current), summarise(previous)
+  # Oldest first, so a session reads as a sequence of steps. Only completed runs land here -- the
+  # one in progress is `current`.
+  history = [summarise(h) for h in (_param_json("TiTuningStatsHistory") or [])]
   result = {
     "current": cur,
     "previous": prev,
+    "history": history,
     "baselines": BASELINE,
     "how_to_read": ("short_of_requested_pct is how often openpilot cut its own command and "
                     "mean_deficit_per_engaged_frame is by how much -- the second is the one that "
@@ -378,6 +390,22 @@ def tool_torque_learning(_args):
     "force_auto_tune_param": forced,
     "advanced_lateral_tune_param": advanced,
     "effectively_in_use": native or (forced and advanced),
+    # lagd's live estimate of steering actuator delay, against the 0.1s this car port declares
+    # statically. The rate limiter is indistinguishable from actuator lag as far as the lateral
+    # controller is concerned, so a learned delay well above the static figure is independent
+    # evidence that the ramp is starving it -- and it should fall back toward the static value if
+    # opening the ramp up genuinely helps. Only meaningful once status reads "estimated".
+    "lateral_delay": {
+      "learned": live.get("learned_lateral_delay"),
+      "estimate": live.get("learned_lateral_delay_estimate"),
+      "status": live.get("lateral_delay_status"),
+      "valid_blocks": live.get("lateral_delay_valid_blocks"),
+      "static_from_car_port": 0.1,
+      "how_to_read": ("Compare learned against static_from_car_port. Materially higher means the "
+                      "controller is compensating for lag the ramp limiter is creating. Watch it "
+                      "across a TiSteerDeltaUp change: it falling is corroboration independent of "
+                      "the shortfall counters."),
+    },
   }
   if not (native or forced):
     out["note"] = ("Neither the car's own auto-tune nor Force Auto-Tune is on, so these values are "
@@ -513,6 +541,8 @@ def tool_analyze_segment(args):
   modes, viols = collections.Counter(), collections.Counter()
   ramp = engaged = 0
   ti_req, curv_err, speeds = [], [], []
+  curv_err_engaged, curv_err_limited, curv_err_free = [], [], []
+  rate_limited_now = False
   transitions = []
   last_sig = None
   truncated = False
@@ -549,7 +579,16 @@ def tool_analyze_segment(args):
         engaged += 1
     elif w == "controlsState":
       c = msg.controlsState
-      curv_err.append(abs(float(getattr(c, "desiredCurvature", 0.0)) - float(c.curvature)))
+      err = abs(float(getattr(c, "desiredCurvature", 0.0)) - float(c.curvature))
+      curv_err.append(err)
+      # Split by whether the limiter was cutting at the time. This is the outcome metric the
+      # counters cannot supply: the counters say the command was cut, this says whether the car
+      # missed its line because of it. Engaged-only, because unengaged curvature error is a
+      # measure of the driver, not of openpilot -- reporting the two together is how a parked or
+      # hand-driven segment ends up looking like a tracking result.
+      if last_lat:
+        curv_err_engaged.append(err)
+        (curv_err_limited if rate_limited_now else curv_err_free).append(err)
     elif w == "carState":
       speeds.append(float(msg.carState.vEgo))
       last_drv = float(msg.carState.steeringTorque)
@@ -592,12 +631,14 @@ def tool_analyze_segment(args):
             if abs(req) >= steer_max:
               at_clip += 1
             desired = int(round(last_steer * steer_max))
+            rate_limited_now = False
             if abs(desired) - abs(req) > 5:
               short += 1
               # Rate limiting only counts while the command is climbing; a command collapsing under
               # driver torque moves at DELTA_DOWN and would otherwise be blamed on the ramp rate.
               if abs(req) > abs(last_sent) and abs(req - last_sent) >= delta_up:
                 rate_lim += 1
+                rate_limited_now = True
               # Only torque OPPOSING the command narrows the cap. openpilot's driver-torque limit
               # is signed: the bound in the driver's own direction widens instead.
               if abs(last_drv) > allowance and (last_drv * desired) < 0:
@@ -607,6 +648,12 @@ def tool_analyze_segment(args):
   def pct(vals, p):
     return round(sorted(vals)[min(len(vals) - 1, int(len(vals) * p))], 6) if vals else None
 
+  def stat(vals):
+    # n is reported alongside every mean because these subsets can be small -- a p95 over eleven
+    # frames is not a p95, and a reader needs to see that rather than infer it.
+    return {"mean": round(sum(vals) / len(vals), 6), "p95": pct(vals, 0.95),
+            "n": len(vals)} if vals else None
+
   result = {
     "segment": segment,
     "truncated": truncated,
@@ -615,10 +662,23 @@ def tool_analyze_segment(args):
     "ti_violations": {("none" if k == 0 else f"0x{k:02X} {TI_VIOL.get(k, '?')}"): v
                       for k, v in viols.most_common()},
     "ti_ramp_frames": ramp,
+    # Against the live TiSteerMax, not a hardcoded 600. They agree only while TiSteerMax is at its
+    # default, and the command block below already uses steer_max -- two figures called at_clip
+    # that disagree the moment the limit is lowered is worse than either alone.
     "lkas_request": {"min": min(ti_req), "max": max(ti_req),
-                     "at_clip": sum(1 for r in ti_req if abs(r) >= 600)} if ti_req else None,
-    "curvature_error": {"mean": round(sum(curv_err) / len(curv_err), 6),
-                        "p95": pct(curv_err, 0.95), "n": len(curv_err)} if curv_err else None,
+                     "at_clip": sum(1 for r in ti_req if abs(r) >= steer_max)} if ti_req else None,
+    "curvature_error": stat(curv_err),
+    # The one that answers "did the car track better", which the counters cannot. Compare
+    # while_rate_limited against while_tracking_freely within a single drive: a large gap means the
+    # ramp limiter is costing real tracking, not just command headroom. Across an A/B, the figure
+    # that should improve is engaged_only.
+    "curvature_error_engaged": {
+      "engaged_only": stat(curv_err_engaged),
+      "while_rate_limited": stat(curv_err_limited),
+      "while_tracking_freely": stat(curv_err_free),
+      "note": ("curvature_error above covers the whole segment including unengaged driving, where "
+               "it measures the driver rather than openpilot. These three are engaged frames only."),
+    } if curv_err_engaged else None,
     "command": {
       "frames": cmd_frames,
       "short_of_requested_pct": round(100.0 * short / cmd_frames, 1),

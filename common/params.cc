@@ -577,6 +577,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiMcpAddress", CLEAR_ON_MANAGER_START},
     {"TiMcpEnabled", PERSISTENT},
     {"TiTuningStats", PERSISTENT},
+    {"TiTuningStatsHistory", PERSISTENT},
     {"TiTuningStatsPrevious", PERSISTENT},
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},

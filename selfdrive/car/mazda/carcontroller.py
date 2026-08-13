@@ -34,6 +34,9 @@ BIAS_MIN_COMMAND = 100
 # Flags kept. Enough for a long tuning drive, small enough that the param stays a few kilobytes.
 FLAG_HISTORY = 40
 
+# Completed measurement runs retained. Enough to hold a session's worth of A/B steps.
+RUN_HISTORY = 5
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -159,6 +162,17 @@ class CarController(CarControllerBase):
       s["bias_sum"] += abs(int(CS.eps_torque_sensor - CS.out.steeringTorque))
       s["bias_frames"] += 1
 
+  def load_param_list(self, key):
+    """A JSON list from params, or an empty one. Anything unparseable is treated as empty rather
+    than raising: this runs inside the 100Hz car controller, where an exception is a dead process
+    and a lost drive, and a corrupt history is not worth that."""
+    try:
+      raw = self.params.get(key, encoding="utf8")
+      value = json.loads(raw) if raw else []
+      return value if isinstance(value, list) else []
+    except (ValueError, TypeError):
+      return []
+
   def check_flag_request(self, CS, CC, sent):
     """The driver tapped "Flag This Moment" on the tuning panel because something felt wrong.
 
@@ -198,12 +212,7 @@ class CarController(CarControllerBase):
       "config": self.ti_config(),
     }
 
-    try:
-      existing = json.loads(self.params.get("TiFlaggedMoments", encoding="utf8") or "[]")
-      if not isinstance(existing, list):
-        existing = []
-    except (ValueError, TypeError):
-      existing = []
+    existing = self.load_param_list("TiFlaggedMoments")
     existing.append(entry)
     # Persisted to flash rather than tmpfs: the entire point is to still have these after the
     # drive. One write per tap is nothing, unlike the per-second counters.
@@ -234,9 +243,20 @@ class CarController(CarControllerBase):
       # Bank this session's counters when it has any, and the persisted ones otherwise. The process
       # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
       # zeros as "previous" and lose the run the user actually meant to keep.
-      self.params.put_nonblocking("TiTuningStatsPrevious",
-                                  payload if self.ti_stats["engaged"] else
-                                  (self.params.get("TiTuningStats") or payload))
+      closing = payload if self.ti_stats["engaged"] else \
+                (self.params.get("TiTuningStats", encoding="utf8") or payload)
+      self.params.put_nonblocking("TiTuningStatsPrevious", closing)
+      # Keep a short history as well as the single previous run. Two slots meant one stray tap on
+      # "Start A New Measurement" destroyed the baseline you were comparing against, which is easy
+      # to do mid-drive and impossible to undo. Now that every run carries the limits it was taken
+      # under, a handful of them is a usable record of a tuning session rather than just a pair.
+      try:
+        history = self.load_param_list("TiTuningStatsHistory")
+        history.append(json.loads(closing))
+        self.params.put_nonblocking("TiTuningStatsHistory",
+                                    json.dumps(history[-RUN_HISTORY:]))
+      except (ValueError, TypeError):
+        pass
       self.reset_ti_stats()
       cleared = self.ti_payload()
       self.params_memory.put_nonblocking("TiTuningStats", cleared)
