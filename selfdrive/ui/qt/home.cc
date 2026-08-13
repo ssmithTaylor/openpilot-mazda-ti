@@ -27,7 +27,10 @@ namespace {
   constexpr int PIXEL_SHIFT = 2;
   constexpr int PIXEL_SHIFT_TICKS = 60 * UI_FREQ;
 
-  constexpr qint64 AUTO_REFRESH_DELAY_S = 2 * 60;
+  // Long enough that the driver has gathered their things and walked away. The device stays up for
+  // a while after ignition off while the car battery holds, so five minutes idle plus a five
+  // minute pass sits comfortably inside that window -- and the whole thing happens unseen.
+  constexpr qint64 AUTO_REFRESH_DELAY_S = 5 * 60;
   constexpr qint64 AUTO_REFRESH_DURATION_S = 5 * 60;
   constexpr qint64 AUTO_REFRESH_INTERVAL_S = 7 * 24 * 60 * 60;
 }

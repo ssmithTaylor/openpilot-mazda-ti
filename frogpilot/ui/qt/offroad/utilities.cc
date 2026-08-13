@@ -101,7 +101,8 @@ FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent
 
   ParamControl *autoRefreshToggle = new ParamControl("AutoScreenRefresh", tr("Weekly Screen Refresh"),
     tr("<b>Run a five minute burn-in reduction pass automatically while the device sits idle after a drive</b>, at most once a week. "
-       "Starts two minutes after the ignition goes off so it never interrupts a brief stop, and cancels immediately if you start driving again."), "");
+       "Starts five minutes after the ignition goes off, so it normally happens once you have walked away and you never see it. "
+       "Cancels immediately if you start driving again, and picks up where it left off next time."), "");
   addItem(autoRefreshToggle);
 
   ParamControl *pixelShiftToggle = new ParamControl("PixelShift", tr("Pixel Shift"),
