@@ -256,10 +256,11 @@ def tool_torque_learning(_args):
   return out
 
 
-# log_root() picks between these depending on whether HD recording is on (/cache/use_HD), so check
-# both rather than assuming. TI_MCP_SEGMENTS overrides if a build puts them somewhere else.
+# log_root() takes HD and konik flags and returns a different directory for each, so all three
+# exist on a device and only one holds the recordings. TI_MCP_SEGMENTS overrides.
 SEGMENT_ROOTS = ([os.environ["TI_MCP_SEGMENTS"]] if os.environ.get("TI_MCP_SEGMENTS") else
-                 ["/data/media/0/realdata_HD", "/data/media/0/realdata"])
+                 ["/data/media/0/realdata_konik", "/data/media/0/realdata_HD",
+                  "/data/media/0/realdata"])
 
 
 def _segment_dirs():
