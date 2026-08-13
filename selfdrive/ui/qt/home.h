@@ -94,6 +94,7 @@ private:
   void updateAutoScreenRefresh(bool started);
 
   qint64 offroad_since = 0;
+  bool drove_this_cycle = false;
   ScreenRefreshOverlay *auto_refresh = nullptr;
 
 private slots:

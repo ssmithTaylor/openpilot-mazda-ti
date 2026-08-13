@@ -102,6 +102,7 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   // A drive starting always wins. Close immediately rather than waiting for the next tick.
   if (started) {
     offroad_since = 0;
+    drove_this_cycle = true;
     if (auto_refresh != nullptr) {
       auto_refresh->close();
       auto_refresh = nullptr;
@@ -128,6 +129,7 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   }
 
   params.putInt("LastScreenRefresh", now);
+  drove_this_cycle = false;
   auto_refresh = new ScreenRefreshOverlay(AUTO_REFRESH_DURATION_S);
   QObject::connect(auto_refresh, &QObject::destroyed, this, [this]() { auto_refresh = nullptr; });
   auto_refresh->showFullScreen();
@@ -168,8 +170,10 @@ void HomeWindow::updateState(const UIState &s, const FrogPilotUIState &fs) {
 
 void HomeWindow::offroadTransition(bool offroad) {
   // Marks when the car went quiet, so the auto refresh can wait out a brief ignition-off before
-  // taking over the screen.
-  offroad_since = offroad ? QDateTime::currentSecsSinceEpoch() : 0;
+  // taking over the screen. Only arms if a drive actually happened this power cycle -- this fires
+  // on boot too, and taking over the screen two minutes after switching the device on, having
+  // driven nowhere, is not what "after a drive" means.
+  offroad_since = (offroad && drove_this_cycle) ? QDateTime::currentSecsSinceEpoch() : 0;
 
   body->setEnabled(false);
   sidebar->setVisible(offroad || params.getBool("Sidebar") || frogpilotUIState()->frogpilot_toggles.value("debug_mode").toBool());
