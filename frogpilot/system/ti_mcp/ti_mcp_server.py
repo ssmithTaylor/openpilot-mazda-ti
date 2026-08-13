@@ -147,8 +147,16 @@ class Snapshot:
         ltp, lp, ctl = sm["liveTorqueParameters"], sm["liveParameters"], sm["controlsState"]
         self.set({
           "available": True,
+          # Monotonic stamp so a consumer can tell a fresh reading from the last one taken before
+          # this thread wedged. The park check refuses to act on a stale snapshot.
+          "ts": time.monotonic(),
           "engaged": bool(cc.latActive),
           "v_ego_ms": round(float(cs.vEgo), 2),
+          # Gear and standstill feed the park check in _refuse_if_driving. Mazda's carstate decodes
+          # both, and openpilot raises wrongGear off the same signal, so this is the car's own
+          # reading rather than something inferred from speed.
+          "gear_shifter": str(cs.gearShifter),
+          "standstill": bool(cs.standstill),
           "steering_angle_deg": round(float(cs.steeringAngleDeg), 2),
           "driver_torque": float(cs.steeringTorque),
           "steer_fault_temporary": bool(cs.steerFaultTemporary),
@@ -495,21 +503,58 @@ def _is_onroad():
     return True
 
 
-def _refuse_if_onroad(tool):
+# How stale a snapshot may be before the park check stops believing it. The snapshot thread turns
+# over on a 1s SubMaster timeout, so more than a few seconds means the messaging side is not
+# keeping up and the gear reading could predate a shift out of park.
+SNAPSHOT_MAX_AGE_S = 3.0
+
+
+def _is_parked():
+  """True only when the car is sitting in Park.
+
+  Deliberately not 'stopped'. Stopped in Drive is still a driving situation -- the car can move and
+  openpilot can engage the instant it does, which is precisely when a background rlog parse must
+  not be competing with camerad and modeld. Park is the one state where neither can happen without
+  the driver moving the selector first, which is not something they do by accident.
+
+  Fails closed on every uncertainty: no snapshot, a stale one, a car port that does not decode
+  gear, or any reported motion at all.
+  """
+  live = snapshot.get()
+  if not live.get("available"):
+    return False
+  ts = live.get("ts")
+  if ts is None or (time.monotonic() - ts) > SNAPSHOT_MAX_AGE_S:
+    return False
+  if live.get("gear_shifter") != "park":
+    return False
+  # Belt and braces against a gear reading that is fresh by timestamp but wrong: a car in park is
+  # not moving, so any speed at all means one of the two signals is lying and neither gets trusted.
+  return bool(live.get("standstill")) and abs(float(live.get("v_ego_ms") or 0.0)) < 0.1
+
+
+def _refuse_if_driving(tool):
   """Reading a segment means decompressing tens of megabytes into RAM and walking every message in
   it, on the same SoC as modeld and camerad. Any LAN client can call these, and a drive is exactly
   when nobody is watching what the tuning laptop is doing. This is the same class of failure as the
   params fsync regression -- background work starving the camera pipeline -- reached through CPU
-  and memory instead of I/O, so it gets refused rather than merely discouraged."""
-  if not _is_onroad():
+  and memory instead of I/O, so it gets refused rather than merely discouraged.
+
+  Onroad-and-in-park is exempt. The reason to refuse is contention with the driving pipeline, and
+  in park there is no engagement to lose -- while sitting in a hot car with the engine running for
+  air conditioning is exactly when someone wants to read a drive they just finished. Ignition off
+  is not a reasonable thing to require for a read-only query.
+  """
+  if not _is_onroad() or _is_parked():
     return None
-  return {"error": f"refused: {tool} does not run while the car is onroad",
+  return {"error": f"refused: {tool} does not run while the car is in motion",
           "why": "it decompresses and walks a whole rlog on the device, which competes with "
                  "camerad and modeld; doing that mid-drive can drop camera frames and cost you "
                  "engagement",
-          "what_to_do": "the segment is already recorded and is not going anywhere -- run this "
-                        "once the car is parked. ti_status, ti_stats, ti_tuning, torque_learning "
-                        "and list_segments are all cheap and stay available while driving."}
+          "what_to_do": "the segment is already recorded and is not going anywhere -- put the car "
+                        "in Park and call again; the engine can stay running. ti_status, ti_stats, "
+                        "ti_tuning, torque_learning and list_segments are all cheap and stay "
+                        "available even while driving."}
 
 
 def _rlog_path(segment):
@@ -549,7 +594,7 @@ def tool_analyze_segment(args):
   segment = args.get("segment")
   if not segment:
     return {"error": "segment required; call list_segments first"}
-  refusal = _refuse_if_onroad("analyze_segment")
+  refusal = _refuse_if_driving("analyze_segment")
   if refusal is not None:
     return refusal
   path = _rlog_path(segment)
@@ -939,7 +984,7 @@ def tool_segment_diagnostics(args):
   segment = args.get("segment")
   if not segment:
     return {"error": "segment required; call list_segments first"}
-  refusal = _refuse_if_onroad("segment_diagnostics")
+  refusal = _refuse_if_driving("segment_diagnostics")
   if refusal is not None:
     return refusal
   path = _rlog_path(segment)
@@ -1127,7 +1172,7 @@ def tool_ti_response(args):
   segment = args.get("segment")
   if not segment:
     return {"error": "segment required; call list_segments first"}
-  refusal = _refuse_if_onroad("ti_response")
+  refusal = _refuse_if_driving("ti_response")
   if refusal is not None:
     return refusal
   path = _rlog_path(segment)
@@ -1603,8 +1648,8 @@ TOOLS = [
      "better, which the live counters cannot answer. Starts with a verdict field stating whether "
      "the segment can support a tuning conclusion at all; a parked or unengaged segment reads as "
      "healthy but proves nothing. Only the summary crosses the wire, never the log itself. "
-     "Refuses to run while the car is onroad, because the parse competes with camerad and modeld; "
-     "wait until it is parked.",
+     "Refuses to run while the car is in motion, because the parse competes with camerad and "
+     "modeld; put it in Park and call again, engine running is fine.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments, "
@@ -1637,8 +1682,8 @@ TOOLS = [
      "analysis measured straight from the log -- so it can identify a stall even when controlsd "
      "attributed it wrongly. Gaps are reported as periods_missed, the gap in units of that "
      "service's own interval, so a 1Hz and a 100Hz service can be compared. Nothing to do with "
-     "the TI; use analyze_segment for that. Refuses to run while the car is onroad, because the "
-     "parse competes with camerad and modeld; wait until it is parked.",
+     "the TI; use analyze_segment for that. Refuses to run while the car is in motion, because "
+     "the parse competes with camerad and modeld; put it in Park, engine running is fine.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments"},
@@ -1668,7 +1713,7 @@ TOOLS = [
      "BEFORE changing limits; use ti_stats and analyze_segment to measure the effect afterwards. "
      "Needs sustained engaged driving, ideally spanning both below 45kph and above 52kph; the "
      "bypass half of measurement_identity needs an OLD recording from the faulty unit, which sat "
-     "out of RUN for whole segments. Refuses to run onroad.",
+     "out of RUN for whole segments. Refuses to run while the car is in motion; Park is enough.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments"}},
