@@ -1,4 +1,78 @@
+#include <QPainter>
+#include <QTimer>
+
 #include "frogpilot/ui/qt/offroad/utilities.h"
+
+namespace {
+  // Each solid phase lasts long enough to matter but short enough that the panel never sits on one
+  // colour, which is what caused the problem in the first place.
+  constexpr int PHASE_MS = 4000;
+  constexpr int TICK_MS = 50;
+  constexpr int BAR_WIDTH = 40;
+}
+
+ScreenRefreshOverlay::ScreenRefreshOverlay(int seconds, QWidget *parent)
+    : QWidget(parent), total_ms(seconds * 1000) {
+  setAttribute(Qt::WA_DeleteOnClose);
+  setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+  setCursor(Qt::BlankCursor);
+  elapsed.start();
+
+  QTimer *ticker = new QTimer(this);
+  QObject::connect(ticker, &QTimer::timeout, [this]() {
+    if (elapsed.elapsed() >= total_ms) {
+      close();
+      return;
+    }
+    // Hold off the screen timeout; the user is deliberately not touching anything.
+    device()->resetInteractiveTimeout();
+    update();
+  });
+  ticker->start(TICK_MS);
+}
+
+void ScreenRefreshOverlay::paintEvent(QPaintEvent *event) {
+  QPainter p(this);
+  const qint64 ms = elapsed.elapsed();
+  const int phase = (ms / PHASE_MS) % 6;
+
+  if (phase < 5) {
+    // Solid fills: white exercises every subpixel at full drive, the primaries each exercise one,
+    // and black gives the panel a rest cycle.
+    static const QColor fills[5] = {Qt::white, Qt::red, Qt::green, Qt::blue, Qt::black};
+    p.fillRect(rect(), fills[phase]);
+  } else {
+    // Sweeping inversion bars. Every pixel alternates black/white as the pattern scrolls, which is
+    // what shifts trapped charge rather than just averaging brightness.
+    const int offset = (ms / 16) % (BAR_WIDTH * 2);
+    p.fillRect(rect(), Qt::black);
+    p.setPen(Qt::NoPen);
+    p.setBrush(Qt::white);
+    for (int x = -BAR_WIDTH * 2 + offset; x < width(); x += BAR_WIDTH * 2) {
+      p.drawRect(x, 0, BAR_WIDTH, height());
+    }
+  }
+
+  // Remaining time and the exit hint. Deliberately repositioned every second -- static text here
+  // would burn in exactly the way this tool exists to reduce.
+  const int remaining = std::max(0, int((total_ms - ms) / 1000));
+  const int step = int(ms / 1000);
+  const int bw = 520, bh = 90;
+  const int bx = (width() > bw) ? (step * 137) % (width() - bw) : 0;
+  const int by = (height() > bh) ? (step * 89) % (height() - bh) : 0;
+
+  p.setBrush(QColor(0, 0, 0, 190));
+  p.setPen(Qt::NoPen);
+  p.drawRoundedRect(bx, by, bw, bh, 12, 12);
+  p.setPen(Qt::white);
+  p.setFont(InterFont(40, QFont::Bold));
+  p.drawText(QRect(bx, by, bw, bh), Qt::AlignCenter,
+             QString("%1:%2  —  tap to stop").arg(remaining / 60).arg(remaining % 60, 2, 10, QChar('0')));
+}
+
+void ScreenRefreshOverlay::mousePressEvent(QMouseEvent *event) {
+  close();
+}
 
 FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent) : FrogPilotListWidget(parent), parent(parent) {
   QJsonObject shownDescriptions = QJsonDocument::fromJson(QString::fromStdString(params.get("ShownToggleDescriptions")).toUtf8()).object();
@@ -16,6 +90,30 @@ FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent
     debugModeToggle->showDescription();
   }
   addItem(debugModeToggle);
+
+  FrogPilotParamValueControl *screenRefreshMinutes = new FrogPilotParamValueControl("ScreenRefreshMinutes",
+    tr("Screen Refresh Duration"),
+    tr("<b>How long the burn-in reduction runs for.</b> Longer helps more; fifteen minutes is a reasonable starting point."),
+    "", 1, 60, tr(" minutes"), std::map<float, QString>(), 1, true);
+  addItem(screenRefreshMinutes);
+
+  ButtonControl *screenRefreshButton = new ButtonControl(tr("Reduce Screen Burn-In"), tr("START"),
+    tr("<b>Cycles the whole screen through white, red, green, blue, black and sweeping bars</b> so every subpixel gets equal use. "
+       "This clears temporary image retention. True burn-in is permanent wear and cannot be undone — cycling only evens it out, "
+       "at the cost of aging the rest of the panel. Tap the screen at any time to stop. Offroad only."));
+  QObject::connect(screenRefreshButton, &ButtonControl::clicked, [this]() {
+    if (uiState()->scene.started) {
+      // Never take over the display while driving.
+      FrogPilotConfirmationDialog::yesorno(tr("Not while driving. Stop the car and try again."), this);
+      return;
+    }
+    int minutes = std::clamp(params.getInt("ScreenRefreshMinutes"), 1, 60);
+    if (FrogPilotConfirmationDialog::yesorno(tr("Run the screen refresh for %1 minutes? Tap the screen to stop early.").arg(minutes), this)) {
+      ScreenRefreshOverlay *overlay = new ScreenRefreshOverlay(minutes * 60);
+      overlay->showFullScreen();
+    }
+  });
+  addItem(screenRefreshButton);
 
   ButtonControl *flashPandaButton = new ButtonControl(tr("Flash Panda"), tr("FLASH"), tr("<b>Reinstall the Panda firmware</b> to fix connection or reliability issues."));
   QObject::connect(flashPandaButton, &ButtonControl::clicked, [parent, flashPandaButton, this]() {
