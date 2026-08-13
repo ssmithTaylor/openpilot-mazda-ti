@@ -231,11 +231,22 @@ def tool_ti_stats(_args):
       # does not move.
       "mean_deficit_per_engaged_frame": round(s.get("deficit", 0) / engaged, 1),
       "rate_limited_pct": round(100.0 * s.get("rate_limited", 0) / engaged, 1),
+      # Which side of the knee the rate limiting happened on. With the knee at its default of
+      # TiSteerMax everything lands in _below_knee, which is correct: there is only one slope.
+      "rate_limited_below_knee_pct": round(100.0 * s.get("rate_limited_low", 0) / engaged, 1),
+      "rate_limited_above_knee_pct": round(100.0 * s.get("rate_limited_high", 0) / engaged, 1),
       "driver_torque_limited_pct": round(100.0 * s.get("driver_limited", 0) / engaged, 1),
       "at_clip_pct": round(100.0 * s.get("at_clip", 0) / engaged, 1),
       "peak_command": s.get("peak_cmd"),
       "peak_requested": s.get("peak_desired"),
       "peak_bias_reaching_eps": s.get("peak_bias"),
+      # Bias counts delivered per count of command, accumulated live over frames with appreciable
+      # command. This is the conversion the whole problem rests on: multiplied by TiSteerMax it is
+      # the most bias this setup can ever produce. ti_response computes the same thing from a log
+      # with linearity, lag and per-speed breakdown; this is the cheap version that needs no parse.
+      "measured_bias_slope": (round(s["bias_sum"] / s["bias_cmd_sum"], 5)
+                              if s.get("bias_cmd_sum") else None),
+      "bias_sample_frames": s.get("bias_frames"),
       "frames_not_in_run": s.get("not_run"),
       "frames_ramping": s.get("ramp"),
       **ident,

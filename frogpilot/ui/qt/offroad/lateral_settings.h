@@ -29,7 +29,11 @@ private:
   QSet<QString> laneChangeKeys = {"LaneChangeTime", "LaneDetectionWidth", "MinimumLaneChangeSpeed", "NudgelessLaneChange", "OneLaneChange"};
   QSet<QString> lateralTuneKeys = {"NNFF", "NNFFLite", "TurnDesires"};
   QSet<QString> qolKeys = {"PauseLateralSpeed"};
-  QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown", "TiSteerDriverAllowance",
+  // Every TI control must appear here. This set decides both which sub-panel a control lands in and
+  // whether the parent stays reachable at all -- a key omitted here is a control that silently
+  // never appears, which is how the whole panel went missing once already.
+  QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaUpKnee",
+                                         "TiSteerDeltaUpHigh", "TiSteerDeltaDown", "TiSteerDriverAllowance",
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
                                          "ClearTiStats", "TiMcpEnabled"};
 

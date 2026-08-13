@@ -72,6 +72,8 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"TorqueInterceptorTune", tr("Torque Interceptor Tuning"), tr("<b>Adjust how the Torque Interceptor delivers steering.</b> Only affects cars fitted with a TI."), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
     {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor ignores anything above 600."), ""},
     {"TiSteerDeltaUp", tr("Ramp-Up Rate"), tr("<b>How quickly steering effort is allowed to build.</b> Raise for sharper response entering corners. Too high and the interceptor treats it as unsafe and cuts assist to zero. Default 6 takes one second to reach full."), ""},
+    {"TiSteerDeltaUpKnee", tr("Cautious Above"), tr("<b>The effort level above which the slower ramp rate takes over.</b> Below this the ramp-up rate applies; above it, the cautious rate. Leave at 600 to use one rate everywhere. Lower it to get quick response in normal driving while staying gentle at high effort."), ""},
+    {"TiSteerDeltaUpHigh", tr("Cautious Ramp-Up Rate"), tr("<b>How quickly steering effort builds once past the level set above.</b> Only does anything if \"Cautious Above\" is below 600. Cannot exceed the main ramp-up rate."), ""},
     {"TiSteerDeltaDown", tr("Ramp-Down Rate"), tr("<b>How quickly steering effort is allowed to release.</b> Raise to hand control back faster when openpilot backs off; lower for smoother corner exits."), ""},
     {"TiSteerDriverAllowance", tr("Driver Torque Allowance"), tr("<b>How firmly you can hold the wheel before openpilot starts easing off.</b> Raise if assist fades just from resting a hand on the wheel; lower to hand over control sooner."), ""},
     {"TiSteerDriverMultiplier", tr("Driver Torque Backoff"), tr("<b>How sharply assist drops once you push past the allowance.</b> Lower it if steering gives up on you mid-corner; raise it to hand over control more readily. At the default of 40, assist is gone almost immediately."), ""},
@@ -133,16 +135,24 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       lateralToggle = torqueInterceptorToggle;
     } else if (param == "TiSteerMax") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+    // Ranges below deliberately match TI_LIMIT_BOUNDS in carcontroller.py and the clips in
+    // frogpilot_variables.py. The panda applies no steering checks to MAZDA_TI_LKAS on gen1, so
+    // these three layers are the entire envelope on the interceptor path; if you widen one, widen
+    // all three, and think about why first.
     } else if (param == "TiSteerDeltaUp") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 30, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
+    } else if (param == "TiSteerDeltaUpKnee") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+    } else if (param == "TiSteerDeltaUpHigh") {
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDeltaDown") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 50, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverAllowance") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 60, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 30, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverMultiplier") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 60, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 10, 60, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerThreshold") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 40, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
 
     } else if (param == "ResetTorqueParams") {
       // An action, not a state. The backend consumes the param and clears it, so a switch would

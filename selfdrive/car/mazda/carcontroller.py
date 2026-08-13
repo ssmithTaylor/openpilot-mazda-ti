@@ -27,6 +27,10 @@ TI_LIMIT_BOUNDS = {
   "TI_STEER_DELTA_UP_HIGH": (1, 15),
 }
 
+# Below this the bias-to-command ratio is dominated by sensor quantisation -- both torque sensors
+# are 8-bit -- so accumulating it would only add noise to the slope estimate.
+BIAS_MIN_COMMAND = 100
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -55,9 +59,11 @@ class CarController(CarControllerBase):
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
-    self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "driver_limited",
+    self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "rate_limited_low",
+                                    "rate_limited_high", "driver_limited",
                                     "at_clip", "peak_cmd", "peak_desired", "deficit",
-                                    "peak_bias", "not_run", "viol", "ramp")}
+                                    "peak_bias", "not_run", "viol", "ramp",
+                                    "bias_cmd_sum", "bias_sum", "bias_frames")}
     self.ti_stats_started = time.time()
 
   def ti_config(self):
@@ -70,6 +76,8 @@ class CarController(CarControllerBase):
       "TiSteerDeltaDown": self.ccp.TI_STEER_DELTA_DOWN,
       "TiSteerDriverAllowance": self.ccp.TI_STEER_DRIVER_ALLOWANCE,
       "TiSteerDriverMultiplier": self.ccp.TI_STEER_DRIVER_MULTIPLIER,
+      "TiSteerDeltaUpKnee": self.ccp.TI_STEER_DELTA_UP_KNEE,
+      "TiSteerDeltaUpHigh": self.ccp.TI_STEER_DELTA_UP_HIGH,
     }
     if self.ti_steer_threshold is not None:
       cfg["TiSteerThreshold"] = self.ti_steer_threshold
@@ -104,12 +112,22 @@ class CarController(CarControllerBase):
       # torque-frames of missing command; divided by engaged it is the single number that should
       # go down when a tuning change actually helps.
       s["deficit"] += abs(desired) - abs(sent)
+      # Test against the rate the limiter actually applied this frame. Above the knee the step is
+      # DELTA_UP_HIGH, which is the smaller of the two, so testing against DELTA_UP would fail to
+      # recognise a high-magnitude rate limit at all -- under-reporting precisely the regime the
+      # knee exists to control, and making the knee look free.
+      above_knee = abs(self.ti_apply_steer_last) >= self.ccp.TI_STEER_DELTA_UP_KNEE
+      delta_up = self.ccp.TI_STEER_DELTA_UP_HIGH if above_knee else self.ccp.TI_STEER_DELTA_UP
       # Compare the signed step so a sign crossing still registers, and only call it rate limiting
       # when the command was climbing -- a command collapsing under driver torque moves at
       # DELTA_DOWN, which would otherwise be miscounted as a rate limit and point at the wrong knob.
       if abs(sent) > abs(self.ti_apply_steer_last) and \
-         abs(sent - self.ti_apply_steer_last) >= self.ccp.TI_STEER_DELTA_UP:
+         abs(sent - self.ti_apply_steer_last) >= delta_up:
         s["rate_limited"] += 1
+        # Which side of the knee did the cutting. With a knee configured, this is what says whether
+        # the remaining shortfall is in the range we chose to open up or the range we chose to keep
+        # cautious -- and so whether the next move is the low rate, the high rate, or the knee.
+        s["rate_limited_high" if above_knee else "rate_limited_low"] += 1
       # Only torque OPPOSING the command narrows the cap -- openpilot's driver-torque limit is
       # signed, and torque in the command's own direction widens the bound instead. Counting both
       # directions would blame the driver term for frames it had nothing to do with.
@@ -119,6 +137,22 @@ class CarController(CarControllerBase):
     if abs(sent) >= self.ccp.TI_STEER_MAX:
       s["at_clip"] += 1
     s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
+
+    # Closed-loop check on whether the command is reaching the car. Both torque sensors are
+    # declared identically in the DBC -- 8 bits, offset -127, range [-85,85] -- so their difference
+    # is the bias the interceptor is actually injecting, in the same units. Accumulating it against
+    # the command gives the conversion slope for this run, live, without waiting for a log parse.
+    #
+    # This deliberately only counts. It does not touch the command, and there is no threshold that
+    # makes it start doing so. The unreliability the guard would defend against has never been
+    # reproduced on this unit, we have no measured slope to set a threshold from, and a guard that
+    # pulls assist down mid-corner on a false positive is a worse failure than the one it watches
+    # for. Establish that decoupling happens, and what it looks like, before giving it authority.
+    # ti_response does the real characterisation offline; this is the cheap in-drive version.
+    if abs(sent) >= BIAS_MIN_COMMAND:
+      s["bias_cmd_sum"] += abs(sent)
+      s["bias_sum"] += abs(int(CS.eps_torque_sensor - CS.out.steeringTorque))
+      s["bias_frames"] += 1
 
   def ti_payload(self):
     # Identity travels with the numbers. loggerd writes CurrentRoute at every onroad transition, so
