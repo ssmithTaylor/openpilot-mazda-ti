@@ -403,9 +403,22 @@ def tool_analyze_segment(args):
     "state_changes": transitions[:40],
     "baselines": BASELINE,
   }
+  # A segment can look healthy -- TI in RUN, no violations -- and still say nothing about tuning,
+  # because the car never moved or openpilot never steered. Say so rather than leaving it to be
+  # inferred from a wall of zeros.
   if 3 not in modes and modes:
-    result["warning"] = ("TI never reached RUN in this segment. It was bypassed, so the stock EPS "
-                         "was steering and no tuning conclusion from this segment is valid.")
+    result["verdict"] = ("UNUSABLE: the TI never reached RUN, so it was bypassed and the stock EPS "
+                         "was steering. No tuning conclusion from this segment is valid.")
+  elif speeds and max(speeds) < 1.0:
+    result["verdict"] = ("NOT A DRIVE: the car never moved. Useful only to confirm the TI comes up "
+                         "healthy; the zero curvature error and zero request are expected here and "
+                         "say nothing about tuning.")
+  elif engaged == 0:
+    result["verdict"] = ("NO ENGAGED DRIVING: the car moved but openpilot never steered, so the "
+                         "limiters were never exercised. Curvature error reflects your driving, "
+                         "not openpilot's.")
+  else:
+    result["verdict"] = f"USABLE: {engaged} engaged frames (~{engaged / 100.0:.0f}s of openpilot steering)."
   return result
 
 
