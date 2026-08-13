@@ -33,6 +33,7 @@ from openpilot.common.params import Params
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "ti-tuning", "version": "1.0.0"}
+MAX_REQUEST_BYTES = 64 * 1024
 
 TI_MODE = {0: "DISCOVER", 1: "OFF", 2: "DRIVER_OVER", 3: "RUN"}
 TI_VIOL = {
@@ -199,29 +200,55 @@ def tool_ti_stats(_args):
 
   def summarise(s):
     engaged = s.get("engaged", 0)
+    # config/route/started_at are reported even for an empty run, because "which limits was this
+    # recorded under" is exactly what you need when a run turns out to be empty.
+    ident = {"config": s.get("config"), "route": s.get("route") or None,
+             "started_at": s.get("started_at")}
     if not engaged:
-      return {"engaged_frames": 0, "note": "no engaged frames recorded"}
+      return {"engaged_frames": 0, "note": "no engaged frames recorded", **ident}
     return {
       "engaged_frames": engaged,
       "short_of_requested_pct": round(100.0 * s.get("short", 0) / engaged, 1),
+      # The magnitude, not just the frequency. A frame cut by 6 counts and one cut by 150 both
+      # count as "short"; only the second misses an apex. This is the number to watch across an
+      # A/B -- it should fall when a change actually helps, and it can fall even if the percentage
+      # does not move.
+      "mean_deficit_per_engaged_frame": round(s.get("deficit", 0) / engaged, 1),
       "rate_limited_pct": round(100.0 * s.get("rate_limited", 0) / engaged, 1),
       "driver_torque_limited_pct": round(100.0 * s.get("driver_limited", 0) / engaged, 1),
-      "at_600_clip_pct": round(100.0 * s.get("at_clip", 0) / engaged, 1),
+      "at_clip_pct": round(100.0 * s.get("at_clip", 0) / engaged, 1),
       "peak_command": s.get("peak_cmd"),
+      "peak_requested": s.get("peak_desired"),
       "peak_bias_reaching_eps": s.get("peak_bias"),
       "frames_not_in_run": s.get("not_run"),
       "frames_ramping": s.get("ramp"),
+      **ident,
     }
 
-  return {
-    "current": summarise(current),
-    "previous": summarise(previous),
+  cur, prev = summarise(current), summarise(previous)
+  result = {
+    "current": cur,
+    "previous": prev,
     "baselines": BASELINE,
-    "how_to_read": ("short_of_requested_pct is how often openpilot cut its own command. The split "
-                    "between rate_limited_pct and driver_torque_limited_pct says which knob to "
-                    "turn: the former points at TiSteerDeltaUp, the latter at "
-                    "TiSteerDriverMultiplier and TiSteerDriverAllowance."),
+    "how_to_read": ("short_of_requested_pct is how often openpilot cut its own command and "
+                    "mean_deficit_per_engaged_frame is by how much -- the second is the one that "
+                    "tracks whether the car actually got its command. The split between "
+                    "rate_limited_pct and driver_torque_limited_pct says which knob to turn: the "
+                    "former points at TiSteerDeltaUp, the latter at TiSteerDriverMultiplier and "
+                    "TiSteerDriverAllowance. peak_requested vs peak_command shows how much of what "
+                    "openpilot asked for ever survived the limiters."),
   }
+  # Comparing two runs recorded under different limits is the easiest way to reach a wrong
+  # conclusion, so say so rather than leaving it to be noticed.
+  if cur.get("config") and prev.get("config"):
+    changed = {k: [prev["config"].get(k), cur["config"].get(k)]
+               for k in set(cur["config"]) | set(prev["config"])
+               if prev["config"].get(k) != cur["config"].get(k)}
+    result["config_changed_between_runs"] = changed or "identical -- this is a repeatability check, not an A/B"
+  elif cur.get("engaged_frames") and prev.get("engaged_frames"):
+    result["config_changed_between_runs"] = ("unknown: one of these runs predates config stamping, "
+                                             "so the comparison cannot be trusted")
+  return result
 
 
 def tool_ti_tuning(_args):
@@ -315,6 +342,33 @@ def _segment_dirs():
   return found, diags
 
 
+def _is_onroad():
+  """manager mirrors the started flag into this param every cycle (system/manager/helpers.py)."""
+  try:
+    return params.get_bool("IsOnroad")
+  except Exception:
+    # Fail closed. Being unable to tell whether the car is moving is not a reason to go ahead and
+    # decompress a hundred megabytes on the SoC that is running the driving model.
+    return True
+
+
+def _refuse_if_onroad(tool):
+  """Reading a segment means decompressing tens of megabytes into RAM and walking every message in
+  it, on the same SoC as modeld and camerad. Any LAN client can call these, and a drive is exactly
+  when nobody is watching what the tuning laptop is doing. This is the same class of failure as the
+  params fsync regression -- background work starving the camera pipeline -- reached through CPU
+  and memory instead of I/O, so it gets refused rather than merely discouraged."""
+  if not _is_onroad():
+    return None
+  return {"error": f"refused: {tool} does not run while the car is onroad",
+          "why": "it decompresses and walks a whole rlog on the device, which competes with "
+                 "camerad and modeld; doing that mid-drive can drop camera frames and cost you "
+                 "engagement",
+          "what_to_do": "the segment is already recorded and is not going anywhere -- run this "
+                        "once the car is parked. ti_status, ti_stats, ti_tuning, torque_learning "
+                        "and list_segments are all cheap and stay available while driving."}
+
+
 def _rlog_path(segment):
   for root in SEGMENT_ROOTS:
     for name in ("rlog.bz2", "rlog", "rlog.zst"):
@@ -352,6 +406,9 @@ def tool_analyze_segment(args):
   segment = args.get("segment")
   if not segment:
     return {"error": "segment required; call list_segments first"}
+  refusal = _refuse_if_onroad("analyze_segment")
+  if refusal is not None:
+    return refusal
   path = _rlog_path(segment)
   if path is None:
     return {"error": f"no rlog found for {segment}"}
@@ -698,6 +755,9 @@ def tool_segment_diagnostics(args):
   segment = args.get("segment")
   if not segment:
     return {"error": "segment required; call list_segments first"}
+  refusal = _refuse_if_onroad("segment_diagnostics")
+  if refusal is not None:
+    return refusal
   path = _rlog_path(segment)
   if path is None:
     return {"error": f"no rlog found for {segment}"}
@@ -873,11 +933,15 @@ TOOLS = [
   {"name": "ti_stats",
    "description":
      "Live tuning counters for the current measurement and the one before it, for A/B comparison. "
-     "short_of_requested_pct is how often openpilot cut its own command; the rate_limited vs "
-     "driver_torque_limited split is the diagnostic that says WHICH parameter to change (rate -> "
-     "TiSteerDeltaUp, driver -> TiSteerDriverMultiplier/Allowance). Only two runs are retained -- "
-     "a third clear destroys the first, so save this output after every run. For an older drive "
-     "use analyze_segment instead, which recomputes the same figures from the log.",
+     "short_of_requested_pct is how often openpilot cut its own command and "
+     "mean_deficit_per_engaged_frame is by how much -- watch the second one across an A/B, since a "
+     "change can shrink the deficit without moving the percentage. The rate_limited vs "
+     "driver_torque_limited split says WHICH parameter to change (rate -> TiSteerDeltaUp, driver "
+     "-> TiSteerDriverMultiplier/Allowance). Each run carries the limits it was recorded under, "
+     "its route and start time, and config_changed_between_runs states plainly whether the two "
+     "runs are even comparable. Only two runs are retained -- a third clear destroys the first, so "
+     "save this output after every run. For an older drive use analyze_segment instead, which "
+     "recomputes the same figures from the log.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_ti_stats},
 
   {"name": "ti_tuning",
@@ -916,7 +980,9 @@ TOOLS = [
      "error (mean and p95) -- the outcome metric that says whether the car actually tracked "
      "better, which the live counters cannot answer. Starts with a verdict field stating whether "
      "the segment can support a tuning conclusion at all; a parked or unengaged segment reads as "
-     "healthy but proves nothing. Only the summary crosses the wire, never the log itself.",
+     "healthy but proves nothing. Only the summary crosses the wire, never the log itself. "
+     "Refuses to run while the car is onroad, because the parse competes with camerad and modeld; "
+     "wait until it is parked.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments, "
@@ -949,7 +1015,8 @@ TOOLS = [
      "analysis measured straight from the log -- so it can identify a stall even when controlsd "
      "attributed it wrongly. Gaps are reported as periods_missed, the gap in units of that "
      "service's own interval, so a 1Hz and a 100Hz service can be compared. Nothing to do with "
-     "the TI; use analyze_segment for that.",
+     "the TI; use analyze_segment for that. Refuses to run while the car is onroad, because the "
+     "parse competes with camerad and modeld; wait until it is parked.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments"},
@@ -983,6 +1050,15 @@ class Handler(BaseHTTPRequestHandler):
   def do_POST(self):
     try:
       length = int(self.headers.get("Content-Length", 0))
+      # Every request this server understands is a small JSON object. Reading an arbitrary length
+      # into RAM on a device that is also running the driving model is not something to leave open
+      # to whatever else is on the network.
+      if length > MAX_REQUEST_BYTES:
+        self._send({"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600,
+                              "message": f"request too large ({length} bytes, "
+                                         f"limit {MAX_REQUEST_BYTES})"}}, 413)
+        return
       req = json.loads(self.rfile.read(length) or b"{}")
     except Exception as e:
       self._send({"jsonrpc": "2.0", "id": None,

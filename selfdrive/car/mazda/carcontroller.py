@@ -1,4 +1,5 @@
 import json
+import time
 
 from cereal import car
 from opendbc.can.packer import CANPacker
@@ -33,11 +34,30 @@ class CarController(CarControllerBase):
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
     self.ti_live = {}
+    self.ti_steer_threshold = None
+    self.ti_route = ""
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
     self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "driver_limited",
-                                    "at_clip", "peak_cmd", "peak_bias", "not_run", "viol", "ramp")}
+                                    "at_clip", "peak_cmd", "peak_desired", "deficit",
+                                    "peak_bias", "not_run", "viol", "ramp")}
+    self.ti_stats_started = time.time()
+
+  def ti_config(self):
+    """The limits these counters were produced under. Without it a saved run has no identity: both
+    the previous/current comparison and analyze_segment otherwise assume the params as they are
+    NOW, which is wrong from the moment you change one -- which is the entire point of the run."""
+    cfg = {
+      "TiSteerMax": self.ccp.TI_STEER_MAX,
+      "TiSteerDeltaUp": self.ccp.TI_STEER_DELTA_UP,
+      "TiSteerDeltaDown": self.ccp.TI_STEER_DELTA_DOWN,
+      "TiSteerDriverAllowance": self.ccp.TI_STEER_DRIVER_ALLOWANCE,
+      "TiSteerDriverMultiplier": self.ccp.TI_STEER_DRIVER_MULTIPLIER,
+    }
+    if self.ti_steer_threshold is not None:
+      cfg["TiSteerThreshold"] = self.ti_steer_threshold
+    return cfg
 
   def record_ti_stats(self, CS, desired, sent):
     # Counters for A/B-ing a tuning change over a chosen stretch of road. "short" is how often the
@@ -59,8 +79,15 @@ class CarController(CarControllerBase):
     if not CS.ti_lkas_allowed:
       return
 
+    s["peak_desired"] = max(s["peak_desired"], abs(desired))
+
     if abs(desired) - abs(sent) > 5:
       s["short"] += 1
+      # How far behind, not just how often. A frame cut by 6 counts and a frame cut by 150 both
+      # increment "short", but only the second one misses an apex. Summed over frames this is
+      # torque-frames of missing command; divided by engaged it is the single number that should
+      # go down when a tuning change actually helps.
+      s["deficit"] += abs(desired) - abs(sent)
       # Compare the signed step so a sign crossing still registers, and only call it rate limiting
       # when the command was climbing -- a command collapsing under driver torque moves at
       # DELTA_DOWN, which would otherwise be miscounted as a rate limit and point at the wrong knob.
@@ -77,8 +104,18 @@ class CarController(CarControllerBase):
       s["at_clip"] += 1
     s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
 
+  def ti_payload(self):
+    # Identity travels with the numbers. loggerd writes CurrentRoute at every onroad transition, so
+    # stamping it here is what lets a saved run be tied back to the segments that produced it --
+    # otherwise the counters and the rlogs can only be matched by guessing at wall-clock.
+    # encoding matters: Params.get returns bytes without it, and bytes are not JSON serialisable,
+    # so the dumps below would raise every second and take the car controller down with it.
+    self.ti_route = self.params.get("CurrentRoute", encoding="utf8") or self.ti_route
+    return json.dumps({**self.ti_stats, "live": self.ti_live, "config": self.ti_config(),
+                       "started_at": self.ti_stats_started, "route": self.ti_route})
+
   def publish_ti_stats(self):
-    payload = json.dumps({**self.ti_stats, "live": self.ti_live})
+    payload = self.ti_payload()
 
     # Live copy on tmpfs. Free -- /dev/shm never reaches flash -- so this one can stay at 1Hz.
     self.params_memory.put_nonblocking("TiTuningStats", payload)
@@ -93,8 +130,9 @@ class CarController(CarControllerBase):
                                   payload if self.ti_stats["engaged"] else
                                   (self.params.get("TiTuningStats") or payload))
       self.reset_ti_stats()
-      self.params.put_nonblocking("TiTuningStats",
-                                  json.dumps({**self.ti_stats, "live": self.ti_live}))
+      cleared = self.ti_payload()
+      self.params_memory.put_nonblocking("TiTuningStats", cleared)
+      self.params.put_nonblocking("TiTuningStats", cleared)
       return
 
     # Flash copy once a minute, not once a second. Params::put fsyncs the temp file and then the
@@ -115,6 +153,10 @@ class CarController(CarControllerBase):
     self.ccp.TI_STEER_DELTA_DOWN = getattr(frogpilot_toggles, "ti_steer_delta_down", self.ccp.TI_STEER_DELTA_DOWN)
     self.ccp.TI_STEER_DRIVER_ALLOWANCE = getattr(frogpilot_toggles, "ti_steer_driver_allowance", self.ccp.TI_STEER_DRIVER_ALLOWANCE)
     self.ccp.TI_STEER_DRIVER_MULTIPLIER = getattr(frogpilot_toggles, "ti_steer_driver_multiplier", self.ccp.TI_STEER_DRIVER_MULTIPLIER)
+    # Not a ccp field -- carstate applies it to steeringPressed -- but it belongs in the run's
+    # config stamp, because it changes when openpilot decides the driver is overriding and so
+    # changes what the driver_limited counter means.
+    self.ti_steer_threshold = getattr(frogpilot_toggles, "ti_steer_threshold", None)
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
