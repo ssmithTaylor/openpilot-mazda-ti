@@ -74,6 +74,14 @@ void ScreenRefreshOverlay::mousePressEvent(QMouseEvent *event) {
   close();
 }
 
+void ScreenRefreshOverlay::closeEvent(QCloseEvent *event) {
+  if (on_finished) {
+    on_finished(int(std::min<qint64>(elapsed.elapsed(), total_ms) / 1000));
+    on_finished = nullptr;  // closeEvent can fire more than once; only bank the time once.
+  }
+  QWidget::closeEvent(event);
+}
+
 FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent) : FrogPilotListWidget(parent), parent(parent) {
   QJsonObject shownDescriptions = QJsonDocument::fromJson(QString::fromStdString(params.get("ShownToggleDescriptions")).toUtf8()).object();
   QString className = this->metaObject()->className();

@@ -128,9 +128,25 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
     return;
   }
 
-  params.putInt("LastScreenRefresh", now);
+  // Resume rather than restart. A refresh cut short by a drive banks what it completed and picks
+  // up the remainder next time; only a full cycle stamps LastScreenRefresh and starts the week
+  // over. Stamping at launch instead would let a five-second interruption count as a done week.
+  int remaining = params.getInt("ScreenRefreshRemaining");
+  if (remaining <= 0 || remaining > AUTO_REFRESH_DURATION_S) {
+    remaining = AUTO_REFRESH_DURATION_S;
+  }
+
   drove_this_cycle = false;
-  auto_refresh = new ScreenRefreshOverlay(AUTO_REFRESH_DURATION_S);
+  auto_refresh = new ScreenRefreshOverlay(remaining);
+  auto_refresh->on_finished = [this, remaining](int completed) {
+    const int left = remaining - completed;
+    if (left > 0) {
+      params.putInt("ScreenRefreshRemaining", left);
+    } else {
+      params.putInt("ScreenRefreshRemaining", 0);
+      params.putInt("LastScreenRefresh", QDateTime::currentSecsSinceEpoch());
+    }
+  };
   QObject::connect(auto_refresh, &QObject::destroyed, this, [this]() { auto_refresh = nullptr; });
   auto_refresh->showFullScreen();
 }

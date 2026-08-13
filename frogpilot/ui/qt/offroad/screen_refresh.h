@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <QElapsedTimer>
 #include <QWidget>
 
@@ -15,9 +17,14 @@ class ScreenRefreshOverlay : public QWidget {
 public:
   explicit ScreenRefreshOverlay(int seconds, QWidget *parent = nullptr);
 
+  // Called on close with the seconds actually completed, whether it ran out or was interrupted.
+  // Lets the caller bank partial progress so a refresh cut short resumes rather than restarting.
+  std::function<void(int)> on_finished;
+
 protected:
   void paintEvent(QPaintEvent *event) override;
   void mousePressEvent(QMouseEvent *event) override;
+  void closeEvent(QCloseEvent *event) override;
 
 private:
   QElapsedTimer elapsed;

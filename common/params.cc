@@ -568,6 +568,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"ClearTiStats", PERSISTENT},
     {"AutoScreenRefresh", PERSISTENT},
     {"LastScreenRefresh", PERSISTENT},
+    {"ScreenRefreshRemaining", PERSISTENT},
     {"PixelShift", PERSISTENT},
     {"ScreenRefreshMinutes", PERSISTENT},
     {"ResetTorqueParams", PERSISTENT},
