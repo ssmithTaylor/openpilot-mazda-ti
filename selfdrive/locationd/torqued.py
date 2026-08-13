@@ -29,11 +29,24 @@ STEER_MIN_THRESHOLD = 0.02
 MIN_FILTER_DECAY = 50
 MAX_FILTER_DECAY = 250
 LAT_ACC_THRESHOLD = 1
-STEER_BUCKET_BOUNDS = [(-0.5, -0.3), (-0.3, -0.2), (-0.2, -0.1), (-0.1, 0), (0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.5)]
+# Outer bounds widened from +-0.5 to +-1.0. add_point silently drops anything outside every
+# bucket, and with the Torque Interceptor reporting ti_apply_steer / TI_STEER_MAX a peak command of
+# 313/600 is already 0.52 -- so the top of the operating range was being discarded, and raising the
+# ramp rate pushes more of it out, leaving the fit to extrapolate exactly the high-torque region we
+# suspect is nonlinear. Widened rather than given extra buckets on purpose: is_calculable() below
+# requires EVERY bucket to be non-empty and gates the fit entirely, so an added bucket that a car
+# never reaches would silently disable auto-tune forever. The bucket count is unchanged and the
+# ranges only grow, so no car can lose validity from this -- it can only keep points it used to
+# throw away.
+# The outer edge is 1.01 rather than 1.0 because add_point's upper test is exclusive (x < max): a
+# fully saturated command normalises to exactly 1.0 and would fall through every bucket. That is
+# 0% of frames today, but saturation is what raising the ramp rate is meant to produce, so those
+# are the frames this exists to keep.
+STEER_BUCKET_BOUNDS = [(-1.01, -0.3), (-0.3, -0.2), (-0.2, -0.1), (-0.1, 0), (0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 1.01)]
 MIN_BUCKET_POINTS = np.array([100, 300, 500, 500, 500, 500, 300, 100])
 MIN_ENGAGE_BUFFER = 2  # secs
 
-VERSION = 1  # bump this to invalidate old parameter caches
+VERSION = 2  # bump this to invalidate old parameter caches (2: widened outer steer buckets)
 ALLOWED_CARS = ['toyota', 'hyundai']
 
 
