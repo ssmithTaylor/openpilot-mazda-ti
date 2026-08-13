@@ -147,11 +147,11 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     } else if (param == "TiSteerDeltaUpHigh") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDeltaDown") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 50, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 10, 50, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverAllowance") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 30, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverMultiplier") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 10, 60, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 20, 60, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerThreshold") {
       lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
 
@@ -395,13 +395,23 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
   };
   auto fmt = [](double v) { return v < 0.0 ? QString("—") : QString::number(v, 'f', 1) + "%"; };
 
+  // Mean deficit alongside the percentage. How OFTEN the command was cut and how FAR short it
+  // fell are different questions, and only the second tracks whether the car actually got what
+  // openpilot asked for -- a change can shrink the deficit without moving the percentage at all.
+  auto perFrame = [](const QJsonObject &o, const QString &key) {
+    double engaged = o.value("engaged").toDouble();
+    return engaged > 0.0 ? o.value(key).toDouble() / engaged : -1.0;
+  };
+  auto fmtCounts = [](double v) { return v < 0.0 ? QString("—") : QString::number(v, 'f', 1); };
+
   if (cur.value("engaged").toDouble() <= 0.0) {
     tiCommandCutLabel->setText(tr("no engaged driving recorded yet"));
   } else {
-    QString text = fmt(pct(cur, "short"));
-    double was = pct(prev, "short");
+    QString text = QString(tr("%1, short by %2"))
+                     .arg(fmt(pct(cur, "short")), fmtCounts(perFrame(cur, "deficit")));
+    double was = perFrame(prev, "deficit");
     if (was >= 0.0) {
-      text += QString(tr(" (was %1)")).arg(fmt(was));
+      text += QString(tr(" (was %1)")).arg(fmtCounts(was));
     }
     tiCommandCutLabel->setText(text);
   }

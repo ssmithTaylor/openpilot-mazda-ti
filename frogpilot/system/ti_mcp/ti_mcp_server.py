@@ -85,6 +85,27 @@ TUNING_PARAMS = ("TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown",
                  "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold",
                  "TiSteerDeltaUpKnee", "TiSteerDeltaUpHigh")
 
+# Param name -> the CarControllerParams attribute the bounds are keyed by. TiSteerThreshold is not
+# a ccp field (carstate applies it to steeringPressed) so it keeps its bound stated here.
+PARAM_TO_LIMIT = {
+  "TiSteerMax": "TI_STEER_MAX", "TiSteerDeltaUp": "TI_STEER_DELTA_UP",
+  "TiSteerDeltaDown": "TI_STEER_DELTA_DOWN", "TiSteerDriverAllowance": "TI_STEER_DRIVER_ALLOWANCE",
+  "TiSteerDriverMultiplier": "TI_STEER_DRIVER_MULTIPLIER",
+  "TiSteerDeltaUpKnee": "TI_STEER_DELTA_UP_KNEE", "TiSteerDeltaUpHigh": "TI_STEER_DELTA_UP_HIGH",
+}
+THRESHOLD_BOUNDS = (1, 15)
+
+# Taken from the car port rather than restated, so this cannot drift from what is actually
+# enforced -- a copy that nothing executes against is the one that goes stale unnoticed. Guarded
+# because the server should keep serving if the import breaks, and say so rather than quietly
+# reporting numbers it made up.
+try:
+  from openpilot.selfdrive.car.mazda.values import TI_LIMIT_BOUNDS
+  TI_LIMIT_SOURCE = "selfdrive/car/mazda/values.py"
+except Exception as _e:  # pragma: no cover - only on a broken install
+  TI_LIMIT_BOUNDS = {}
+  TI_LIMIT_SOURCE = f"unavailable ({_e}) -- ranges below are unknown, not unrestricted"
+
 # Baselines measured from route 8590bb6980c396f4_00000342, segments 42/55/56, so a caller can tell
 # whether a number is normal without having to remember what normal looked like.
 BASELINE = {
@@ -255,6 +276,13 @@ def tool_ti_stats(_args):
       "measured_bias_slope": (round(s["bias_sum"] / s["bias_cmd_sum"], 5)
                               if s.get("bias_cmd_sum") else None),
       "bias_sample_frames": s.get("bias_frames"),
+      # The two tails kept apart. Ratios are bias per command in thousandths, so 61 is the 0.0607
+      # working figure. A low min is assist fading, which is benign. A high max, or any wrong_sign
+      # frames at all, is torque the command did not ask for -- the direction that would justify
+      # ever letting the guard touch the command, and the only one worth acting on.
+      "bias_ratio_min_per_1000": s.get("bias_ratio_min") or None,
+      "bias_ratio_max_per_1000": s.get("bias_ratio_max") or None,
+      "bias_wrong_sign_frames": s.get("bias_wrong_sign"),
       "frames_not_in_run": s.get("not_run"),
       "frames_ramping": s.get("ramp"),
       **ident,
@@ -344,11 +372,10 @@ def tool_ti_tuning(_args):
                  "TiSteerDriverAllowance": 15, "TiSteerDriverMultiplier": 40,
                  "TiSteerThreshold": 6, "TiSteerDeltaUpKnee": 600, "TiSteerDeltaUpHigh": 6},
     "allowed_range": {
-      "TiSteerMax": [100, 600], "TiSteerDeltaUp": [1, 15], "TiSteerDeltaDown": [1, 50],
-      "TiSteerDriverAllowance": [5, 30], "TiSteerDriverMultiplier": [10, 60],
-      "TiSteerThreshold": [1, 15], "TiSteerDeltaUpKnee": [100, 600],
-      "TiSteerDeltaUpHigh": [1, 15],
+      **{p: list(TI_LIMIT_BOUNDS[a]) for p, a in PARAM_TO_LIMIT.items() if a in TI_LIMIT_BOUNDS},
+      "TiSteerThreshold": list(THRESHOLD_BOUNDS),
     },
+    "allowed_range_source": TI_LIMIT_SOURCE,
     "notes": {
       "TiSteerMax": "TI clips its own input at 600; higher values are discarded by the unit.",
       "TiSteerDeltaUp": "Per 10ms frame, below the knee. 6 means a full second from zero to "
@@ -1188,6 +1215,28 @@ def tool_ti_response(args):
                          "anything; pick one with sustained engaged driving.")
     return result
 
+  # Bias behaviour per TI mode, over ALL engaged frames rather than the RUN-only subset the fit
+  # uses. The faulty unit's signature lived precisely in the frames where it left RUN, ramped down
+  # or threw a violation -- the frames the fit discards -- so without this, running the tool
+  # against an old log returns a clean fit over the survivors and reads as "no fault found", which
+  # is the filter talking rather than the data.
+  by_mode = {}
+  for (_, c_i, b_i, _v, m_i, r_i) in rows:
+    key = f"{TI_MODE.get(m_i, m_i)}{'+ramping' if r_i else ''}"
+    d = by_mode.setdefault(key, {"frames": 0, "cmd_sum": 0.0, "bias_sum": 0.0})
+    d["frames"] += 1
+    d["cmd_sum"] += abs(c_i)
+    d["bias_sum"] += abs(b_i)
+  result["bias_by_ti_mode"] = {
+    k: {"frames": v["frames"],
+        "slope": round(v["bias_sum"] / v["cmd_sum"], 5) if v["cmd_sum"] else None}
+    for k, v in sorted(by_mode.items(), key=lambda kv: -kv[1]["frames"])
+  }
+  result["bias_by_ti_mode_note"] = (
+    "Everything below RUN is the interceptor not taking commands. A slope near zero there is "
+    "correct and expected -- it is bypassed. A slope that collapses WITHIN RUN is the fault worth "
+    "finding, and that is what response.r2 and anomalies address.")
+
   arr = np.array([(c, b, v) for (_, c, b, v, _, _) in usable], dtype=float)
   cmd, bias, spd = arr[:, 0], arr[:, 1], arr[:, 2]
 
@@ -1252,20 +1301,59 @@ def tool_ti_response(args):
   # the whole exercise is looking for -- but sensor saturation produces the same shape, so those
   # frames are counted separately rather than being allowed to masquerade as a fault.
   if overall and overall["slope"] > 0:
-    predicted = overall["slope"] * np.abs(cmd)
-    actual = np.abs(bias)
-    big = np.abs(cmd) >= max(100.0, 0.6 * float(np.abs(cmd).max()))
-    shortfall = big & (actual < 0.5 * predicted)
-    idx = np.where(shortfall)[0]
-    worst = sorted(idx, key=lambda i: float(predicted[i] - actual[i]), reverse=True)[:10]
+    # Compare each command against the bias it actually produced, lag included. Predicting
+    # instantaneously while separately measuring a command-to-bias lag makes every ramp read as
+    # under-delivery -- and ramps are corner entry, which is exactly where the large commands and
+    # the high-torque question live. Left uncorrected this is a false-alarm generator aimed at the
+    # frames the whole investigation is about.
+    lag = int(best.get("lag_frames") or 0)
+    end = len(cmd) - lag if lag else len(cmd)
+    c, b, s_spd = cmd[:end], bias[lag:] if lag else bias, spd[:end]
+    idx_of = (lambda i: i)  # rows align with c, and usable[] is indexed the same way
+
+    predicted = overall["slope"] * np.abs(c)
+    actual = np.abs(b)
+    big = np.abs(c) >= max(100.0, 0.6 * float(np.abs(c).max()))
+
+    # Two tails, and they mean opposite things. Under-delivery is the benign failure: assist fades
+    # and the driver steers. OVER-delivery is the dangerous one -- bias larger than the command
+    # asked for, or bias that does not follow the command back down, which is a latched output
+    # producing steering nobody requested. The +3 keeps a near-zero prediction from making the
+    # ratio explode, and the 5-count floor keeps 8-bit sensor quantisation out of it.
+    under = big & (actual < 0.5 * predicted)
+    over = (actual >= 5) & (actual > 2.0 * predicted + 3.0)
+    # Sign disagreement: bias pushing the opposite way to the command. Never expected above the
+    # noise floor, and unambiguous when it happens.
+    wrong_sign = big & (c * b < 0)
+
+    def worst_of(mask, key):
+      order = sorted(np.where(mask)[0], key=key, reverse=True)[:10]
+      return [{"t": round(usable[idx_of(i)][0], 2), "command": int(c[i]), "bias": int(b[i]),
+               "predicted_bias": round(float(predicted[i]), 1),
+               "speed_ms": round(float(s_spd[i]), 1)} for i in order]
+
     result["anomalies"] = {
+      "lag_frames_applied": lag,
       "high_command_frames": int(big.sum()),
-      "bias_below_half_predicted": int(shortfall.sum()),
-      "pct_of_high_command_frames": round(100.0 * int(shortfall.sum()) / max(int(big.sum()), 1), 1),
-      "worst": [{"t": round(usable[i][0], 2), "command": int(cmd[i]), "bias": int(bias[i]),
-                 "predicted_bias": round(float(predicted[i]), 1),
-                 "speed_ms": round(float(spd[i]), 1)} for i in worst],
-      "caveat": ("Sensor saturation looks identical to a decoder fault here. Check "
+      "under_delivery": {
+        "frames": int(under.sum()),
+        "pct_of_high_command_frames": round(100.0 * int(under.sum()) / max(int(big.sum()), 1), 1),
+        "worst": worst_of(under, lambda i: float(predicted[i] - actual[i])),
+        "meaning": "bias below half what the fit predicts -- assist fading, the benign direction",
+      },
+      "over_delivery": {
+        "frames": int(over.sum()),
+        "worst": worst_of(over, lambda i: float(actual[i] - predicted[i])),
+        "meaning": ("bias more than double the prediction, or bias that has not followed the "
+                    "command back down. This is the direction that produces steering the driver "
+                    "did not ask for, and the one worth acting on."),
+      },
+      "wrong_sign": {
+        "frames": int(wrong_sign.sum()),
+        "worst": worst_of(wrong_sign, lambda i: abs(float(b[i]))),
+        "meaning": "bias opposing the command; never expected above the noise floor",
+      },
+      "caveat": ("Sensor saturation looks identical to under-delivery here. Check "
                  "eps_sensor_saturated_frames: if those are numerous the shortfall is the [-85,85] "
                  "DBC range running out, not the interceptor misbehaving."),
     }

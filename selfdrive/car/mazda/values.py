@@ -145,6 +145,35 @@ class CAR(Platforms):
   )
 
 
+# Absolute bounds on every live Torque Interceptor limit. Defined here, once, because they are
+# restated in four other places -- the toggle clips in frogpilot_variables, the re-clamp in the car
+# controller, the UI sliders, and the telemetry server's report of what is allowed -- and the one
+# that drifts silently is whichever copy nothing executes against.
+#
+# These are the entire safety envelope on this path: the panda applies steering checks to the stock
+# MAZDA_LKAS message but none at all to MAZDA_TI_LKAS on gen1. Chosen to leave room for the tuning
+# intended and no more.
+#
+# Floors matter as much as ceilings, and on two of these the dangerous direction is downward:
+#   TI_STEER_DELTA_DOWN -- the driver-torque cap is applied BEFORE the rate clip, so when an
+#     override collapses the cap the command can still only fall at this rate. At 1 count/frame,
+#     unwinding from a command of 313 is 3.1 seconds of decaying counter-torque against the
+#     driver's hands; at the default 15 it is 0.21s, and the stock Mazda path uses 25.
+#   TI_STEER_DRIVER_MULTIPLIER -- the cap reaches zero at |driver| = allowance + 600/multiplier.
+#     At the default 40 that is 30 counts. At 10 it would be 75, against a torque sensor whose
+#     range ends at 85 -- so the driver could not fully yield the command before the sensor
+#     saturates. At 20 it is 45: a hard push, but one a person can actually make.
+TI_LIMIT_BOUNDS = {
+  "TI_STEER_MAX": (100, 600),               # 600 is the TI's own hardware clip
+  "TI_STEER_DELTA_UP": (1, 15),             # stock Mazda path runs 10 against the same EPS
+  "TI_STEER_DELTA_DOWN": (10, 50),
+  "TI_STEER_DRIVER_ALLOWANCE": (5, 30),
+  "TI_STEER_DRIVER_MULTIPLIER": (20, 60),
+  "TI_STEER_DELTA_UP_KNEE": (100, 600),
+  "TI_STEER_DELTA_UP_HIGH": (1, 15),
+}
+
+
 class LKAS_LIMITS:
   STEER_THRESHOLD = 15
   DISABLE_SPEED = 45    # kph

@@ -703,9 +703,9 @@ class FrogPilotVariables:
     # bounded on the side that widens the command under driver torque, which is the unsafe
     # direction for both.
     toggle.ti_steer_delta_up = int(np.clip(params.get_float("TiSteerDeltaUp"), 1, 15)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUp"] else int(default.get_float("TiSteerDeltaUp"))
-    toggle.ti_steer_delta_down = int(np.clip(params.get_float("TiSteerDeltaDown"), 1, 50)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaDown"] else int(default.get_float("TiSteerDeltaDown"))
+    toggle.ti_steer_delta_down = int(np.clip(params.get_float("TiSteerDeltaDown"), 10, 50)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaDown"] else int(default.get_float("TiSteerDeltaDown"))
     toggle.ti_steer_driver_allowance = int(np.clip(params.get_float("TiSteerDriverAllowance"), 5, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverAllowance"] else int(default.get_float("TiSteerDriverAllowance"))
-    toggle.ti_steer_driver_multiplier = int(np.clip(params.get_float("TiSteerDriverMultiplier"), 10, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverMultiplier"] else int(default.get_float("TiSteerDriverMultiplier"))
+    toggle.ti_steer_driver_multiplier = int(np.clip(params.get_float("TiSteerDriverMultiplier"), 20, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverMultiplier"] else int(default.get_float("TiSteerDriverMultiplier"))
     toggle.ti_steer_threshold = int(np.clip(params.get_float("TiSteerThreshold"), 1, 15)) if ti_tune and toggle.tuning_level >= level["TiSteerThreshold"] else int(default.get_float("TiSteerThreshold"))
     # Two-stage climb. Knee defaults to TiSteerMax, which reproduces the single-slope limiter
     # exactly, so this does nothing until the knee is deliberately brought down.

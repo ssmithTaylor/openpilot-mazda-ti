@@ -6,26 +6,10 @@ from opendbc.can.packer import CANPacker
 from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_steer_torque_limits
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
-from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE
+from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE, TI_LIMIT_BOUNDS
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
-
-# Absolute bounds on every live Torque Interceptor limit, applied in the process that builds the
-# CAN frame. The panda checks MAZDA_LKAS on bus 0 but applies nothing at all to MAZDA_TI_LKAS on
-# gen1, so on this car there is no safety layer downstream of here -- these are the envelope.
-# Chosen to leave room for the tuning we intend and no more: DeltaUp 15 is past the stock Mazda
-# path's 10, which is what the A/B is aimed at; allowance and multiplier are bounded on the side
-# that widens the command as the driver pushes back, which is the unsafe direction for both.
-TI_LIMIT_BOUNDS = {
-  "TI_STEER_MAX": (100, 600),               # 600 is the TI's own hardware clip
-  "TI_STEER_DELTA_UP": (1, 15),
-  "TI_STEER_DELTA_DOWN": (1, 50),
-  "TI_STEER_DRIVER_ALLOWANCE": (5, 30),
-  "TI_STEER_DRIVER_MULTIPLIER": (10, 60),
-  "TI_STEER_DELTA_UP_KNEE": (100, 600),
-  "TI_STEER_DELTA_UP_HIGH": (1, 15),
-}
 
 # Below this the bias-to-command ratio is dominated by sensor quantisation -- both torque sensors
 # are 8-bit -- so accumulating it would only add noise to the slope estimate.
@@ -71,7 +55,8 @@ class CarController(CarControllerBase):
                                     "rate_limited_high", "driver_limited",
                                     "at_clip", "peak_cmd", "peak_desired", "deficit",
                                     "peak_bias", "not_run", "viol", "ramp",
-                                    "bias_cmd_sum", "bias_sum", "bias_frames")}
+                                    "bias_cmd_sum", "bias_sum", "bias_frames",
+                                    "bias_ratio_min", "bias_ratio_max", "bias_wrong_sign")}
     self.ti_stats_started = time.time()
 
   def ti_config(self):
@@ -158,8 +143,19 @@ class CarController(CarControllerBase):
     # for. Establish that decoupling happens, and what it looks like, before giving it authority.
     # ti_response does the real characterisation offline; this is the cheap in-drive version.
     if abs(sent) >= BIAS_MIN_COMMAND:
+      bias = int(CS.eps_torque_sensor - CS.out.steeringTorque)
       s["bias_cmd_sum"] += abs(sent)
-      s["bias_sum"] += abs(int(CS.eps_torque_sensor - CS.out.steeringTorque))
+      s["bias_sum"] += abs(bias)
+      # Both tails, kept apart. The sums above fold them together, and they mean opposite things:
+      # bias below the command asked for is assist fading, which the driver simply steers through;
+      # bias above it is torque nobody requested. Only the second would ever justify letting this
+      # touch the command, so it has to be visible separately. Ratio in thousandths to stay integer.
+      ratio = int(1000 * abs(bias) / abs(sent))
+      s["bias_ratio_max"] = max(s["bias_ratio_max"], ratio)
+      s["bias_ratio_min"] = ratio if not s["bias_frames"] else min(s["bias_ratio_min"], ratio)
+      # Bias opposing the command. Never expected this far above the noise floor.
+      if bias * sent < 0:
+        s["bias_wrong_sign"] += 1
       s["bias_frames"] += 1
 
   def load_param_list(self, key):
@@ -250,8 +246,14 @@ class CarController(CarControllerBase):
       # Bank this session's counters when it has any, and the persisted ones otherwise. The process
       # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
       # zeros as "previous" and lose the run the user actually meant to keep.
+      # tmpfs first. The flash copy is only written once a minute, so closing a run while parked
+      # would bank a snapshot up to 59 seconds behind -- and for an A/B that ends at the corner you
+      # cared about, the missing minute is the part you wanted. The tmpfs copy is a second old and
+      # survives ignition-off (the device stays powered); it is only lost at reboot, where the
+      # flash copy is the correct fallback.
       closing = payload if self.ti_stats["engaged"] else \
-                (self.params.get("TiTuningStats", encoding="utf8") or payload)
+                (self.params_memory.get("TiTuningStats", encoding="utf8") or
+                 self.params.get("TiTuningStats", encoding="utf8") or payload)
       self.params.put_nonblocking("TiTuningStatsPrevious", closing)
       # Keep a short history as well as the single previous run. Two slots meant one stray tap on
       # "Start A New Measurement" destroyed the baseline you were comparing against, which is easy
