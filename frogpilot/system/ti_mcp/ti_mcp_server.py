@@ -256,39 +256,63 @@ def tool_torque_learning(_args):
   return out
 
 
-SEGMENT_ROOT = os.getenv("TI_MCP_SEGMENTS", "/data/media/0/realdata")
+# log_root() picks between these depending on whether HD recording is on (/cache/use_HD), so check
+# both rather than assuming. TI_MCP_SEGMENTS overrides if a build puts them somewhere else.
+SEGMENT_ROOTS = ([os.environ["TI_MCP_SEGMENTS"]] if os.environ.get("TI_MCP_SEGMENTS") else
+                 ["/data/media/0/realdata_HD", "/data/media/0/realdata"])
 
 
 def _segment_dirs():
-  try:
-    names = [n for n in os.listdir(SEGMENT_ROOT) if "--" in n]
-  except Exception:
-    return []
-  return sorted(names, reverse=True)
+  """Returns (segments, diagnostics). Diagnostics matter: a missing directory, a permission error
+  and an empty one are three different problems that all otherwise look like 'no segments'."""
+  found, diags = [], []
+  for root in SEGMENT_ROOTS:
+    if not os.path.isdir(root):
+      diags.append(f"{root}: does not exist")
+      continue
+    try:
+      names = [n for n in os.listdir(root) if "--" in n]
+    except PermissionError:
+      diags.append(f"{root}: permission denied (ti_mcp runs as the manager's user)")
+      continue
+    except Exception as e:
+      diags.append(f"{root}: {e}")
+      continue
+    if not names:
+      diags.append(f"{root}: exists but holds no segments")
+    found += [(root, n) for n in names]
+  found.sort(key=lambda rn: rn[1], reverse=True)
+  return found, diags
 
 
 def _rlog_path(segment):
-  for name in ("rlog.bz2", "rlog", "rlog.zst"):
-    p = os.path.join(SEGMENT_ROOT, segment, name)
-    if os.path.exists(p):
-      return p
+  for root in SEGMENT_ROOTS:
+    for name in ("rlog.bz2", "rlog", "rlog.zst"):
+      p = os.path.join(root, segment, name)
+      if os.path.exists(p):
+        return p
   return None
 
 
 def tool_list_segments(args):
   """Recorded segments on the device, newest first."""
   limit = int(args.get("limit", 20))
+  segments, diags = _segment_dirs()
   out = []
-  for name in _segment_dirs()[:limit]:
+  for root, name in segments[:limit]:
     p = _rlog_path(name)
     out.append({
       "segment": name,
+      "root": root,
       "rlog": os.path.basename(p) if p else None,
       "size_mb": round(os.path.getsize(p) / 1e6, 1) if p else None,
     })
-  return {"root": SEGMENT_ROOT, "count": len(out), "segments": out,
-          "note": "Pass a segment name to analyze_segment. Raw logs are not served; the analysis "
-                  "is done here because an rlog is tens of megabytes."}
+  result = {"roots_checked": SEGMENT_ROOTS, "count": len(out), "segments": out,
+            "note": "Pass a segment name to analyze_segment. Raw logs are not served; the analysis "
+                    "is done here because an rlog is tens of megabytes."}
+  if not out:
+    result["why_empty"] = diags or ["no diagnostics"]
+  return result
 
 
 def tool_analyze_segment(args):
