@@ -56,6 +56,7 @@ class CarController(CarControllerBase):
       cloudlog.warning("TI telemetry unavailable: cereal has not been rebuilt for "
                        "frogpilotTorqueInterceptor. Counters will be absent; steering is fine.")
 
+    self.ti_send_failed = False
     self.ti_live = {}
     self.ti_steer_threshold = None
     self.ti_route = ""
@@ -250,103 +251,67 @@ class CarController(CarControllerBase):
     the dumps downstream would raise every second and take the car controller down with it."""
     self.ti_route = self.params.get("CurrentRoute", encoding="utf8") or self.ti_route
 
-  def ti_payload(self):
-    return json.dumps({**self.ti_stats, "live": self.ti_live, "config": self.ti_config(),
-                       "started_at": self.ti_stats_started, "route": self.ti_route})
-
   def publish_ti_stats(self):
-    """Publish the counters as a cereal message, and handle the clear trigger.
+    """Publish the counters and consume the clear trigger. No periodic filesystem writes at all.
 
-    No periodic filesystem writes at all. A cereal send is a shared-memory write; a param write
-    from here is either a thread spawn or a blocking write plus a file lock, and either was enough
-    to skip a carState frame once a second on a fixed phase -- which made the 20Hz consumers
-    polling carState fail their all_checks, flag their own output invalid, and surface to the
-    driver as a constant comm-issue alert. Persistence and the copy the settings panel reads are
-    the telemetry server's job now; it is a normal-priority process where a small write is free."""
+    A cereal send is a shared-memory write. A param write from this thread is either a thread
+    spawn -- put_nonblocking creates one through std::async on nearly every call -- or a blocking
+    write plus a file lock, and either was enough to skip a carState frame once a second on a fixed
+    phase, which the 20Hz consumers turned into a constant comm-issue alert. Persistence belongs to
+    the telemetry server, which is normal priority and can afford it."""
     self.send_ti_message()
 
-    # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
-    # A tmpfs READ takes no lock (Params::get(block=false) is a plain file read), so polling the
-    # trigger here is cheap. The writes below happen only on the tap itself.
+    # A tmpfs READ takes no lock -- Params::get(block=false) is a plain file read -- so polling the
+    # trigger here costs microseconds. The one write happens only on the tap itself.
     if self.params_memory.get_bool("ClearTiStats"):
       self.params_memory.put_bool("ClearTiStats", False)
-      payload = self.ti_payload()
-      # Bank this session's counters when it has any, and the persisted ones otherwise. The process
-      # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
-      # zeros as "previous" and lose the run the user actually meant to keep.
-      # tmpfs first. The flash copy is only written once a minute, so closing a run while parked
-      # would bank a snapshot up to 59 seconds behind -- and for an A/B that ends at the corner you
-      # cared about, the missing minute is the part you wanted. The tmpfs copy is a second old and
-      # survives ignition-off (the device stays powered); it is only lost at reboot, where the
-      # flash copy is the correct fallback.
-      closing = payload if self.ti_stats["engaged"] else \
-                (self.params_memory.get("TiTuningStats", encoding="utf8") or
-                 self.params.get("TiTuningStats", encoding="utf8") or payload)
-      self.params.put_nonblocking("TiTuningStatsPrevious", closing)
-      # Keep a short history as well as the single previous run. Two slots meant one stray tap on
-      # "Start A New Measurement" destroyed the baseline you were comparing against, which is easy
-      # to do mid-drive and impossible to undo. Now that every run carries the limits it was taken
-      # under, a handful of them is a usable record of a tuning session rather than just a pair.
-      try:
-        history = self.load_param_list("TiTuningStatsHistory")
-        history.append(json.loads(closing))
-        self.params.put_nonblocking("TiTuningStatsHistory",
-                                    json.dumps(history[-RUN_HISTORY:]))
-      except (ValueError, TypeError):
-        pass
       self.reset_ti_stats()
-      # startedAt changes here, which is how the telemetry server recognises a new run.
+      # Resetting bumps startedAt, which is how the telemetry server recognises the boundary and
+      # banks the run that just ended. Doing nothing else here is deliberate: when this path ALSO
+      # wrote TiTuningStatsPrevious and the history, two processes raced to record the same run and
+      # produced near-duplicate entries -- halving the usable history and letting a run be compared
+      # against a slightly staler copy of itself. One writer.
       self.send_ti_message()
 
   def send_ti_message(self):
     """One shared-memory publish. Nothing here touches the filesystem."""
     if self.ti_pm is None:
       return
-    msg = messaging.new_message("frogpilotTorqueInterceptor")
-    msg.valid = True
-    t = msg.frogpilotTorqueInterceptor
-    s, cfg = self.ti_stats, self.ti_config()
+    try:
+      msg = messaging.new_message("frogpilotTorqueInterceptor")
+      msg.valid = True
+      t = msg.frogpilotTorqueInterceptor
+      cfg = self.ti_config()
 
-    t.mode = int(self.ti_live.get("mode", 0))
-    t.violation = int(self.ti_live.get("viol", 0))
-    t.rampingDown = bool(self.ti_live.get("ramp", False))
-    t.version = int(self.ti_live.get("version", 0))
-    t.lkasAllowed = bool(self.ti_live.get("lkas_allowed", False))
+      t.mode = int(self.ti_live.get("mode", 0))
+      t.violation = int(self.ti_live.get("viol", 0))
+      t.rampingDown = bool(self.ti_live.get("ramp", False))
+      t.version = int(self.ti_live.get("version", 0))
+      t.lkasAllowed = bool(self.ti_live.get("lkas_allowed", False))
 
-    t.engagedFrames = s["engaged"]
-    t.shortFrames = s["short"]
-    t.rateLimitedFrames = s["rate_limited"]
-    t.rateLimitedBelowKnee = s["rate_limited_low"]
-    t.rateLimitedAboveKnee = s["rate_limited_high"]
-    t.driverLimitedFrames = s["driver_limited"]
-    t.atClipFrames = s["at_clip"]
-    t.deficit = float(s["deficit"])
-    t.peakCommand = s["peak_cmd"]
-    t.peakDesired = s["peak_desired"]
-    t.peakBias = s["peak_bias"]
-    t.notRunFrames = s["not_run"]
-    t.rampFrames = s["ramp"]
+      t.route = self.ti_route or ""
+      t.startedAt = self.ti_stats_started
 
-    t.biasCommandSum = float(s["bias_cmd_sum"])
-    t.biasSum = float(s["bias_sum"])
-    t.biasFrames = s["bias_frames"]
-    t.biasRatioMin = s["bias_ratio_min"]
-    t.biasRatioMax = s["bias_ratio_max"]
-    t.biasWrongSignFrames = s["bias_wrong_sign"]
+      t.steerMax = cfg["TiSteerMax"]
+      t.steerDeltaUp = cfg["TiSteerDeltaUp"]
+      t.steerDeltaDown = cfg["TiSteerDeltaDown"]
+      t.steerDeltaUpKnee = cfg["TiSteerDeltaUpKnee"]
+      t.steerDeltaUpHigh = cfg["TiSteerDeltaUpHigh"]
+      t.driverAllowance = cfg["TiSteerDriverAllowance"]
+      t.driverMultiplier = cfg["TiSteerDriverMultiplier"]
+      t.steerThreshold = cfg.get("TiSteerThreshold", 0)
 
-    t.route = self.ti_route or ""
-    t.startedAt = self.ti_stats_started
+      # Adding a counter is a Python-only change; see the schema comment.
+      t.countersJson = json.dumps(self.ti_stats)
 
-    t.steerMax = cfg["TiSteerMax"]
-    t.steerDeltaUp = cfg["TiSteerDeltaUp"]
-    t.steerDeltaDown = cfg["TiSteerDeltaDown"]
-    t.steerDeltaUpKnee = cfg["TiSteerDeltaUpKnee"]
-    t.steerDeltaUpHigh = cfg["TiSteerDeltaUpHigh"]
-    t.driverAllowance = cfg["TiSteerDriverAllowance"]
-    t.driverMultiplier = cfg["TiSteerDriverMultiplier"]
-    t.steerThreshold = cfg.get("TiSteerThreshold", 0)
-
-    self.ti_pm.send("frogpilotTorqueInterceptor", msg)
+      self.ti_pm.send("frogpilotTorqueInterceptor", msg)
+    except Exception:
+      # Same stakes as the constructor guard: an exception on this path would take the car
+      # controller down, and telemetry is never worth that. Logged once so a real fault is still
+      # findable without a message a second forever.
+      if not self.ti_send_failed:
+        self.ti_send_failed = True
+        cloudlog.exception("TI telemetry send failed; counters will be absent, steering is fine")
 
   def _ti_limit(self, frogpilot_toggles, attr, toggle_name):
     """One live limit, clamped. Deliberately repeats the clip in frogpilot_variables rather than
@@ -545,22 +510,15 @@ class CarController(CarControllerBase):
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX
       new_actuators.steerOutputCan = apply_steer
 
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
-      # Trigger polls stay at 1Hz -- they are tmpfs reads costing microseconds, and the flag button
-      # needs to feel responsive.
-      if self.frame % 100 == 0:
-        self.maybe_refresh_route()
-        self.check_flag_request(CS, CC, ti_apply_steer)
-
-      # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
-      # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a
-      # new thread's stack has to be allocated and faulted in. At 1Hz that cost landed in the
-      # 100Hz thread that builds the steering frame once a second, on a fixed phase -- visible in
-      # the logs as a skipped carState frame at exactly 1Hz, which then made the 20Hz consumers
-      # polling carState fail their all_checks and flag their own output invalid, which controlsd
-      # reports as commIssue. Five seconds of staleness costs the counters nothing.
-      if self.frame % 500 == 0:
-        self.publish_ti_stats()
+    # Everything TI-related happens once a second, matching the rate frogpilotTorqueInterceptor
+    # declares in services.py. Nothing is throttled below that any more: the publish is a
+    # shared-memory write and the two trigger polls are tmpfs reads that take no lock, so the
+    # buttons stay responsive. What used to be expensive here -- the param write and the /data
+    # route read -- is gone.
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and self.frame % 100 == 0:
+      self.maybe_refresh_route()
+      self.check_flag_request(CS, CC, ti_apply_steer)
+      self.publish_ti_stats()
 
     self.frame += 1
     Timer.tick()

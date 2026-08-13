@@ -17,9 +17,12 @@ def iscar(started: bool, params: Params, CP: car.CarParams, classic_model, tinyg
   return started and not CP.notCar
 
 def ti_mcp(started: bool, params: Params, CP: car.CarParams, classic_model, tinygrad_model, frogpilot_toggles) -> bool:
-  # Deliberately not gated on `started`: the counters are worth querying while parked, which is
-  # when you would sit and compare two runs.
-  return params.get_bool("TiMcpEnabled")
+  # Always. Not gated on `started`, because the counters are worth querying while parked -- that is
+  # when you sit and compare two runs. And not gated on TiMcpEnabled either: this process owns
+  # persistence of the counters and the copy the settings panel reads, so tying it to the network
+  # toggle meant turning telemetry off silently killed the panel and stopped banking runs. The
+  # toggle now gates only the HTTP listener, inside the process.
+  return True
 
 def logging(started, params, CP: car.CarParams, classic_model, tinygrad_model, frogpilot_toggles) -> bool:
   run = (not CP.notCar) or not params.get_bool("DisableLogging")

@@ -36,6 +36,9 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "ti-tuning", "version": "1.0.0"}
 MAX_REQUEST_BYTES = 64 * 1024
 
+# Completed measurement runs retained, matching the car controller.
+RUN_HISTORY = 5
+
 TI_MODE = {0: "DISCOVER", 1: "OFF", 2: "DRIVER_OVER", 3: "RUN"}
 TI_VIOL = {
   0x11: "LKAS_STUK (class 2) LKAS request stuck",
@@ -134,43 +137,40 @@ class Snapshot:
   last_started_at = None
   last_payload = None
   last_flash_write = 0.0
+  warned_unavailable = False
   has_ti_service = False
 
   def persist_counters(self, t):
-    """Turn the counters message back into the JSON shape the settings panel and tools expect, and
-    bank a run when it ends.
+    """Turn the counters message into the JSON shape the settings panel and tools expect, and bank
+    a run when one ends.
 
-    Done here rather than in the car controller because this is a normal-priority process: a tmpfs
+    Done here rather than in the car controller because this is a normal-priority process: a small
     write costs nothing, whereas the same write from the 100Hz control thread was skipping a
     carState frame every second. A new startedAt is how a reset announces itself -- the car
-    controller stamps it when it zeroes the counters -- so the previous values can be banked
-    without either side needing a handshake."""
-    stats = {
-      "engaged": t.engagedFrames, "short": t.shortFrames,
-      "rate_limited": t.rateLimitedFrames, "rate_limited_low": t.rateLimitedBelowKnee,
-      "rate_limited_high": t.rateLimitedAboveKnee, "driver_limited": t.driverLimitedFrames,
-      "at_clip": t.atClipFrames, "deficit": round(float(t.deficit), 1),
-      "peak_cmd": t.peakCommand, "peak_desired": t.peakDesired, "peak_bias": t.peakBias,
-      "not_run": t.notRunFrames, "ramp": t.rampFrames, "viol": t.violation,
-      "bias_cmd_sum": round(float(t.biasCommandSum), 1), "bias_sum": round(float(t.biasSum), 1),
-      "bias_frames": t.biasFrames, "bias_ratio_min": t.biasRatioMin,
-      "bias_ratio_max": t.biasRatioMax, "bias_wrong_sign": t.biasWrongSignFrames,
-      "live": {"mode": t.mode, "viol": t.violation, "ramp": bool(t.rampingDown),
-               "version": t.version, "lkas_allowed": bool(t.lkasAllowed)},
-      "config": {"TiSteerMax": t.steerMax, "TiSteerDeltaUp": t.steerDeltaUp,
-                 "TiSteerDeltaDown": t.steerDeltaDown, "TiSteerDeltaUpKnee": t.steerDeltaUpKnee,
-                 "TiSteerDeltaUpHigh": t.steerDeltaUpHigh,
-                 "TiSteerDriverAllowance": t.driverAllowance,
-                 "TiSteerDriverMultiplier": t.driverMultiplier,
-                 "TiSteerThreshold": t.steerThreshold},
-      "route": str(t.route) or None,
-      "started_at": round(float(t.startedAt), 1),
-    }
+    controller stamps it when it zeroes the counters -- so a run boundary is recognised without
+    either side needing a handshake, and this is the SINGLE writer of the banked keys."""
+    try:
+      stats = json.loads(t.countersJson) if t.countersJson else {}
+    except (ValueError, TypeError):
+      return
+    if not isinstance(stats, dict):
+      return
+
+    stats["live"] = {"mode": t.mode, "viol": t.violation, "ramp": bool(t.rampingDown),
+                     "version": t.version, "lkas_allowed": bool(t.lkasAllowed)}
+    stats["config"] = {"TiSteerMax": t.steerMax, "TiSteerDeltaUp": t.steerDeltaUp,
+                       "TiSteerDeltaDown": t.steerDeltaDown,
+                       "TiSteerDeltaUpKnee": t.steerDeltaUpKnee,
+                       "TiSteerDeltaUpHigh": t.steerDeltaUpHigh,
+                       "TiSteerDriverAllowance": t.driverAllowance,
+                       "TiSteerDriverMultiplier": t.driverMultiplier,
+                       "TiSteerThreshold": t.steerThreshold}
+    stats["route"] = str(t.route) or None
+    stats["started_at"] = round(float(t.startedAt), 1)
     payload = json.dumps(stats)
 
     started_at = float(t.startedAt)
     if self.last_started_at is not None and started_at > self.last_started_at and self.last_payload:
-      # The run that just ended. Bank it under both keys the comparison tools read.
       params.put_nonblocking("TiTuningStatsPrevious", self.last_payload)
       try:
         raw = params.get("TiTuningStatsHistory", encoding="utf8")
@@ -178,21 +178,36 @@ class Snapshot:
         if not isinstance(history, list):
           history = []
         history.append(json.loads(self.last_payload))
-        params.put_nonblocking("TiTuningStatsHistory", json.dumps(history[-5:]))
+        params.put_nonblocking("TiTuningStatsHistory", json.dumps(history[-RUN_HISTORY:]))
       except (ValueError, TypeError):
         pass
+      # Cleared, or a run that records nothing between two real ones would bank the older one a
+      # second time at the next boundary.
+      self.last_payload = None
     self.last_started_at = started_at
 
-    # Only bank runs that actually recorded something.
-    if stats["engaged"]:
+    # Only a run that recorded something is worth banking.
+    if stats.get("engaged"):
       self.last_payload = payload
 
-    params_memory.put_nonblocking("TiTuningStats", payload)
-    # Flash copy once a minute so an unexpected reboot costs at most that much.
+    # Blocking on purpose: this is a normal-priority process, and put_nonblocking would spawn a
+    # thread per message in the very change that exists to stop spawning threads.
+    params_memory.put("TiTuningStats", payload)
     now = time.time()
     if now - self.last_flash_write >= 60:
       self.last_flash_write = now
       params.put_nonblocking("TiTuningStats", payload)
+
+  def note_unavailable(self, reason):
+    """Say so where the user is actually looking.
+
+    A silently absent counter set is indistinguishable from "you have not driven yet", and would
+    waste a whole tuning drive before anyone noticed. The guards keep a stale build from costing
+    the car; this keeps it from costing a drive."""
+    if self.warned_unavailable:
+      return
+    self.warned_unavailable = True
+    params_memory.put("TiTuningStats", json.dumps({"unavailable": reason}))
 
   def run(self):
     try:
@@ -215,6 +230,7 @@ class Snapshot:
       # cereal should lose the counters, not the server.
       sm = messaging.SubMaster(services)
       self.has_ti_service = False
+      self.note_unavailable("cereal has not been rebuilt for frogpilotTorqueInterceptor")
     while True:
       try:
         sm.update(1000)
@@ -255,8 +271,14 @@ class Snapshot:
           "lateral_delay_status": str(sm["liveDelay"].status),
           "lateral_delay_valid_blocks": int(sm["liveDelay"].validBlocks),
         })
-        if self.has_ti_service and sm.updated["frogpilotTorqueInterceptor"]:
-          self.persist_counters(sm["frogpilotTorqueInterceptor"])
+        if self.has_ti_service:
+          if sm.updated["frogpilotTorqueInterceptor"]:
+            self.persist_counters(sm["frogpilotTorqueInterceptor"])
+          elif sm.seen["carState"] and not sm.seen["frogpilotTorqueInterceptor"]:
+            # The car is publishing but the interceptor telemetry never has. Either this is not a
+            # TI car, or the car controller could not construct its publisher.
+            self.note_unavailable("no frogpilotTorqueInterceptor message seen while driving; "
+                                  "the car controller may not have been rebuilt")
       except Exception as e:
         self.set({"available": False, "reason": str(e)})
 
@@ -711,6 +733,7 @@ def tool_analyze_segment(args):
   delta_up_high = _param_int("TiSteerDeltaUpHigh") or delta_up
   allowance = _param_int("TiSteerDriverAllowance") or 15
   cmd_frames = short = rate_lim = drv_lim = at_clip = 0
+  limits_from_log = False
   peak_cmd = 0
   last_steer, last_lat, last_drv, last_sent = 0.0, False, 0.0, 0
   static_tune, learned_tune, native_autotune = None, None, None
@@ -757,6 +780,18 @@ def tool_analyze_segment(args):
                          "friction": round(float(lt.torque.friction), 4)}
       except Exception:
         pass
+    elif w == "frogpilotTorqueInterceptor" and not limits_from_log:
+      # The limits the drive actually ran under, straight from the log. Until this existed the
+      # attribution below had to assume the params as they are NOW, which is wrong for any drive
+      # taken before a change -- the exact comparison this tool is for. Applied from the first
+      # message, so at most the opening second uses the fallback.
+      ti = msg.frogpilotTorqueInterceptor
+      steer_max = ti.steerMax or steer_max
+      delta_up = ti.steerDeltaUp or delta_up
+      delta_up_knee = ti.steerDeltaUpKnee or delta_up_knee
+      delta_up_high = ti.steerDeltaUpHigh or delta_up_high
+      allowance = ti.driverAllowance or allowance
+      limits_from_log = True
     elif w == "liveTorqueParameters":
       q = msg.liveTorqueParameters
       native_autotune = bool(q.useParams)
@@ -847,9 +882,13 @@ def tool_analyze_segment(args):
       "limits_used": {"TiSteerMax": steer_max, "TiSteerDeltaUp": delta_up,
                       "TiSteerDeltaUpKnee": delta_up_knee, "TiSteerDeltaUpHigh": delta_up_high,
                       "TiSteerDriverAllowance": allowance},
-      "caveat": "Limits are the CURRENT param values; if they changed since this drive the "
-                "attribution is wrong. driver_torque_limited counts only torque opposing the "
-                "command, since same-direction torque widens the cap rather than narrowing it.",
+      "limits_source": "the log itself" if limits_from_log else "current params",
+      "caveat": ("Limits came from the log, so the attribution reflects what this drive actually "
+                 "ran under." if limits_from_log else
+                 "Limits are the CURRENT param values -- this segment predates the interceptor "
+                 "telemetry message -- so if they changed since the drive the attribution is "
+                 "wrong.") + " driver_torque_limited counts only torque opposing the command, "
+                "since same-direction torque widens the cap rather than narrowing it.",
     } if cmd_frames else None,
     "speed_ms": {"mean": round(sum(speeds) / len(speeds), 2), "max": round(max(speeds), 2)} if speeds else None,
     "state_changes": transitions[:40],
@@ -1953,7 +1992,18 @@ def publish_address(bind_host, port):
 def main():
   host = os.getenv("TI_MCP_HOST", "0.0.0.0")
   port = int(os.getenv("TI_MCP_PORT", "8756"))
+
+  # The subscriber is this process's real job now -- it owns persistence of the tuning counters and
+  # the copy the settings panel reads. It runs whether or not the network endpoint is wanted, so
+  # that turning the telemetry service off (which its own description tells you to do on untrusted
+  # networks) stops serving without also silently killing the panel and the run history.
   threading.Thread(target=snapshot.run, daemon=True).start()
+
+  if not params.get_bool("TiMcpEnabled"):
+    print("ti-tuning: telemetry endpoint disabled; counters still recorded")
+    while True:
+      time.sleep(60)
+
   threading.Thread(target=publish_address, args=(host, port), daemon=True).start()
   print(f"ti-tuning MCP (read-only) on http://{host}:{port}/mcp")
   ThreadingHTTPServer((host, port), Handler).serve_forever()

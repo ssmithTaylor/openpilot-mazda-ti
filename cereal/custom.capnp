@@ -231,50 +231,38 @@ struct FrogPilotPlan @0xa1680744031fdb2d {
 # carState fail their all_checks and flag their own output invalid, surfacing to the driver as a
 # constant "communication issue between processes". A cereal publish is a shared-memory write.
 struct FrogPilotTorqueInterceptor {
-  # Live interceptor state, refreshed every frame regardless of engagement.
+  # Live interceptor state. Stable since inception, and read on its own, so typed.
   mode @0 :UInt8;                 # 0 DISCOVER, 1 OFF, 2 DRIVER_OVER, 3 RUN
   violation @1 :UInt8;            # 0 = none
   rampingDown @2 :Bool;
   version @3 :UInt8;
   lkasAllowed @4 :Bool;
 
-  # Measurement counters for the run in progress.
-  engagedFrames @5 :UInt32;
-  shortFrames @6 :UInt32;         # command cut below what openpilot asked for
-  rateLimitedFrames @7 :UInt32;
-  rateLimitedBelowKnee @8 :UInt32;
-  rateLimitedAboveKnee @9 :UInt32;
-  driverLimitedFrames @10 :UInt32;
-  atClipFrames @11 :UInt32;
-  deficit @12 :Float32;           # summed torque-frames of missing command
-  peakCommand @13 :Int32;
-  peakDesired @14 :Int32;
-  peakBias @15 :Int32;
-  notRunFrames @16 :UInt32;
-  rampFrames @17 :UInt32;
+  # Identity, so a saved run ties back to the segments that produced it. startedAt stays typed
+  # because the run-banking logic keys on it changing.
+  route @5 :Text;
+  startedAt @6 :Float64;
 
-  # Closed-loop bias measurement. The signed extremes are kept apart because under-delivery is
-  # assist fading and over-delivery is torque nobody asked for.
-  biasCommandSum @18 :Float32;
-  biasSum @19 :Float32;
-  biasFrames @20 :UInt32;
-  biasRatioMin @21 :Int32;        # thousandths of a bias count per command count
-  biasRatioMax @22 :Int32;
-  biasWrongSignFrames @23 :UInt32;
+  # The limits this run was recorded under. Landing these in every rlog and qlog makes
+  # analyze_segment's standing caveat obsolete -- it no longer has to assume the params as they are
+  # NOW when attributing an old drive.
+  steerMax @7 :UInt16;
+  steerDeltaUp @8 :UInt16;
+  steerDeltaDown @9 :UInt16;
+  steerDeltaUpKnee @10 :UInt16;
+  steerDeltaUpHigh @11 :UInt16;
+  driverAllowance @12 :UInt16;
+  driverMultiplier @13 :UInt16;
+  steerThreshold @14 :UInt16;
 
-  # Identity, so a saved run ties back to the segments that produced it.
-  route @24 :Text;
-  startedAt @25 :Float64;
-
-  # The limits this run was recorded under.
-  steerMax @26 :UInt16;
-  steerDeltaUp @27 :UInt16;
-  steerDeltaDown @28 :UInt16;
-  steerDeltaUpKnee @29 :UInt16;
-  steerDeltaUpHigh @30 :UInt16;
-  driverAllowance @31 :UInt16;
-  driverMultiplier @32 :UInt16;
-  steerThreshold @33 :UInt16;
+  # The counters, carried as JSON rather than as typed fields. Deliberate: this set changed three
+  # times in one week, every schema change costs a full cereal rebuild on a device whose build has
+  # already failed once, and typing them meant four hand-synced copies of the same field list --
+  # the dict keys, the JSON payload, the publish assignments and the reverse mapping. That is the
+  # N-copies-must-agree pattern that has already caused two bugs here. Adding a counter is now a
+  # Python-only change. Costs ~450 bytes/s in the logs and typed access that nothing consumes:
+  # every reader of these is our own Python.
+  countersJson @15 :Text;
 }
 
 struct FrogPilotRadarState @0xcb9fd56c7057593a {
