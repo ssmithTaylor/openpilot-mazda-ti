@@ -534,6 +534,17 @@ CONTROLSD_INPUTS = {
   "frogpilotPlan",
 }
 
+# Services controlsd never looks at directly but whose health decides whether the ones above call
+# themselves valid -- plannerd, for one, publishes longitudinalPlan with
+# valid = all_checks(['carState', 'controlsState', 'modelV2']). A stall here surfaces as some
+# other service going invalid, which is why these are reported unconditionally rather than only
+# when they cross a threshold: their absence from the list is itself the finding.
+UPSTREAM_OF_VALIDITY = {
+  "carState", "controlsState", "modelV2", "driverStateV2", "cameraOdometry", "sendcan", "can",
+  "roadCameraState", "driverCameraState", "wideRoadCameraState", "livePose",
+  "accelerometer", "gyroscope", "magnetometer", "gpsLocationExternal",
+}
+
 
 def _swaglog_dir():
   try:
@@ -690,11 +701,17 @@ def tool_segment_diagnostics(args):
   except Exception as e:
     return {"error": f"cannot load decoder: {e}"}
 
-  try:
-    from cereal.services import SERVICES
-    freqs = {k: float(v.frequency) for k, v in SERVICES.items()}
-  except Exception:
-    freqs = {}
+  # The dict is SERVICE_LIST here; SERVICES is the newer upstream name. Without it every gap falls
+  # back to an absolute threshold, which hides exactly the failure worth finding: a 100Hz service
+  # missing a handful of frames is a tenth of a second and would never trip a one-second bar.
+  freqs = {}
+  for attr in ("SERVICE_LIST", "SERVICES"):
+    try:
+      mod = __import__("cereal.services", fromlist=[attr])
+      freqs = {k: float(v.frequency) for k, v in getattr(mod, attr).items()}
+      break
+    except Exception:
+      continue
 
   raw = open(path, "rb").read()
   if path.endswith(".bz2"):
@@ -760,30 +777,47 @@ def tool_segment_diagnostics(args):
         text = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
         errors.append({"t": round(ts, 2), "where": rec.get("filename"), "msg": text[:600]})
 
-  gaps = []
-  for name, (gap, at) in max_gap.items():
+  def gap_row(name, gap, at):
     hz = freqs.get(name, 0.0)
-    missed = round(gap * hz, 1) if hz else None
+    return {"service": name, "max_gap_s": round(gap, 3), "at_s": round(at, 1),
+            "expected_hz": hz or None, "periods_missed": round(gap * hz, 1) if hz else None,
+            "checked_by_controlsd": name in CONTROLSD_INPUTS}
+
+  gaps, upstream = [], []
+  for name, (gap, at) in max_gap.items():
+    row = gap_row(name, gap, at)
+    missed = row["periods_missed"]
     # A service is only interesting if it missed several of its own periods. Rate-less services
     # keep an absolute threshold so they are not silently dropped.
     if (missed is not None and missed >= 5) or (missed is None and gap >= 1.0):
-      gaps.append({"service": name, "max_gap_s": round(gap, 3), "at_s": round(at, 1),
-                   "expected_hz": hz or None, "periods_missed": missed,
-                   "checked_by_controlsd": name in CONTROLSD_INPUTS})
+      gaps.append(row)
+    if name in UPSTREAM_OF_VALIDITY:
+      upstream.append(row)
   gaps.sort(key=lambda g: (g["checked_by_controlsd"], g["periods_missed"] or 0), reverse=True)
+  upstream.sort(key=lambda g: g["periods_missed"] or 0, reverse=True)
 
   ordered = sorted(ev_frames.items(), key=lambda kv: kv[1], reverse=True)
   onroad = [{"event": n, "frames": c, "first_s": round(ev_first[n], 1),
              "last_s": round(ev_last[n], 1)} for n, c in ordered]
 
-  culprits = sorted({s for c in comm for s in (c["not_alive"] + c["not_freq_ok"] + c["invalid"])})
+  # The three lists mean genuinely different things and must not be merged: a service that stopped
+  # publishing points at its own process, one that published on time and flagged itself bad points
+  # at whatever it depends on. Conflating them sends the reader to the wrong place.
+  stale = sorted({s for c in comm for s in (c["not_alive"] + c["not_freq_ok"])})
+  flagged = sorted({s for c in comm for s in c["invalid"]})
   if proc_trouble:
     verdict = ("PROCESS FAILURE: " + ", ".join(sorted(proc_trouble)) +
                " stopped running while manager expected them up. Exit codes are in "
                "process_failures; a crash here explains any stale service downstream.")
-  elif culprits:
-    verdict = ("STALE SERVICES: " + ", ".join(culprits) + ". controlsd raised commIssue because "
-               "these stopped meeting their timing. Find the process that publishes them.")
+  elif stale:
+    verdict = ("STOPPED PUBLISHING: " + ", ".join(stale) + ". These missed their timing outright, "
+               "so look at the process that publishes them and at whatever is starving it.")
+  elif flagged:
+    verdict = ("FLAGGED INVALID: " + ", ".join(flagged) + ". Nothing stalled and nothing died -- "
+               "these published on schedule and marked their own output bad, which nearly always "
+               "means something they consume did. Validity propagates: plannerd marks "
+               "longitudinalPlan invalid when carState, controlsState or modelV2 fail ITS checks. "
+               "upstream_gaps measures those inputs directly and is where to look next.")
   elif any(e["event"] == "commIssue" for e in onroad):
     verdict = ("commIssue was raised but no detail line was recorded in this segment -- the "
                "detail is logged only when the failing set changes, so it is likely in the "
@@ -803,14 +837,19 @@ def tool_segment_diagnostics(args):
     "comm_issue_count": len(comm),
     "process_failures": proc_trouble,
     "worst_service_gaps": gaps[:15],
+    "upstream_gaps": upstream,
     "error_log": errors[:limit],
     "error_log_count": len(errors),
     "how_to_read": (
-      "Read verdict first, then comm_issue_detail, which names the services controlsd found "
-      "stale. worst_service_gaps is the independent check: it measures actual publication gaps "
-      "from the log, so it can catch a stall controlsd did not attribute correctly. "
-      "periods_missed is the gap in units of that service's own expected interval, which makes a "
-      "1Hz service and a 100Hz service comparable. process_failures is decisive when non-empty."),
+      "Read verdict first, then comm_issue_detail. Its three lists are not interchangeable: "
+      "not_alive means a service stopped publishing, not_freq_ok that it fell behind its rate, "
+      "invalid that it published on time but flagged its own output bad -- the last one points at "
+      "that service's INPUTS, not at itself. worst_service_gaps and upstream_gaps measure real "
+      "publication gaps from the log, independent of what controlsd concluded; upstream_gaps is "
+      "reported in full even when nothing crosses a threshold, because a clean result there is "
+      "itself informative. periods_missed expresses a gap in units of that service's own "
+      "interval, so a 1Hz and a 100Hz service can be compared. process_failures is decisive when "
+      "non-empty."),
   }
 
 
