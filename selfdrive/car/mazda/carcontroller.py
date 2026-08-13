@@ -31,6 +31,9 @@ TI_LIMIT_BOUNDS = {
 # are 8-bit -- so accumulating it would only add noise to the slope estimate.
 BIAS_MIN_COMMAND = 100
 
+# Flags kept. Enough for a long tuning drive, small enough that the param stays a few kilobytes.
+FLAG_HISTORY = 40
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -56,6 +59,8 @@ class CarController(CarControllerBase):
     self.ti_live = {}
     self.ti_steer_threshold = None
     self.ti_route = ""
+    self.ti_route_seen = ""
+    self.ti_route_started = 0.0
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -154,13 +159,66 @@ class CarController(CarControllerBase):
       s["bias_sum"] += abs(int(CS.eps_torque_sensor - CS.out.steeringTorque))
       s["bias_frames"] += 1
 
-  def ti_payload(self):
-    # Identity travels with the numbers. loggerd writes CurrentRoute at every onroad transition, so
-    # stamping it here is what lets a saved run be tied back to the segments that produced it --
-    # otherwise the counters and the rlogs can only be matched by guessing at wall-clock.
-    # encoding matters: Params.get returns bytes without it, and bytes are not JSON serialisable,
-    # so the dumps below would raise every second and take the car controller down with it.
+  def check_flag_request(self, CS, CC, sent):
+    """The driver tapped "Flag This Moment" on the tuning panel because something felt wrong.
+
+    Records enough to find the spot again without trawling a whole drive: when, which route and
+    segment, and what the interceptor was doing at that instant. Polled at 1Hz alongside the other
+    trigger, so the recorded moment can trail the tap by up to a second -- immaterial, since the
+    thing being marked is a stretch of road and the driver is reacting to something already a
+    second or two old anyway."""
+    if not self.params.get_bool("TiFlagMoment"):
+      return
+    self.params.put_bool("TiFlagMoment", False)
+
+    now = time.time()
+    if self.ti_route and self.ti_route != self.ti_route_seen:
+      self.ti_route_seen, self.ti_route_started = self.ti_route, now
+
+    segment = None
+    if self.ti_route and self.ti_route_started:
+      # loggerd rotates a segment a minute, so elapsed time in the route gives the index. Slightly
+      # approximate -- this process comes up a moment after loggerd opens the route -- so a flag
+      # landing near a minute boundary may name the neighbouring segment. Both are worth reading.
+      segment = f"{self.ti_route}--{int((now - self.ti_route_started) // 60)}"
+
+    entry = {
+      "at": round(now, 1),
+      "route": self.ti_route or None,
+      "segment": segment,
+      "engaged": bool(CC.latActive),
+      "speed_ms": round(float(CS.out.vEgo), 1),
+      "steering_angle_deg": round(float(CS.out.steeringAngleDeg), 1),
+      "command": int(sent),
+      "driver_torque": int(CS.out.steeringTorque),
+      "bias": int(CS.eps_torque_sensor - CS.out.steeringTorque),
+      "ti_mode": int(CS.ti_state),
+      "ti_viol": int(CS.ti_violation),
+      "ti_ramp": bool(CS.ti_ramp_down),
+      "config": self.ti_config(),
+    }
+
+    try:
+      existing = json.loads(self.params.get("TiFlaggedMoments", encoding="utf8") or "[]")
+      if not isinstance(existing, list):
+        existing = []
+    except (ValueError, TypeError):
+      existing = []
+    existing.append(entry)
+    # Persisted to flash rather than tmpfs: the entire point is to still have these after the
+    # drive. One write per tap is nothing, unlike the per-second counters.
+    self.params.put_nonblocking("TiFlaggedMoments", json.dumps(existing[-FLAG_HISTORY:]))
+
+  def refresh_route(self):
+    """Identity for everything recorded this second. loggerd writes CurrentRoute at every onroad
+    transition, so stamping it is what ties a saved run, or a flagged moment, back to the segments
+    that produced it -- otherwise they can only be matched by guessing at wall-clock.
+
+    encoding matters: Params.get returns bytes without it, and bytes are not JSON serialisable, so
+    the dumps downstream would raise every second and take the car controller down with it."""
     self.ti_route = self.params.get("CurrentRoute", encoding="utf8") or self.ti_route
+
+  def ti_payload(self):
     return json.dumps({**self.ti_stats, "live": self.ti_live, "config": self.ti_config(),
                        "started_at": self.ti_stats_started, "route": self.ti_route})
 
@@ -391,6 +449,8 @@ class CarController(CarControllerBase):
       new_actuators.steerOutputCan = apply_steer
 
     if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and self.frame % 100 == 0:
+      self.refresh_route()
+      self.check_flag_request(CS, CC, ti_apply_steer)
       self.publish_ti_stats()
 
     self.frame += 1

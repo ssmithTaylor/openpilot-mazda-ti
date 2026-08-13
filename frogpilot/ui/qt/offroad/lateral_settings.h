@@ -35,7 +35,7 @@ private:
   QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaUpKnee",
                                          "TiSteerDeltaUpHigh", "TiSteerDeltaDown", "TiSteerDriverAllowance",
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
-                                         "ClearTiStats", "TiMcpEnabled"};
+                                         "ClearTiStats", "TiFlagMoment", "TiMcpEnabled"};
 
   QSet<QString> parentKeys;
 
@@ -54,6 +54,9 @@ private:
   LabelControl *tiOutputLabel = nullptr;
   LabelControl *tiHealthLabel = nullptr;
   LabelControl *tiMcpLabel = nullptr;
+  // Held so its text can be put back once the car controller has consumed the flag, which is the
+  // only feedback the driver gets that the tap actually landed.
+  ButtonControl *tiFlagButton = nullptr;
   int tiStatsTick = 0;
 
   FrogPilotSettingsWindow *parent;

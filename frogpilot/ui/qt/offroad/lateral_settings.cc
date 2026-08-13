@@ -80,6 +80,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"TiSteerThreshold", tr("Steering Pressed Threshold"), tr("<b>How much pressure on the wheel counts as you taking over.</b> Raise if bumps and road feedback falsely trigger a takeover; lower to have openpilot notice your input sooner."), ""},
     {"TiMcpEnabled", tr("Telemetry Service"), tr("<b>Serve the tuning counters on the local network so a laptop can read them while you drive.</b> Read-only and unauthenticated, so anyone on the same network can see driving state. Turn it off on networks you do not trust. Requires a reboot to take effect."), ""},
     {"ClearTiStats", tr("Start A New Measurement"), tr("<b>Zero the tuning counters so the next stretch of road is measured on its own.</b> The previous run's figures are kept for comparison. Turn this on just before the corner or road you want to judge a change on."), ""},
+    {"TiFlagMoment", tr("Flag This Moment"), tr("<b>Mark right now as worth looking at later.</b> Tap it when the steering does something odd — a dropout, a wander, effort that does not arrive. Records the spot, the segment and what the interceptor was doing, so the drive can be reviewed without trawling the whole route."), ""},
 
     {"AlwaysOnLateral", tr("Always On Lateral"), tr("<b>openpilot's steering remains active even when the accelerator or brake pedals are pressed.</b>"), "../../frogpilot/assets/toggle_icons/icon_always_on_lateral.png"},
     {"AlwaysOnLateralMain", tr("Enable With Cruise Control"), tr("<b>Enable \"Always On Lateral\" whenever \"Cruise Control\" is on, even when openpilot is not engaged.</b>"), ""},
@@ -172,6 +173,17 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
         clearStatsButton->setText(tr("STARTED"));
       });
       lateralToggle = clearStatsButton;
+    } else if (param == "TiFlagMoment") {
+      // Pressed while driving, so no confirmation dialog: one tap, immediate feedback, done. A
+      // yes/no prompt here would take the driver's attention for exactly as long as the thing
+      // they are trying to report. The car controller picks the flag up within a second and
+      // clears it; the button text is set back by updateTorqueInterceptorStats once it has.
+      tiFlagButton = new ButtonControl(title, tr("FLAG"), desc);
+      QObject::connect(tiFlagButton, &ButtonControl::clicked, [this]() {
+        params.putBool("TiFlagMoment", true);
+        tiFlagButton->setText(tr("FLAGGED"));
+      });
+      lateralToggle = tiFlagButton;
 
     } else if (param == "AlwaysOnLateral") {
       FrogPilotManageControl *aolToggle = new FrogPilotManageControl(param, title, desc, icon);
@@ -395,6 +407,15 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
                             .arg(fmt(pct(cur, "rate_limited")), fmt(pct(cur, "driver_limited"))));
   tiOutputLabel->setText(QString(tr("peak bias %1, %2 at clip"))
                          .arg(QString::number(cur.value("peak_bias").toInt()), fmt(pct(cur, "at_clip"))));
+
+  // The car controller clears TiFlagMoment once it has recorded the flag, within a second. Until
+  // then the button reads FLAGGED, so a tap still in flight looks different from one that landed
+  // -- and the count going up is the confirmation that it did.
+  if (tiFlagButton != nullptr) {
+    tiFlagButton->setText(params.getBool("TiFlagMoment") ? tr("FLAGGING") : tr("FLAG"));
+    int flagged = QJsonDocument::fromJson(QString::fromStdString(params.get("TiFlaggedMoments")).toUtf8()).array().size();
+    tiFlagButton->setValue(flagged > 0 ? tr("%1 saved").arg(flagged) : QString());
+  }
 
   // Address is republished every 5s, so anything older than 15s means the service is not running.
   // On tmpfs: it is regenerated at every startup and never needed across a boot, so there was no

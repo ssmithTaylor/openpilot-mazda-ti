@@ -467,6 +467,8 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TetheringEnabled", "0", 0, "0"),
   ("ThemesDownloaded", "", 0, ""),
   ("ClearTiStats", "0", 3, "0"),
+  ("TiFlagMoment", "0", 3, "0"),
+  ("TiFlaggedMoments", "", 3, ""),
   ("AutoScreenRefresh", "1", 0, "1"),
   ("LastScreenRefresh", "0", 0, "0"),
   ("ScreenRefreshRemaining", "0", 0, "0"),

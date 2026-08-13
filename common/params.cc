@@ -566,6 +566,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"ThemeDownloadProgress", CLEAR_ON_MANAGER_START},
     {"ThemesDownloaded", PERSISTENT},
     {"ClearTiStats", PERSISTENT},
+    {"TiFlagMoment", PERSISTENT},
+    {"TiFlaggedMoments", PERSISTENT},
     {"AutoScreenRefresh", PERSISTENT},
     {"LastScreenRefresh", PERSISTENT},
     {"ScreenRefreshRemaining", PERSISTENT},

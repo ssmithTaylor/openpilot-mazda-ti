@@ -278,6 +278,50 @@ def tool_ti_stats(_args):
   return result
 
 
+def tool_ti_flags(args):
+  """Moments the driver marked from the tuning panel, newest first."""
+  flags = _param_json("TiFlaggedMoments") or []
+  limit = int(args.get("limit", 25))
+  out = []
+  for f in reversed(flags[-limit:]):
+    entry = dict(f)
+    seg = f.get("segment")
+    entry["rlog_present"] = bool(seg) and _rlog_path(seg) is not None
+    try:
+      entry["at_local"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(f["at"])))
+    except (KeyError, TypeError, ValueError):
+      pass
+    # The segment index is derived from elapsed time in the route, so a flag landing near a minute
+    # boundary can name the neighbour. Offer the ones either side that actually exist rather than
+    # letting a reader conclude the interesting frames are missing.
+    if seg and "--" in seg:
+      base, _, idx = seg.rpartition("--")
+      try:
+        n = int(idx)
+        neighbours = [f"{base}--{n - 1}"] if n > 0 else []
+        neighbours.append(f"{base}--{n + 1}")
+        entry["also_check"] = [s for s in neighbours if _rlog_path(s)]
+      except ValueError:
+        pass
+    out.append(entry)
+
+  return {
+    "count": len(flags),
+    "returned": len(out),
+    "flags": out,
+    "how_to_read": (
+      "Each flag is a moment the driver marked because something felt wrong. Pass its segment "
+      "straight to ti_response, analyze_segment or segment_diagnostics -- and check also_check "
+      "too, since the index is derived from elapsed time and a flag near a minute boundary can "
+      "name the neighbouring segment. The recorded instant can trail the tap by up to a second, "
+      "and the driver is reacting to something already a second or two old, so read the flag as "
+      "marking a stretch of road rather than a frame. command, bias, driver_torque and ti_mode are "
+      "what the interceptor was doing at the time; config is the limits in force, which is what "
+      "makes a flag from an earlier tuning state still interpretable. at_local uses the device "
+      "clock, which is wrong until it syncs after boot -- trust the route and segment over it."),
+  }
+
+
 def tool_ti_tuning(_args):
   """Current values of the six TI limits."""
   values = {name: _param_int(name) for name in TUNING_PARAMS}
@@ -1192,6 +1236,20 @@ TOOLS = [
      "save this output after every run. For an older drive use analyze_segment instead, which "
      "recomputes the same figures from the log.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_ti_stats},
+
+  {"name": "ti_flags",
+   "description":
+     "Moments the driver flagged from the tuning panel while driving, newest first -- odd "
+     "behaviour, a torque dropout, anything worth a second look. CHECK THIS EARLY in any "
+     "investigation of a drive: it is the driver telling you where to look, and it turns 'trawl "
+     "the whole route' into 'read these two segments'. Each flag carries the segment name to pass "
+     "straight to ti_response, analyze_segment or segment_diagnostics, the neighbouring segments "
+     "to check alongside it, and what the interceptor was doing at that instant (command, bias, "
+     "driver torque, mode, violation) plus the tuning limits in force, so a flag from an earlier "
+     "tuning state is still interpretable. Empty just means nothing has been flagged.",
+   "inputSchema": {"type": "object", "properties": {
+     "limit": {"type": "integer", "description": "How many to return, newest first (default 25)"}}},
+   "fn": tool_ti_flags},
 
   {"name": "ti_tuning",
    "description":
