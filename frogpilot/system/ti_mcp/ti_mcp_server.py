@@ -23,6 +23,7 @@ on an untrusted or public network, turn the toggle off or set TI_MCP_HOST=127.0.
 """
 import collections
 import json
+import math
 import os
 import socket
 import time
@@ -1146,12 +1147,19 @@ def tool_ti_response(args):
 
   rows = []
   srcs = collections.Counter()
-  eps = ti = vego = None
+  eps = ti = vego = sensor1 = None
   mode = ramp = None
   lat_active = False
   sat_eps = sat_ti = 0
   over_600 = 0
   truncated = False
+  # Sensor-identity pairs, collected at TI_FEEDBACK cadence and NOT gated on engagement -- the
+  # bypass frames that prove the two sensors agree happen precisely when openpilot is not driving.
+  identity = []
+  # Redundant sensor on the same message, for inter-channel skew.
+  skew = []
+  # (bias, lateral accel) at liveLocationKalman cadence, for the response ceiling.
+  latacc = []
 
   events = capnp_log.Event.read_multiple_bytes(raw)
   t0 = None
@@ -1172,18 +1180,39 @@ def tool_ti_response(args):
       vego = float(msg.carState.vEgo)
     elif w == "carControl":
       lat_active = bool(msg.carControl.latActive)
+    elif w == "liveLocationKalman":
+      # Lateral acceleration exactly as torqued derives it. This is the outcome domain: what a
+      # count of bias actually buys in cornering, which is the only ceiling that matters to the
+      # goal. The internal clamp, the DAC range and the sensor range are all upstream of it.
+      try:
+        llk = msg.liveLocationKalman
+        if vego is not None and eps is not None and ti is not None:
+          yaw_rate = float(llk.angularVelocityCalibrated.value[2])
+          roll = float(llk.orientationNED.value[0])
+          lat_acc = (vego * yaw_rate) - (math.sin(roll) * 9.81)
+          latacc.append((eps - ti, lat_acc, vego, mode, ramp, lat_active))
+      except Exception:
+        pass
     elif w == "can":
       for f in msg.can:
         if f.address == STEER_TORQUE:
           srcs[f"eps_bus{f.src}"] += 1
-          eps = bytes(f.dat)[0] - TORQUE_SENSOR_OFFSET
+          d = bytes(f.dat)
+          eps = d[0] - TORQUE_SENSOR_OFFSET
           sat_eps += abs(eps) >= TORQUE_SENSOR_LIMIT
+          # SENSOR1 rides the same message: 39|8@0+ (1,-128), i.e. byte 4 with a different offset
+          # and a different declared range from STEER_TORQUE_SENSOR. Whether the two are meant to
+          # track each other is NOT established -- this is exploratory.
+          sensor1 = d[4] - 128
+          skew.append((eps, sensor1))
         elif f.address == TI_FEEDBACK:
           srcs[f"ti_bus{f.src}"] += 1
           d = bytes(f.dat)
           ti = d[0] - TORQUE_SENSOR_OFFSET
           sat_ti += abs(ti) >= TORQUE_SENSOR_LIMIT
           mode, ramp = d[3], bool(d[6])
+          if eps is not None:
+            identity.append((eps, ti, mode))
     elif w == "sendcan":
       # Sampled at the command's cadence against the most recent sensor readings, the same
       # last-value alignment analyze_segment uses. Both sensors arrive at 50-100Hz, so the
@@ -1358,6 +1387,111 @@ def tool_ti_response(args):
                  "DBC range running out, not the interceptor misbehaving."),
     }
 
+  # --- Does eps - ti actually isolate the injected bias? -----------------------------------------
+  # Every bias figure anywhere in this project assumes it does. That holds only if the TI's own
+  # sensor report is calibrated to match what the EPS reads through the TI's output stage. Two
+  # checks settle it from recordings that already exist, and if either fails, its deviation IS the
+  # correction factor rather than merely bad news.
+  identity_out = {}
+  bypass = [(e, t) for (e, t, m) in identity if m != 3]
+  if len(bypass) >= 200:
+    be = np.array([p[0] for p in bypass], dtype=float)
+    bt = np.array([p[1] for p in bypass], dtype=float)
+    if bt.std() > 0:
+      m_b, c_b = np.polyfit(bt, be, 1)
+      ok = abs(float(m_b) - 1.0) < 0.1 and abs(float(c_b)) < 3.0
+      identity_out["bypass_regression"] = {
+        "n": len(bypass), "slope": round(float(m_b), 4), "intercept": round(float(c_b), 3),
+        "expected": "slope 1.0, intercept 0",
+        "verdict": ("the two sensors agree with the DAC out of the loop -- the subtraction is sound"
+                    if ok else
+                    "THEY DO NOT AGREE. The slope is the scale factor between the TI's report and "
+                    "the EPS reading, and every bias figure in this project needs dividing by it."),
+      }
+  else:
+    identity_out["bypass_regression"] = {
+      "n": len(bypass),
+      "note": ("needs >=200 frames with the TI out of RUN, where the sensor passes through "
+               "untouched. A healthy unit never leaves RUN, so run this against an old recording "
+               "from the faulty unit, which sat bypassed for whole segments."),
+    }
+
+  quiet = [(c, b) for (_, c, b, _v, m, r) in rows if m == 3 and not r and abs(c) <= 20]
+  if len(quiet) >= 100:
+    qb = np.array([p[1] for p in quiet], dtype=float)
+    identity_out["near_zero_command_residual"] = {
+      "n": len(quiet),
+      "mean_bias": round(float(qb.mean()), 3),
+      "abs_p95": round(float(np.percentile(np.abs(qb), 95)), 2),
+      "expected": "≈ 0",
+      "verdict": ("consistent with zero -- the full path including the DAC passes through cleanly"
+                  if abs(float(qb.mean())) < 2.0 else
+                  "NOT zero. A standing offset with no command means the subtraction is not "
+                  "isolating what we think, or the TI injects at rest."),
+    }
+  result["measurement_identity"] = identity_out
+
+  # --- What a count of bias is actually worth ----------------------------------------------------
+  # The ceiling that matters is not the interceptor's internal clamp, the DAC range or the sensor
+  # range -- it is wherever the EPS's response to sensor bias rolls off. That is observable here,
+  # in the outcome domain, and it is what replaces the cross-unit "36 of 119" comparison that was
+  # never a valid ratio.
+  la = np.array([(b, a) for (b, a, v, m, r, act) in latacc
+                 if act and m == 3 and not r and v > 5.0 and abs(b) >= 3], dtype=float)
+  if len(la) >= 200:
+    lb, ll = la[:, 0], la[:, 1]
+    whole = _fit_through_origin(lb, ll, np)
+    # Split at the median magnitude and compare. A materially lower slope in the upper half is
+    # rolloff -- the EPS giving less per count as bias grows, which is exactly the shape the
+    # high-torque suspicion predicts and which no amount of TI headroom would fix.
+    cut = float(np.median(np.abs(lb)))
+    lo_sel, hi_sel = np.abs(lb) < cut, np.abs(lb) >= cut
+    lo_fit = _fit_through_origin(lb[lo_sel], ll[lo_sel], np) if int(lo_sel.sum()) >= 80 else None
+    hi_fit = _fit_through_origin(lb[hi_sel], ll[hi_sel], np) if int(hi_sel.sum()) >= 80 else None
+    out = {"overall": whole, "split_at_bias": round(cut, 1),
+           "lower_half": lo_fit, "upper_half": hi_fit,
+           "units": "m/s^2 of lateral acceleration per count of bias"}
+    if lo_fit and hi_fit and lo_fit["slope"]:
+      ratio = hi_fit["slope"] / lo_fit["slope"]
+      out["upper_over_lower"] = round(ratio, 3)
+      out["verdict"] = (
+        "ROLLOFF: the EPS returns materially less per count of bias at higher bias. The binding "
+        "constraint is the EPS response, not any interceptor limit, and raising command headroom "
+        "will not buy proportional cornering." if ratio < 0.8 else
+        "No rolloff detected over the range driven: response is proportional, so amplitude headroom "
+        "is worth having if it can be obtained. Note this says nothing about bias levels never "
+        "reached in this segment.")
+    result["lateral_response"] = out
+  else:
+    result["lateral_response"] = {
+      "n": int(len(la)),
+      "note": ("needs >=200 engaged frames above 5 m/s with appreciable bias. liveLocationKalman "
+               "publishes at 20Hz, so a segment of sustained engaged cornering is required."),
+    }
+
+  # --- Redundant sensor on the same message ------------------------------------------------------
+  # The interceptor drives two DAC channels, and 0x240 carries a second sensor. Divergence between
+  # them is the signature an EPS plausibility check would trip on. Exploratory: the DBC declares the
+  # two signals with different offsets and ranges, so whether they are meant to track is unknown --
+  # a stable relationship of ANY shape is the useful finding, and a drifting one is the interesting.
+  if len(skew) >= 200:
+    s0 = np.array([p[0] for p in skew], dtype=float)
+    s1 = np.array([p[1] for p in skew], dtype=float)
+    corr = float(np.corrcoef(s0, s1)[0, 1]) if s0.std() > 0 and s1.std() > 0 else None
+    result["redundant_sensor"] = {
+      "n": len(skew),
+      "steer_torque_sensor": {"mean": round(float(s0.mean()), 2), "min": int(s0.min()),
+                              "max": int(s0.max())},
+      "sensor1": {"mean": round(float(s1.mean()), 2), "min": int(s1.min()), "max": int(s1.max())},
+      "correlation": round(corr, 4) if corr is not None else None,
+      "how_to_read": ("A high absolute correlation, positive or negative, means the two track and "
+                      "the pair can be used as a consistency check going forward. Near zero means "
+                      "SENSOR1 measures something else entirely and should be ignored. Correlation "
+                      "that DROPS between segments, or within one, is the inter-channel divergence "
+                      "worth chasing -- compare this figure across drives rather than judging it "
+                      "in isolation."),
+    }
+
   result["how_to_read"] = (
     "response.slope is bias counts per count of command -- the conversion the whole tuning problem "
     "rests on, and multiplying it by TiSteerMax gives the most bias this setup can ever deliver. "
@@ -1498,10 +1632,19 @@ TOOLS = [
      "unreliability this fork exists to chase, reported next to a sensor-saturation count because "
      "saturation looks identical and must not be mistaken for it. Also tests whether the stock "
      "Mazda LKAS request contributes torque above its 52kph enable speed, which would mean the car "
-     "has two actuators and torqued has been fitting one line through both plants. Use this to "
-     "establish the plant BEFORE changing limits; use ti_stats and analyze_segment to measure the "
-     "effect afterwards. Needs sustained engaged driving, ideally spanning both below 45kph and "
-     "above 52kph. Refuses to run onroad.",
+     "has two actuators and torqued has been fitting one line through both plants. "
+     "THREE FIELDS DESERVE READING BEFORE THE SLOPE ITSELF. measurement_identity checks whether "
+     "the eps-minus-ti subtraction isolates injected bias at all -- every bias number in this "
+     "project rests on that and it had never been verified; if it fails, its deviation is the "
+     "correction factor. lateral_response gives m/s^2 of cornering per count of bias, split high "
+     "against low, which is the only ceiling that matters to the goal and the one that replaces "
+     "comparing figures from different unit domains. redundant_sensor tracks a second sensor on "
+     "the same CAN message against the first, since divergence between the interceptor's two DAC "
+     "channels is what an EPS plausibility check would trip on. Use this to establish the plant "
+     "BEFORE changing limits; use ti_stats and analyze_segment to measure the effect afterwards. "
+     "Needs sustained engaged driving, ideally spanning both below 45kph and above 52kph; the "
+     "bypass half of measurement_identity needs an OLD recording from the faulty unit, which sat "
+     "out of RUN for whole segments. Refuses to run onroad.",
    "inputSchema": {"type": "object", "properties": {
      "segment": {"type": "string",
                  "description": "Segment name exactly as returned by list_segments"}},
