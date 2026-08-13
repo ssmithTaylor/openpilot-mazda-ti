@@ -222,6 +222,61 @@ struct FrogPilotPlan @0xa1680744031fdb2d {
   weatherId @37 :Int16;
 }
 
+# Torque Interceptor telemetry, published by the Mazda car controller once a second.
+#
+# A message rather than a param because the car controller runs at 100Hz in a SCHED_FIFO thread,
+# where writing a param costs either a thread spawn -- put_nonblocking creates one through
+# std::async on nearly every call -- or a blocking write plus a file lock. Either was enough to
+# skip a carState frame once a second on a fixed phase, which made the 20Hz consumers polling
+# carState fail their all_checks and flag their own output invalid, surfacing to the driver as a
+# constant "communication issue between processes". A cereal publish is a shared-memory write.
+struct FrogPilotTorqueInterceptor {
+  # Live interceptor state, refreshed every frame regardless of engagement.
+  mode @0 :UInt8;                 # 0 DISCOVER, 1 OFF, 2 DRIVER_OVER, 3 RUN
+  violation @1 :UInt8;            # 0 = none
+  rampingDown @2 :Bool;
+  version @3 :UInt8;
+  lkasAllowed @4 :Bool;
+
+  # Measurement counters for the run in progress.
+  engagedFrames @5 :UInt32;
+  shortFrames @6 :UInt32;         # command cut below what openpilot asked for
+  rateLimitedFrames @7 :UInt32;
+  rateLimitedBelowKnee @8 :UInt32;
+  rateLimitedAboveKnee @9 :UInt32;
+  driverLimitedFrames @10 :UInt32;
+  atClipFrames @11 :UInt32;
+  deficit @12 :Float32;           # summed torque-frames of missing command
+  peakCommand @13 :Int32;
+  peakDesired @14 :Int32;
+  peakBias @15 :Int32;
+  notRunFrames @16 :UInt32;
+  rampFrames @17 :UInt32;
+
+  # Closed-loop bias measurement. The signed extremes are kept apart because under-delivery is
+  # assist fading and over-delivery is torque nobody asked for.
+  biasCommandSum @18 :Float32;
+  biasSum @19 :Float32;
+  biasFrames @20 :UInt32;
+  biasRatioMin @21 :Int32;        # thousandths of a bias count per command count
+  biasRatioMax @22 :Int32;
+  biasWrongSignFrames @23 :UInt32;
+
+  # Identity, so a saved run ties back to the segments that produced it.
+  route @24 :Text;
+  startedAt @25 :Float64;
+
+  # The limits this run was recorded under.
+  steerMax @26 :UInt16;
+  steerDeltaUp @27 :UInt16;
+  steerDeltaDown @28 :UInt16;
+  steerDeltaUpKnee @29 :UInt16;
+  steerDeltaUpHigh @30 :UInt16;
+  driverAllowance @31 :UInt16;
+  driverMultiplier @32 :UInt16;
+  steerThreshold @33 :UInt16;
+}
+
 struct FrogPilotRadarState @0xcb9fd56c7057593a {
   leadLeft @0 :LeadData;
   leadRight @1 :LeadData;

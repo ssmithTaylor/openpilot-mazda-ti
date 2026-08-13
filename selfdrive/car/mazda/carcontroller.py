@@ -2,6 +2,7 @@ import json
 import time
 
 from cereal import car
+import cereal.messaging as messaging
 from opendbc.can.packer import CANPacker
 from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_steer_torque_limits
 from openpilot.selfdrive.car.interfaces import CarControllerBase
@@ -10,6 +11,7 @@ from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, M
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 
 # Below this the bias-to-command ratio is dominated by sensor quantisation -- both torque sensors
 # are 8-bit -- so accumulating it would only add noise to the slope estimate.
@@ -43,6 +45,17 @@ class CarController(CarControllerBase):
     self.long_active_last = False
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
+    # Guarded on purpose. PubMaster resolves the service name against the COMPILED service list, so
+    # on a device that pulled this code but did not rebuild cereal, constructing it raises -- and an
+    # exception here kills the car controller, which means no steering. Telemetry is worth having;
+    # it is not worth trading a working car for. A stale build degrades to no counters instead.
+    try:
+      self.ti_pm = messaging.PubMaster(["frogpilotTorqueInterceptor"])
+    except Exception:
+      self.ti_pm = None
+      cloudlog.warning("TI telemetry unavailable: cereal has not been rebuilt for "
+                       "frogpilotTorqueInterceptor. Counters will be absent; steering is fine.")
+
     self.ti_live = {}
     self.ti_steer_threshold = None
     self.ti_route = ""
@@ -242,20 +255,22 @@ class CarController(CarControllerBase):
                        "started_at": self.ti_stats_started, "route": self.ti_route})
 
   def publish_ti_stats(self):
-    payload = self.ti_payload()
+    """Publish the counters as a cereal message, and handle the clear trigger.
 
-    # Live copy on tmpfs, written BLOCKING on purpose. put_nonblocking hands the write to a
-    # background thread, and Params spawns that thread through std::async on nearly every call --
-    # which is the expensive part here, not the write. A tmpfs write is a memcpy and its fsync is a
-    # no-op, so doing it inline is cheaper than creating a thread to avoid it. put_nonblocking is
-    # still right for the flash copy below, where the write genuinely is slow.
-    self.params_memory.put("TiTuningStats", payload)
+    No periodic filesystem writes at all. A cereal send is a shared-memory write; a param write
+    from here is either a thread spawn or a blocking write plus a file lock, and either was enough
+    to skip a carState frame once a second on a fixed phase -- which made the 20Hz consumers
+    polling carState fail their all_checks, flag their own output invalid, and surface to the
+    driver as a constant comm-issue alert. Persistence and the copy the settings panel reads are
+    the telemetry server's job now; it is a normal-priority process where a small write is free."""
+    self.send_ti_message()
 
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
-    # Same reasoning as the flag trigger: ephemeral, so tmpfs, so no journal commit in the control
-    # loop. This one predates the flag work and had the same defect.
+    # A tmpfs READ takes no lock (Params::get(block=false) is a plain file read), so polling the
+    # trigger here is cheap. The writes below happen only on the tap itself.
     if self.params_memory.get_bool("ClearTiStats"):
       self.params_memory.put_bool("ClearTiStats", False)
+      payload = self.ti_payload()
       # Bank this session's counters when it has any, and the persisted ones otherwise. The process
       # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
       # zeros as "previous" and lose the run the user actually meant to keep.
@@ -280,19 +295,58 @@ class CarController(CarControllerBase):
       except (ValueError, TypeError):
         pass
       self.reset_ti_stats()
-      cleared = self.ti_payload()
-      self.params_memory.put("TiTuningStats", cleared)
-      self.params.put_nonblocking("TiTuningStats", cleared)
-      return
+      # startedAt changes here, which is how the telemetry server recognises a new run.
+      self.send_ti_message()
 
-    # Flash copy once a minute, not once a second. Params::put fsyncs the temp file and then the
-    # params directory, and each of those is an ext4 journal commit the whole filesystem queues
-    # behind -- including loggerd streaming camera video to the same eMMC. At 1Hz this put ~60 such
-    # barriers a minute underneath the camera pipeline. openpilot persists its own derived state at
-    # a minute (LiveTorqueParameters); match that. A reboot now costs at most a minute of counters,
-    # and anything watching live should read the tmpfs copy above.
-    if self.frame % 6000 == 0:
-      self.params.put_nonblocking("TiTuningStats", payload)
+  def send_ti_message(self):
+    """One shared-memory publish. Nothing here touches the filesystem."""
+    if self.ti_pm is None:
+      return
+    msg = messaging.new_message("frogpilotTorqueInterceptor")
+    msg.valid = True
+    t = msg.frogpilotTorqueInterceptor
+    s, cfg = self.ti_stats, self.ti_config()
+
+    t.mode = int(self.ti_live.get("mode", 0))
+    t.violation = int(self.ti_live.get("viol", 0))
+    t.rampingDown = bool(self.ti_live.get("ramp", False))
+    t.version = int(self.ti_live.get("version", 0))
+    t.lkasAllowed = bool(self.ti_live.get("lkas_allowed", False))
+
+    t.engagedFrames = s["engaged"]
+    t.shortFrames = s["short"]
+    t.rateLimitedFrames = s["rate_limited"]
+    t.rateLimitedBelowKnee = s["rate_limited_low"]
+    t.rateLimitedAboveKnee = s["rate_limited_high"]
+    t.driverLimitedFrames = s["driver_limited"]
+    t.atClipFrames = s["at_clip"]
+    t.deficit = float(s["deficit"])
+    t.peakCommand = s["peak_cmd"]
+    t.peakDesired = s["peak_desired"]
+    t.peakBias = s["peak_bias"]
+    t.notRunFrames = s["not_run"]
+    t.rampFrames = s["ramp"]
+
+    t.biasCommandSum = float(s["bias_cmd_sum"])
+    t.biasSum = float(s["bias_sum"])
+    t.biasFrames = s["bias_frames"]
+    t.biasRatioMin = s["bias_ratio_min"]
+    t.biasRatioMax = s["bias_ratio_max"]
+    t.biasWrongSignFrames = s["bias_wrong_sign"]
+
+    t.route = self.ti_route or ""
+    t.startedAt = self.ti_stats_started
+
+    t.steerMax = cfg["TiSteerMax"]
+    t.steerDeltaUp = cfg["TiSteerDeltaUp"]
+    t.steerDeltaDown = cfg["TiSteerDeltaDown"]
+    t.steerDeltaUpKnee = cfg["TiSteerDeltaUpKnee"]
+    t.steerDeltaUpHigh = cfg["TiSteerDeltaUpHigh"]
+    t.driverAllowance = cfg["TiSteerDriverAllowance"]
+    t.driverMultiplier = cfg["TiSteerDriverMultiplier"]
+    t.steerThreshold = cfg.get("TiSteerThreshold", 0)
+
+    self.ti_pm.send("frogpilotTorqueInterceptor", msg)
 
   def _ti_limit(self, frogpilot_toggles, attr, toggle_name):
     """One live limit, clamped. Deliberately repeats the clip in frogpilot_variables rather than
@@ -339,7 +393,8 @@ class CarController(CarControllerBase):
       # process can see them unless we forward them. "Is the interceptor healthy right now" should
       # not require having already driven.
       self.ti_live = {"mode": int(CS.ti_state), "viol": int(CS.ti_violation),
-                      "ramp": bool(CS.ti_ramp_down), "version": int(CS.ti_version)}
+                      "ramp": bool(CS.ti_ramp_down), "version": int(CS.ti_version),
+                      "lkas_allowed": bool(CS.ti_lkas_allowed)}
 
     apply_steer = 0
     ti_apply_steer = 0

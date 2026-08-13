@@ -2417,6 +2417,7 @@ struct Event {
     frogpilotOnroadEvents @114: List(Custom.FrogPilotCarEvent);
     frogpilotPlan @115 :Custom.FrogPilotPlan;
     frogpilotRadarState @116 :Custom.FrogPilotRadarState;
+    frogpilotTorqueInterceptor @131 :Custom.FrogPilotTorqueInterceptor;
 
     # *********** legacy + deprecated ***********
     model @9 :Legacy.ModelData; # TODO: rename modelV2 and mark this as deprecated

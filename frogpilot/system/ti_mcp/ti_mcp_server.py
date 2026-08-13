@@ -131,6 +131,69 @@ class Snapshot:
     with self.lock:
       self.data = data
 
+  last_started_at = None
+  last_payload = None
+  last_flash_write = 0.0
+  has_ti_service = False
+
+  def persist_counters(self, t):
+    """Turn the counters message back into the JSON shape the settings panel and tools expect, and
+    bank a run when it ends.
+
+    Done here rather than in the car controller because this is a normal-priority process: a tmpfs
+    write costs nothing, whereas the same write from the 100Hz control thread was skipping a
+    carState frame every second. A new startedAt is how a reset announces itself -- the car
+    controller stamps it when it zeroes the counters -- so the previous values can be banked
+    without either side needing a handshake."""
+    stats = {
+      "engaged": t.engagedFrames, "short": t.shortFrames,
+      "rate_limited": t.rateLimitedFrames, "rate_limited_low": t.rateLimitedBelowKnee,
+      "rate_limited_high": t.rateLimitedAboveKnee, "driver_limited": t.driverLimitedFrames,
+      "at_clip": t.atClipFrames, "deficit": round(float(t.deficit), 1),
+      "peak_cmd": t.peakCommand, "peak_desired": t.peakDesired, "peak_bias": t.peakBias,
+      "not_run": t.notRunFrames, "ramp": t.rampFrames, "viol": t.violation,
+      "bias_cmd_sum": round(float(t.biasCommandSum), 1), "bias_sum": round(float(t.biasSum), 1),
+      "bias_frames": t.biasFrames, "bias_ratio_min": t.biasRatioMin,
+      "bias_ratio_max": t.biasRatioMax, "bias_wrong_sign": t.biasWrongSignFrames,
+      "live": {"mode": t.mode, "viol": t.violation, "ramp": bool(t.rampingDown),
+               "version": t.version, "lkas_allowed": bool(t.lkasAllowed)},
+      "config": {"TiSteerMax": t.steerMax, "TiSteerDeltaUp": t.steerDeltaUp,
+                 "TiSteerDeltaDown": t.steerDeltaDown, "TiSteerDeltaUpKnee": t.steerDeltaUpKnee,
+                 "TiSteerDeltaUpHigh": t.steerDeltaUpHigh,
+                 "TiSteerDriverAllowance": t.driverAllowance,
+                 "TiSteerDriverMultiplier": t.driverMultiplier,
+                 "TiSteerThreshold": t.steerThreshold},
+      "route": str(t.route) or None,
+      "started_at": round(float(t.startedAt), 1),
+    }
+    payload = json.dumps(stats)
+
+    started_at = float(t.startedAt)
+    if self.last_started_at is not None and started_at > self.last_started_at and self.last_payload:
+      # The run that just ended. Bank it under both keys the comparison tools read.
+      params.put_nonblocking("TiTuningStatsPrevious", self.last_payload)
+      try:
+        raw = params.get("TiTuningStatsHistory", encoding="utf8")
+        history = json.loads(raw) if raw else []
+        if not isinstance(history, list):
+          history = []
+        history.append(json.loads(self.last_payload))
+        params.put_nonblocking("TiTuningStatsHistory", json.dumps(history[-5:]))
+      except (ValueError, TypeError):
+        pass
+    self.last_started_at = started_at
+
+    # Only bank runs that actually recorded something.
+    if stats["engaged"]:
+      self.last_payload = payload
+
+    params_memory.put_nonblocking("TiTuningStats", payload)
+    # Flash copy once a minute so an unexpected reboot costs at most that much.
+    now = time.time()
+    if now - self.last_flash_write >= 60:
+      self.last_flash_write = now
+      params.put_nonblocking("TiTuningStats", payload)
+
   def run(self):
     try:
       import cereal.messaging as messaging
@@ -138,8 +201,20 @@ class Snapshot:
       self.set({"available": False, "reason": f"cereal unavailable: {e}"})
       return
 
-    sm = messaging.SubMaster(["carState", "carControl", "controlsState",
-                              "liveTorqueParameters", "liveParameters", "liveDelay"])
+    # frogpilotTorqueInterceptor carries the tuning counters. They used to be written to a param by
+    # the car controller, from its 100Hz SCHED_FIFO thread, which cost a carState frame once a
+    # second and produced a constant comm-issue alert. They arrive as a message now, and persisting
+    # them is this process's job -- a normal-priority process where a small write is free.
+    services = ["carState", "carControl", "controlsState",
+                "liveTorqueParameters", "liveParameters", "liveDelay"]
+    try:
+      sm = messaging.SubMaster(services + ["frogpilotTorqueInterceptor"])
+      self.has_ti_service = True
+    except Exception:
+      # Same reasoning as the publisher's guard: a device that pulled the code without rebuilding
+      # cereal should lose the counters, not the server.
+      sm = messaging.SubMaster(services)
+      self.has_ti_service = False
     while True:
       try:
         sm.update(1000)
@@ -180,6 +255,8 @@ class Snapshot:
           "lateral_delay_status": str(sm["liveDelay"].status),
           "lateral_delay_valid_blocks": int(sm["liveDelay"].validBlocks),
         })
+        if self.has_ti_service and sm.updated["frogpilotTorqueInterceptor"]:
+          self.persist_counters(sm["frogpilotTorqueInterceptor"])
       except Exception as e:
         self.set({"available": False, "reason": str(e)})
 
