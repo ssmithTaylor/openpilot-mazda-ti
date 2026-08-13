@@ -181,9 +181,14 @@ class CarController(CarControllerBase):
     trigger, so the recorded moment can trail the tap by up to a second -- immaterial, since the
     thing being marked is a stretch of road and the driver is reacting to something already a
     second or two old anyway."""
-    if not self.params.get_bool("TiFlagMoment"):
+    if not self.params_memory.get_bool("TiFlagMoment"):
       return
-    self.params.put_bool("TiFlagMoment", False)
+    # tmpfs, and the clear is blocking there because tmpfs writes do not reach flash. On /data this
+    # was Params::put -- temp-file fsync plus directory fsync, two ext4 journal commits -- executed
+    # inside the 100Hz thread that builds the steering frame, at the exact moment the driver taps
+    # the button mid-drive. That is the commIssue mechanism again, reduced to once per tap. A
+    # trigger flag is ephemeral by nature and has no business on flash.
+    self.params_memory.put_bool("TiFlagMoment", False)
 
     now = time.time()
     if self.ti_route and self.ti_route != self.ti_route_seen:
@@ -238,8 +243,10 @@ class CarController(CarControllerBase):
     self.params_memory.put_nonblocking("TiTuningStats", payload)
 
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
-    if self.params.get_bool("ClearTiStats"):
-      self.params.put_bool("ClearTiStats", False)
+    # Same reasoning as the flag trigger: ephemeral, so tmpfs, so no journal commit in the control
+    # loop. This one predates the flag work and had the same defect.
+    if self.params_memory.get_bool("ClearTiStats"):
+      self.params_memory.put_bool("ClearTiStats", False)
       # Bank this session's counters when it has any, and the persisted ones otherwise. The process
       # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
       # zeros as "previous" and lose the run the user actually meant to keep.

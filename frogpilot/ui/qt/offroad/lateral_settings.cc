@@ -169,7 +169,10 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     } else if (param == "ClearTiStats") {
       ButtonControl *clearStatsButton = new ButtonControl(title, tr("START"), desc);
       QObject::connect(clearStatsButton, &ButtonControl::clicked, [this, clearStatsButton]() {
-        params.putBool("ClearTiStats", true);
+        // tmpfs. Both trigger flags are ephemeral, and the car controller has to clear them from
+        // inside its 100Hz loop -- on /data that clear is two ext4 journal commits in the thread
+        // that builds the steering frame.
+        params_memory.putBool("ClearTiStats", true);
         clearStatsButton->setText(tr("STARTED"));
       });
       lateralToggle = clearStatsButton;
@@ -180,7 +183,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       // clears it; the button text is set back by updateTorqueInterceptorStats once it has.
       tiFlagButton = new ButtonControl(title, tr("FLAG"), desc);
       QObject::connect(tiFlagButton, &ButtonControl::clicked, [this]() {
-        params.putBool("TiFlagMoment", true);
+        params_memory.putBool("TiFlagMoment", true);
         tiFlagButton->setText(tr("FLAGGED"));
       });
       lateralToggle = tiFlagButton;
@@ -412,7 +415,7 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
   // then the button reads FLAGGED, so a tap still in flight looks different from one that landed
   // -- and the count going up is the confirmation that it did.
   if (tiFlagButton != nullptr) {
-    tiFlagButton->setText(params.getBool("TiFlagMoment") ? tr("FLAGGING") : tr("FLAG"));
+    tiFlagButton->setText(params_memory.getBool("TiFlagMoment") ? tr("FLAGGING") : tr("FLAG"));
     int flagged = QJsonDocument::fromJson(QString::fromStdString(params.get("TiFlaggedMoments")).toUtf8()).array().size();
     tiFlagButton->setValue(flagged > 0 ? tr("%1 saved").arg(flagged) : QString());
   }

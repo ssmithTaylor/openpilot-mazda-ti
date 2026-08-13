@@ -552,6 +552,13 @@ def tool_analyze_segment(args):
   # params as they are NOW -- if they were changed since the drive, the attribution is off.
   steer_max = _param_int("TiSteerMax") or 600
   delta_up = _param_int("TiSteerDeltaUp") or 6
+  # The knee pair has to be recomputed here too. Above the knee the limiter applies the smaller
+  # DELTA_UP_HIGH, so testing every frame against the base rate under-reports rate limiting in
+  # exactly the regime the knee governs -- and because rate_limited_now drives the curvature-error
+  # split, those frames would land in "while_tracking_freely", making the knee look free in the
+  # headline outcome metric. Same bug that was fixed in the live counter; it lived on here.
+  delta_up_knee = _param_int("TiSteerDeltaUpKnee") or 600
+  delta_up_high = _param_int("TiSteerDeltaUpHigh") or delta_up
   allowance = _param_int("TiSteerDriverAllowance") or 15
   cmd_frames = short = rate_lim = drv_lim = at_clip = 0
   peak_cmd = 0
@@ -636,7 +643,8 @@ def tool_analyze_segment(args):
               short += 1
               # Rate limiting only counts while the command is climbing; a command collapsing under
               # driver torque moves at DELTA_DOWN and would otherwise be blamed on the ramp rate.
-              if abs(req) > abs(last_sent) and abs(req - last_sent) >= delta_up:
+              applied_up = delta_up_high if abs(last_sent) >= delta_up_knee else delta_up
+              if abs(req) > abs(last_sent) and abs(req - last_sent) >= applied_up:
                 rate_lim += 1
                 rate_limited_now = True
               # Only torque OPPOSING the command narrows the cap. openpilot's driver-torque limit
@@ -687,6 +695,7 @@ def tool_analyze_segment(args):
       "at_clip_pct": round(100.0 * at_clip / cmd_frames, 1),
       "peak_command": peak_cmd,
       "limits_used": {"TiSteerMax": steer_max, "TiSteerDeltaUp": delta_up,
+                      "TiSteerDeltaUpKnee": delta_up_knee, "TiSteerDeltaUpHigh": delta_up_high,
                       "TiSteerDriverAllowance": allowance},
       "caveat": "Limits are the CURRENT param values; if they changed since this drive the "
                 "attribution is wrong. driver_torque_limited counts only torque opposing the "
