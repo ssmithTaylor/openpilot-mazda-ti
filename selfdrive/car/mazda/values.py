@@ -164,7 +164,16 @@ class CAR(Platforms):
 #     range ends at 85 -- so the driver could not fully yield the command before the sensor
 #     saturates. At 20 it is 45: a hard push, but one a person can actually make.
 TI_LIMIT_BOUNDS = {
-  "TI_STEER_MAX": (100, 600),               # 600 is the TI's own hardware clip
+  # 620 deliberately exceeds the documented 600 clip by 3.3%, to test whether that clip is real.
+  # "The TI discards anything above 600" is vendor documentation plus a code comment; it has never
+  # been measured, because openpilot has always clamped first and so commands_above_600 is 0 in
+  # every log ever taken (OPEN_QUESTIONS Q5). The three outcomes are all informative: the request
+  # is clipped to 600 internally (claim confirmed, no-op), it is honoured (claim false, and the
+  # ceiling is ours not the device's), or the unit raises a violation and bypasses -- which is
+  # degraded assist, not runaway torque. Kept small and incremental per TI_DEVICE_SPEC section 5,
+  # since the calibration is unknown and so is the CAN-count value that trips the unit's own
+  # plausibility monitor. The default stays 600: nothing changes unless the slider is moved.
+  "TI_STEER_MAX": (100, 620),
   "TI_STEER_DELTA_UP": (1, 15),             # stock Mazda path runs 10 against the same EPS
   "TI_STEER_DELTA_DOWN": (10, 50),
   "TI_STEER_DRIVER_ALLOWANCE": (5, 30),

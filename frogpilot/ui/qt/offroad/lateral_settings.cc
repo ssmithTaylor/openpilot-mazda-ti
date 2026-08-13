@@ -70,7 +70,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"ResetTorqueParams", tr("Reset Learned Steering Values"), tr("<b>Throw away what openpilot has learned about your steering and start over.</b> Do this after changing anything that affects how much the car turns for a given command, otherwise it keeps using values learned from the old behaviour. Switches itself back off once done."), ""},
 
     {"TorqueInterceptorTune", tr("Torque Interceptor Tuning"), tr("<b>Adjust how the Torque Interceptor delivers steering.</b> Only affects cars fitted with a TI."), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
-    {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor ignores anything above 600."), ""},
+    {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor is documented to ignore anything above 600, but that has never been measured — 610 and 620 exist to test it."), ""},
     {"TiSteerDeltaUp", tr("Ramp-Up Rate"), tr("<b>How quickly steering effort is allowed to build.</b> Raise for sharper response entering corners. Too high and the interceptor treats it as unsafe and cuts assist to zero. Default 6 takes one second to reach full."), ""},
     {"TiSteerDeltaUpKnee", tr("Cautious Above"), tr("<b>The effort level above which the slower ramp rate takes over.</b> Below this the ramp-up rate applies; above it, the cautious rate. Leave at 600 to use one rate everywhere. Lower it to get quick response in normal driving while staying gentle at high effort."), ""},
     {"TiSteerDeltaUpHigh", tr("Cautious Ramp-Up Rate"), tr("<b>How quickly steering effort builds once past the level set above.</b> Only does anything if \"Cautious Above\" is below 600. Cannot exceed the main ramp-up rate."), ""},
@@ -135,7 +135,10 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       });
       lateralToggle = torqueInterceptorToggle;
     } else if (param == "TiSteerMax") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+      // Upper bound is 620, not 600. The 600 clip is vendor-documented but has never been
+      // measured -- see TI_LIMIT_BOUNDS in selfdrive/car/mazda/values.py and OPEN_QUESTIONS Q5.
+      // The default is still 600, so this only matters if the slider is deliberately moved.
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 620, QString(), std::map<float, QString>(), 10, true);
     // Ranges below deliberately match TI_LIMIT_BOUNDS in carcontroller.py and the clips in
     // frogpilot_variables.py. The panda applies no steering checks to MAZDA_TI_LKAS on gen1, so
     // these three layers are the entire envelope on the interceptor path; if you widen one, widen

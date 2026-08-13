@@ -688,11 +688,13 @@ class FrogPilotVariables:
     toggle.use_custom_steerRatio = bool(round(toggle.steerRatio, 2) != round(steerRatio, 2)) and not toggle.force_auto_tune or toggle.force_auto_tune_off
 
     # Torque Interceptor limits. Defaults match the hard-coded CarControllerParams values so an
-    # untouched install behaves identically. TiSteerMax is capped at 600 because the TI clips the
-    # LKAS request there in hardware; anything above is silently discarded by the unit.
+    # untouched install behaves identically. TiSteerMax now allows 620 rather than 600: that the
+    # unit clips its own input at 600 and discards anything above is documented but has never been
+    # measured, since openpilot always clamped first. See TI_LIMIT_BOUNDS in the Mazda values.py
+    # for why 620, and OPEN_QUESTIONS Q5 for what the answer decides. Default is unchanged.
     ti_tune = params.get_bool("TorqueInterceptorTune") if toggle.tuning_level >= level["TorqueInterceptorTune"] else default.get_bool("TorqueInterceptorTune")
     toggle.ti_tune = ti_tune
-    toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 600)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
+    toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 620)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
     # Ranges below are tighter than they were. The panda applies no steering checks at all to
     # MAZDA_TI_LKAS on gen1 -- only the stock 0x243 path is rate and magnitude limited -- so these
     # clips, and the clamp in the car controller behind them, are the whole envelope on the
