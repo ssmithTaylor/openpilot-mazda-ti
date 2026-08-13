@@ -375,6 +375,7 @@ def tool_analyze_segment(args):
   cmd_frames = short = rate_lim = drv_lim = at_clip = 0
   peak_cmd = 0
   last_steer, last_lat, last_drv, last_sent = 0.0, False, 0.0, 0
+  static_tune, learned_tune, native_autotune = None, None, None
 
   events = capnp_log.Event.read_multiple_bytes(raw)
   t0 = None
@@ -401,6 +402,20 @@ def tool_analyze_segment(args):
     elif w == "carState":
       speeds.append(float(msg.carState.vEgo))
       last_drv = float(msg.carState.steeringTorque)
+    elif w == "carParams" and static_tune is None:
+      try:
+        lt = msg.carParams.lateralTuning
+        if lt.which() == "torque":
+          static_tune = {"latAccelFactor": round(float(lt.torque.latAccelFactor), 4),
+                         "friction": round(float(lt.torque.friction), 4)}
+      except Exception:
+        pass
+    elif w == "liveTorqueParameters":
+      q = msg.liveTorqueParameters
+      native_autotune = bool(q.useParams)
+      learned_tune = {"latAccelFactor": round(float(q.latAccelFactorFiltered), 4),
+                      "friction": round(float(q.frictionCoefficientFiltered), 4),
+                      "valid": bool(q.liveValid), "bucket_points": float(q.totalBucketPoints)}
     elif w == "can":
       for f in msg.can:
         if f.src == 0 and f.address == TI_FEEDBACK:
@@ -468,6 +483,16 @@ def tool_analyze_segment(args):
     } if cmd_frames else None,
     "speed_ms": {"mean": round(sum(speeds) / len(speeds), 2), "max": round(max(speeds), 2)} if speeds else None,
     "state_changes": transitions[:40],
+    "lateral_tuning": {
+      "static_from_car_port": static_tune,
+      "learned": learned_tune,
+      "car_native_autotune": native_autotune,
+      "caveat": "Whether the learned values were actually APPLIED cannot be determined from an "
+                "rlog. controlsd applies them when `useParams or force_auto_tune`, and the "
+                "force_auto_tune toggle is never logged -- only car_native_autotune is. Use the "
+                "torque_learning tool for the current config. These fields still let you spot a "
+                "configuration change between segments.",
+    },
     "baselines": BASELINE,
   }
   # A segment can look healthy -- TI in RUN, no violations -- and still say nothing about tuning,
@@ -490,31 +515,66 @@ def tool_analyze_segment(args):
 
 
 TOOLS = [
-  {"name": "ti_status", "description": "Live Torque Interceptor health: engaged state, mode, "
-                                       "violations and ramp-downs. Check this before trusting any "
-                                       "other reading.",
+  {"name": "ti_status",
+   "description":
+     "Live health of the Torque Interceptor. CALL THIS FIRST -- if ti_mode is not RUN the device "
+     "is bypassed, the stock EPS is steering, and no other reading means anything for tuning. "
+     "Also returns violation code and meaning, the ramp-down flag, engagement, speed and driver "
+     "torque. Reads 'unknown' when the car is parked, because the car controller only runs "
+     "onroad; that is expected, not a fault.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_ti_status},
-  {"name": "ti_stats", "description": "Tuning counters for the current and previous measurement, "
-                                      "with the limiter breakdown that says which parameter to "
-                                      "change.",
+
+  {"name": "ti_stats",
+   "description":
+     "Live tuning counters for the current measurement and the one before it, for A/B comparison. "
+     "short_of_requested_pct is how often openpilot cut its own command; the rate_limited vs "
+     "driver_torque_limited split is the diagnostic that says WHICH parameter to change (rate -> "
+     "TiSteerDeltaUp, driver -> TiSteerDriverMultiplier/Allowance). Only two runs are retained -- "
+     "a third clear destroys the first, so save this output after every run. For an older drive "
+     "use analyze_segment instead, which recomputes the same figures from the log.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_ti_stats},
-  {"name": "ti_tuning", "description": "Current values of the six Torque Interceptor limits, with "
-                                       "defaults and what each one does.",
+
+  {"name": "ti_tuning",
+   "description":
+     "Current values of the six Torque Interceptor command limits, with their defaults and notes "
+     "on what each does. Read-only: changing them is done by hand on the device under Settings -> "
+     "STEERING -> Torque Interceptor Tuning. Use this to confirm what a drive was actually run "
+     "with before drawing any conclusion from it.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_ti_tuning},
-  {"name": "torque_learning", "description": "openpilot's learned lateral parameters and live "
-                                             "curvature tracking error.",
+
+  {"name": "torque_learning",
+   "description":
+     "openpilot's learned lateral parameters (latAccelFactor, friction), whether they have "
+     "converged, and crucially whether they are actually being APPLIED. controlsd applies them "
+     "when the car natively supports auto-tune OR Force Auto-Tune is set, and the force toggle is "
+     "itself gated on Advanced Lateral Tune -- all three are reported separately plus a combined "
+     "effectively_in_use. This is the only reliable way to establish that configuration; it is "
+     "not recoverable from a log. Reads zero when parked.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_torque_learning},
-  {"name": "list_segments", "description": "Recorded driving segments on the device, newest first. "
-                                           "Use to find a segment to analyze.",
+
+  {"name": "list_segments",
+   "description":
+     "Recorded driving segments on the device, newest first, sorted by route then segment number. "
+     "Each entry gives the segment name to pass to analyze_segment, plus rlog size. If none are "
+     "found, a why_empty field names the cause per directory searched (missing, permission "
+     "denied, or genuinely empty) rather than silently returning nothing.",
    "inputSchema": {"type": "object", "properties": {
-     "limit": {"type": "integer", "description": "How many to list (default 20)"}}},
+     "limit": {"type": "integer", "description": "How many segments to list (default 20)"}}},
    "fn": tool_list_segments},
-  {"name": "analyze_segment", "description": "Parse one segment's rlog on the device and return TI "
-                                             "mode/violation timeline, LKAS request range and "
-                                             "curvature tracking error. More authoritative than the "
-                                             "live counters: it has the full time series.",
+
+  {"name": "analyze_segment",
+   "description":
+     "Parse one segment's rlog ON THE DEVICE and return the full picture for that drive: TI "
+     "mode/violation/ramp timeline with timestamps, LKAS request range and time at the 600 clip, "
+     "command shortfall with the rate vs driver-torque limiter split, and curvature tracking "
+     "error (mean and p95) -- the outcome metric that says whether the car actually tracked "
+     "better, which the live counters cannot answer. Starts with a verdict field stating whether "
+     "the segment can support a tuning conclusion at all; a parked or unengaged segment reads as "
+     "healthy but proves nothing. Only the summary crosses the wire, never the log itself.",
    "inputSchema": {"type": "object", "properties": {
-     "segment": {"type": "string", "description": "Segment name from list_segments"}},
+     "segment": {"type": "string",
+                 "description": "Segment name exactly as returned by list_segments, "
+                                "e.g. 00000056--9892b4291f--5"}},
      "required": ["segment"]},
    "fn": tool_analyze_segment},
 ]
