@@ -514,6 +514,306 @@ def tool_analyze_segment(args):
   return result
 
 
+# ---------------------------------------------------------------------------------------------
+# Diagnostics.
+#
+# Added after a drive where openpilot could not hold engagement while the interceptor sat in RUN
+# the whole time. The tuning tools could rule the TI out but had nothing to say about what was
+# actually failing: "communication issue between processes" means one of controlsd's inputs went
+# stale, and the alert never says which. These answer that, from the log of the drive that already
+# happened rather than from a reproduction.
+
+SWAGLOG_LEVEL_ERROR = 40
+
+# Services whose staleness controlsd turns into that alert. Used to rank gaps by relevance, not to
+# exclude anything -- a stall in a service controlsd ignores can still name the guilty process.
+CONTROLSD_INPUTS = {
+  "deviceState", "pandaStates", "peripheralState", "modelV2", "liveCalibration", "carOutput",
+  "driverMonitoringState", "longitudinalPlan", "liveLocationKalman", "managerState",
+  "liveParameters", "radarState", "liveTorqueParameters", "liveDelay", "frogpilotCarState",
+  "frogpilotPlan",
+}
+
+
+def _swaglog_dir():
+  try:
+    from openpilot.system.hardware.hw import Paths
+    return Paths.swaglog_root()
+  except Exception:
+    return "/data/log"
+
+
+def _unsuffix(key):
+  """SwagLogFileFormatter tags every scalar key with its type ('event' -> 'event$s') so keys of
+  different types cannot collide. Strip it so lookups can use the real name. The same records
+  arrive over cereal without the tags, so both forms have to work."""
+  return key.rsplit("$", 1)[0] if "$" in key else key
+
+
+def _normalise(obj):
+  if isinstance(obj, dict):
+    return {_unsuffix(k): _normalise(v) for k, v in obj.items()}
+  if isinstance(obj, list):
+    return [_normalise(v) for v in obj]
+  return obj
+
+
+def _parse_log_line(text):
+  """Log records are JSON, sometimes behind a context prefix. Find the object rather than assuming
+  how wide the prefix is."""
+  start = text.find("{")
+  if start < 0:
+    return None
+  try:
+    return _normalise(json.loads(text[start:]))
+  except Exception:
+    return None
+
+
+def _comm_issue_from(record):
+  """Pull the service lists out of a commIssue record. controlsd logs this only when the set
+  changes, so every one of these is a distinct failure, not a repeat."""
+  msg = record.get("msg") if isinstance(record, dict) else None
+  if not isinstance(msg, dict) or msg.get("event") != "commIssue":
+    return None
+  return {
+    "time": record.get("created"),
+    "not_alive": msg.get("not_alive", []),
+    "not_freq_ok": msg.get("not_freq_ok", []),
+    "invalid": msg.get("invalid", []),
+  }
+
+
+def tool_device_errors(args):
+  """Error-level device log plus the live process table."""
+  limit = int(args.get("limit", 25))
+  needle = str(args.get("match", "")).lower()
+  result = {"swaglog_dir": _swaglog_dir()}
+
+  # One-shot subscription rather than adding managerState to the background snapshot. This is only
+  # interesting when something is already wrong, and a permanent extra subscriber to a running
+  # control system is exactly the kind of thing worth not adding.
+  try:
+    import cereal.messaging as messaging
+    sm = messaging.SubMaster(["managerState"])
+    for _ in range(40):
+      sm.update(100)
+      if sm.seen["managerState"]:
+        break
+    if sm.seen["managerState"]:
+      procs = [{"name": p.name, "running": bool(p.running),
+                "should_be_running": bool(p.shouldBeRunning), "exit_code": int(p.exitCode)}
+               for p in sm["managerState"].processes]
+      result["process_count"] = len(procs)
+      result["processes_not_running"] = [p for p in procs
+                                         if p["should_be_running"] and not p["running"]]
+      result["processes_with_nonzero_exit"] = [p for p in procs if p["exit_code"] != 0]
+    else:
+      result["processes_note"] = "managerState never arrived; manager may not be running"
+  except Exception as e:
+    result["processes_note"] = f"could not read managerState: {e}"
+
+  errors, comm = [], []
+  try:
+    d = _swaglog_dir()
+    # Rotation is every 60 seconds or 256KB, so a few dozen files covers the recent past without
+    # reading the whole backlog (the handler keeps up to 2500).
+    paths = sorted((os.path.join(d, f) for f in os.listdir(d) if f.startswith("swaglog.")),
+                   key=os.path.getmtime, reverse=True)[:int(args.get("files", 40))]
+    result["swaglog_files_read"] = len(paths)
+    for path in paths:
+      try:
+        with open(path, errors="replace") as fh:
+          lines = fh.readlines()
+      except Exception:
+        continue
+      for line in lines:
+        rec = _parse_log_line(line)
+        if rec is None:
+          continue
+        issue = _comm_issue_from(rec)
+        if issue is not None:
+          comm.append(issue)
+          continue
+        msg = rec.get("msg")
+        text = json.dumps(msg) if isinstance(msg, (dict, list)) else str(msg)
+        if rec.get("levelnum", 0) >= SWAGLOG_LEVEL_ERROR or (needle and needle in text.lower()):
+          errors.append({"time": rec.get("created"), "level": rec.get("level"),
+                         "where": rec.get("filename"), "msg": text[:600]})
+  except Exception as e:
+    result["swaglog_note"] = f"could not read swaglog: {e}"
+
+  # Sort by time rather than by file: files come newest-first but lines within one run oldest-first.
+  comm.sort(key=lambda r: r.get("time") or 0, reverse=True)
+  errors.sort(key=lambda r: r.get("time") or 0, reverse=True)
+  result["comm_issues"] = comm[:limit]
+  result["comm_issue_count"] = len(comm)
+  result["errors"] = errors[:limit]
+  result["error_count"] = len(errors)
+
+  crashes = []
+  for cd in ("/data/crashes", "/data/community/crashes", os.path.join(_swaglog_dir(), "crashes")):
+    if not os.path.isdir(cd):
+      continue
+    try:
+      for name in os.listdir(cd):
+        p = os.path.join(cd, name)
+        crashes.append({"file": p, "mtime": round(os.path.getmtime(p), 1),
+                        "size": os.path.getsize(p)})
+    except Exception:
+      continue
+  crashes.sort(key=lambda c: c["mtime"], reverse=True)
+  result["crash_files"] = crashes[:10]
+
+  result["how_to_read"] = (
+    "comm_issues is the decisive field: not_alive names a service that stopped publishing "
+    "entirely, not_freq_ok one that fell behind its rate, invalid one publishing but flagged bad. "
+    "Map the service to its process (carOutput/frogpilotCarState -> card, liveTorqueParameters -> "
+    "torqued, modelV2 -> modeld) and that is the process to investigate. Empty comm_issues with a "
+    "populated errors list usually means a process crashed instead of stalling.")
+  return result
+
+
+def tool_segment_diagnostics(args):
+  """Why a recorded drive misbehaved: events raised, processes that died, and which services
+  stopped publishing on time. Independent of the TI entirely."""
+  segment = args.get("segment")
+  if not segment:
+    return {"error": "segment required; call list_segments first"}
+  path = _rlog_path(segment)
+  if path is None:
+    return {"error": f"no rlog found for {segment}"}
+
+  try:
+    import bz2
+    from cereal import log as capnp_log
+  except Exception as e:
+    return {"error": f"cannot load decoder: {e}"}
+
+  try:
+    from cereal.services import SERVICES
+    freqs = {k: float(v.frequency) for k, v in SERVICES.items()}
+  except Exception:
+    freqs = {}
+
+  raw = open(path, "rb").read()
+  if path.endswith(".bz2"):
+    raw = bz2.decompress(raw)
+
+  limit = int(args.get("limit", 25))
+
+  ev_frames, ev_first, ev_last = collections.Counter(), {}, {}
+  comm, errors = [], []
+  proc_trouble = {}
+  last_seen, max_gap = {}, {}
+  truncated = False
+
+  events = capnp_log.Event.read_multiple_bytes(raw)
+  t0 = ts = None
+  while True:
+    try:
+      msg = next(events)
+    except StopIteration:
+      break
+    except Exception:
+      truncated = True
+      break
+    if t0 is None:
+      t0 = msg.logMonoTime
+    ts = (msg.logMonoTime - t0) / 1e9
+    w = msg.which()
+
+    # Publication gaps straight from the log, per service. This does not depend on what controlsd
+    # concluded, so it still points at the right process even if the alert blamed the wrong thing.
+    prev = last_seen.get(w)
+    if prev is not None and msg.logMonoTime > prev:
+      gap = (msg.logMonoTime - prev) / 1e9
+      if gap > max_gap.get(w, (0.0, 0.0))[0]:
+        max_gap[w] = (gap, ts)
+    last_seen[w] = msg.logMonoTime
+
+    if w == "onroadEvents":
+      for e in msg.onroadEvents:
+        name = str(e.name)
+        ev_frames[name] += 1
+        ev_first.setdefault(name, ts)
+        ev_last[name] = ts
+    elif w == "managerState":
+      for p in msg.managerState.processes:
+        if p.shouldBeRunning and not p.running:
+          d = proc_trouble.setdefault(p.name, {"frames_down": 0, "exit_codes": [],
+                                               "first_s": round(ts, 1), "last_s": round(ts, 1)})
+          d["frames_down"] += 1
+          d["last_s"] = round(ts, 1)
+          if int(p.exitCode) not in d["exit_codes"]:
+            d["exit_codes"].append(int(p.exitCode))
+    elif w in ("errorLogMessage", "logMessage"):
+      rec = _parse_log_line(getattr(msg, w))
+      if rec is None:
+        continue
+      issue = _comm_issue_from(rec)
+      if issue is not None:
+        issue["t"] = round(ts, 2)
+        comm.append(issue)
+      elif w == "errorLogMessage":
+        body = rec.get("msg")
+        text = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
+        errors.append({"t": round(ts, 2), "where": rec.get("filename"), "msg": text[:600]})
+
+  gaps = []
+  for name, (gap, at) in max_gap.items():
+    hz = freqs.get(name, 0.0)
+    missed = round(gap * hz, 1) if hz else None
+    # A service is only interesting if it missed several of its own periods. Rate-less services
+    # keep an absolute threshold so they are not silently dropped.
+    if (missed is not None and missed >= 5) or (missed is None and gap >= 1.0):
+      gaps.append({"service": name, "max_gap_s": round(gap, 3), "at_s": round(at, 1),
+                   "expected_hz": hz or None, "periods_missed": missed,
+                   "checked_by_controlsd": name in CONTROLSD_INPUTS})
+  gaps.sort(key=lambda g: (g["checked_by_controlsd"], g["periods_missed"] or 0), reverse=True)
+
+  ordered = sorted(ev_frames.items(), key=lambda kv: kv[1], reverse=True)
+  onroad = [{"event": n, "frames": c, "first_s": round(ev_first[n], 1),
+             "last_s": round(ev_last[n], 1)} for n, c in ordered]
+
+  culprits = sorted({s for c in comm for s in (c["not_alive"] + c["not_freq_ok"] + c["invalid"])})
+  if proc_trouble:
+    verdict = ("PROCESS FAILURE: " + ", ".join(sorted(proc_trouble)) +
+               " stopped running while manager expected them up. Exit codes are in "
+               "process_failures; a crash here explains any stale service downstream.")
+  elif culprits:
+    verdict = ("STALE SERVICES: " + ", ".join(culprits) + ". controlsd raised commIssue because "
+               "these stopped meeting their timing. Find the process that publishes them.")
+  elif any(e["event"] == "commIssue" for e in onroad):
+    verdict = ("commIssue was raised but no detail line was recorded in this segment -- the "
+               "detail is logged only when the failing set changes, so it is likely in the "
+               "segment before this one. Check worst_service_gaps here, and the earlier segment.")
+  elif onroad:
+    verdict = "No comm issue in this segment. Events raised are listed in onroad_events."
+  else:
+    verdict = "Nothing notable: no events, no process failures, no significant publication gaps."
+
+  return {
+    "segment": segment,
+    "truncated": truncated,
+    "duration_s": round(ts, 1) if ts else 0,
+    "verdict": verdict,
+    "onroad_events": onroad[:limit],
+    "comm_issue_detail": comm[:limit],
+    "comm_issue_count": len(comm),
+    "process_failures": proc_trouble,
+    "worst_service_gaps": gaps[:15],
+    "error_log": errors[:limit],
+    "error_log_count": len(errors),
+    "how_to_read": (
+      "Read verdict first, then comm_issue_detail, which names the services controlsd found "
+      "stale. worst_service_gaps is the independent check: it measures actual publication gaps "
+      "from the log, so it can catch a stall controlsd did not attribute correctly. "
+      "periods_missed is the gap in units of that service's own expected interval, which makes a "
+      "1Hz service and a 100Hz service comparable. process_failures is decisive when non-empty."),
+  }
+
+
 TOOLS = [
   {"name": "ti_status",
    "description":
@@ -577,6 +877,39 @@ TOOLS = [
                                 "e.g. 00000056--9892b4291f--5"}},
      "required": ["segment"]},
    "fn": tool_analyze_segment},
+
+  {"name": "device_errors",
+   "description":
+     "Why the device itself is unhappy, as opposed to the interceptor. Returns every commIssue "
+     "record from the device log with the SERVICE NAMES that went stale (not_alive stopped "
+     "publishing, not_freq_ok fell behind its rate, invalid published but flagged bad) -- the "
+     "detail the on-screen 'communication issue between processes' alert never shows. Also "
+     "returns the live process table with exit codes, error-level log entries, and any crash "
+     "files. Use this whenever openpilot will not engage or drops out and the TI reads healthy.",
+   "inputSchema": {"type": "object", "properties": {
+     "limit": {"type": "integer", "description": "Max records of each kind (default 25)"},
+     "files": {"type": "integer", "description": "How many rotated log files to read (default 40, "
+                                                 "each covers 60s or 256KB)"},
+     "match": {"type": "string", "description": "Also return non-error lines containing this text, "
+                                                "e.g. a process name"}}},
+   "fn": tool_device_errors},
+
+  {"name": "segment_diagnostics",
+   "description":
+     "The retrospective counterpart to device_errors: reads a recorded segment and reports why "
+     "that drive misbehaved, without needing to reproduce it. Gives the onroadEvents timeline "
+     "(what openpilot raised and when), any process manager expected to be running that was not, "
+     "with exit codes, the commIssue detail lines, and an independent per-service publication gap "
+     "analysis measured straight from the log -- so it can identify a stall even when controlsd "
+     "attributed it wrongly. Gaps are reported as periods_missed, the gap in units of that "
+     "service's own interval, so a 1Hz and a 100Hz service can be compared. Nothing to do with "
+     "the TI; use analyze_segment for that.",
+   "inputSchema": {"type": "object", "properties": {
+     "segment": {"type": "string",
+                 "description": "Segment name exactly as returned by list_segments"},
+     "limit": {"type": "integer", "description": "Max records of each kind (default 25)"}},
+     "required": ["segment"]},
+   "fn": tool_segment_diagnostics},
 ]
 
 
