@@ -1156,6 +1156,8 @@ def tool_ti_response(args):
   # Sensor-identity pairs, collected at TI_FEEDBACK cadence and NOT gated on engagement -- the
   # bypass frames that prove the two sensors agree happen precisely when openpilot is not driving.
   identity = []
+  # First src seen per address wins, so a frame duplicated across buses is counted once.
+  first_src = {}
   # Redundant sensor on the same message, for inter-channel skew.
   skew = []
   # (bias, lateral accel) at liveLocationKalman cadence, for the response ceiling.
@@ -1195,6 +1197,12 @@ def tool_ti_response(args):
         pass
     elif w == "can":
       for f in msg.can:
+        # The same frame is logged under several src values (0, 1 and 128+bus have all been seen
+        # for these addresses), so without this every message is processed two or three times.
+        # The main fit is unaffected -- it samples last-known values -- but the identity and skew
+        # lists would carry each sample repeatedly and report an n several times the truth.
+        if first_src.setdefault(f.address, f.src) != f.src:
+          continue
         if f.address == STEER_TORQUE:
           srcs[f"eps_bus{f.src}"] += 1
           d = bytes(f.dat)
@@ -1454,13 +1462,29 @@ def tool_ti_response(args):
     if lo_fit and hi_fit and lo_fit["slope"]:
       ratio = hi_fit["slope"] / lo_fit["slope"]
       out["upper_over_lower"] = round(ratio, 3)
-      out["verdict"] = (
-        "ROLLOFF: the EPS returns materially less per count of bias at higher bias. The binding "
-        "constraint is the EPS response, not any interceptor limit, and raising command headroom "
-        "will not buy proportional cornering." if ratio < 0.8 else
-        "No rolloff detected over the range driven: response is proportional, so amplitude headroom "
-        "is worth having if it can be obtained. Note this says nothing about bias levels never "
-        "reached in this segment.")
+      # Comparing two slopes is only meaningful if both fits are any good. Lateral acceleration is
+      # driven by steering ANGLE through the whole vehicle, not by torque directly, so this fit is
+      # confounded by speed and by how much cornering happened to occur -- and a slope ratio drawn
+      # between a tight fit and a scattered one says more about the scatter than about the plant.
+      worst_r2 = min(lo_fit["r2"] or 0.0, hi_fit["r2"] or 0.0)
+      if worst_r2 < 0.5:
+        out["verdict"] = (
+          f"INCONCLUSIVE: the weaker half fits at r2={worst_r2:.2f}, too scattered to compare "
+          f"slopes against. The ratio is reported but should not be read as rolloff or its "
+          f"absence. Needs a segment with more sustained cornering.")
+      else:
+        out["verdict"] = (
+          "ROLLOFF: the EPS returns materially less per count of bias at higher bias. If this "
+          "holds up, the binding constraint is the EPS response rather than any interceptor limit, "
+          "and raising command headroom will not buy proportional cornering." if ratio < 0.8 else
+          "No rolloff over the range driven: response is proportional, so amplitude headroom is "
+          "worth having if it can be obtained. Says nothing about bias levels never reached here.")
+      out["caveat"] = (
+        "torqued fits this same torque-to-lateral-acceleration relationship properly -- with "
+        "buckets, lag compensation and point filtering -- and publishes it as latAccelFactor. "
+        "Where the two disagree, believe torqued and treat this as a cheap cross-check. Its value "
+        "is in comparing the SAME figure across drives, not in its absolute magnitude. The sign is "
+        "negative by convention: torqued negates actuatorsOutput.steer for exactly this reason.")
     result["lateral_response"] = out
   else:
     result["lateral_response"] = {
