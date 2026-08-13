@@ -1020,10 +1020,13 @@ def tool_segment_diagnostics(args):
   proc_trouble = {}
   last_seen, max_gap = {}, {}
   truncated = False
-  # Why paramsd is declaring its own output invalid, term by term.
-  lp_frames = lp_invalid = 0
-  lp_fail = collections.Counter()
-  declared_steer_ratio = None
+  # Event-level valid, per service. This is the flag SubMaster.valid tracks and therefore the one
+  # controlsd reports as "invalid" -- NOT the inner struct's own valid field, which is a different
+  # thing entirely. paramsd, for instance, sets LiveParametersData.valid from its estimator's
+  # sanity checks but sets the Event's valid from sm.all_checks(), so an invalid liveParameters
+  # means paramsd's INPUTS were unhealthy, not that its estimate went bad. Reading the struct field
+  # sends you hunting a healthy estimator.
+  ev_valid_total, ev_valid_bad, ev_valid_first = collections.Counter(), collections.Counter(), {}
 
   events = capnp_log.Event.read_multiple_bytes(raw)
   t0 = ts = None
@@ -1049,39 +1052,17 @@ def tool_segment_diagnostics(args):
         max_gap[w] = (gap, ts)
     last_seen[w] = msg.logMonoTime
 
+    ev_valid_total[w] += 1
+    if not msg.valid:
+      ev_valid_bad[w] += 1
+      ev_valid_first.setdefault(w, round(ts, 2))
+
     if w == "onroadEvents":
       for e in msg.onroadEvents:
         name = str(e.name)
         ev_frames[name] += 1
         ev_first.setdefault(name, ts)
         ev_last[name] = ts
-    elif w == "carParams" and declared_steer_ratio is None:
-      declared_steer_ratio = float(msg.carParams.steerRatio)
-    elif w == "liveParameters":
-      # paramsd sets valid = all() over six terms. liveParameters is the service that dominates
-      # commIssue records on this car, so knowing WHICH term fails is the whole difference between
-      # a sensor-noise threshold -- benign, and expected on a rough road -- and a real estimator
-      # problem. Five of the six terms are published; roll_std lives only in filterState under
-      # DEBUG. So if every published term passes on a frame that is nonetheless invalid, roll_std
-      # is the cause by elimination, and roll_std is a noise threshold rather than a sanity bound.
-      lp = msg.liveParameters
-      lp_frames += 1
-      if not lp.valid:
-        lp_invalid += 1
-        sr, failed_any = declared_steer_ratio, False
-        for name, failed in (
-          ("angle_offset_average_over_10deg", abs(float(lp.angleOffsetAverageDeg)) >= 10.0),
-          ("angle_offset_over_10deg", abs(float(lp.angleOffsetDeg)) >= 10.0),
-          ("roll_over_10deg", abs(float(lp.roll)) >= math.radians(10.0)),
-          ("stiffness_outside_0.2_to_5.0", not 0.2 <= float(lp.stiffnessFactor) <= 5.0),
-          ("steer_ratio_outside_half_to_double_declared",
-           sr is not None and not (0.5 * sr <= float(lp.steerRatio) <= 2.0 * sr)),
-        ):
-          if failed:
-            lp_fail[name] += 1
-            failed_any = True
-        if not failed_any:
-          lp_fail["no_published_term_failed__roll_std_by_elimination"] += 1
     elif w == "managerState":
       for p in msg.managerState.processes:
         if p.shouldBeRunning and not p.running:
@@ -1163,25 +1144,28 @@ def tool_segment_diagnostics(args):
     "comm_issue_detail": comm[:limit],
     "comm_issue_count": len(comm),
     "process_failures": proc_trouble,
-    "live_parameters_invalid_why": {
-      "frames": lp_frames,
-      "invalid_frames": lp_invalid,
-      "invalid_pct": round(100.0 * lp_invalid / lp_frames, 1) if lp_frames else None,
-      "declared_steer_ratio": declared_steer_ratio,
-      "steer_ratio_valid_band": ([round(0.5 * declared_steer_ratio, 2),
-                                  round(2.0 * declared_steer_ratio, 2)]
-                                 if declared_steer_ratio else None),
-      "failing_terms": dict(lp_fail.most_common()),
+    "event_valid_census": {
+      "services": [
+        {"service": s, "invalid": n, "total": ev_valid_total[s],
+         "pct": round(100.0 * n / ev_valid_total[s], 1), "first_at_s": ev_valid_first.get(s)}
+        for s, n in ev_valid_bad.most_common(20)
+      ],
       "how_to_read": (
-        "paramsd publishes liveParameters.valid = all() over six terms (paramsd.py:232). This "
-        "counts which ones actually fail. If the dominant entry is "
-        "no_published_term_failed__roll_std_by_elimination, the cause is roll_std exceeding "
-        "1.5 degrees -- a NOISE threshold on the road-roll estimate, not a sanity bound, and "
-        "expected to trip intermittently on rough or cambered roads. That is benign and explains "
-        "an invalid flicker with nothing wrong. Any other entry dominating is a real estimator "
-        "problem worth chasing. Note the offset and roll terms carry hysteresis (they must return "
-        "below 8 rather than 10 to clear), so these counts are a lower bound on failures."),
-    } if lp_frames else None,
+        "Event-level valid per service -- the flag SubMaster tracks and controlsd reports as "
+        "'invalid'. NOT the same as a struct's own valid field: paramsd sets "
+        "LiveParametersData.valid from its estimator's sanity checks but sets the Event's valid "
+        "from sm.all_checks(), so an invalid liveParameters means paramsd's INPUTS were unhealthy "
+        "rather than its estimate being bad. Reading the struct field sends you hunting a "
+        "perfectly healthy estimator.\n"
+        "Services at 100% are permanently invalid -- usually a publisher that never sets "
+        "valid=True, since messaging.new_message() defaults it to False. That is harmless unless "
+        "something downstream runs all_checks() over a SubMaster containing it, in which case that "
+        "consumer is permanently invalid too.\n"
+        "A service invalid at a few percent, sharing an onset timestamp with others, is a cascade: "
+        "find the inputs they have in common. Their publishers' valid expressions are the map -- "
+        "e.g. frogpilotPlan uses all_checks(['carState','controlsState']), so it says nothing "
+        "about the model or the interceptor."),
+    } if ev_valid_bad else None,
     "worst_service_gaps": gaps[:15],
     "upstream_gaps": upstream,
     "error_log": errors[:limit],
