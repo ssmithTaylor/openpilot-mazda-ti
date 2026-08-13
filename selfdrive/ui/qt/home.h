@@ -10,6 +10,7 @@
 #include "common/params.h"
 #include "selfdrive/ui/qt/offroad/driverview.h"
 #include "selfdrive/ui/qt/body.h"
+#include "frogpilot/ui/qt/offroad/screen_refresh.h"
 #include "selfdrive/ui/qt/onroad/onroad_home.h"
 #include "selfdrive/ui/qt/sidebar.h"
 #include "selfdrive/ui/qt/widgets/controls.h"
@@ -87,6 +88,13 @@ private:
   QHBoxLayout *root_layout = nullptr;
   int pixel_shift_tick = 0;
   int pixel_shift_step = 0;
+
+  // Automatic post-drive screen refresh, the same idea as an OLED TV's compensation cycle: run it
+  // while the device is sitting idle after a drive rather than relying on the user to remember.
+  void updateAutoScreenRefresh(bool started);
+
+  qint64 offroad_since = 0;
+  ScreenRefreshOverlay *auto_refresh = nullptr;
 
 private slots:
   void updateState(const UIState &s, const FrogPilotUIState &fs);

@@ -1,5 +1,6 @@
 #include "selfdrive/ui/qt/home.h"
 
+#include <QDateTime>
 #include <QHBoxLayout>
 #include <QMouseEvent>
 #include <QStackedWidget>
@@ -25,6 +26,10 @@ namespace {
   // resizing instead would relayout everything and be plainly visible.
   constexpr int PIXEL_SHIFT = 2;
   constexpr int PIXEL_SHIFT_TICKS = 60 * UI_FREQ;
+
+  constexpr qint64 AUTO_REFRESH_DELAY_S = 2 * 60;
+  constexpr qint64 AUTO_REFRESH_DURATION_S = 5 * 60;
+  constexpr qint64 AUTO_REFRESH_INTERVAL_S = 7 * 24 * 60 * 60;
 }
 
 void HomeWindow::updatePixelShift() {
@@ -93,8 +98,44 @@ void HomeWindow::showMapPanel(bool show) {
   onroad->showMapPanel(show);
 }
 
+void HomeWindow::updateAutoScreenRefresh(bool started) {
+  // A drive starting always wins. Close immediately rather than waiting for the next tick.
+  if (started) {
+    offroad_since = 0;
+    if (auto_refresh != nullptr) {
+      auto_refresh->close();
+      auto_refresh = nullptr;
+    }
+    return;
+  }
+
+  if (auto_refresh != nullptr || offroad_since == 0 || !params.getBool("AutoScreenRefresh")) {
+    return;
+  }
+
+  const qint64 now = QDateTime::currentSecsSinceEpoch();
+  // Wait a couple of minutes so this never fires while you are still parked at a light with the
+  // ignition briefly off, and keep it to five minutes so it finishes before the device powers
+  // down rather than holding it awake off the car battery.
+  if (now - offroad_since < AUTO_REFRESH_DELAY_S) {
+    return;
+  }
+  // Weekly, like a TV's compensation cycle. Running a bright full-screen pass after every drive
+  // would itself age the panel faster than the wear it is spreading.
+  const qint64 last = params.getInt("LastScreenRefresh");
+  if (last != 0 && now - last < AUTO_REFRESH_INTERVAL_S) {
+    return;
+  }
+
+  params.putInt("LastScreenRefresh", now);
+  auto_refresh = new ScreenRefreshOverlay(AUTO_REFRESH_DURATION_S);
+  QObject::connect(auto_refresh, &QObject::destroyed, this, [this]() { auto_refresh = nullptr; });
+  auto_refresh->showFullScreen();
+}
+
 void HomeWindow::updateState(const UIState &s, const FrogPilotUIState &fs) {
   updatePixelShift();
+  updateAutoScreenRefresh(s.scene.started);
 
   const SubMaster &sm = *(s.sm);
 
@@ -126,6 +167,10 @@ void HomeWindow::updateState(const UIState &s, const FrogPilotUIState &fs) {
 }
 
 void HomeWindow::offroadTransition(bool offroad) {
+  // Marks when the car went quiet, so the auto refresh can wait out a brief ignition-off before
+  // taking over the screen.
+  offroad_since = offroad ? QDateTime::currentSecsSinceEpoch() : 0;
+
   body->setEnabled(false);
   sidebar->setVisible(offroad || params.getBool("Sidebar") || frogpilotUIState()->frogpilot_toggles.value("debug_mode").toBool());
   if (offroad) {
