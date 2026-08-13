@@ -91,6 +91,11 @@ FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent
   }
   addItem(debugModeToggle);
 
+  ParamControl *pixelShiftToggle = new ParamControl("PixelShift", tr("Pixel Shift"),
+    tr("<b>Nudge the driving view a couple of pixels once a minute</b> so the sidebar and speed readout don't wear the same pixels on every drive. "
+       "Too small and too slow to notice while driving. This prevents further burn-in; it does not undo what is already there."), "");
+  addItem(pixelShiftToggle);
+
   FrogPilotParamValueControl *screenRefreshMinutes = new FrogPilotParamValueControl("ScreenRefreshMinutes",
     tr("Screen Refresh Duration"),
     tr("<b>How long the burn-in reduction runs for.</b> Longer helps more; fifteen minutes is a reasonable starting point."),

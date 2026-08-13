@@ -19,8 +19,35 @@
 
 // HomeWindow: the container for the offroad and onroad UIs
 
+namespace {
+  // Two pixels is enough to move wear off a given emitter and far too little to notice. The view
+  // loses 2*PIXEL_SHIFT of width and height so the content can slide inside a fixed outer size --
+  // resizing instead would relayout everything and be plainly visible.
+  constexpr int PIXEL_SHIFT = 2;
+  constexpr int PIXEL_SHIFT_TICKS = 60 * UI_FREQ;
+}
+
+void HomeWindow::updatePixelShift() {
+  if (root_layout == nullptr || ++pixel_shift_tick < PIXEL_SHIFT_TICKS) {
+    return;
+  }
+  pixel_shift_tick = 0;
+
+  if (!params.getBool("PixelShift")) {
+    root_layout->setContentsMargins(0, 0, 0, 0);
+    return;
+  }
+
+  static const QPoint kOffsets[4] = {{0, 0}, {2 * PIXEL_SHIFT, 0},
+                                     {2 * PIXEL_SHIFT, 2 * PIXEL_SHIFT}, {0, 2 * PIXEL_SHIFT}};
+  pixel_shift_step = (pixel_shift_step + 1) % 4;
+  const QPoint o = kOffsets[pixel_shift_step];
+  root_layout->setContentsMargins(o.x(), o.y(), 2 * PIXEL_SHIFT - o.x(), 2 * PIXEL_SHIFT - o.y());
+}
+
 HomeWindow::HomeWindow(QWidget* parent) : QWidget(parent) {
   QHBoxLayout *main_layout = new QHBoxLayout(this);
+  root_layout = main_layout;
   main_layout->setMargin(0);
   main_layout->setSpacing(0);
 
@@ -67,6 +94,8 @@ void HomeWindow::showMapPanel(bool show) {
 }
 
 void HomeWindow::updateState(const UIState &s, const FrogPilotUIState &fs) {
+  updatePixelShift();
+
   const SubMaster &sm = *(s.sm);
 
   // switch to the generic robot UI

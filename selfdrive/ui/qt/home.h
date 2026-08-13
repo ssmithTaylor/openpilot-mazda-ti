@@ -79,6 +79,15 @@ private:
 
   DeveloperSidebar *developer_sidebar;
 
+  // Pixel shift. Applied at this level rather than inside OnroadWindow because the sidebar is a
+  // sibling of the stacked onroad view -- shifting further down would move the camera and leave
+  // the sidebar, which is the worst offender for static wear, perfectly still.
+  void updatePixelShift();
+
+  QHBoxLayout *root_layout = nullptr;
+  int pixel_shift_tick = 0;
+  int pixel_shift_step = 0;
+
 private slots:
   void updateState(const UIState &s, const FrogPilotUIState &fs);
 };
