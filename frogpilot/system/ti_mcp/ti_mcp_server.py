@@ -21,6 +21,7 @@ There is no authentication. Anyone who can reach the port can read driving state
 steering, engagement. That is an accepted trade for a read-only service on a trusted home network;
 on an untrusted or public network, turn the toggle off or set TI_MCP_HOST=127.0.0.1 and tunnel.
 """
+import collections
 import json
 import os
 import socket
@@ -60,6 +61,9 @@ TI_VIOL = {
   0x42: "DBG_STOP (class 1) debug console disabled ESC",
   0x43: "CLK_STOP (class 1) main oscillator stopped",
 }
+
+TI_STEER = 0x249     # openpilot -> TI, carries LKAS_REQUEST plus the discovery key
+TI_FEEDBACK = 0x24A  # TI -> openpilot, byte 3 mode, byte 4 violation, byte 6 ramp-down
 
 TUNING_PARAMS = ("TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown",
                  "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold")
@@ -150,18 +154,26 @@ def tool_ti_status(_args):
   interceptor is not in RUN, because it is then bypassed and the stock EPS is steering."""
   live = snapshot.get()
   stats = _param_json("TiTuningStats") or {}
-  viol = int(stats.get("viol", 0))
+  ti = stats.get("live") or {}
+  mode, viol = ti.get("mode"), int(ti.get("viol") or stats.get("viol") or 0)
   out = {
     "live_available": live.get("available", False),
+    # Current TI state, forwarded by the car controller -- it is not published in cereal.
+    "ti_mode": TI_MODE.get(mode, mode) if mode is not None else "unknown",
+    "ti_ramping_down": ti.get("ramp"),
+    "ti_version": ti.get("version"),
+    "violation_code": f"0x{viol:02X}" if viol else None,
+    "violation_meaning": TI_VIOL.get(viol) if viol else None,
     "engaged": live.get("engaged"),
     "speed_ms": live.get("v_ego_ms"),
     "driver_torque": live.get("driver_torque"),
     "steer_fault_temporary": live.get("steer_fault_temporary"),
     "frames_not_in_run": stats.get("not_run"),
     "frames_ramping_down": stats.get("ramp"),
-    "last_violation_code": f"0x{viol:02X}" if viol else None,
-    "last_violation_meaning": TI_VIOL.get(viol) if viol else None,
   }
+  if mode is not None and mode != 3:
+    out["warning_mode"] = ("TI is not in RUN right now -- it is bypassed and the stock EPS is "
+                           "steering. Nothing tuned here takes effect until this reads RUN.")
   if not live.get("available"):
     out["reason"] = live.get("reason")
   if stats.get("not_run"):
@@ -244,6 +256,134 @@ def tool_torque_learning(_args):
   return out
 
 
+SEGMENT_ROOT = os.getenv("TI_MCP_SEGMENTS", "/data/media/0/realdata")
+
+
+def _segment_dirs():
+  try:
+    names = [n for n in os.listdir(SEGMENT_ROOT) if "--" in n]
+  except Exception:
+    return []
+  return sorted(names, reverse=True)
+
+
+def _rlog_path(segment):
+  for name in ("rlog.bz2", "rlog", "rlog.zst"):
+    p = os.path.join(SEGMENT_ROOT, segment, name)
+    if os.path.exists(p):
+      return p
+  return None
+
+
+def tool_list_segments(args):
+  """Recorded segments on the device, newest first."""
+  limit = int(args.get("limit", 20))
+  out = []
+  for name in _segment_dirs()[:limit]:
+    p = _rlog_path(name)
+    out.append({
+      "segment": name,
+      "rlog": os.path.basename(p) if p else None,
+      "size_mb": round(os.path.getsize(p) / 1e6, 1) if p else None,
+    })
+  return {"root": SEGMENT_ROOT, "count": len(out), "segments": out,
+          "note": "Pass a segment name to analyze_segment. Raw logs are not served; the analysis "
+                  "is done here because an rlog is tens of megabytes."}
+
+
+def tool_analyze_segment(args):
+  """Decode one segment's TI and lateral behaviour. This is the authority the live counters are
+  only an approximation of -- it has the full time series, so it can show curvature tracking and
+  exactly when the TI changed state."""
+  segment = args.get("segment")
+  if not segment:
+    return {"error": "segment required; call list_segments first"}
+  path = _rlog_path(segment)
+  if path is None:
+    return {"error": f"no rlog found for {segment}"}
+
+  try:
+    import bz2
+    from cereal import log as capnp_log
+  except Exception as e:
+    return {"error": f"cannot load decoder: {e}"}
+
+  raw = open(path, "rb").read()
+  if path.endswith(".bz2"):
+    raw = bz2.decompress(raw)
+
+  modes, viols = collections.Counter(), collections.Counter()
+  ramp = engaged = 0
+  ti_req, curv_err, speeds = [], [], []
+  transitions = []
+  last_sig = None
+  truncated = False
+
+  events = capnp_log.Event.read_multiple_bytes(raw)
+  t0 = None
+  while True:
+    try:
+      msg = next(events)
+    except StopIteration:
+      break
+    except Exception:
+      truncated = True
+      break
+    if t0 is None:
+      t0 = msg.logMonoTime
+    ts = (msg.logMonoTime - t0) / 1e9
+    w = msg.which()
+    if w == "carControl" and msg.carControl.latActive:
+      engaged += 1
+    elif w == "controlsState":
+      c = msg.controlsState
+      curv_err.append(abs(float(getattr(c, "desiredCurvature", 0.0)) - float(c.curvature)))
+    elif w == "carState":
+      speeds.append(float(msg.carState.vEgo))
+    elif w == "can":
+      for f in msg.can:
+        if f.src == 0 and f.address == TI_FEEDBACK:
+          d = bytes(f.dat)
+          modes[d[3]] += 1
+          viols[d[4]] += 1
+          if d[6]:
+            ramp += 1
+          sig = (d[3], d[4], bool(d[6]))
+          if sig != last_sig:
+            transitions.append({"t": round(ts, 2), "mode": TI_MODE.get(d[3], d[3]),
+                                "viol": f"0x{d[4]:02X}" if d[4] else None, "ramp": bool(d[6])})
+            last_sig = sig
+    elif w == "sendcan":
+      for f in msg.sendcan:
+        if f.address == TI_STEER:
+          d = bytes(f.dat)
+          ti_req.append(((d[0] << 8 | d[1]) & 0x0FFF) - 2048)
+
+  def pct(vals, p):
+    return round(sorted(vals)[min(len(vals) - 1, int(len(vals) * p))], 6) if vals else None
+
+  result = {
+    "segment": segment,
+    "truncated": truncated,
+    "engaged_frames": engaged,
+    "ti_mode": {TI_MODE.get(k, k): v for k, v in modes.most_common()},
+    "ti_violations": {("none" if k == 0 else f"0x{k:02X} {TI_VIOL.get(k, '?')}"): v
+                      for k, v in viols.most_common()},
+    "ti_ramp_frames": ramp,
+    "lkas_request": {"min": min(ti_req), "max": max(ti_req),
+                     "at_clip": sum(1 for r in ti_req if abs(r) >= 600)} if ti_req else None,
+    "curvature_error": {"mean": round(sum(curv_err) / len(curv_err), 6),
+                        "p95": pct(curv_err, 0.95), "n": len(curv_err)} if curv_err else None,
+    "speed_ms": {"mean": round(sum(speeds) / len(speeds), 2), "max": round(max(speeds), 2)} if speeds else None,
+    "state_changes": transitions[:40],
+    "baselines": BASELINE,
+  }
+  if 3 not in modes and modes:
+    result["warning"] = ("TI never reached RUN in this segment. It was bypassed, so the stock EPS "
+                         "was steering and no tuning conclusion from this segment is valid.")
+  return result
+
+
 TOOLS = [
   {"name": "ti_status", "description": "Live Torque Interceptor health: engaged state, mode, "
                                        "violations and ramp-downs. Check this before trusting any "
@@ -259,6 +399,19 @@ TOOLS = [
   {"name": "torque_learning", "description": "openpilot's learned lateral parameters and live "
                                              "curvature tracking error.",
    "inputSchema": {"type": "object", "properties": {}}, "fn": tool_torque_learning},
+  {"name": "list_segments", "description": "Recorded driving segments on the device, newest first. "
+                                           "Use to find a segment to analyze.",
+   "inputSchema": {"type": "object", "properties": {
+     "limit": {"type": "integer", "description": "How many to list (default 20)"}}},
+   "fn": tool_list_segments},
+  {"name": "analyze_segment", "description": "Parse one segment's rlog on the device and return TI "
+                                             "mode/violation timeline, LKAS request range and "
+                                             "curvature tracking error. More authoritative than the "
+                                             "live counters: it has the full time series.",
+   "inputSchema": {"type": "object", "properties": {
+     "segment": {"type": "string", "description": "Segment name from list_segments"}},
+     "required": ["segment"]},
+   "fn": tool_analyze_segment},
 ]
 
 

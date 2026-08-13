@@ -32,6 +32,7 @@ class CarController(CarControllerBase):
     self.long_active_last = False
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
+    self.ti_live = {}
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -82,7 +83,7 @@ class CarController(CarControllerBase):
       persisted = self.params.get("TiTuningStats")
       self.params.put_nonblocking("TiTuningStatsPrevious", persisted or json.dumps(self.ti_stats))
       self.reset_ti_stats()
-    self.params.put_nonblocking("TiTuningStats", json.dumps(self.ti_stats))
+    self.params.put_nonblocking("TiTuningStats", json.dumps({**self.ti_stats, "live": self.ti_live}))
 
   def apply_ti_tuning(self, frogpilot_toggles):
     # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
@@ -99,6 +100,12 @@ class CarController(CarControllerBase):
 
     if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
       self.apply_ti_tuning(frogpilot_toggles)
+      # Live TI state, refreshed every frame regardless of engagement. The mode and violation are
+      # kept on the CarState object rather than published in cereal, so nothing outside this
+      # process can see them unless we forward them. "Is the interceptor healthy right now" should
+      # not require having already driven.
+      self.ti_live = {"mode": int(CS.ti_state), "viol": int(CS.ti_violation),
+                      "ramp": bool(CS.ti_ramp_down), "version": int(CS.ti_version)}
 
     apply_steer = 0
     ti_apply_steer = 0
