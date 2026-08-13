@@ -131,6 +131,7 @@ class Snapshot:
 
 snapshot = Snapshot()
 params = Params()
+params_memory = Params("/dev/shm/params")
 
 
 def _param_int(name):
@@ -141,12 +142,18 @@ def _param_int(name):
     return None
 
 
-def _param_json(name):
-  try:
-    raw = params.get(name)
-    return json.loads(raw) if raw else None
-  except Exception:
-    return None
+def _param_json(name, live_first=False):
+  """live_first reads /dev/shm before /data. The car controller keeps the current counters on
+  tmpfs and only persists them once a minute, so the flash copy lags a live run by up to that --
+  but it is the one that survives an ignition cycle, so it stays as the fallback."""
+  for store in ((params_memory, params) if live_first else (params,)):
+    try:
+      raw = store.get(name)
+      if raw:
+        return json.loads(raw)
+    except Exception:
+      continue
+  return None
 
 
 def tool_ti_status(_args):
@@ -187,7 +194,7 @@ def tool_ti_status(_args):
 
 def tool_ti_stats(_args):
   """Counters for the current measurement and the one before it, for A/B comparison."""
-  current = _param_json("TiTuningStats") or {}
+  current = _param_json("TiTuningStats", live_first=True) or {}
   previous = _param_json("TiTuningStatsPrevious") or {}
 
   def summarise(s):
@@ -1046,7 +1053,11 @@ def publish_address(bind_host, port):
   reachable = bind_host not in ("127.0.0.1", "localhost")
   url = f"http://{ip or bind_host}:{port}/mcp"
   while True:
-    params.put_nonblocking("TiMcpAddress", json.dumps({
+    # On tmpfs. This is a liveness heartbeat that is regenerated at every startup and never wanted
+    # across a boot, so it has no business on flash: at 5s each write was a pair of fsyncs, and an
+    # fsync is an ext4 journal commit the whole filesystem queues behind -- loggerd streaming
+    # camera video included. /dev/shm keeps the cadence and costs nothing.
+    params_memory.put_nonblocking("TiMcpAddress", json.dumps({
       "url": url,
       "bind": bind_host,
       "port": port,

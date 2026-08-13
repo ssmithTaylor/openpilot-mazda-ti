@@ -78,16 +78,33 @@ class CarController(CarControllerBase):
     s["peak_cmd"] = max(s["peak_cmd"], abs(sent))
 
   def publish_ti_stats(self):
+    payload = json.dumps({**self.ti_stats, "live": self.ti_live})
+
+    # Live copy on tmpfs. Free -- /dev/shm never reaches flash -- so this one can stay at 1Hz.
+    self.params_memory.put_nonblocking("TiTuningStats", payload)
+
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
     if self.params.get_bool("ClearTiStats"):
       self.params.put_bool("ClearTiStats", False)
-      # Snapshot the persisted figures rather than the in-memory ones. This process restarts every
-      # ignition cycle, so clearing while parked would otherwise stash a set of zeros as "previous"
-      # and lose the run the user actually wanted to compare against.
-      persisted = self.params.get("TiTuningStats")
-      self.params.put_nonblocking("TiTuningStatsPrevious", persisted or json.dumps(self.ti_stats))
+      # Bank this session's counters when it has any, and the persisted ones otherwise. The process
+      # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
+      # zeros as "previous" and lose the run the user actually meant to keep.
+      self.params.put_nonblocking("TiTuningStatsPrevious",
+                                  payload if self.ti_stats["engaged"] else
+                                  (self.params.get("TiTuningStats") or payload))
       self.reset_ti_stats()
-    self.params.put_nonblocking("TiTuningStats", json.dumps({**self.ti_stats, "live": self.ti_live}))
+      self.params.put_nonblocking("TiTuningStats",
+                                  json.dumps({**self.ti_stats, "live": self.ti_live}))
+      return
+
+    # Flash copy once a minute, not once a second. Params::put fsyncs the temp file and then the
+    # params directory, and each of those is an ext4 journal commit the whole filesystem queues
+    # behind -- including loggerd streaming camera video to the same eMMC. At 1Hz this put ~60 such
+    # barriers a minute underneath the camera pipeline. openpilot persists its own derived state at
+    # a minute (LiveTorqueParameters); match that. A reboot now costs at most a minute of counters,
+    # and anything watching live should read the tmpfs copy above.
+    if self.frame % 6000 == 0:
+      self.params.put_nonblocking("TiTuningStats", payload)
 
   def apply_ti_tuning(self, frogpilot_toggles):
     # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so

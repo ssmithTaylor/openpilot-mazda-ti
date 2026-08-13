@@ -353,7 +353,15 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
 }
 
 void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
-  QJsonObject cur = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStats")).toUtf8()).object();
+  // Live counters come off tmpfs, where the car controller refreshes them every second. The flash
+  // copy is only written once a minute now, so reading it here would show a run lagging by up to
+  // that; fall back to it only when tmpfs is empty, which is the case before the first drive of a
+  // boot. The previous run is a persisted snapshot and has no live counterpart.
+  std::string curRaw = params_memory.get("TiTuningStats");
+  if (curRaw.empty()) {
+    curRaw = params.get("TiTuningStats");
+  }
+  QJsonObject cur = QJsonDocument::fromJson(QString::fromStdString(curRaw).toUtf8()).object();
   QJsonObject prev = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStatsPrevious")).toUtf8()).object();
 
   auto pct = [](const QJsonObject &o, const QString &key) {
@@ -379,7 +387,9 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
                          .arg(QString::number(cur.value("peak_bias").toInt()), fmt(pct(cur, "at_clip"))));
 
   // Address is republished every 5s, so anything older than 15s means the service is not running.
-  QJsonObject mcp = QJsonDocument::fromJson(QString::fromStdString(params.get("TiMcpAddress")).toUtf8()).object();
+  // On tmpfs: it is regenerated at every startup and never needed across a boot, so there was no
+  // reason for a heartbeat to be writing to flash at that rate.
+  QJsonObject mcp = QJsonDocument::fromJson(QString::fromStdString(params_memory.get("TiMcpAddress")).toUtf8()).object();
   qint64 age = QDateTime::currentSecsSinceEpoch() - (qint64)mcp.value("heartbeat").toDouble();
   if (mcp.isEmpty() || age > 15) {
     tiMcpLabel->setText(tr("not running"));

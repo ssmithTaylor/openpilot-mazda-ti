@@ -57,4 +57,8 @@ private:
   QJsonObject frogpilotToggleLevels;
 
   Params params;
+  // The TI counters and the MCP address are republished every few seconds. They live on tmpfs so
+  // that cadence costs nothing: on /data each write forced an ext4 journal commit underneath the
+  // camera pipeline, several times a minute, for the whole drive.
+  Params params_memory{"/dev/shm/params"};
 };
