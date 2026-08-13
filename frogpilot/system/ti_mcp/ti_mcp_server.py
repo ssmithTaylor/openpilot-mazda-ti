@@ -82,7 +82,8 @@ LKAS_DISABLE_MS = 45 / 3.6
 LKAS_ENABLE_MS = 52 / 3.6
 
 TUNING_PARAMS = ("TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaDown",
-                 "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold")
+                 "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold",
+                 "TiSteerDeltaUpKnee", "TiSteerDeltaUpHigh")
 
 # Baselines measured from route 8590bb6980c396f4_00000342, segments 42/55/56, so a caller can tell
 # whether a number is normal without having to remember what normal looked like.
@@ -274,12 +275,28 @@ def tool_ti_tuning(_args):
     "values": values,
     "defaults": {"TiSteerMax": 600, "TiSteerDeltaUp": 6, "TiSteerDeltaDown": 15,
                  "TiSteerDriverAllowance": 15, "TiSteerDriverMultiplier": 40,
-                 "TiSteerThreshold": 6},
+                 "TiSteerThreshold": 6, "TiSteerDeltaUpKnee": 600, "TiSteerDeltaUpHigh": 6},
+    "allowed_range": {
+      "TiSteerMax": [100, 600], "TiSteerDeltaUp": [1, 15], "TiSteerDeltaDown": [1, 50],
+      "TiSteerDriverAllowance": [5, 30], "TiSteerDriverMultiplier": [10, 60],
+      "TiSteerThreshold": [1, 15], "TiSteerDeltaUpKnee": [100, 600],
+      "TiSteerDeltaUpHigh": [1, 15],
+    },
     "notes": {
       "TiSteerMax": "TI clips its own input at 600; higher values are discarded by the unit.",
-      "TiSteerDeltaUp": "Per 10ms frame. 6 means a full second from zero to maximum.",
+      "TiSteerDeltaUp": "Per 10ms frame, below the knee. 6 means a full second from zero to "
+                        "maximum; the stock Mazda LKAS path uses 10 against the same EPS.",
+      "TiSteerDeltaUpKnee": "Command magnitude above which the climb rate drops to "
+                            "TiSteerDeltaUpHigh. At its default of 600 the rate never changes and "
+                            "the limiter behaves exactly as a single slope -- lowering it is what "
+                            "turns the two-stage ramp on.",
+      "TiSteerDeltaUpHigh": "Climb rate above the knee. Held at or below TiSteerDeltaUp, since it "
+                            "exists to be the more cautious of the two.",
       "TiSteerDriverMultiplier": "Command cap is 600 + (allowance + driver_torque) * this. At 40 "
                                  "the cap reaches zero about 30 counts past the allowance.",
+      "ranges": "These bounds are enforced twice, once where the toggles are read and again in the "
+                "car controller, because the panda applies no steering checks to MAZDA_TI_LKAS on "
+                "gen1 -- there is no safety layer downstream of openpilot on this path.",
     },
   }
 

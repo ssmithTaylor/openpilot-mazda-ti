@@ -580,6 +580,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},
     {"TiSteerDeltaUp", PERSISTENT},
+    {"TiSteerDeltaUpHigh", PERSISTENT},
+    {"TiSteerDeltaUpKnee", PERSISTENT},
     {"TiSteerDriverAllowance", PERSISTENT},
     {"TiSteerDriverMultiplier", PERSISTENT},
     {"TiSteerMax", PERSISTENT},

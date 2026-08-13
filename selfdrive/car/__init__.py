@@ -120,12 +120,23 @@ def apply_ti_steer_torque_limits(apply_torque, apply_torque_last, driver_torque,
   min_steer_allowed = min(max(-LIMITS.TI_STEER_MAX, driver_min_torque), 0)
   apply_torque = clip(apply_torque, min_steer_allowed, max_steer_allowed)
 
-  # slow rate if steer torque increases in magnitude
+  # Slow rate if steer torque increases in magnitude. The climb rate is knee dependent: the
+  # unreliability this limiter was tightened for lives at high amplitude, but a flat DELTA_UP taxes
+  # every transient -- including the low range where all the real driving happens and where the
+  # unit has never misbehaved. Below the knee the command may climb at DELTA_UP; above it, at
+  # DELTA_UP_HIGH. With the knee defaulted to TI_STEER_MAX this is exactly the old flat limiter,
+  # so it ships inert and only does something once the knee is deliberately lowered.
+  knee = getattr(LIMITS, "TI_STEER_DELTA_UP_KNEE", LIMITS.TI_STEER_MAX)
+  delta_up = LIMITS.TI_STEER_DELTA_UP if abs(apply_torque_last) < knee else \
+             getattr(LIMITS, "TI_STEER_DELTA_UP_HIGH", LIMITS.TI_STEER_DELTA_UP)
+
   if apply_torque_last > 0:
+    # The -TI_STEER_DELTA_UP bound here limits crossing through zero rather than climbing, so it
+    # keeps the base rate: a sign change is by definition happening at low magnitude.
     apply_torque = clip(apply_torque, max(apply_torque_last - LIMITS.TI_STEER_DELTA_DOWN, -LIMITS.TI_STEER_DELTA_UP),
-                        apply_torque_last + LIMITS.TI_STEER_DELTA_UP)
+                        apply_torque_last + delta_up)
   else:
-    apply_torque = clip(apply_torque, apply_torque_last - LIMITS.TI_STEER_DELTA_UP,
+    apply_torque = clip(apply_torque, apply_torque_last - delta_up,
                         min(apply_torque_last + LIMITS.TI_STEER_DELTA_DOWN, LIMITS.TI_STEER_DELTA_UP))
 
   return int(round(float(apply_torque)))

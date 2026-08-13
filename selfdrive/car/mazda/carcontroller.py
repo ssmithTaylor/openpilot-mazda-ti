@@ -11,6 +11,22 @@ from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 
+# Absolute bounds on every live Torque Interceptor limit, applied in the process that builds the
+# CAN frame. The panda checks MAZDA_LKAS on bus 0 but applies nothing at all to MAZDA_TI_LKAS on
+# gen1, so on this car there is no safety layer downstream of here -- these are the envelope.
+# Chosen to leave room for the tuning we intend and no more: DeltaUp 15 is past the stock Mazda
+# path's 10, which is what the A/B is aimed at; allowance and multiplier are bounded on the side
+# that widens the command as the driver pushes back, which is the unsafe direction for both.
+TI_LIMIT_BOUNDS = {
+  "TI_STEER_MAX": (100, 600),               # 600 is the TI's own hardware clip
+  "TI_STEER_DELTA_UP": (1, 15),
+  "TI_STEER_DELTA_DOWN": (1, 50),
+  "TI_STEER_DRIVER_ALLOWANCE": (5, 30),
+  "TI_STEER_DRIVER_MULTIPLIER": (10, 60),
+  "TI_STEER_DELTA_UP_KNEE": (100, 600),
+  "TI_STEER_DELTA_UP_HIGH": (1, 15),
+}
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -144,15 +160,36 @@ class CarController(CarControllerBase):
     if self.frame % 6000 == 0:
       self.params.put_nonblocking("TiTuningStats", payload)
 
+  def _ti_limit(self, frogpilot_toggles, attr, toggle_name):
+    """One live limit, clamped. Deliberately repeats the clip in frogpilot_variables rather than
+    trusting it: the panda applies no steering checks at all to MAZDA_TI_LKAS on gen1, so this
+    process is the last thing between a bad number and the CAN bus. A stale params file, a
+    half-written value or a bug upstream has nothing downstream to catch it."""
+    value = getattr(frogpilot_toggles, toggle_name, None)
+    if value is None:
+      return getattr(self.ccp, attr)
+    lo, hi = TI_LIMIT_BOUNDS[attr]
+    try:
+      return int(min(max(value, lo), hi))
+    except (TypeError, ValueError):
+      return getattr(self.ccp, attr)
+
   def apply_ti_tuning(self, frogpilot_toggles):
     # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
     # writing them here takes effect immediately. Falls back to the compiled-in value whenever a
     # toggle is absent, which keeps older FrogPilot params files working.
-    self.ccp.TI_STEER_MAX = getattr(frogpilot_toggles, "ti_steer_max", self.ccp.TI_STEER_MAX)
-    self.ccp.TI_STEER_DELTA_UP = getattr(frogpilot_toggles, "ti_steer_delta_up", self.ccp.TI_STEER_DELTA_UP)
-    self.ccp.TI_STEER_DELTA_DOWN = getattr(frogpilot_toggles, "ti_steer_delta_down", self.ccp.TI_STEER_DELTA_DOWN)
-    self.ccp.TI_STEER_DRIVER_ALLOWANCE = getattr(frogpilot_toggles, "ti_steer_driver_allowance", self.ccp.TI_STEER_DRIVER_ALLOWANCE)
-    self.ccp.TI_STEER_DRIVER_MULTIPLIER = getattr(frogpilot_toggles, "ti_steer_driver_multiplier", self.ccp.TI_STEER_DRIVER_MULTIPLIER)
+    self.ccp.TI_STEER_MAX = self._ti_limit(frogpilot_toggles, "TI_STEER_MAX", "ti_steer_max")
+    self.ccp.TI_STEER_DELTA_UP = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP", "ti_steer_delta_up")
+    self.ccp.TI_STEER_DELTA_DOWN = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_DOWN", "ti_steer_delta_down")
+    self.ccp.TI_STEER_DRIVER_ALLOWANCE = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_ALLOWANCE", "ti_steer_driver_allowance")
+    self.ccp.TI_STEER_DRIVER_MULTIPLIER = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_MULTIPLIER", "ti_steer_driver_multiplier")
+    self.ccp.TI_STEER_DELTA_UP_KNEE = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_KNEE", "ti_steer_delta_up_knee")
+    # The high-magnitude rate is the REDUCED one by construction. Letting it exceed the base rate
+    # would inverse the whole point -- fast where the unit is suspect, slow where it is proven --
+    # so it is held at or below it rather than trusted to be set sensibly.
+    self.ccp.TI_STEER_DELTA_UP_HIGH = min(
+      self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_HIGH", "ti_steer_delta_up_high"),
+      self.ccp.TI_STEER_DELTA_UP)
     # Not a ccp field -- carstate applies it to steeringPressed -- but it belongs in the run's
     # config stamp, because it changes when openpilot decides the driver is overriding and so
     # changes what the driver_limited counter means.

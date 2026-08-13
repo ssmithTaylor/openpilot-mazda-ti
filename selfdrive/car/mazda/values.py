@@ -31,6 +31,11 @@ class CarControllerParams:
       self.TI_STEER_DRIVER_MULTIPLIER = 40     # weight driver torque
       self.TI_STEER_DRIVER_FACTOR = 1         # from dbc
       self.TI_STEER_ERROR_MAX = 350           # max delta between torque cmd and torque motor
+      # Two-stage climb rate. Below the knee the command may ramp at TI_STEER_DELTA_UP, above it at
+      # TI_STEER_DELTA_UP_HIGH. Defaulted to the full range and the same rate, which reproduces the
+      # single-slope limiter exactly -- lowering the knee is what turns the feature on.
+      self.TI_STEER_DELTA_UP_KNEE = 600       # command magnitude above which the slow rate applies
+      self.TI_STEER_DELTA_UP_HIGH = 6         # torque increase per refresh above the knee
     if CP.flags & (MazdaFlags.GEN2 | MazdaFlags.GEN3):
       self.STEER_MAX = 8000
       self.STEER_DELTA_UP = 45              # torque increase per refresh
