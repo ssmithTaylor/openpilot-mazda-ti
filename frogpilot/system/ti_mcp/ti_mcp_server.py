@@ -240,19 +240,33 @@ def tool_torque_learning(_args):
   live = snapshot.get()
   if not live.get("available"):
     return {"available": False, "reason": live.get("reason")}
+  # controlsd applies the learned values when `useParams or force_auto_tune`, so useParams alone
+  # does not say whether they are in effect -- forcing it is the other half of the condition.
+  native = bool(live.get("learned_in_use"))
+  forced = bool(_param_int("ForceAutoTune"))
+  advanced = bool(_param_int("AdvancedLateralTune"))
   out = {
     "lat_accel_factor": live.get("learned_lat_accel_factor"),
     "friction": live.get("learned_friction"),
     "valid": live.get("learned_valid"),
-    "in_use": live.get("learned_in_use"),
     "bucket_points": live.get("learned_bucket_points"),
     "decay": live.get("learned_decay"),
     "learned_steer_ratio": live.get("learned_steer_ratio"),
     "curvature_error": live.get("curvature_error"),
+    "car_supports_autotune": native,
+    "force_auto_tune_param": forced,
+    "advanced_lateral_tune_param": advanced,
+    "effectively_in_use": native or (forced and advanced),
   }
-  if not live.get("learned_in_use"):
-    out["note"] = ("useParams is false, so these learned values are being computed and cached but "
-                   "not applied. FrogPilot's Force Auto-Tune On is what enables them.")
+  if not (native or forced):
+    out["note"] = ("Neither the car's own auto-tune nor Force Auto-Tune is on, so these values are "
+                   "computed and cached but never applied.")
+  elif forced and not advanced:
+    out["note"] = ("ForceAutoTune is set but AdvancedLateralTune is not, and the toggle is gated on "
+                   "it -- the learned values are NOT being applied.")
+  elif forced:
+    out["note"] = ("Applied via Force Auto-Tune. Reset learned values after changing anything that "
+                   "alters the command-to-response relationship, or these describe the old setup.")
   return out
 
 
