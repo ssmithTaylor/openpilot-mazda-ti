@@ -6,7 +6,15 @@
 #include <atomic>
 
 #define DEFAULT_SEGMENT_SIZE (10 * 1024 * 1024)
-#define NUM_READERS 15
+// 32, not the upstream 15. Slots are never released when a subscriber closes, so the cap has to
+// exceed the number of subscribers a queue will ever see in one boot, ghosts included. This fork
+// runs more than 15 live readers on carState and frogpilotPlan (stock daemons plus the FrogPilot
+// process, classic_modeld, two UI SubMasters, and the TI MCP server). At the cap, the next
+// registration evicts every reader, and each of them silently drops the messages in flight on
+// its next receive -- which surfaced as 20Hz daemons flipping carState not-alive once or twice a
+// second, cascading through valid=False into a permanent commIssue while driving. Sizing rule:
+// N > max live readers, so a transient subscriber costs at most one round instead of a storm.
+#define NUM_READERS 32
 #define ALIGN(n) ((n + (8 - 1)) & -8)
 
 #define UNUSED(x) (void)x

@@ -115,11 +115,6 @@ class SubMaster:
     self.ignore_alive = [] if ignore_alive is None else ignore_alive
     self.ignore_valid = [] if ignore_valid is None else ignore_valid
 
-    # TI-DEBUG (device-local diagnostic, remove after the commIssue root-cause): last-known
-    # health per service, to log the exact check that flips one unhealthy.
-    self._dbg_ok: Dict[str, bool] = {}
-    self._dbg_last = 0.
-
     self.simulation = bool(int(os.getenv("SIMULATION", "0")))
 
     # if freq and poll aren't specified, assume the max to be conservative
@@ -215,37 +210,6 @@ class SubMaster:
           self.alive[s] = self.seen[s] # alive is defined as seen when simulation flag set
         else:
           self.alive[s] = True
-
-    # TI-DEBUG (device-local diagnostic, remove after the commIssue root-cause). When a service
-    # turns unhealthy, record which of the three checks tripped and the receive evidence. The
-    # rlog gets it via the swaglog bridge, so a normal drive produces the answer.
-    try:
-      flips = []
-      for s in self.data:
-        ok = self.alive[s] and self.freq_ok[s] and self.valid[s]
-        if self._dbg_ok.get(s, True) and not ok:
-          why = []
-          if not self.alive[s]:
-            why.append(f"alive(age={cur_time - self.recv_time[s]:.3f})")
-          if not self.freq_ok[s]:
-            dts = list(self.recv_dts[s])
-            k = max(1, int((self.recv_dts[s].maxlen or 10) / 10))
-            recent = dts[-k:]
-            avg = 1. / (sum(dts) / len(dts)) if dts else 0.
-            avg_r = 1. / (sum(recent) / len(recent)) if recent else 0.
-            why.append(f"freq(avg={avg:.2f},recent={avg_r:.2f},"
-                       f"lim=[{self.min_freq[s]:.1f},{self.max_freq[s]:.1f}])")
-          if not self.valid[s]:
-            why.append("valid=False")
-          flips.append(f"{s}: {','.join(why)} "
-                       f"dts={[round(x, 3) for x in list(self.recv_dts[s])[-6:]]}")
-        self._dbg_ok[s] = ok
-      if flips and (cur_time - self._dbg_last) > 1.0:
-        self._dbg_last = cur_time
-        from openpilot.common.swaglog import cloudlog
-        cloudlog.event("submaster_unhealthy", flips=flips, upd=int(self.frame))
-    except Exception:
-      pass
 
   def all_alive(self, service_list: Optional[List[str]] = None) -> bool:
     if service_list is None:
