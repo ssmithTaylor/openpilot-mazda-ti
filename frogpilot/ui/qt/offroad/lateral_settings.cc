@@ -361,6 +361,7 @@ void FrogPilotLateralPanel::showEvent(QShowEvent *event) {
 void FrogPilotLateralPanel::updateState(const UIState &s) {
   if (!isVisible()) return;
 
+  FrogPilotUIState &fs = *frogpilotUIState();
   started = s.scene.started;
 
   // These eight are the entire safety envelope on the interceptor path -- panda applies no
@@ -368,6 +369,12 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
   // them. Unlike every other slider in this panel, they should not be adjustable with the car in
   // motion. ClearTiStats, TiFlagMoment and TiMcpEnabled are deliberately left out: none of them
   // change what gets commanded, and TiFlagMoment specifically exists to be used while driving.
+  //
+  // Gate on PARKED, not on `started`. The onroad flag follows the ignition line, so gating on it
+  // locked the sliders with the engine running in Park and with the key on and the engine off --
+  // exactly when tuning gets done. Same expression maps_settings.cc uses for map downloads:
+  // offroad counts as parked, and onroad needs the shifter in P.
+  bool parked = !started || fs.frogpilot_scene.parked;
   static const std::vector<QString> tiLimitKeys = {
     "TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaUpKnee", "TiSteerDeltaUpHigh",
     "TiSteerDeltaDown", "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold",
@@ -375,7 +382,7 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
   for (const QString &key : tiLimitKeys) {
     auto it = toggles.find(key);
     if (it != toggles.end()) {
-      it->second->setEnabled(!started);
+      it->second->setEnabled(parked);
     }
   }
 
