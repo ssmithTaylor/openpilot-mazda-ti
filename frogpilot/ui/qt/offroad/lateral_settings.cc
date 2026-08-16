@@ -135,25 +135,25 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       });
       lateralToggle = torqueInterceptorToggle;
     } else if (param == "TiSteerMax") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 1200, QString(), std::map<float, QString>(), 10, true);
     // Ranges below deliberately match TI_LIMIT_BOUNDS in carcontroller.py and the clips in
     // frogpilot_variables.py. The panda applies no steering checks to MAZDA_TI_LKAS on gen1, so
     // these three layers are the entire envelope on the interceptor path; if you widen one, widen
     // all three, and think about why first.
     } else if (param == "TiSteerDeltaUp") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 30, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDeltaUpKnee") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 600, QString(), std::map<float, QString>(), 10, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 100, 1200, QString(), std::map<float, QString>(), 10, true);
     } else if (param == "TiSteerDeltaUpHigh") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 30, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDeltaDown") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 10, 50, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 10, 100, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverAllowance") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 30, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 5, 60, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerDriverMultiplier") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 20, 60, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 20, 120, QString(), std::map<float, QString>(), 1, true);
     } else if (param == "TiSteerThreshold") {
-      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 15, QString(), std::map<float, QString>(), 1, true);
+      lateralToggle = new FrogPilotParamValueControl(param, title, desc, icon, 1, 30, QString(), std::map<float, QString>(), 1, true);
 
     } else if (param == "ResetTorqueParams") {
       // An action, not a state. The backend consumes the param and clears it, so a switch would

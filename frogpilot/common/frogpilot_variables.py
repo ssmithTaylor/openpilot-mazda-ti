@@ -692,7 +692,7 @@ class FrogPilotVariables:
     # LKAS request there in hardware; anything above is silently discarded by the unit.
     ti_tune = params.get_bool("TorqueInterceptorTune") if toggle.tuning_level >= level["TorqueInterceptorTune"] else default.get_bool("TorqueInterceptorTune")
     toggle.ti_tune = ti_tune
-    toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 600)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
+    toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 1200)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
     # Ranges below are tighter than they were. The panda applies no steering checks at all to
     # MAZDA_TI_LKAS on gen1 -- only the stock 0x243 path is rate and magnitude limited -- so these
     # clips, and the clamp in the car controller behind them, are the whole envelope on the
@@ -702,15 +702,15 @@ class FrogPilotVariables:
     # system further before openpilot notices an override at all. Allowance and multiplier are
     # bounded on the side that widens the command under driver torque, which is the unsafe
     # direction for both.
-    toggle.ti_steer_delta_up = int(np.clip(params.get_float("TiSteerDeltaUp"), 1, 15)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUp"] else int(default.get_float("TiSteerDeltaUp"))
-    toggle.ti_steer_delta_down = int(np.clip(params.get_float("TiSteerDeltaDown"), 10, 50)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaDown"] else int(default.get_float("TiSteerDeltaDown"))
-    toggle.ti_steer_driver_allowance = int(np.clip(params.get_float("TiSteerDriverAllowance"), 5, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverAllowance"] else int(default.get_float("TiSteerDriverAllowance"))
-    toggle.ti_steer_driver_multiplier = int(np.clip(params.get_float("TiSteerDriverMultiplier"), 20, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverMultiplier"] else int(default.get_float("TiSteerDriverMultiplier"))
-    toggle.ti_steer_threshold = int(np.clip(params.get_float("TiSteerThreshold"), 1, 15)) if ti_tune and toggle.tuning_level >= level["TiSteerThreshold"] else int(default.get_float("TiSteerThreshold"))
+    toggle.ti_steer_delta_up = int(np.clip(params.get_float("TiSteerDeltaUp"), 1, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUp"] else int(default.get_float("TiSteerDeltaUp"))
+    toggle.ti_steer_delta_down = int(np.clip(params.get_float("TiSteerDeltaDown"), 10, 100)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaDown"] else int(default.get_float("TiSteerDeltaDown"))
+    toggle.ti_steer_driver_allowance = int(np.clip(params.get_float("TiSteerDriverAllowance"), 5, 60)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverAllowance"] else int(default.get_float("TiSteerDriverAllowance"))
+    toggle.ti_steer_driver_multiplier = int(np.clip(params.get_float("TiSteerDriverMultiplier"), 20, 120)) if ti_tune and toggle.tuning_level >= level["TiSteerDriverMultiplier"] else int(default.get_float("TiSteerDriverMultiplier"))
+    toggle.ti_steer_threshold = int(np.clip(params.get_float("TiSteerThreshold"), 1, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerThreshold"] else int(default.get_float("TiSteerThreshold"))
     # Two-stage climb. Knee defaults to TiSteerMax, which reproduces the single-slope limiter
     # exactly, so this does nothing until the knee is deliberately brought down.
-    toggle.ti_steer_delta_up_knee = int(np.clip(params.get_float("TiSteerDeltaUpKnee"), 100, 600)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUpKnee"] else int(default.get_float("TiSteerDeltaUpKnee"))
-    toggle.ti_steer_delta_up_high = int(np.clip(params.get_float("TiSteerDeltaUpHigh"), 1, 15)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUpHigh"] else int(default.get_float("TiSteerDeltaUpHigh"))
+    toggle.ti_steer_delta_up_knee = int(np.clip(params.get_float("TiSteerDeltaUpKnee"), 100, 1200)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUpKnee"] else int(default.get_float("TiSteerDeltaUpKnee"))
+    toggle.ti_steer_delta_up_high = int(np.clip(params.get_float("TiSteerDeltaUpHigh"), 1, 30)) if ti_tune and toggle.tuning_level >= level["TiSteerDeltaUpHigh"] else int(default.get_float("TiSteerDeltaUpHigh"))
 
     advanced_longitudinal_tuning = toggle.openpilot_longitudinal and (params.get_bool("AdvancedLongitudinalTune") if toggle.tuning_level >= level["AdvancedLongitudinalTune"] else default.get_bool("AdvancedLongitudinalTune"))
     toggle.longitudinalActuatorDelay = np.clip(params.get_float("LongitudinalActuatorDelay"), 0, 1) if advanced_longitudinal_tuning and toggle.tuning_level >= level["LongitudinalActuatorDelay"] else longitudinalActuatorDelay

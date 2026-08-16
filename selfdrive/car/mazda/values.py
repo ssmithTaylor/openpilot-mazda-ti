@@ -163,14 +163,21 @@ class CAR(Platforms):
 #     At the default 40 that is 30 counts. At 10 it would be 75, against a torque sensor whose
 #     range ends at 85 -- so the driver could not fully yield the command before the sensor
 #     saturates. At 20 it is 45: a hard push, but one a person can actually make.
+# Widened for the characterisation drives. The 600 ceiling was never a measured device limit: the
+# only observation behind it was openpilot watching its own clamp, which cannot distinguish a
+# device clip at 600 from one at 800 or none at all. LKAS_REQUEST is a 12-bit field with a 2048
+# offset, so the encoding is valid to +-2047; 1200 is a first probe, not the wire limit. Defaults
+# are unchanged, so an untouched install still commands exactly what it did. The panda applies no
+# checks to MAZDA_TI_LKAS on gen1, so this dict, the clips in frogpilot_variables.py and the
+# ranges in lateral_settings.cc are the entire envelope: keep all three identical.
 TI_LIMIT_BOUNDS = {
-  "TI_STEER_MAX": (100, 600),               # 600 is the TI's own hardware clip
-  "TI_STEER_DELTA_UP": (1, 15),             # stock Mazda path runs 10 against the same EPS
-  "TI_STEER_DELTA_DOWN": (10, 50),
-  "TI_STEER_DRIVER_ALLOWANCE": (5, 30),
-  "TI_STEER_DRIVER_MULTIPLIER": (20, 60),
-  "TI_STEER_DELTA_UP_KNEE": (100, 600),
-  "TI_STEER_DELTA_UP_HIGH": (1, 15),
+  "TI_STEER_MAX": (100, 1200),              # encoding allows 2047; 600 was an untested convention
+  "TI_STEER_DELTA_UP": (1, 30),             # stock Mazda path runs 10 against the same EPS
+  "TI_STEER_DELTA_DOWN": (10, 100),
+  "TI_STEER_DRIVER_ALLOWANCE": (5, 60),
+  "TI_STEER_DRIVER_MULTIPLIER": (20, 120),
+  "TI_STEER_DELTA_UP_KNEE": (100, 1200),    # tracks TI_STEER_MAX so the knee can sit above 600
+  "TI_STEER_DELTA_UP_HIGH": (1, 30),
 }
 
 

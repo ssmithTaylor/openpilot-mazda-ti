@@ -386,7 +386,12 @@ def tool_ti_tuning(_args):
     },
     "allowed_range_source": TI_LIMIT_SOURCE,
     "notes": {
-      "TiSteerMax": "TI clips its own input at 600; higher values are discarded by the unit.",
+      "TiSteerMax": "600 was a convention, not a measured device limit: the only evidence was "
+                    "openpilot watching its own clamp, which cannot tell a device clip at 600 from "
+                    "one at 800 or none. LKAS_REQUEST is 12-bit with a 2048 offset (valid to +-2047). "
+                    "Above 600 is uncharted: score it with ti_response (does bias keep rising with "
+                    "command, or flatline?), commands_above_600 in analyze_segment, and the TI "
+                    "violation byte. Raise in steps and stop at the first flat bucket or violation.",
       "TiSteerDeltaUp": "Per 10ms frame, below the knee. 6 means a full second from zero to "
                         "maximum; the stock Mazda LKAS path uses 10 against the same EPS.",
       "TiSteerDeltaUpKnee": "Command magnitude above which the climb rate drops to "
