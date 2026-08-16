@@ -70,7 +70,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"ResetTorqueParams", tr("Reset Learned Steering Values"), tr("<b>Throw away what openpilot has learned about your steering and start over.</b> Do this after changing anything that affects how much the car turns for a given command, otherwise it keeps using values learned from the old behaviour. Switches itself back off once done."), ""},
 
     {"TorqueInterceptorTune", tr("Torque Interceptor Tuning"), tr("<b>Adjust how the Torque Interceptor delivers steering.</b> Only affects cars fitted with a TI."), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
-    {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor ignores anything above 600."), ""},
+    {"TiSteerMax", tr("Max Torque"), tr("<b>The most steering effort openpilot can ask the interceptor for.</b> Lower this to cap how strong assist can get. The interceptor's own onboard hardware clamps its output near 600 per its spec sheet, outside openpilot's control; values above that are for confirming the clamp actually holds, not for asking for more real torque."), ""},
     {"TiSteerDeltaUp", tr("Ramp-Up Rate"), tr("<b>How quickly steering effort is allowed to build.</b> Raise for sharper response entering corners. Too high and the interceptor treats it as unsafe and cuts assist to zero. Default 6 takes one second to reach full."), ""},
     {"TiSteerDeltaUpKnee", tr("Cautious Above"), tr("<b>The effort level above which the slower ramp rate takes over.</b> Below this the ramp-up rate applies; above it, the cautious rate. Leave at 600 to use one rate everywhere. Lower it to get quick response in normal driving while staying gentle at high effort."), ""},
     {"TiSteerDeltaUpHigh", tr("Cautious Ramp-Up Rate"), tr("<b>How quickly steering effort builds once past the level set above.</b> Only does anything if \"Cautious Above\" is below 600. Cannot exceed the main ramp-up rate."), ""},
@@ -362,6 +362,22 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
   if (!isVisible()) return;
 
   started = s.scene.started;
+
+  // These eight are the entire safety envelope on the interceptor path -- panda applies no
+  // steering checks to MAZDA_TI_LKAS on gen1, so nothing downstream of openpilot double-checks
+  // them. Unlike every other slider in this panel, they should not be adjustable with the car in
+  // motion. ClearTiStats, TiFlagMoment and TiMcpEnabled are deliberately left out: none of them
+  // change what gets commanded, and TiFlagMoment specifically exists to be used while driving.
+  static const std::vector<QString> tiLimitKeys = {
+    "TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaUpKnee", "TiSteerDeltaUpHigh",
+    "TiSteerDeltaDown", "TiSteerDriverAllowance", "TiSteerDriverMultiplier", "TiSteerThreshold",
+  };
+  for (const QString &key : tiLimitKeys) {
+    auto it = toggles.find(key);
+    if (it != toggles.end()) {
+      it->second->setEnabled(!started);
+    }
+  }
 
   if (lateralLayoutRef != nullptr && lateralLayoutRef->currentWidget() == torqueInterceptorPanelRef) {
     // Hold off the inactivity timeout while this panel is open. It would otherwise drop back to

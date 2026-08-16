@@ -138,6 +138,14 @@ FrogPilotUtilitiesPanel::FrogPilotUtilitiesPanel(FrogPilotSettingsWindow *parent
     int minutes = std::clamp(params.getInt("ScreenRefreshMinutes"), 1, 60);
     if (FrogPilotConfirmationDialog::yesorno(tr("Run the screen refresh for %1 minutes? Tap the screen to stop early.").arg(minutes), this)) {
       ScreenRefreshOverlay *overlay = new ScreenRefreshOverlay(minutes * 60);
+      // Close automatically the instant a drive starts, same as the automatic weekly pass already
+      // does for itself in HomeWindow::updateAutoScreenRefresh. Connection is scoped to overlay,
+      // so it tears down with the widget (WA_DeleteOnClose) rather than needing to be tracked here.
+      QObject::connect(uiState(), &UIState::offroadTransition, overlay, [overlay](bool offroad) {
+        if (!offroad) {
+          overlay->close();
+        }
+      });
       overlay->showFullScreen();
     }
   });

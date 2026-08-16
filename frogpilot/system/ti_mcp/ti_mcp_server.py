@@ -94,7 +94,7 @@ PARAM_TO_LIMIT = {
   "TiSteerDriverMultiplier": "TI_STEER_DRIVER_MULTIPLIER",
   "TiSteerDeltaUpKnee": "TI_STEER_DELTA_UP_KNEE", "TiSteerDeltaUpHigh": "TI_STEER_DELTA_UP_HIGH",
 }
-THRESHOLD_BOUNDS = (1, 15)
+THRESHOLD_BOUNDS = (1, 30)  # kept in sync with the TiSteerThreshold clip in frogpilot_variables.py
 
 # Taken from the car port rather than restated, so this cannot drift from what is actually
 # enforced -- a copy that nothing executes against is the one that goes stale unnoticed. Guarded
@@ -215,7 +215,10 @@ def tool_ti_status(_args):
   """Live TI health. This is the first thing to check: everything else is meaningless if the
   interceptor is not in RUN, because it is then bypassed and the stock EPS is steering."""
   live = snapshot.get()
-  stats = _param_json("TiTuningStats") or {}
+  # live_first: this is the tool documented as "check this first" for current TI health, so it
+  # needs the tmpfs copy the car controller refreshes every second, not the one only persisted to
+  # flash once a minute -- tool_ti_stats already read tmpfs correctly, this one did not.
+  stats = _param_json("TiTuningStats", live_first=True) or {}
   ti = stats.get("live") or {}
   mode, viol = ti.get("mode"), int(ti.get("viol") or stats.get("viol") or 0)
   out = {
@@ -563,6 +566,13 @@ def _refuse_if_driving(tool):
 
 
 def _rlog_path(segment):
+  # segment arrives from an unauthenticated network caller (tool_analyze_segment,
+  # tool_segment_diagnostics, tool_ti_response, tool_ti_flags) and used to be joined onto
+  # SEGMENT_ROOTS with no check at all -- a segment of "../../../../etc/passwd"-shaped input could
+  # walk outside the intended directories. Reject anything that is not a bare path component before
+  # it ever reaches os.path.join.
+  if not segment or os.path.basename(segment) != segment or segment in (".", ".."):
+    return None
   for root in SEGMENT_ROOTS:
     for name in ("rlog.bz2", "rlog", "rlog.zst"):
       p = os.path.join(root, segment, name)
