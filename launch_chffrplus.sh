@@ -191,7 +191,10 @@ function launch {
 
   # start manager
   cd system/manager
-  if [ ! -f $DIR/prebuilt ]; then
+  # build.py writes the built commit into `prebuilt`; skip the ~40s no-op scons pass only when
+  # that stamp matches HEAD, so a fetched, pulled or edited tree always rebuilds. An empty or
+  # unreadable marker fails this comparison and rebuilds, which is the safe direction.
+  if [ "$(cat $DIR/prebuilt 2>/dev/null)" != "$(git -C $DIR rev-parse HEAD 2>/dev/null)" ] || [ -z "$(cat $DIR/prebuilt 2>/dev/null)" ]; then
     ./build.py
   fi
   ./manager.py

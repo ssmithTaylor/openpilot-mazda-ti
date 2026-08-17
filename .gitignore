@@ -84,3 +84,7 @@ build/
 
 poetry.toml
 Pipfile
+
+# written by system/manager/build.py after a successful build; the launcher skips scons
+# while it matches HEAD. Ignored so it never shows in status or flips the tree dirty.
+prebuilt

@@ -82,6 +82,24 @@ def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
     cache_size -= f.stat().st_size
     f.unlink()
 
+  # Stamp the tree as built. The launcher skips this whole step next boot when the marker's
+  # content matches HEAD, which is what makes a no-change boot ~40s faster on the device: scons
+  # walking 3600 up-to-date nodes is pure CPU. Stamping the COMMIT rather than touching an
+  # empty file is what keeps it safe -- any commit change invalidates it, so stale binaries can
+  # never run under a marker left behind by an older build. Written last, after the cache
+  # sweep, so nothing that can fail after this point leaves a marker for an unfinished build.
+  # Stamped regardless of is_dirty: the build itself rewrites the translation .ts files
+  # (lupdate in selfdrive/ui/SConscript), so this tree is dirty on every boot by construction,
+  # and a dirty-tree guard would make the marker unreachable. The commit stamp is the invariant
+  # that matters -- an edited source file on an unchanged HEAD is the one case this does not
+  # catch, and on this device sources only change by commit.
+  try:
+    commit = get_build_metadata().openpilot.git_commit
+    if commit:
+      Path(BASEDIR, "prebuilt").write_text(commit + "\n")
+  except Exception:
+    cloudlog.exception("failed to write prebuilt marker")
+
 
 if __name__ == "__main__":
   spinner = Spinner()
