@@ -23,7 +23,10 @@ def is_registered_device() -> bool:
   return dongle not in (None, UNREGISTERED_DONGLE_ID)
 
 
-def register(show_spinner=False, register_konik=False) -> str | None:
+def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60) -> str | None:
+  # `timeout` is the per-attempt HTTP timeout and `max_wait` the total budget before giving up
+  # with UNREGISTERED_DONGLE_ID. Defaults reproduce the stock behaviour. FrogPilot's boot path
+  # passes small values so a device with no network does not sit on the spinner for a minute.
   params = Params()
 
   IMEI = params.get("IMEI", encoding='utf8')
@@ -70,7 +73,7 @@ def register(show_spinner=False, register_konik=False) -> str | None:
       try:
         register_token = jwt.encode({'register': True, 'exp': datetime.utcnow() + timedelta(hours=1)}, private_key, algorithm='RS256')
         cloudlog.info("getting pilotauth")
-        resp = api_get("v2/pilotauth/", method='POST', timeout=15,
+        resp = api_get("v2/pilotauth/", method='POST', timeout=timeout,
                        imei=imei1, imei2=imei2, serial=serial, public_key=public_key, register_token=register_token)
 
         if resp.status_code in (402, 403):
@@ -85,7 +88,7 @@ def register(show_spinner=False, register_konik=False) -> str | None:
         backoff = min(backoff + 1, 15)
         time.sleep(backoff)
 
-      if time.monotonic() - start_time > 60 and show_spinner:
+      if time.monotonic() - start_time > max_wait and (show_spinner or max_wait < 60):
         dongle_id = UNREGISTERED_DONGLE_ID
         break
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.common.time import system_time_valid
-from openpilot.system.athena.registration import register
+from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.system.hardware import HARDWARE
 
 from openpilot.frogpilot.assets.model_manager import ModelManager
@@ -157,12 +157,41 @@ def frogpilot_boot_functions(build_metadata, params_cache):
     for video in VIDEO_CACHE_PATH.glob("*.mp4"):
       delete_file(video)
 
+  # Konik registration must never hold up boot. This device usually has no network at all, and
+  # the old flow cost it ~120s per offline boot: konik registration timing out to the
+  # "UnregisteredDevice" sentinel, that sentinel being copied into DongleId, and stock
+  # register() then re-registering for another minute because DongleId looked unregistered.
+  # Worse, the sentinel was cached and passed the `!= None` check on every later boot -- a
+  # cached failure treated as a cached success -- so it never recovered on its own.
+  #
+  # Now: a sentinel is "not registered". A real ID already on the device (a previous good konik
+  # registration, or the stock comma one -- konik hands out the same ID for this device) stays
+  # in DongleId, which makes stock register() a no-op. The boot-path attempt is one quick try
+  # (3s per request, 6s total) so an offline boot loses seconds, not minutes, and the real
+  # retry runs in boot_thread below, after system time is valid, i.e. once there is a network.
+  konik_id_needed = False
   if use_konik_server():
-    if params.get("KonikDongleId", encoding="utf8") != None:
-      params.put("DongleId", params.get("KonikDongleId", encoding="utf8"))
+    konik_id = params.get("KonikDongleId", encoding="utf8")
+    if konik_id == UNREGISTERED_DONGLE_ID:
+      params.remove("KonikDongleId")
+      konik_id = None
+    if konik_id is None:
+      attempt = register(show_spinner=True, register_konik=True, timeout=3, max_wait=6)
+      if attempt not in (None, UNREGISTERED_DONGLE_ID):
+        params.put("KonikDongleId", attempt)
+        konik_id = attempt
+      else:
+        konik_id_needed = True
+    if konik_id is not None:
+      params.put("DongleId", konik_id)
     else:
-      params.put("KonikDongleId", register(show_spinner=True, register_konik=True))
-      params.put("DongleId", params.get("KonikDongleId", encoding="utf8"))
+      # No konik ID yet. Keep whatever real ID we have so boot and logging carry on with a
+      # valid identity instead of the sentinel; the thread below finishes the job.
+      stock_id = params.get("StockDongleId", encoding="utf8")
+      if stock_id not in (None, UNREGISTERED_DONGLE_ID):
+        params.put("DongleId", stock_id)
+      elif params.get("DongleId", encoding="utf8") == UNREGISTERED_DONGLE_ID:
+        params.remove("DongleId")
   elif params.get("DongleId", encoding="utf8") == params.get("KonikDongleId", encoding="utf8"):
     params.remove("DongleId")
 
@@ -170,6 +199,15 @@ def frogpilot_boot_functions(build_metadata, params_cache):
     while not system_time_valid():
       print("Waiting for system time to become valid...")
       time.sleep(1)
+
+    if konik_id_needed:
+      # Time is valid, so there is a network now. Full-patience registration, off the boot path.
+      # DongleId is only touched on success; on failure the identity chosen above stays in place
+      # and the next boot tries again from the top.
+      late_id = register(show_spinner=False, register_konik=True)
+      if late_id not in (None, UNREGISTERED_DONGLE_ID):
+        params.put("KonikDongleId", late_id)
+        params.put("DongleId", late_id)
 
     backup_frogpilot(build_metadata)
     backup_toggles(params_cache)
