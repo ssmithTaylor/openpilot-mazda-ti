@@ -17,6 +17,11 @@ BIAS_MIN_COMMAND = 100
 
 # Flags kept. Enough for a long tuning drive, small enough that the param stays a few kilobytes.
 FLAG_HISTORY = 40
+# ...and how long any one of them is kept. A flag exists to find a moment in a drive again, so
+# it has to outlive the drive -- but not the tuning campaign. A week covers "look at Tuesday's
+# flag at the weekend"; older ones are pruned when the next flag is written. The rlog still
+# holds the moment itself; the flag is only the pointer to it.
+FLAG_MAX_AGE_S = 7 * 24 * 3600
 
 # Completed measurement runs retained. Enough to hold a session's worth of A/B steps.
 RUN_HISTORY = 5
@@ -214,6 +219,14 @@ class CarController(CarControllerBase):
     }
 
     existing = self.load_param_list("TiFlaggedMoments")
+    # Drop anything past its keep-time on the way through, so flags do not pile up across weeks
+    # of drives. Done here rather than on a timer: the only moment this list is worth touching
+    # from the control loop is when a tap is already writing it. Entries without a usable
+    # timestamp are kept rather than guessed at.
+    cutoff = now - FLAG_MAX_AGE_S
+    existing = [f for f in existing
+                if not isinstance(f, dict) or not isinstance(f.get("at"), (int, float))
+                or f["at"] >= cutoff]
     existing.append(entry)
     # Persisted to flash rather than tmpfs: the entire point is to still have these after the
     # drive. One write per tap is nothing, unlike the per-second counters.
@@ -241,21 +254,20 @@ class CarController(CarControllerBase):
     return json.dumps({**self.ti_stats, "live": self.ti_live, "config": self.ti_config(),
                        "started_at": self.ti_stats_started, "route": self.ti_route})
 
-  def publish_ti_stats(self):
-    payload = self.ti_payload()
+  def check_clear_request(self):
+    """The driver tapped "Start A New Measurement". Bank the run as it stands and zero the counters.
 
-    # Live copy on tmpfs, written BLOCKING on purpose. put_nonblocking hands the write to a
-    # background thread, and Params spawns that thread through std::async on nearly every call --
-    # which is the expensive part here, not the write. A tmpfs write is a memcpy and its fsync is a
-    # no-op, so doing it inline is cheaper than creating a thread to avoid it. put_nonblocking is
-    # still right for the flash copy below, where the write genuinely is slow.
-    self.params_memory.put("TiTuningStats", payload)
-
+    Polled at 1Hz next to the flag check, not inside the 0.2Hz publish. When it lived in the
+    publish it was consumed at most once every five seconds, so a second tap inside that window
+    found the flag already set and did nothing, and two runs collapsed into one -- the button
+    only worked once per drive in practice. A tmpfs read costs microseconds; a tap now lands
+    within a second and banks exactly the run that was showing when it was pressed."""
     # Clearing keeps the outgoing run under a second key so the two can be compared side by side.
     # Same reasoning as the flag trigger: ephemeral, so tmpfs, so no journal commit in the control
     # loop. This one predates the flag work and had the same defect.
     if self.params_memory.get_bool("ClearTiStats"):
       self.params_memory.put_bool("ClearTiStats", False)
+      payload = self.ti_payload()
       # Bank this session's counters when it has any, and the persisted ones otherwise. The process
       # restarts every ignition cycle, so clearing while parked would otherwise stash a set of
       # zeros as "previous" and lose the run the user actually meant to keep.
@@ -283,7 +295,16 @@ class CarController(CarControllerBase):
       cleared = self.ti_payload()
       self.params_memory.put("TiTuningStats", cleared)
       self.params.put_nonblocking("TiTuningStats", cleared)
-      return
+
+  def publish_ti_stats(self):
+    payload = self.ti_payload()
+
+    # Live copy on tmpfs, written BLOCKING on purpose. put_nonblocking hands the write to a
+    # background thread, and Params spawns that thread through std::async on nearly every call --
+    # which is the expensive part here, not the write. A tmpfs write is a memcpy and its fsync is a
+    # no-op, so doing it inline is cheaper than creating a thread to avoid it. put_nonblocking is
+    # still right for the flash copy below, where the write genuinely is slow.
+    self.params_memory.put("TiTuningStats", payload)
 
     # Flash copy once a minute, not once a second. Params::put fsyncs the temp file and then the
     # params directory, and each of those is an ext4 journal commit the whole filesystem queues
@@ -496,6 +517,7 @@ class CarController(CarControllerBase):
       if self.frame % 100 == 0:
         self.maybe_refresh_route()
         self.check_flag_request(CS, CC, ti_apply_steer)
+        self.check_clear_request()
 
       # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
       # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a

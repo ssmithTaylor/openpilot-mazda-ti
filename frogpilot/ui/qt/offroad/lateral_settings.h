@@ -57,6 +57,7 @@ private:
   // Held so its text can be put back once the car controller has consumed the flag, which is the
   // only feedback the driver gets that the tap actually landed.
   ButtonControl *tiFlagButton = nullptr;
+  ButtonControl *tiClearButton = nullptr;
   int tiStatsTick = 0;
 
   FrogPilotSettingsWindow *parent;

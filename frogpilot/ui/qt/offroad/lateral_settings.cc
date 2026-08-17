@@ -167,15 +167,18 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
       });
       lateralToggle = resetTorqueButton;
     } else if (param == "ClearTiStats") {
-      ButtonControl *clearStatsButton = new ButtonControl(title, tr("START"), desc);
-      QObject::connect(clearStatsButton, &ButtonControl::clicked, [this, clearStatsButton]() {
+      // Re-armable, like the flag button below: the car controller consumes the trigger at 1Hz
+      // and updateTorqueInterceptorStats sets the label back once it has, so every tap starts a
+      // fresh run. It used to stick on STARTED for the rest of the drive, which read as one-shot.
+      tiClearButton = new ButtonControl(title, tr("START"), desc);
+      QObject::connect(tiClearButton, &ButtonControl::clicked, [this]() {
         // tmpfs. Both trigger flags are ephemeral, and the car controller has to clear them from
         // inside its 100Hz loop -- on /data that clear is two ext4 journal commits in the thread
         // that builds the steering frame.
         params_memory.putBool("ClearTiStats", true);
-        clearStatsButton->setText(tr("STARTED"));
+        tiClearButton->setText(tr("STARTING"));
       });
-      lateralToggle = clearStatsButton;
+      lateralToggle = tiClearButton;
     } else if (param == "TiFlagMoment") {
       // Pressed while driving, so no confirmation dialog: one tap, immediate feedback, done. A
       // yes/no prompt here would take the driver's attention for exactly as long as the thing
@@ -451,6 +454,18 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
     tiFlagButton->setText(params_memory.getBool("TiFlagMoment") ? tr("FLAGGING") : tr("FLAG"));
     int flagged = QJsonDocument::fromJson(QString::fromStdString(params.get("TiFlaggedMoments")).toUtf8()).array().size();
     tiFlagButton->setValue(flagged > 0 ? tr("%1 saved").arg(flagged) : QString());
+  }
+  // Same treatment for the measurement button: STARTING while the tap is in flight, START once
+  // the controller has banked the run, and the number of runs kept so far as the hint.
+  if (tiClearButton != nullptr) {
+    // The car controller is the only consumer of the trigger and it does not run offroad, so a
+    // tap while parked stays pending until the next ignition-on -- where it closes the last
+    // drive's run as "previous", which is the sensible parked use. Say so rather than showing a
+    // spinner-word that never resolves.
+    bool pending = params_memory.getBool("ClearTiStats");
+    tiClearButton->setText(!pending ? tr("START") : (started ? tr("STARTING") : tr("AT NEXT START")));
+    int runs = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStatsHistory")).toUtf8()).array().size();
+    tiClearButton->setValue(runs > 0 ? tr("%1 runs kept").arg(runs) : QString());
   }
 
   // Address is republished every 5s, so anything older than 15s means the service is not running.
