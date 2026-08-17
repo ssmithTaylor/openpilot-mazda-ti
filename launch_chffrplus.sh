@@ -157,7 +157,16 @@ function launch {
     if [ $? -eq 0 ]; then
       echo "${BASEDIR} has been modified, skipping overlay update installation"
     else
-      if [ -f "${STAGING_ROOT}/finalized/.overlay_consistent" ]; then
+      if [ -f "${STAGING_ROOT}/finalized/.overlay_consistent" ] && \
+         [ "$(git -C ${STAGING_ROOT}/finalized rev-parse HEAD 2>/dev/null)" = "$(git -C ${BASEDIR} rev-parse HEAD 2>/dev/null)" ] && \
+         [ -n "$(git -C ${BASEDIR} rev-parse HEAD 2>/dev/null)" ]; then
+        # The overlay would install the commit that is already running. That happens when a commit
+        # was pulled straight into BASEDIR: the updater tracks its own overlay, so its next fetch
+        # finalizes a copy of what is already here, and the swap below would spend ~1 minute moving
+        # 1.9 GB across eMMC to change nothing. Drop it and boot; the updater regenerates it.
+        echo "Finalized overlay is the running commit, skipping installation"
+        rm -rf "${STAGING_ROOT}/finalized"
+      elif [ -f "${STAGING_ROOT}/finalized/.overlay_consistent" ]; then
         if [ ! -d /data/safe_staging/old_openpilot ]; then
           echo "Valid overlay update found, installing"
           LAUNCHER_LOCATION="${BASH_SOURCE[0]}"
