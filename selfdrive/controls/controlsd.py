@@ -3,6 +3,7 @@ import os
 import math
 import time
 import threading
+from collections import deque
 from typing import SupportsFloat
 
 import cereal.messaging as messaging
@@ -160,6 +161,9 @@ class Controls:
     self.logged_comm_issue = None
     self.not_running_prev = None
     self.steer_limited_by_safety = False
+    # the last few torque requests, so carOutput (which trails the request by one to three cycles)
+    # can be checked against the request that produced it rather than the newest one
+    self.recent_steer_requests = deque([0.0] * 3, maxlen=3)
     self.curvature = 0.0
     self.desired_curvature = 0.0
     self.experimental_mode = False
@@ -853,7 +857,14 @@ class Controls:
         self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
                                               STEER_ANGLE_SATURATION_THRESHOLD
       else:
-        self.steer_limited_by_safety = abs(CC.actuators.steer - CO.actuatorsOutput.steer) > 1e-2
+        # carOutput reflects a request from one to three cycles ago (card publishes carOutput before
+        # it applies the newest carControl), so comparing it with THIS cycle's request flags every
+        # smooth change faster than 0.01/frame as limited -- on the interceptor that is 6 counts against
+        # an 8-10 count/frame ramp, and it froze the integrator on 55-77 % of turn frames. The output
+        # is limited only if it matches none of the recent requests: unclipped output equals one of
+        # them to within 1/STEER_MAX; rate-, driver- or safety-limited output equals none.
+        self.steer_limited_by_safety = all(abs(req - CO.actuatorsOutput.steer) > 1e-2 for req in self.recent_steer_requests)
+      self.recent_steer_requests.append(CC.actuators.steer)
 
     force_decel = (self.sm['driverMonitoringState'].awarenessStatus < 0.) or \
                   (self.state == State.softDisabling) or \
