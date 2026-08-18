@@ -38,7 +38,6 @@ class Car:
     self.CC_prev = car.CarControl.new_message()
     self.CS_prev = car.CarState.new_message()
     self.initialized_prev = False
-    self.controls_ready_signalled = False
 
     self.last_actuators_output = car.CarControl.Actuators.new_message()
 
@@ -192,13 +191,12 @@ class Car:
   def controls_update(self, CS: car.CarState, CC: car.CarControl):
     """control update loop, driven by carControl"""
 
-    if not self.initialized_prev and not self.controls_ready_signalled:
+    if not self.initialized_prev:
       # Initialize CarInterface, once controls are ready
       # TODO: this can make us miss at least a few cycles when doing an ECU knockout
       self.CI.init(self.CP, self.can_sock, self.pm.sock['sendcan'])
       # signal pandad to switch to car safety mode
       self.params.put_bool_nonblocking("ControlsReady", True)
-      self.controls_ready_signalled = True
 
     if self.sm.all_alive(['carControl']):
       # send car controls over can
@@ -214,21 +212,6 @@ class Car:
     self.update_events(CS)
 
     self.state_publish(CS, FPCS)
-
-    # Signal pandad to switch to the car's safety mode on the FIRST frame when the interface's
-    # init() is the no-op base implementation, instead of waiting for controlsd to finish
-    # initializing. Waiting cost 6 s on every ignition-on here: controlsd's init needs canValid,
-    # Mazda's canValid needs the camera bus, the panda only forwards that bus once it leaves
-    # elm327 mode, and it only leaves elm327 mode on this signal -- a loop that nothing but
-    # controlsd's 6 s timeout could break. Actuation below keeps its gate on controlsd, so the
-    # only thing that moves earlier is the mode switch; and elm327 permits no non-diagnostic
-    # transmit anyway, so nothing could reach the bus early even if it tried. Interfaces whose
-    # init() does real work (ECU knockouts) keep the original ordering.
-    if not self.controls_ready_signalled and not self.CP.passive and \
-       type(self.CI).init is CarInterfaceBase.init:
-      self.CI.init(self.CP, self.can_sock, self.pm.sock['sendcan'])
-      self.params.put_bool_nonblocking("ControlsReady", True)
-      self.controls_ready_signalled = True
 
     initialized = (not any(e.name == EventName.controlsInitializing for e in self.sm['onroadEvents']) and
                    self.sm.seen['onroadEvents'])
