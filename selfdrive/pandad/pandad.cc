@@ -46,6 +46,9 @@
 using namespace std::chrono_literals;
 
 std::atomic<bool> ignition(false);
+// mirrored from panda_state_thread for the relay logic in send_panda_states and the exit path
+std::atomic<bool> panda_is_onroad(false);
+std::atomic<bool> panda_engaged(false);
 
 ExitHandler do_exit;
 
@@ -327,8 +330,11 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
       panda->set_power_saving(power_save_desired);
     }
 
-    // set safety mode to NO_OUTPUT when car is off. ELM327 is an alternative if we want to leverage athenad/connect
-    if (!ignition_local && (health.safety_mode_pkt != (uint8_t)(cereal::CarParams::SafetyModel::NO_OUTPUT)) && (nanos_since_boot() - last_door_lock_command_time >= 2e9)) {
+    // set safety mode to NO_OUTPUT when car is off or we're not onroad. ELM327 is an alternative if we want to leverage athenad/connect
+    // (upstream #35739: going offroad with the ignition on -- toggle, thermal -- otherwise leaves the relay
+    // closed with nobody spoofing the camera's LKAS frames, and the car faults)
+    bool should_close_relay = !ignition_local || !panda_is_onroad;
+    if (should_close_relay && (health.safety_mode_pkt != (uint8_t)(cereal::CarParams::SafetyModel::NO_OUTPUT)) && (nanos_since_boot() - last_door_lock_command_time >= 2e9)) {
       panda->set_safety_model(cereal::CarParams::SafetyModel::NO_OUTPUT);
     }
 
@@ -501,6 +507,7 @@ void panda_state_thread(std::vector<Panda *> pandas, bool spoofing_started) {
     }
 
     is_onroad = params.getBool("IsOnroad");
+    panda_is_onroad = is_onroad;
 
     // set new safety on onroad transition, after params are cleared
     if (is_onroad && !is_onroad_last) {
@@ -515,6 +522,7 @@ void panda_state_thread(std::vector<Panda *> pandas, bool spoofing_started) {
 
     sm.update(0);
     const bool engaged = sm.allAliveAndValid({"controlsState"}) && sm["controlsState"].getControlsState().getEnabled();
+    panda_engaged = engaged;
 
     for (const auto &panda : pandas) {
       panda->send_heartbeat(engaged);
@@ -621,6 +629,20 @@ void pandad_main_thread(std::vector<std::string> serials) {
     threads.emplace_back(can_recv_thread, pandas);
 
     for (auto &t : threads) t.join();
+  }
+
+  // Close relay on exit to prevent a fault (upstream #32103). In a car safety mode the panda blocks
+  // the camera's own CAM_LKAS/CAM_LANEINFO so openpilot can spoof them; if we exit with the ignition
+  // on (reboot, update, manager restart) the firmware holds that mode for its 5 s heartbeat timeout
+  // with nobody spoofing, and the Mazda EPS latches the forward-camera fault for the ignition cycle.
+  // Skipped while engaged, as upstream does, so a crash mid-engagement still trips the panda's
+  // heartbeat-lost path (siren) instead of silently handing the car back.
+  if (panda_is_onroad && !panda_engaged) {
+    for (Panda *panda : pandas) {
+      if (panda->connected()) {
+        panda->set_safety_model(cereal::CarParams::SafetyModel::NO_OUTPUT);
+      }
+    }
   }
 
   for (Panda *panda : pandas) {
