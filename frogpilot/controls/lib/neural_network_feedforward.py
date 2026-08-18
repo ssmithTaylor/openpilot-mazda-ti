@@ -324,7 +324,13 @@ class LatControlNNFF(LatControl):
           # compute feedforward (same as nn setpoint output)
           error = setpoint - measurement
           friction_input = self.lat_accel_friction_factor * error + self.lat_jerk_friction_factor * lookahead_lateral_jerk
-          nn_input = [CS.vEgo, desired_lateral_accel, friction_input, roll] + past_lateral_accels_desired + future_lateral_accels + nnff_common
+          # latAccelOffset (torqued) is the lateral accel the car has at zero torque beyond what roll
+          # explains; LatControlTorque subtracts it from the feedforward's lateral accel, do the same
+          # for every lateral-accel input of the feedforward evaluation (0.0 unless live params apply)
+          lat_accel_offset = self.torque_params.latAccelOffset
+          nn_input = [CS.vEgo, desired_lateral_accel - lat_accel_offset, friction_input, roll] + \
+                     [x - lat_accel_offset for x in past_lateral_accels_desired] + \
+                     [x - lat_accel_offset for x in future_lateral_accels] + nnff_common
           ff = self.lat_torque_nn_model.evaluate(nn_input)
 
           # apply friction override for cars with low NN friction response
@@ -338,14 +344,16 @@ class LatControlNNFF(LatControl):
 
           error = desired_lateral_accel - actual_lateral_accel
           friction_input = self.lat_accel_friction_factor * error + self.lat_jerk_friction_factor * lookahead_lateral_jerk
-          ff = self.torque_from_lateral_accel(gravity_adjusted_lateral_accel, self.torque_params)
+          # same offset treatment as LatControlTorque
+          ff = self.torque_from_lateral_accel(gravity_adjusted_lateral_accel - self.torque_params.latAccelOffset, self.torque_params)
       else:
         torque_from_measurement = self.torque_from_lateral_accel(measurement, self.torque_params)
         torque_from_setpoint = self.torque_from_lateral_accel(setpoint, self.torque_params)
 
         pid_log.error = float(torque_from_setpoint - torque_from_measurement)
 
-        ff = self.torque_from_lateral_accel(gravity_adjusted_lateral_accel, self.torque_params)
+        # same offset treatment as LatControlTorque
+        ff = self.torque_from_lateral_accel(gravity_adjusted_lateral_accel - self.torque_params.latAccelOffset, self.torque_params)
 
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       output_torque = self.pid.update(pid_log.error,
