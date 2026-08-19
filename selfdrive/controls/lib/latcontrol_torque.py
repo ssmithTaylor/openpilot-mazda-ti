@@ -34,6 +34,17 @@ FRICTION_DEADZONE = 0.04   # m/s^2 of error below which the friction term is off
                            # chattering about noise (measured 250-330 sign flips/min without it)
 FRICTION_TORQUE = 0.10     # normalized torque of breakaway help at full error
 
+# Stiction breaker. The rack does not answer a torque command until static friction lets go, and
+# measured over 482 stick-then-move events it wanted a median 30 counts more than it was getting
+# (p90 91) after sitting still for a median 0.8 s. These fire it only while that is happening.
+BREAK_ERR = 0.10           # m/s^2 of error worth unsticking the wheel for
+BREAK_STICK_RATE = 1.0     # deg/s: below this the wheel is not moving
+BREAK_FREE_RATE = 2.0      # deg/s: above this it is moving and the boost lets go
+BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes through zero rate on every
+                           # direction reversal, and that is not the same thing as being stuck
+BREAK_MAX = 0.15           # normalized torque, ~90 counts at a 600 ceiling: the p90 of what was needed
+BREAK_RAMP = 0.25          # s to reach full boost, so it is never a step onto the wheel
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -53,6 +64,8 @@ class LatControlTorque(LatControl):
     self.plant = getattr(CI, "lateral_plant", None)
     self.ff_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
     self.friction_torque = FRICTION_TORQUE
+    self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
+    self.break_boost = 0.0       # counts, ramped, signed in the command's frame
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     if self.plant is not None:
@@ -69,6 +82,8 @@ class LatControlTorque(LatControl):
 
   def reset(self):
     super().reset()
+    self.break_frames = 0
+    self.break_boost = 0.0
     if self.plant is not None:
       self.plant.reset()
 
@@ -102,6 +117,8 @@ class LatControlTorque(LatControl):
 
     if not active:
       self.plant.u_prev = 0.0
+      self.break_frames = 0
+      self.break_boost = 0.0
       pid_log.active = False
       return 0.0, 0.0, pid_log
 
@@ -150,6 +167,24 @@ class LatControlTorque(LatControl):
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
     command = float(np.clip(command + friction_torque, -u_max, u_max))
 
+    # Stiction breaker. Only while the wheel is genuinely stuck: the driver is not steering, the
+    # error is worth acting on, the wheel is not moving, and it has been that way long enough that a
+    # zero-crossing mid-reversal cannot trigger it. Ramped in and out so it never steps, and it lets
+    # go the moment the wheel moves -- the plant is a full 2x quicker once it is already sliding.
+    wheel_rate = abs(float(CS.steeringRateDeg))
+    stuck = (abs(error) > BREAK_ERR and wheel_rate < BREAK_STICK_RATE
+             and not CS.steeringPressed and not steer_limited_by_safety)
+    self.break_frames = self.break_frames + 1 if stuck else 0
+    engaged_long_enough = self.break_frames * self.dt >= BREAK_DEBOUNCE
+    if engaged_long_enough and wheel_rate < BREAK_FREE_RATE:
+      direction = np.sign(command) if command != 0.0 else np.sign(error)
+      target = BREAK_MAX * u_max * float(direction)
+    else:
+      target = 0.0
+    step = BREAK_MAX * u_max * self.dt / BREAK_RAMP
+    self.break_boost += float(np.clip(target - self.break_boost, -step, step))
+    command = float(np.clip(command + self.break_boost, -u_max, u_max))
+
     output_torque = command / u_max
     self.plant.u_prev = -command   # wire convention: actuators.steer is positive left
 
@@ -162,7 +197,7 @@ class LatControlTorque(LatControl):
     pid_log.output = float(-output_torque)
     pid_log.actualLateralAccel = float(measurement)
     pid_log.desiredLateralAccel = float(setpoint)
-    pid_log.frictionTorque = float(friction_torque / u_max)
+    pid_log.frictionTorque = float((friction_torque + self.break_boost) / u_max)
     pid_log.saturated = bool(self._check_saturation(abs(command) >= u_max - 1.0, CS, steer_limited_by_safety, curvature_limited))
 
     # TODO left is positive in this convention
