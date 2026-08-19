@@ -303,6 +303,8 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LaneDetectionWidth", "0", 1, "0"),
   ("LaneLinesWidth", "4", 2, "2"),
   ("LatOutputFilter", "0", 3, "0"),
+  ("LatNoFrictionRelay", "0", 3, "0"),
+  ("LatStallModulation", "1", 3, "1"),
   ("LateralTune", "0", 1, "0"),
   ("LeadDepartingAlert", "0", 0, "0"),
   ("LeadDetectionThreshold", "35", 3, "50"),
@@ -699,6 +701,14 @@ class FrogPilotVariables:
     toggle.lat_output_filter = (params.get_bool("LatOutputFilter")
                                 if toggle.tuning_level >= level["LatOutputFilter"]
                                 else default.get_bool("LatOutputFilter"))
+    # Both of these only ever reduce the command, so like the output filter they are safe to move
+    # while driving and are not gated on parked the way the limit sliders are.
+    toggle.lat_no_friction_relay = (params.get_bool("LatNoFrictionRelay")
+                                    if toggle.tuning_level >= level["LatNoFrictionRelay"]
+                                    else default.get_bool("LatNoFrictionRelay"))
+    toggle.lat_stall_modulation = (params.get_bool("LatStallModulation")
+                                   if toggle.tuning_level >= level["LatStallModulation"]
+                                   else default.get_bool("LatStallModulation"))
     toggle.ti_steer_max = int(np.clip(params.get_float("TiSteerMax"), 100, 1200)) if ti_tune and toggle.tuning_level >= level["TiSteerMax"] else int(default.get_float("TiSteerMax"))
     # Ranges below are tighter than they were. The panda applies no steering checks at all to
     # MAZDA_TI_LKAS on gen1 -- only the stock 0x243 path is rate and magnitude limited -- so these

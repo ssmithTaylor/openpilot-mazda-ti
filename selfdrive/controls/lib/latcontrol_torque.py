@@ -54,6 +54,39 @@ BREAK_RAMP = 0.25          # s to reach full boost, so it is never a step onto t
 OUT_FILTER_TAU = 0.25      # s
 OUT_FILTER_FLAG = 8        # added to plantState while active, so a drive can be split on it
 
+# Breakaway prediction, from the unsaturated column torque on 0x75. Across 23 recorded stalls
+# (demand over 3.0 m/s^2, command at the clip, wheel stopped for at least 0.30 s) this separates
+# the ones that free themselves from the ones that do not, with no overlap: 123-202 counts broke
+# free and went on to make the corner, 203-337 stayed locked. Wheel angle does not separate them.
+# The margin below 202 is deliberate -- being wrong in the "predict it will recover" direction
+# suppresses a warning the driver wanted, so only claim recovery well inside the boundary.
+BREAKAWAY_TORQUE = 202.0   # counts of column torque at which the rack stops answering
+BREAKAWAY_MARGIN = 25.0    # counts of headroom before claiming the wheel will move
+
+# Modulation at saturation. The breaker adds torque, and adding to a command already at the clip
+# does nothing -- measured: frictionTorque -0.226 while the output sat at 1.000 and the wheel did
+# not move for another 2.5 s. Unloading is the only direction left, so drop the command briefly
+# and re-apply; the transient is what breaks static friction, not the magnitude.
+#
+# The period is set by the car controller rate limits, not by preference: TiSteerDeltaDown 15 and
+# TiSteerDeltaUp 10 per frame at 100 Hz means a 150-count round trip cannot complete faster than
+# about 0.25 s. Asking for more just produces a smaller triangle.
+# Depth is measured, not chosen. Across 410 recorded releases -- a rack sitting still, the command
+# falling, the rack letting go -- the command had to drop a median 116 counts and a p75 of 178 before
+# anything moved, and that figure is flat across load. 178 of 600 is 30 %. Sizing on p75 rather than
+# the median because a pulse that fails to release is wasted; sizing below p90 because every count of
+# unload is authority briefly given up.
+STALL_MOD_CLIP = 0.995     # fraction of u_max at or above which the command counts as clipped
+STALL_MOD_DEPTH = 0.30     # fraction of u_max to unload -- the p75 of what actually releases a rack
+# Period is set by the car controller's slew limits, not by preference: TiSteerDeltaDown 15/frame
+# unloads 180 counts in 0.12 s, TiSteerDeltaUp 10/frame restores them in 0.18 s, so a cycle cannot
+# complete in under 0.30 s. 0.40 s with 35 % duty gives 0.14 s to fall and 0.26 s to recover, both
+# with margin, and fits six cycles inside the time limit.
+STALL_MOD_PERIOD = 0.40    # s per unload/reapply cycle
+STALL_MOD_DUTY = 0.35      # fraction of the cycle spent unloaded
+STALL_MOD_MAX = 2.5        # s: if it has not broken loose by now it is not going to, stop shaking
+STALL_MOD_FLAG = 16        # added to plantState while modulating
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -77,6 +110,8 @@ class LatControlTorque(LatControl):
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
     self.out_filter = FirstOrderFilter(0.0, OUT_FILTER_TAU, self.dt)
     self.out_filter_on = 0.0     # blend weight, ramped, so both directions are continuous
+    self.mod_t = 0.0             # s the rack has been stalled against the clip
+    self.modulating = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     if self.plant is not None:
@@ -97,6 +132,8 @@ class LatControlTorque(LatControl):
     self.break_boost = 0.0
     self.out_filter.x = 0.0
     self.out_filter_on = 0.0
+    self.mod_t = 0.0
+    self.modulating = False
     if self.plant is not None:
       self.plant.reset()
 
@@ -175,7 +212,8 @@ class LatControlTorque(LatControl):
     # in play there is nothing to break away, so send nothing rather than a standing offset that
     # would step onto the wheel the moment an actuator comes back.
     friction_torque = 0.0
-    if la_max > 0.0:
+    relay_off = bool(getattr(frogpilot_toggles, "lat_no_friction_relay", False))
+    if la_max > 0.0 and not relay_off:
       friction_torque = self.friction_torque * u_max * float(np.clip(
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
     command = float(np.clip(command + friction_torque, -u_max, u_max))
@@ -198,6 +236,27 @@ class LatControlTorque(LatControl):
     self.break_boost += float(np.clip(target - self.break_boost, -step, step))
     command = float(np.clip(command + self.break_boost, -u_max, u_max))
 
+    # Modulation at saturation. Everything above adds torque, and none of it reaches the car once the
+    # command is clipped -- which is precisely the state a lost corner is in. Unload and re-apply
+    # instead. Conditions are the breaker's, plus the command actually being at the clip.
+    col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
+    # Below the breakaway threshold the rack frees itself, so shaking it would add a disturbance for
+    # nothing. A missing reading (0, e.g. gen2) modulates anyway: doing nothing is what already fails.
+    will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
+    clipped = abs(command) >= STALL_MOD_CLIP * u_max
+    mod_on = bool(getattr(frogpilot_toggles, "lat_stall_modulation", True))
+    if mod_on and clipped and engaged_long_enough and wheel_rate < BREAK_FREE_RATE and not will_recover:
+      self.mod_t += self.dt
+    else:
+      self.mod_t = 0.0
+    self.modulating = 0.0 < self.mod_t <= STALL_MOD_MAX
+    if self.modulating and (self.mod_t % STALL_MOD_PERIOD) / STALL_MOD_PERIOD < STALL_MOD_DUTY:
+      # A square, deliberately. The car controller's slew limits turn it into the steepest ramp the
+      # car accepts, which is both the sharpest transient available for breaking stiction and a
+      # guarantee that nothing reaches the wheel as a step. Shaping it here would only soften it.
+      command *= (1.0 - STALL_MOD_DEPTH)
+    command = float(np.clip(command, -u_max, u_max))
+
     # Optional output smoothing. The filter tracks the command even while it is switched off, so
     # turning it on mid-corner continues from where the command already is instead of stepping
     # down to a stale value. It cannot raise anything: the clip below and the rate limiter and
@@ -217,6 +276,8 @@ class LatControlTorque(LatControl):
 
     if self.out_filter_on > 0.5:
       pid_log.plantState = int(plant_state) + OUT_FILTER_FLAG   # so a drive can be split on it
+    if self.modulating:
+      pid_log.plantState = int(pid_log.plantState) + STALL_MOD_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
@@ -227,7 +288,11 @@ class LatControlTorque(LatControl):
     pid_log.actualLateralAccel = float(measurement)
     pid_log.desiredLateralAccel = float(setpoint)
     pid_log.frictionTorque = float((friction_torque + self.break_boost) / u_max)
-    pid_log.saturated = bool(self._check_saturation(abs(command) >= u_max - 1.0, CS, steer_limited_by_safety, curvature_limited))
+    # The rack is loaded well below where it stops answering, so it is going to move: sitting at the
+    # clip here is not a loss of control and does not deserve a warning. 0 means the car did not
+    # publish a reading, which falls through to the old behaviour.
+    pid_log.saturated = bool(self._check_saturation(abs(command) >= u_max - 1.0, CS, steer_limited_by_safety,
+                                                    curvature_limited, expected_to_recover=will_recover))
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log

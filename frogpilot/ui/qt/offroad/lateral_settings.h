@@ -36,7 +36,8 @@ private:
                                          "TiSteerDeltaUpHigh", "TiSteerDeltaDown", "TiSteerDriverAllowance",
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
                                          "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
-                                         "LatOutputFilter"};
+                                         "LatOutputFilter", "LatNoFrictionRelay",
+                                         "LatStallModulation"};
 
   QSet<QString> parentKeys;
 

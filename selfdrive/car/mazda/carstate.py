@@ -171,6 +171,7 @@ class CarState(CarStateBase):
     fp_ret.lkasBlocked = bool(lkas_blocked)
     fp_ret.lkasEffective = float(cp.vl["STEER_RATE"]["LKAS_EFFECTIVE"])
     fp_ret.tiActive = bool(self.ti_lkas_allowed)
+    fp_ret.columnTorque = float(cp.vl["STEER_RELATED"]["STEER_TORQUE"])
 
     return ret, fp_ret
 
@@ -272,6 +273,9 @@ class CarState(CarStateBase):
         ("BLINK_INFO", 10),
         ("STEER_RATE", 83),
         ("STEER_TORQUE", 83),
+        # Unsaturated column torque. STEER_TORQUE on 0x240 clips at the top of its range under
+        # exactly the loads worth measuring; this one is 12-bit and does not.
+        ("STEER_RELATED", 100),
         ("WHEEL_SPEEDS", 100),
       ]
 

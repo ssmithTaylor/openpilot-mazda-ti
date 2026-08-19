@@ -135,6 +135,10 @@ struct FrogPilotCarState @0xda96579883444c35 {
   lkasBlocked @16 :Bool;      # EPS is ignoring the stock CAM_LKAS request (below ~45 km/h, hands-off lockout)
   lkasEffective @17 :Float32; # torque the EPS is applying from the stock request, counts, signed (clips at +-308)
   tiActive @18 :Bool;         # interceptor in RUN and not ramping down, i.e. its command reaches the wheel
+  # Column torque off 0x75 STEER_RELATED, 12-bit and unsaturated, counts. This is the load the rack
+  # is working against. The 0x240 sensor the controller used to read pins at 32-33 whenever it
+  # matters, so it cannot answer "is the wheel about to move". 0 = not published (gen2).
+  columnTorque @19 :Float32;
 
   struct ButtonEvent {
     enum Type {

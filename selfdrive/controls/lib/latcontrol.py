@@ -24,9 +24,14 @@ class LatControl(ABC):
   def reset(self):
     self.sat_time = 0.
 
-  def _check_saturation(self, saturated, CS, steer_limited_by_safety, curvature_limited):
-    # Saturated only if control output is not being limited by car torque/angle rate limits
-    if (saturated or curvature_limited) and CS.vEgo > self.sat_check_min_speed and not steer_limited_by_safety and not CS.steeringPressed:
+  def _check_saturation(self, saturated, CS, steer_limited_by_safety, curvature_limited,
+                        expected_to_recover=False):
+    # Saturated only if control output is not being limited by car torque/angle rate limits.
+    #
+    # expected_to_recover: the car port can say it knows the actuator is about to catch up, in
+    # which case sitting at the clip is not a loss of control and should not raise a warning. It
+    # only ever suppresses -- a port that cannot tell leaves it False and gets the old behaviour.
+    if (saturated or curvature_limited) and CS.vEgo > self.sat_check_min_speed and not steer_limited_by_safety and not CS.steeringPressed and not expected_to_recover:
       self.sat_time += self.dt
     else:
       self.sat_time -= self.dt

@@ -78,6 +78,8 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"TiSteerDriverAllowance", tr("Driver Torque Allowance"), tr("<b>How firmly you can hold the wheel before openpilot starts easing off.</b> Raise if assist fades just from resting a hand on the wheel; lower to hand over control sooner."), ""},
     {"TiSteerDriverMultiplier", tr("Driver Torque Backoff"), tr("<b>How sharply assist drops once you push past the allowance.</b> Lower it if steering gives up on you mid-corner; raise it to hand over control more readily. At the default of 40, assist is gone almost immediately."), ""},
     {"LatOutputFilter", tr("Smooth Steering Output"), tr("<b>Low-pass the steering command before it goes out.</b> About a third of the command's movement is faster than the steering rack can follow, so it becomes torque you feel at the rim rather than motion of the car. Smoothing it removes that without changing how firmly openpilot holds the lane. Safe to switch on and off while driving, so you can feel the difference on the same piece of road."), ""},
+    {"LatNoFrictionRelay", tr("Disable Centring Nudge"), tr("<b>Stop adding a constant nudge toward the lane centre.</b> openpilot adds a small steady torque in whichever direction it is correcting, on straight road as much as anywhere. On this car it is active about two thirds of the time on a straight and does little except add movement you feel at the rim. Turning it off should make the wheel calmer; if the car starts wandering slightly within the lane instead, turn it back on. Safe to switch while driving."), ""},
+    {"LatStallModulation", tr("Unstick Jammed Steering"), tr("<b>Shake the wheel loose when it jams at full steering.</b> In a hard corner the steering can stop moving while openpilot is already asking for everything it has, and asking harder does nothing. This briefly eases off and re-applies, which is what actually unsticks it. It only ever asks for less, never more, and only while the wheel is stopped and openpilot is at its limit."), ""},
     {"TiSteerThreshold", tr("Steering Pressed Threshold"), tr("<b>How much pressure on the wheel counts as you taking over.</b> Raise if bumps and road feedback falsely trigger a takeover; lower to have openpilot notice your input sooner."), ""},
     {"TiMcpEnabled", tr("Telemetry Service"), tr("<b>Serve the tuning counters on the local network so a laptop can read them while you drive.</b> Read-only and unauthenticated, so anyone on the same network can see driving state. Turn it off on networks you do not trust. Requires a reboot to take effect."), ""},
     {"ClearTiStats", tr("Start A New Measurement"), tr("<b>Zero the tuning counters so the next stretch of road is measured on its own.</b> The previous run's figures are kept for comparison. Turn this on just before the corner or road you want to judge a change on."), ""},
@@ -278,6 +280,17 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   QSet<QString> forceUpdateKeys = {"ForceAutoTune", "ForceAutoTuneOff", "LateralTune", "NNFF", "NudgelessLaneChange"};
   for (const QString &key : forceUpdateKeys) {
     QObject::connect(static_cast<ToggleControl*>(toggles[key]), &ToggleControl::toggleFlipped, this, &FrogPilotLateralPanel::updateToggles);
+  }
+
+  // Toggles meant to be flipped while moving. Flipping one writes the param, but nothing tells
+  // the running processes to re-read it -- that only happens when the settings window hides. A
+  // drive meant to compare the output filter on against off ran with it off for all 21 minutes
+  // because of this, and only the plantState flag showed it. Notify on the flip itself.
+  QSet<QString> liveUpdateKeys = {"LatOutputFilter", "LatNoFrictionRelay", "LatStallModulation"};
+  for (const QString &key : liveUpdateKeys) {
+    QObject::connect(static_cast<ToggleControl*>(toggles[key]), &ToggleControl::toggleFlipped, [](bool) {
+      updateFrogPilotToggles();
+    });
   }
 
   QSet<QString> rebootKeys = {"AlwaysOnLateral", "ForceTorqueController", "NNFF", "NNFFLite"};
