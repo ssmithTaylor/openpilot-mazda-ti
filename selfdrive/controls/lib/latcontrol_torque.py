@@ -45,6 +45,15 @@ BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes throu
 BREAK_MAX = 0.15           # normalized torque, ~90 counts at a 600 ceiling: the p90 of what was needed
 BREAK_RAMP = 0.25          # s to reach full boost, so it is never a step onto the wheel
 
+# Optional smoothing of the finished command ("Smooth Steering Output"). Measured on straight
+# road above 60 km/h, the command carries 33 counts RMS above 0.5 Hz -- a third of its total
+# variation -- which the rack turns into 0.45 deg of wheel motion and 0.061 m/s^2 of car motion.
+# The plan it is following has only 0.6 % of its power up there, so this is the controller's own
+# content, not something the road asked for. Whether removing it feels better or just vague is a
+# question for the driver, hence the toggle.
+OUT_FILTER_TAU = 0.25      # s
+OUT_FILTER_FLAG = 8        # added to plantState while active, so a drive can be split on it
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -66,6 +75,8 @@ class LatControlTorque(LatControl):
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
+    self.out_filter = FirstOrderFilter(0.0, OUT_FILTER_TAU, self.dt)
+    self.out_filter_on = 0.0     # blend weight, ramped, so both directions are continuous
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     if self.plant is not None:
@@ -84,6 +95,8 @@ class LatControlTorque(LatControl):
     super().reset()
     self.break_frames = 0
     self.break_boost = 0.0
+    self.out_filter.x = 0.0
+    self.out_filter_on = 0.0
     if self.plant is not None:
       self.plant.reset()
 
@@ -185,9 +198,25 @@ class LatControlTorque(LatControl):
     self.break_boost += float(np.clip(target - self.break_boost, -step, step))
     command = float(np.clip(command + self.break_boost, -u_max, u_max))
 
+    # Optional output smoothing. The filter tracks the command even while it is switched off, so
+    # turning it on mid-corner continues from where the command already is instead of stepping
+    # down to a stale value. It cannot raise anything: the clip below and the rate limiter and
+    # the interceptor's own bounds all still apply.
+    smooth = bool(getattr(frogpilot_toggles, "lat_output_filter", False))
+    filtered = self.out_filter.update(command)
+    # Blend rather than switch. Enabling is continuous either way because the filter tracks the
+    # command while it is off, but DISABLING would hand back the raw command in one frame -- a step
+    # the size of whatever ripple was being removed. Ramping the blend makes both directions
+    # continuous, which is the point of a control meant to be flipped while moving.
+    self.out_filter_on += float(np.clip((1.0 if smooth else 0.0) - self.out_filter_on,
+                                        -self.dt / OUT_FILTER_TAU, self.dt / OUT_FILTER_TAU))
+    command = float(np.clip(command + self.out_filter_on * (filtered - command), -u_max, u_max))
+
     output_torque = command / u_max
     self.plant.u_prev = -command   # wire convention: actuators.steer is positive left
 
+    if self.out_filter_on > 0.5:
+      pid_log.plantState = int(plant_state) + OUT_FILTER_FLAG   # so a drive can be split on it
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)

@@ -35,7 +35,8 @@ private:
   QSet<QString> torqueInterceptorKeys = {"TiSteerMax", "TiSteerDeltaUp", "TiSteerDeltaUpKnee",
                                          "TiSteerDeltaUpHigh", "TiSteerDeltaDown", "TiSteerDriverAllowance",
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
-                                         "ClearTiStats", "TiFlagMoment", "TiMcpEnabled"};
+                                         "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
+                                         "LatOutputFilter"};
 
   QSet<QString> parentKeys;
 

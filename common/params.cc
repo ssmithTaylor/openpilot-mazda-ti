@@ -382,6 +382,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"LaneChangeTime", PERSISTENT},
     {"LaneDetectionWidth", PERSISTENT},
     {"LaneLinesWidth", PERSISTENT},
+    {"LatOutputFilter", PERSISTENT},
     {"LastMapsUpdate", PERSISTENT},
     {"LateralTune", PERSISTENT},
     {"LeadDepartingAlert", PERSISTENT},
