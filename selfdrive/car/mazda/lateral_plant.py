@@ -15,10 +15,21 @@ another car) is a chord through that convex, clipped, state-dependent curve: too
 commands, too strong at large ones, and it moves with whatever roads were driven last. This module
 is the measured shape instead, so the feedforward can be inverted from it.
 
-Fitted 2026-08-18 from 119 min of engaged driving on this car (22 routes, TI-analysis/tools/
-rlog_analysis/plant_fit.py; per-band r^2 0.61-0.94). The shape and tables are properties of the EPS
-firmware and the interceptor's DAC scaling and are fixed; live learning is limited to
-latAccelOffset today and, later, a bounded gain multiplier per actuator state.
+These are STEADY-STATE gains. The car does not answer a command and stop: identification over
+119 min of engaged driving (39 routes; TI-analysis/tools/rlog_analysis/dyn_fit.py) puts a 1.0 s
+first-order lag behind 0.2 s of pure delay, r^2 0.79 against 0.73 for the "answered within 0.3 s"
+assumption the first cut of these tables was fitted on. That first cut therefore held a 0.3 s map,
+and a feedforward inverting it over-commanded whenever a corner lasted -- measured 1.2-1.3x too much
+torque with both actuators live. Refitted 2026-08-18: q from interceptor-alone frames with an
+instrumented estimator (the command is generated inside the loop, so plain least squares is biased;
+modelV2's desired lateral accel is the instrument), g_s from the same dynamics with q held fixed.
+Scored against every recorded frame (model_check.py), the tables now sit within 5 % of measured for
+both actuators from 250 counts up, and run deliberately strong with the interceptor alone (0.75-0.86
+of measured), which under-commands rather than over-steers where the data is thinnest.
+
+The shape and tables are properties of the EPS firmware and the interceptor's DAC scaling and are
+fixed; live learning is limited to latAccelOffset today and, later, a bounded gain multiplier per
+actuator state.
 
 Sign convention here: `u` (counts) and `la` (m/s^2) are both positive = left, matching the wire.
 The controller works in its own frame and handles signs at the call site.
@@ -27,13 +38,13 @@ import numpy as np
 
 # --- fitted tables (see module docstring) -----------------------------------------------------
 V_BP = [7.0, 12.5, 15.0, 17.5, 20.0, 25.0, 30.0, 35.0]              # m/s (25, 45, 54, 63, 72, 90, 108, 126 km/h)
-Q_BP = [2.5e-6, 2.6e-6, 2.4e-6, 3.7e-6, 4.2e-6, 4.3e-6, 4.3e-6, 4.4e-6]    # m/s^2 per count^2, interceptor
-GS_BP = [1.0e-3, 1.0e-3, 1.1e-3, 1.2e-3, 1.3e-3, 1.8e-3, 1.9e-3, 1.95e-3]  # m/s^2 per LKAS_EFFECTIVE count, stock
+Q_BP = [2.79e-6, 3.14e-6, 3.49e-6, 4.00e-6, 4.51e-6, 4.96e-6, 4.96e-6, 4.96e-6]  # m/s^2 per count^2, interceptor
+GS_BP = [1.21e-3, 1.21e-3, 1.31e-3, 1.88e-3, 2.14e-3, 2.34e-3, 2.41e-3, 2.41e-3]  # m/s^2 per LKAS_EFFECTIVE count, stock
 
 K_EFF = 0.90            # LKAS_EFFECTIVE the EPS applies per count of stock request, settled (measured p50 0.91)
 EFF_MAX = 308.0         # EPS clip on the stock path (never exceeded in 342 segments)
 U_EFF_CLIP = EFF_MAX / K_EFF   # 342 counts of request: above this the stock path adds nothing more
-U_KNEE = 250.0          # below this the interceptor term is linearised so the inverse stays finite at 0
+U_KNEE = 150.0          # below this the interceptor term is linearised so the inverse stays finite at 0
 EFF_RAMP_UP = 1.5       # counts/frame the EPS ramps LKAS_EFFECTIVE in after LKAS_BLOCK clears (measured 1.4-1.6)
 
 # ramp-in bookkeeping

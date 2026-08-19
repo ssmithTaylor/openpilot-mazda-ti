@@ -66,14 +66,16 @@ class TestForward:
     assert at_clip == pytest.approx(p._gs(v) * EFF_MAX, abs=1e-9)
 
   def test_authority_matches_measurements(self):
-    """la_max against the drives: TI alone ~1.0 m/s2 at 600 counts below 52 km/h, ~1.55 above 65;
-    with the stock path on, ~2.0-2.2 at speed."""
+    """la_max against the drives. These are steady-state values -- what the car reaches if the
+    command is held, not what it has done 0.3 s in -- so they sit above the numbers the first cut of
+    these tables carried. Measured at the ceiling on interceptor-alone frames: 1.13 m/s2 at 45 km/h,
+    1.6-1.8 above 70; with the stock path on, 2.3-2.5 at speed (model_check.py)."""
     ti_only = plant(ti_active=True, stock_active=False)
-    assert ti_only.la_max(12.5) == pytest.approx(0.94, abs=0.15)
-    assert ti_only.la_max(20.0) == pytest.approx(1.51, abs=0.15)
+    assert ti_only.la_max(12.5) == pytest.approx(1.13, abs=0.15)
+    assert ti_only.la_max(20.0) == pytest.approx(1.62, abs=0.15)
     both = plant()
-    assert both.la_max(20.0) == pytest.approx(2.0, abs=0.2)
-    assert both.la_max(25.0) == pytest.approx(2.1, abs=0.2)
+    assert both.la_max(20.0) == pytest.approx(2.28, abs=0.2)
+    assert both.la_max(25.0) == pytest.approx(2.51, abs=0.2)
 
   def test_where_each_actuator_matters(self):
     """The measured split: at small commands the stock path carries at least as much as the
@@ -152,11 +154,14 @@ class TestInverse:
       assert p.inverse(0.0, v) == 0.0
 
   def test_small_command_is_finite_at_zero(self):
-    """Without the knee a pure quadratic needs 141 counts for 0.05 m/s2 at 30 km/h; the knee makes
-    the inverse linear there so small requests do not jump."""
+    """Below the knee the model is linear in the command, so the inverse stays finite and smooth
+    through zero instead of the square root a pure quadratic would give. The knee is 150 counts:
+    small enough that the model does not credit the interceptor with torque it has not got down
+    there (measured 0.85 of the model at 60-150 counts, against 0.68 at a 250-count knee), large
+    enough that the feedforward is not chasing the last few counts around centre."""
     p = plant(ti_active=True, stock_active=False)
     v = 8.5
-    assert p.inverse(0.05, v) < 110.0
+    assert p.inverse(0.05, v) < 130.0
     assert p.inverse(0.10, v) < 210.0
 
   def test_ramp_in_uses_the_measurement(self):
@@ -181,7 +186,7 @@ class TestStateMachine:
     code = p.update_state(25.0, lkas_blocked=False, eff_meas=200.0, ti_active=False)
     assert p.stock_active and not p.ti_active
     assert code in (STATE_STOCK_ONLY, STATE_STOCK_ONLY + STATE_RAMP_FLAG)
-    assert p.la_max(25.0) < 0.7      # the stock clip is all that is left
+    assert p.la_max(25.0) < 0.8      # the stock clip is all that is left
 
   def test_both_off(self):
     p = TiLateralPlant()
