@@ -255,7 +255,8 @@ class CarController(CarControllerBase):
                        "started_at": self.ti_stats_started, "route": self.ti_route})
 
   def check_clear_request(self):
-    """The driver tapped "Start A New Measurement". Bank the run as it stands and zero the counters.
+    """The driver tapped "Start A New Measurement". Bank the run as it stands -- counters and
+    flagged moments alike -- and start the next one clean.
 
     Polled at 1Hz next to the flag check, not inside the 0.2Hz publish. When it lived in the
     publish it was consumed at most once every five seconds, so a second tap inside that window
@@ -279,6 +280,18 @@ class CarController(CarControllerBase):
       closing = payload if self.ti_stats["engaged"] else \
                 (self.params_memory.get("TiTuningStats", encoding="utf8") or
                  self.params.get("TiTuningStats", encoding="utf8") or payload)
+      # The moments the driver flagged belong to the run they were taken in, so they close with it
+      # and the new measurement starts with none. Otherwise the list is a week of drives deep and
+      # "the markers from this run" means matching them up by route and wall clock afterwards.
+      # They ride on the run payload rather than in a key of their own: a new params key also has
+      # to be declared in common/params.cc, and that mistake does not fail loudly, it stops the
+      # device booting (RUNBOOK section 2). Banked, not dropped -- same reason the counters are.
+      flagged = self.load_param_list("TiFlaggedMoments")
+      if flagged:
+        try:
+          closing = json.dumps({**json.loads(closing), "flags": flagged})
+        except (ValueError, TypeError):
+          pass          # a payload we cannot parse still banks, just without the flags attached
       self.params.put_nonblocking("TiTuningStatsPrevious", closing)
       # Keep a short history as well as the single previous run. Two slots meant one stray tap on
       # "Start A New Measurement" destroyed the baseline you were comparing against, which is easy
@@ -291,6 +304,8 @@ class CarController(CarControllerBase):
                                     json.dumps(history[-RUN_HISTORY:]))
       except (ValueError, TypeError):
         pass
+      if flagged:
+        self.params.put_nonblocking("TiFlaggedMoments", "[]")
       self.reset_ti_stats()
       cleared = self.ti_payload()
       self.params_memory.put("TiTuningStats", cleared)
