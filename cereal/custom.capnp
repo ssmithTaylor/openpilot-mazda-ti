@@ -129,6 +129,13 @@ struct FrogPilotCarState @0xda96579883444c35 {
   sportGear @14 :Bool;
   trafficModeEnabled @15 :Bool;
 
+  # Mazda w/ Torque Interceptor: the actuator state the EPS reports on STEER_RATE (0x241) and the
+  # interceptor on TI_FEEDBACK (0x24A). The car has two lateral actuators whose authority depends
+  # on these, so the lateral controller needs them every frame.
+  lkasBlocked @16 :Bool;      # EPS is ignoring the stock CAM_LKAS request (below ~45 km/h, hands-off lockout)
+  lkasEffective @17 :Float32; # torque the EPS is applying from the stock request, counts, signed (clips at +-308)
+  tiActive @18 :Bool;         # interceptor in RUN and not ramping down, i.e. its command reaches the wheel
+
   struct ButtonEvent {
     enum Type {
       lkas @0;

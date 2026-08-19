@@ -164,6 +164,14 @@ class CarState(CarStateBase):
     self.lkas_previously_enabled = self.lkas_enabled
     self.lkas_enabled = not self.lkas_disabled
 
+    # Lateral actuator state. This car steers through two actuators at once -- the stock LKAS path
+    # (CAM_LKAS, which the EPS applies and reports back as LKAS_EFFECTIVE, clipped to +-308) and the
+    # Torque Interceptor -- and their authority depends on LKAS_BLOCK and the TI's mode. The lateral
+    # controller models that, so publish what the EPS and the interceptor say rather than assuming.
+    fp_ret.lkasBlocked = bool(lkas_blocked)
+    fp_ret.lkasEffective = float(cp.vl["STEER_RATE"]["LKAS_EFFECTIVE"])
+    fp_ret.tiActive = bool(self.ti_lkas_allowed)
+
     return ret, fp_ret
 
   def update_gen2(self, cp, cp_cam, cp_body, frogpilot_variables):

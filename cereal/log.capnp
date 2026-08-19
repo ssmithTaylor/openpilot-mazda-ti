@@ -797,6 +797,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
+    frictionTorque @13 :Float32;  # friction/breakaway term, normalized torque (see plantState cars)
+    plantState @14 :Int32;        # lateral plant model state: 0 none, 1 stock only, 2 TI only, 3 TI+stock, +4 ramping in
    }
 
   struct LateralLQRState {
@@ -2109,6 +2111,11 @@ struct LiveTorqueParametersData {
   points @10 :List(List(Float32));
   version @11 :Int32;
   useParams @12 :Bool;
+  # cars with a modelled plant per actuator state (Mazda + Torque Interceptor): gain multiplier
+  # on the model while the stock LKAS path is blocked. The unblocked one rides in latAccelFactor*.
+  latAccelFactorBlockedRaw @13 :Float32;
+  latAccelFactorBlockedFiltered @14 :Float32;
+  blockedValid @15 :Bool;
 }
 
 struct LiveDelayData {

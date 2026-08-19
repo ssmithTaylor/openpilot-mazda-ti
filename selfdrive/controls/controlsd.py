@@ -688,12 +688,16 @@ class Controls:
       lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
       actuators.curvature = self.desired_curvature
+      # frogpilotCarState carries the car's lateral actuator state (Mazda TI: LKAS_BLOCK, LKAS_EFFECTIVE,
+      # TI RUN). Pass it only while it is alive and valid; the controllers treat None as "unknown".
+      fp_car_state = self.sm['frogpilotCarState'] if self.sm.all_checks(['frogpilotCarState']) else None
       steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                          self.steer_limited_by_safety, self.desired_curvature,
                                                          curvature_limited, lat_delay,
                                                          self.sm['liveLocationKalman'],
                                                          self.sm['modelV2'],
-                                                         self.frogpilot_toggles)
+                                                         self.frogpilot_toggles,
+                                                         fp_car_state)
       actuators.steer = float(steer)
       actuators.steeringAngleDeg = float(steeringAngleDeg)
 

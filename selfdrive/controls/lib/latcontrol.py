@@ -14,8 +14,11 @@ class LatControl(ABC):
     # we define the steer torque scale as [-1.0...1.0]
     self.steer_max = 1.0
 
+  # fp_car_state (frogpilotCarState) carries per-car actuator state -- e.g. Mazda + Torque Interceptor
+  # reports whether the stock LKAS path is blocked and what torque the EPS is applying on it. None when
+  # the car port does not publish it, or the message is stale.
   @abstractmethod
-  def update(self, active: bool, CS, VM, params, steer_limited_by_safety: bool, desired_curvature: float, curvature_limited: bool, lat_delay: float, llk, model_data, frogpilot_toggles):
+  def update(self, active: bool, CS, VM, params, steer_limited_by_safety: bool, desired_curvature: float, curvature_limited: bool, lat_delay: float, llk, model_data, frogpilot_toggles, fp_car_state=None):
     pass
 
   def reset(self):
