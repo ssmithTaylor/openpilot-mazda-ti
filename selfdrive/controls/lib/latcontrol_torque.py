@@ -38,8 +38,21 @@ FRICTION_TORQUE = 0.10     # normalized torque of breakaway help at full error
 # measured over 482 stick-then-move events it wanted a median 30 counts more than it was getting
 # (p90 91) after sitting still for a median 0.8 s. These fire it only while that is happening.
 BREAK_ERR = 0.10           # m/s^2 of error worth unsticking the wheel for
-BREAK_STICK_RATE = 1.0     # deg/s: below this the wheel is not moving
-BREAK_FREE_RATE = 2.0      # deg/s: above this it is moving and the boost lets go
+# A stalled rack is not still. Through a real stall the steering rate exceeds 1.0 deg/s on 39 % of
+# frames (p75 1.5, p90 3.8) -- it creeps and jitters against stiction rather than stopping dead.
+# With the threshold at 1.0 the `stuck` flag had a median run length of TWO frames and only 1 % of
+# its runs (52 of 4243) survived the 0.20 s debounce, so the breaker fired at 34 episodes/hr
+# against a 317/hr design point and the saturation modulation ran 0.1 s in an entire drive.
+#
+# Raising the threshold to 2.0 lifts coverage of genuine saturated stalls from 5.8 % to 29.8 % of
+# their duration, at a straight-road firing rate of 0.08 % against 0.02 % before -- still, in
+# practice, nothing. A leaky counter tolerating 20 % non-stuck frames reaches 42.8 % but triples
+# the straight-road rate to 0.27 %; that trade is available if 30 % proves too little, but ripple
+# on a straight is what the driver actually feels, so it is not taken by default.
+#
+# FREE moves with STICK to keep the hysteresis: equal thresholds would chatter the boost on and off.
+BREAK_STICK_RATE = 2.0     # deg/s: below this the wheel counts as not moving
+BREAK_FREE_RATE = 4.0      # deg/s: above this it is moving and the boost lets go
 BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes through zero rate on every
                            # direction reversal, and that is not the same thing as being stuck
 BREAK_MAX = 0.15           # normalized torque, ~90 counts at a 600 ceiling: the p90 of what was needed
