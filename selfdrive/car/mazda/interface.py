@@ -5,7 +5,8 @@ import numpy as np
 from cereal import car, custom
 from panda import Panda
 from openpilot.common.conversions import Conversions as CV
-from openpilot.selfdrive.car.mazda.values import CAR, LKAS_LIMITS, MazdaFlags, GEN1, GEN2, GEN3
+from openpilot.selfdrive.car.mazda.lateral_plant import TiLateralPlant
+from openpilot.selfdrive.car.mazda.values import CAR, CarControllerParams, LKAS_LIMITS, MazdaFlags, GEN1, GEN2, GEN3
 from openpilot.selfdrive.car import create_button_events, get_safety_config
 from openpilot.selfdrive.car.interfaces import CarInterfaceBase, TorqueFromLateralAccelCallbackType, LateralAccelFromTorqueCallbackType
 from openpilot.common.params import Params
@@ -22,6 +23,15 @@ NON_LINEAR_TORQUE_PARAMS = {
 }
 
 class CarInterface(CarInterfaceBase):
+  def __init__(self, CP, FPCP, CarController, CarState):
+    super().__init__(CP, FPCP, CarController, CarState)
+
+    # With the Torque Interceptor this car has two lateral actuators with different shapes (a
+    # clipped-linear stock LKAS path and a quadratic interceptor), and which of them is live
+    # depends on speed and on what the EPS reports. A single torque->lat-accel gain cannot
+    # describe that, so hand the controller the measured model to invert instead.
+    if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      self.lateral_plant = TiLateralPlant(CarControllerParams(CP).TI_STEER_MAX)
 
   def get_lataccel_torque_siglin(self) -> float:
 

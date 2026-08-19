@@ -114,6 +114,11 @@ class CarInterfaceBase(ABC):
     dbc_name = "" if self.cp is None else self.cp.dbc_name
     self.CC: CarControllerBase = CarController(dbc_name, CP, self.VM)
 
+    # Model of how commanded torque becomes lateral acceleration, when the car port has one that
+    # is worth inverting (non-linear, or more than one actuator). None means the lateral
+    # controller uses its own torque_from_lateral_accel callback, as before.
+    self.lateral_plant = None
+
     # FrogPilot variables
     self.always_on_lateral_allowed = False
 
