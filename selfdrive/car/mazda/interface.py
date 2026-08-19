@@ -138,6 +138,15 @@ class CarInterface(CarInterfaceBase):
 
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
+    if ret.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      # The feedforward is inverted through the measured plant model (lateral_plant.py) rather than
+      # through a single learned gain, so the loop needs less help: gains below upstream's defaults.
+      # latAccelFactor is left alone -- torqued still fits and publishes it, the controller just does
+      # not steer by it. friction here is the lateral-accel-space value other code reads; the plant
+      # branch uses its own torque-space term.
+      ret.lateralTuning.torque.kp = 0.8
+      ret.lateralTuning.torque.ki = 0.2
+
     if candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_3_2019, CAR.MAZDA_CX_30, CAR.MAZDA_CX_50, CAR.MAZDA_3_2023, CAR.MAZDA_CX_30_2023) and not ret.flags & MazdaFlags.TORQUE_INTERCEPTOR:
       ret.minSteerSpeed = LKAS_LIMITS.DISABLE_SPEED * CV.KPH_TO_MS
 
