@@ -535,8 +535,7 @@ void FrogPilotAnnotatedCameraWidget::paintSteerAuthority(QPainter &p, const cere
   p.setPen(Qt::white);
   if (latched) {
     p.setFont(InterFont(44, QFont::Bold));
-    p.drawText(box, Qt::AlignCenter, tr("STEERING
-AT LIMIT"));
+    p.drawText(box, Qt::AlignCenter, tr("STEERING\nAT LIMIT"));
   } else {
     float shown = advisory * (isMetric ? MS_TO_KPH : MS_TO_MPH);
     p.setFont(InterFont(30, QFont::DemiBold));
