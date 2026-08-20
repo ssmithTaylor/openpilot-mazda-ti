@@ -89,6 +89,28 @@ BREAKAWAY_MARGIN = 25.0    # counts of headroom before claiming the wheel will m
 # anything moved, and that figure is flat across load. 178 of 600 is 30 %. Sizing on p75 rather than
 # the median because a pulse that fails to release is wasted; sizing below p90 because every count of
 # unload is authority briefly given up.
+# Demand honesty ("Cap Steering Demand"). The rack statically stalls almost exclusively while the
+# command sits flat at the ceiling: over the whole recent corpus (hands-off, above 50 km/h, more
+# than 200 counts on the wire) 10.1 % of command-pinned frames are inside a stall against 0.03 %
+# of breathing frames. The command only sits flat because the lat-accel clip erases the loop's
+# texture whenever the ask exceeds what the actuators deliver -- the excess ask buys nothing (the
+# hands-off ceiling is the same ~2.55 m/s^2 in every pass), it only manufactures standing error,
+# windup and a du/dt of zero for static friction to win against. The one clean pass of the 73 km/h
+# reference corner (route 00000273, t=364) is the one whose ask stayed inside authority: command
+# breathing 400-600, feedback near zero, zero stalls, zero saturation events.
+#
+# So, optionally, never ask the loop to track more than the plant can deliver, and hold the
+# open-loop feedforward a little off the absolute clip so feedback keeps authority over du/dt at
+# the top. Feedback may still use the full range: only the open-loop part is held back, so a rack
+# that stalls (measurement falls) still gets everything the car has, plus a command that is now
+# moving rather than pinned. This can only reduce the command, so like the output filter it is
+# safe to flip while driving and is not gated on Park.
+CAP_HEADROOM = 0.10        # m/s^2 kept out of the feedforward at the top; ~19 counts at 73 km/h,
+                           # sized so the near-ceiling command sits where the clean pass ran (~580)
+CAP_MIN_AUTHORITY = 0.5    # m/s^2: below this the actuator set is absent or mid-change and the
+                           # inverse already commands almost nothing; capping would add nothing
+DEMAND_CAP_FLAG = 128      # added to plantState while the cap is actually moving something
+
 STALL_MOD_CLIP = 0.995     # fraction of u_max at or above which the command counts as clipped
 STALL_MOD_DEPTH = 0.30     # fraction of u_max to unload -- the p75 of what actually releases a rack
 # Period is set by the car controller's slew limits, not by preference: TiSteerDeltaDown 15/frame
@@ -195,19 +217,41 @@ class LatControlTorque(LatControl):
     # answer, so that is what the error is against (upstream master does the same).
     delay_frames = int(np.clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
     setpoint = self.requested_lateral_accel_buffer[-delay_frames]
-    error = setpoint - measurement
-    low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
-    error_lsf = error + low_speed_factor / self.torque_params.kp * error
-
-    # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts below.
-    # latAccelOffset is what the car does at zero torque (device roll misalignment).
-    ff = future_lateral_accel - roll_compensation - self.torque_params.latAccelOffset
 
     # Wind the integrator against the authority this car actually has in its current state -- at
     # low speed, or with the stock LKAS path blocked, that is a fraction of what it has on the
     # highway, and winding past it only delays the recovery.
     la_max = self.plant.la_max(CS.vEgo)
     self.pid.set_limits(la_max, -la_max)
+
+    # Demand honesty, see CAP_HEADROOM above. The plant's authority is about the tire, so the
+    # road-frame bound moves with camber (and the zero-torque offset) by the full amount and with
+    # its sign -- the same corner has two different bounds depending on direction of travel. The
+    # bound also widens to the live measurement, because the plant's top end is conservative (600
+    # counts models ~2.30 m/s^2 where the reference corner measures ~2.5 delivered): a cap must
+    # never manufacture error AGAINST lateral accel the car is demonstrably producing. A stalling
+    # rack shrinks the measurement back inside the plant bound, so recovery keeps full feedback.
+    lat_accel_offset = self.torque_params.latAccelOffset
+    cap_on = bool(getattr(frogpilot_toggles, "lat_demand_cap", False)) and la_max > CAP_MIN_AUTHORITY
+    demand_capped = False
+    tracked_setpoint = setpoint
+    if cap_on:
+      tracked_setpoint = float(np.clip(setpoint,
+                                       min(-la_max + roll_compensation + lat_accel_offset, measurement),
+                                       max(la_max + roll_compensation + lat_accel_offset, measurement)))
+      demand_capped = tracked_setpoint != setpoint
+
+    error = tracked_setpoint - measurement
+    low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
+    error_lsf = error + low_speed_factor / self.torque_params.kp * error
+
+    # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts below.
+    # latAccelOffset is what the car does at zero torque (device roll misalignment).
+    ff = future_lateral_accel - roll_compensation - lat_accel_offset
+    if cap_on:
+      ff_capped = float(np.clip(ff, -(la_max - CAP_HEADROOM), la_max - CAP_HEADROOM))
+      demand_capped = demand_capped or ff_capped != ff
+      ff = ff_capped
 
     freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
     output_lataccel = self.pid.update(error_lsf,
@@ -291,6 +335,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(plant_state) + OUT_FILTER_FLAG   # so a drive can be split on it
     if self.modulating:
       pid_log.plantState = int(pid_log.plantState) + STALL_MOD_FLAG
+    if demand_capped:
+      pid_log.plantState = int(pid_log.plantState) + DEMAND_CAP_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
