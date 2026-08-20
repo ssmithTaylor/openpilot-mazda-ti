@@ -212,8 +212,61 @@ class Controls:
 
     self.frogpilot_toggles = get_frogpilot_toggles()
 
-    if self.CP.lateralTuning.which() == "torque" and (self.frogpilot_toggles.nnff or self.frogpilot_toggles.nnff_lite):
-      self.LaC = LatControlNNFF(self.CP, self.CI, DT_CTRL)
+    # Both lateral controllers are built here; self.LaC only points at one of them, so which one is
+    # driving can change while the car is moving. Comparing them across separate drives has misled
+    # this project twice already -- a "night" effect that was an 8 km/h speed difference, and a
+    # baseline drive running with a second of control-loop lag -- and NNFF was reboot-only, which
+    # made same-road comparison impossible. Nothing about the choice needed to be frozen at start:
+    # the toggles are already re-read every cycle, and both classes implement the same LatControl
+    # interface.
+    self.LaC_plant = self.LaC
+    # Tied to LatControlTorque specifically: NNFF replaces that controller and nothing else, so
+    # an angle-steering car never builds one even when its lateralTuning happens to be torque.
+    self.LaC_nnff = LatControlNNFF(self.CP, self.CI, DT_CTRL) if isinstance(self.LaC, LatControlTorque) else None
+    self.select_lat_control(handover=False)
+
+  def select_lat_control(self, handover=True):
+    """Point self.LaC at whichever lateral controller the toggles are asking for.
+
+    The integrators are NOT carried across. They are not the same quantity: the plant branch's PID
+    runs in lateral-acceleration space and is limited to +/-la_max (about 2.55 m/s^2 on this car),
+    while NNFF's runs in normalized torque and is limited to +/-1.0. Copying one into the other
+    would read an accumulated 0.4 m/s^2 of trim as 0.4 of full steering authority -- 240 counts of
+    600. There is no dimensionally valid conversion in both directions either, because the maps
+    between the two spaces are non-linear and the integrator is an increment, not an absolute. So
+    the incoming integrator starts at zero and re-converges.
+
+    That leaves a real transient, and deliberately so: forcing the outputs to agree at the instant
+    of the switch would mask exactly the feedforward difference the comparison exists to measure.
+    The step is bounded by the car controller's own slew limits (TiSteerDeltaUp 10 and
+    TiSteerDeltaDown 15 per frame out of 600, so under 2.5 % of full scale per frame) and by the
+    interceptor's bounds, so it comes out as a ramp of order 0.1 s rather than a jolt. Discard the
+    first second after a flip when reading the logs -- the plantState NNFF bit is what makes that
+    stretch findable.
+
+    sat_time IS carried: it counts how long the actuator has been saturated, which is a property of
+    the car and the corner, not of whichever controller is driving.
+    """
+    if self.LaC_nnff is None:
+      return
+
+    wants_nnff = bool(self.frogpilot_toggles.nnff or self.frogpilot_toggles.nnff_lite)
+    target = self.LaC_nnff if wants_nnff else self.LaC_plant
+    if target is self.LaC:
+      return
+
+    if handover:
+      target.sat_time = self.LaC.sat_time
+      target.pid.reset()
+      if target is self.LaC_nnff:
+        # NNFF reads 0.3 s of past roll and desired lateral accel, and those deques only fill while
+        # it is the controller being called. Whatever is in them is from before the switch, so drop
+        # it: refilling from the current frame makes the first 0.3 s treat the recent past as flat,
+        # which is the same assumption every fresh engagement already starts from.
+        target.roll_deque.clear()
+        target.lateral_accel_desired_deque.clear()
+
+    self.LaC = target
 
   def set_initial_state(self):
     if REPLAY:
@@ -789,6 +842,7 @@ class Controls:
     # Update FrogPilot variables
     if self.sm['frogpilotPlan'].togglesUpdated:
       self.frogpilot_toggles = get_frogpilot_toggles()
+      self.select_lat_control()
 
   def publish_logs(self, CS, start_time, CC, lac_log):
     """Send actuators and hud commands to the car, send controlsstate and MPC logging"""
