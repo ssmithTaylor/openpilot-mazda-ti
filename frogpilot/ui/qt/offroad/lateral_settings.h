@@ -37,7 +37,8 @@ private:
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
                                          "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
                                          "LatOutputFilter", "LatNoFrictionRelay",
-                                         "LatStallModulation", "LatDemandCap", "SteerAuthorityAdvisory",
+                                         "LatStallModulation", "LatDemandCap", "LatFFLookahead",
+                                         "SteerAuthorityAdvisory",
                                          "NNFF", "NNFFLite", "NNFFGainCorrection"};
 
   QSet<QString> parentKeys;

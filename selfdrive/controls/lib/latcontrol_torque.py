@@ -5,10 +5,12 @@ from collections import deque
 from cereal import log
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.car.interfaces import FRICTION_THRESHOLD
-from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, apply_center_deadzone, get_friction
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED, \
+                                                           apply_center_deadzone, get_friction
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.pid import PIDController
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # At higher speeds (25+mph) we can assume:
 # Lateral acceleration achieved by a specific car correlates to
@@ -115,6 +117,25 @@ CAP_MIN_AUTHORITY = 0.5    # m/s^2: below this the actuator set is absent or mid
                            # inverse already commands almost nothing; capping would add nothing
 DEMAND_CAP_FLAG = 128      # added to plantState while the cap is actually moving something
 
+# Lookahead feedforward ("Start Steering Earlier"). The slow half of this plant is torque ->
+# steering angle and it is friction, not a lag: 1.40 s from rest, 0.70 s at high command. A
+# feedforward built from the instantaneous setpoint therefore lands its lateral accel a plant-lag
+# late -- measured command -> achieved-lat-accel lag is 0.67-0.93 s (r ~0.92, routes 270/272/273)
+# against a learned steer delay of only ~0.34 s. The model plan already knows the future:
+# modelV2.acceleration.y is same-frame, same-sign, unit-slope against desired_curvature*v^2 on
+# this car's own logs (corr 0.98, slope 0.99), and its horizons track later desired at r=0.97. So
+# feed the feedforward from the plan at t+lead instead, where lead is the learned delay plus the
+# measured friction shortfall. The plan is pre-clip_curvature, so it is bounded here by the same
+# ISO envelope (+-MAX_LATERAL_ACCEL_NO_ROLL shifted by roll compensation): the feature may move
+# torque EARLIER, never ask for more of it. The setpoint/error path is untouched -- its delay
+# alignment is correct as-is; only the open-loop term gains the lead.
+FF_LOOKAHEAD_EXTRA = 0.5   # s on top of the learned delay: 0.34 learned + 0.5 = 0.84, inside the
+                           # measured 0.67-0.93 window
+FF_LOOKAHEAD_MIN = 0.2     # s, floor and ceiling on the total lead; the plan is trustworthy to
+FF_LOOKAHEAD_MAX = 1.2     # 2.5 s (T_IDXS[CONTROL_N-1]) but corner shape decorrelates well before
+FF_LOOKAHEAD_RAMP = 1.0    # s to fade the plan in and out, so flipping mid-drive never steps
+FF_LOOKAHEAD_FLAG = 256    # added to plantState while the lookahead is carrying the feedforward
+
 STALL_MOD_CLIP = 0.995     # fraction of u_max at or above which the command counts as clipped
 STALL_MOD_DEPTH = 0.30     # fraction of u_max to unload -- the p75 of what actually releases a rack
 # Period is set by the car controller's slew limits, not by preference: TiSteerDeltaDown 15/frame
@@ -144,6 +165,11 @@ class LatControlTorque(LatControl):
     # than one actuator, or non-linear) hands us a model of it; see CarInterfaceBase.lateral_plant.
     self.plant = getattr(CI, "lateral_plant", None)
     self.ff_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
+    # The lookahead feedforward has its own filter: the setpoint buffer is fed from ff_filter's
+    # output, so filtering the plan value through that same instance would push future values into
+    # the delay line and silently cancel the error path's delay compensation.
+    self.ff_plan_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
+    self.look_blend = 0.0        # 0 = instantaneous setpoint, 1 = plan at t+lead; ramped
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
@@ -192,7 +218,7 @@ class LatControlTorque(LatControl):
                                    fp_car_state.tiActive, active=active)
 
   def _update_with_plant(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature,
-                         curvature_limited, lat_delay, frogpilot_toggles, fp_car_state):
+                         curvature_limited, lat_delay, model_data, frogpilot_toggles, fp_car_state):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 2
 
@@ -201,6 +227,29 @@ class LatControlTorque(LatControl):
     # curvature while latActive is false).
     future_lateral_accel = self.ff_filter.update(desired_curvature * CS.vEgo ** 2)
     self.requested_lateral_accel_buffer.append(future_lateral_accel)
+
+    # Lookahead feedforward source, see FF_LOOKAHEAD_EXTRA above. Kept warm while inactive for the
+    # same reason as the filter above, and blended over FF_LOOKAHEAD_RAMP so the mid-drive toggle
+    # never steps. Without a usable plan it degrades to exactly the instantaneous source.
+    roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
+    look_on = bool(getattr(frogpilot_toggles, "lat_ff_lookahead", False))
+    model_good = model_data is not None and len(model_data.acceleration.y) >= CONTROL_N
+    if model_good:
+      lead = float(np.clip(lat_delay + FF_LOOKAHEAD_EXTRA, FF_LOOKAHEAD_MIN, FF_LOOKAHEAD_MAX))
+      plan_la = float(np.interp(lead, ModelConstants.T_IDXS[:CONTROL_N],
+                                list(model_data.acceleration.y)[:CONTROL_N]))
+      # The plan is pre-clip_curvature: bound it by the same ISO envelope so the lookahead can
+      # move torque earlier but never ask beyond what the limiter would allow.
+      plan_la = float(np.clip(plan_la, -MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation,
+                              MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation))
+    else:
+      plan_la = desired_curvature * CS.vEgo ** 2
+    blend_step = self.dt / FF_LOOKAHEAD_RAMP
+    self.look_blend += float(np.clip((1.0 if (look_on and model_good) else 0.0) - self.look_blend,
+                                     -blend_step, blend_step))
+    ff_lat_accel = self.ff_plan_filter.update(self.look_blend * plan_la +
+                                              (1.0 - self.look_blend) * desired_curvature * CS.vEgo ** 2)
+
     plant_state = self._plant_state(active, CS, fp_car_state, frogpilot_toggles)
     pid_log.plantState = int(plant_state)
 
@@ -215,7 +264,6 @@ class LatControlTorque(LatControl):
     measurement = measured_curvature * CS.vEgo ** 2
     measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
     self.previous_measurement = measurement
-    roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
 
     # Compare like with like: the request from lat_delay ago is the one the car has had time to
     # answer, so that is what the error is against (upstream master does the same).
@@ -249,9 +297,11 @@ class LatControlTorque(LatControl):
     low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
     error_lsf = error + low_speed_factor / self.torque_params.kp * error
 
-    # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts below.
+    # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts
+    # below. ff_lat_accel is the (possibly lookahead) source computed above; with the lookahead
+    # off it is the same filtered instantaneous request as always.
     # latAccelOffset is what the car does at zero torque (device roll misalignment).
-    ff = future_lateral_accel - roll_compensation - lat_accel_offset
+    ff = ff_lat_accel - roll_compensation - lat_accel_offset
     if cap_on:
       ff_capped = float(np.clip(ff, -(la_max - CAP_HEADROOM), la_max - CAP_HEADROOM))
       demand_capped = demand_capped or ff_capped != ff
@@ -341,6 +391,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(pid_log.plantState) + STALL_MOD_FLAG
     if demand_capped:
       pid_log.plantState = int(pid_log.plantState) + DEMAND_CAP_FLAG
+    if self.look_blend > 0.5:
+      pid_log.plantState = int(pid_log.plantState) + FF_LOOKAHEAD_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
@@ -363,7 +415,7 @@ class LatControlTorque(LatControl):
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay, llk, model_data, frogpilot_toggles, fp_car_state=None):
     if self.plant is not None:
       return self._update_with_plant(active, CS, VM, params, steer_limited_by_safety, desired_curvature,
-                                     curvature_limited, lat_delay, frogpilot_toggles, fp_car_state)
+                                     curvature_limited, lat_delay, model_data, frogpilot_toggles, fp_car_state)
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     if not active:

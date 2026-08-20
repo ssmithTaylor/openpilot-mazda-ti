@@ -306,6 +306,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatNoFrictionRelay", "0", 3, "0"),
   ("LatStallModulation", "1", 3, "1"),
   ("LatDemandCap", "0", 3, "0"),
+  ("LatFFLookahead", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -717,6 +718,12 @@ class FrogPilotVariables:
     toggle.lat_demand_cap = (params.get_bool("LatDemandCap")
                              if toggle.tuning_level >= level["LatDemandCap"]
                              else default.get_bool("LatDemandCap"))
+    # Moves feedforward torque earlier (the plan at t+lead), never asks for more of it -- the plan
+    # is bounded by the same ISO envelope as the setpoint, and the blend fades over a second, so
+    # it is safe to flip while driving.
+    toggle.lat_ff_lookahead = (params.get_bool("LatFFLookahead")
+                               if toggle.tuning_level >= level["LatFFLookahead"]
+                               else default.get_bool("LatFFLookahead"))
     # Display only -- it computes an advisory and shows it. It cannot touch the command, which is
     # why it is not gated on parked and sits at a lower tuning level than the tuning controls.
     toggle.steer_authority_advisory = (params.get_bool("SteerAuthorityAdvisory")
