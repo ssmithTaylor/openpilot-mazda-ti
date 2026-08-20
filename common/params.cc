@@ -385,6 +385,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"LatOutputFilter", PERSISTENT},
     {"LatNoFrictionRelay", PERSISTENT},
     {"LatStallModulation", PERSISTENT},
+    {"SteerAuthorityAdvisory", PERSISTENT},
     {"LastMapsUpdate", PERSISTENT},
     {"LateralTune", PERSISTENT},
     {"LeadDepartingAlert", PERSISTENT},

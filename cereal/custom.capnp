@@ -231,6 +231,13 @@ struct FrogPilotPlan @0xa1680744031fdb2d {
   vCruise @35 :Float32;
   weatherDaytime @36 :Bool;
   weatherId @37 :Int16;
+  # Steering-authority advisory. Both lateral actuators are hard-clipped, so the car has a fixed
+  # ceiling on the lateral acceleration it can hold; a corner past it is completed only if the lane
+  # absorbs the shortfall. These say how much slower the corner ahead needs to be taken, how far wide
+  # the car is predicted to run at the current speed, and whether the rack is latched right now.
+  steerAdvisorySpeed @38 :Float32;    # m/s, 0 = the corner ahead fits
+  steerPredictedDrift @39 :Float32;   # m of path error the shortfall is predicted to cost
+  steerLatched @40 :Bool;             # rack stopped with the command at its clip, right now
 }
 
 struct FrogPilotRadarState @0xcb9fd56c7057593a {

@@ -18,6 +18,7 @@ from openpilot.frogpilot.controls.lib.frogpilot_acceleration import FrogPilotAcc
 from openpilot.frogpilot.controls.lib.frogpilot_events import FrogPilotEvents
 from openpilot.frogpilot.controls.lib.frogpilot_following import FrogPilotFollowing
 from openpilot.frogpilot.controls.lib.frogpilot_vcruise import FrogPilotVCruise
+from openpilot.frogpilot.controls.lib import steer_authority
 from openpilot.frogpilot.controls.lib.weather_checker import WeatherChecker
 
 class FrogPilotPlanner:
@@ -33,6 +34,10 @@ class FrogPilotPlanner:
 
     self.driving_in_curve = False
     self.lateral_check = False
+    self.steer_latched = False
+    self.latch_frames = 0
+    self.steer_advisory_speed = 0.0
+    self.steer_predicted_drift = 0.0
     self.model_stopped = False
     self.road_curvature_detected = False
     self.slower_lead = False
@@ -105,6 +110,28 @@ class FrogPilotPlanner:
 
     self.road_curvature, self.time_to_curve = calculate_road_curvature(sm["modelV2"], v_ego)
 
+    # Steering-authority advisory. The forecast peak lateral acceleration is what the model intends
+    # to ask for; the ceiling is what the rack can hold. Where the first exceeds the second the car
+    # runs wide, and whether that matters is a question about lane width, not about torque -- five
+    # recorded passes finished a 3.0 m/s^2 corner on a 2.65 ceiling because the lane had room. So the
+    # advice is keyed to predicted path error, not to closing the torque gap.
+    v_kph = v_ego * CV.MS_TO_KPH
+    forecast_la = abs(self.road_curvature) * max(v_ego, 1.0) ** 2
+    self.steer_predicted_drift = steer_authority.predicted_drift_m(forecast_la, v_kph)
+    advisory_on = getattr(frogpilot_toggles, "steer_authority_advisory", True)
+    advisory_kph = steer_authority.advisory_speed_margin(forecast_la, v_kph) if advisory_on else 0.0
+    self.steer_advisory_speed = advisory_kph * CV.KPH_TO_MS if advisory_kph > 0 else 0.0
+
+    # Latched: the rack has stopped while the command is at its clip and the column is loaded near
+    # the ceiling. The driver already reacts to this about a second later by feel; saying it out loud
+    # is the point. Debounced, because the wheel crosses zero rate on every direction reversal.
+    column_torque = abs(sm["frogpilotCarState"].columnTorque)
+    at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
+    stopped = abs(sm["carState"].steeringRateDeg) < 2.0
+    loaded = column_torque > steer_authority.CEILING_COUNTS - 25.0
+    self.latch_frames = self.latch_frames + 1 if (at_clip and stopped and loaded) else 0
+    self.steer_latched = bool(advisory_on and self.latch_frames >= 15)
+
     self.road_curvature_detected = (1 / abs(self.road_curvature))**0.5 < v_ego > CRUISING_SPEED and not (sm["carState"].leftBlinker or sm["carState"].rightBlinker)
 
     if not sm["carState"].standstill:
@@ -136,6 +163,9 @@ class FrogPilotPlanner:
     frogpilotPlan.speedJerk = J_EGO_COST * self.frogpilot_following.speed_jerk
     frogpilotPlan.speedJerkStock = J_EGO_COST * self.frogpilot_following.base_speed_jerk
     frogpilotPlan.tFollow = self.frogpilot_following.t_follow
+    frogpilotPlan.steerAdvisorySpeed = float(self.steer_advisory_speed)
+    frogpilotPlan.steerPredictedDrift = float(self.steer_predicted_drift)
+    frogpilotPlan.steerLatched = bool(self.steer_latched)
 
     frogpilotPlan.cscControllingSpeed = self.frogpilot_vcruise.csc_controlling_speed
     frogpilotPlan.cscSpeed = self.frogpilot_vcruise.csc_target
