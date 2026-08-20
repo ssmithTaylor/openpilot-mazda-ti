@@ -837,7 +837,14 @@ class Controls:
       self.experimental_mode = self.sm['frogpilotPlan'].experimentalMode
 
     if hasattr(self.LaC, "pid") and self.CP.lateralTuning.which() != "pid":
-      self.LaC.pid._k_p = self.frogpilot_toggles.steerKp
+      # The slider is clipped around the car's kp, which on a TI car is the plant branch's
+      # reduced value. A controller that needs a different baseline declares kp_scale so the
+      # slider still trims it proportionally instead of overwriting its tuning every frame.
+      kp = self.frogpilot_toggles.steerKp
+      scale = getattr(self.LaC, "kp_scale", 1.0)
+      if scale != 1.0 and isinstance(kp, (list, tuple)) and len(kp) == 2:
+        kp = [list(kp[0]), [v * scale for v in kp[1]]]
+      self.LaC.pid._k_p = kp
 
     # Update FrogPilot variables
     if self.sm['frogpilotPlan'].togglesUpdated:

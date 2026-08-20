@@ -187,6 +187,15 @@ NNFF_GAIN_FLAG = 64  # added while the gain correction is actually moving the co
 # lateral accel: what the network asks for, against what the plant model -- fitted on THIS car,
 # and aware of speed and of which actuators are live -- says that lateral accel actually needs.
 # Agreement gives exactly 1.0 and changes nothing.
+# The TI block in interface.py drops kp 1.0 -> 0.8 and ki 0.3 -> 0.2, on the stated grounds that
+# "the feedforward is inverted through the measured plant model ... so the loop needs less help".
+# That is an argument about the PLANT BRANCH's feedforward. This controller's comes from a network
+# trained on another Mazda and under-delivers, so it needs MORE help, not less -- and it silently
+# inherited the cut. Measured: 32 historical NNFF drives ran the upstream 1.0/0.3 and held a lane
+# sd of 0.228 (speed-adjusted); the 2026-08-19 drive ran 0.8/0.2 and held 0.298, worse than 29 of
+# the 32. Take the upstream numbers back for this controller only; the plant branch keeps its own.
+NNFF_KP, NNFF_KI = 1.0, 0.3
+
 GAIN_TAU = 1.0             # s, so a change in actuator state ramps rather than steps
 GAIN_MIN, GAIN_MAX = 0.7, 1.5
 # The ratio is taken at the lateral accel actually being asked for, because neither side is a
@@ -213,7 +222,11 @@ class LatControlNNFF(LatControl):
     self.gain_ratio = FirstOrderFilter(1.0, GAIN_TAU, dt)
 
     self.torque_params = CP.lateralTuning.torque
-    self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
+    # controlsd rewrites pid._k_p from the SteerKP slider every frame, and that slider is clipped
+    # around the car's kp (0.8). kp_scale lets it keep trimming proportionally without dragging
+    # this controller back to the plant branch's value.
+    self.kp_scale = NNFF_KP / self.torque_params.kp if self.torque_params.kp else 1.0
+    self.pid = PIDController(NNFF_KP, NNFF_KI,
                              pos_limit=self.steer_max, neg_limit=-self.steer_max)
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.use_steering_angle = self.torque_params.useSteeringAngle
