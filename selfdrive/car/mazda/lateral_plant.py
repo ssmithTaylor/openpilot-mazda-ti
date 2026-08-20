@@ -60,12 +60,18 @@ DEAD_STOCK_CLEAR = 20.0 # counts: any real feedback revives it
 
 ALPHA_MIN, ALPHA_MAX = 0.75, 1.25   # bounds on the learned per-state gain multipliers (phase 2)
 
-# plantState log codes
+# plantState log codes. Bits 0-1 are the actuator state; everything above is a flag added to it so
+# a drive can be split on it afterwards. The full allocation is listed here because the flags are
+# set in three different files, and a collision would be silent -- it would just mislabel a
+# population, which is the failure mode this whole field exists to prevent.
 STATE_NONE = 0
 STATE_STOCK_ONLY = 1
 STATE_TI_ONLY = 2
 STATE_TI_STOCK = 3
-STATE_RAMP_FLAG = 4     # added to the above while the stock path is ramping in
+STATE_RAMP_FLAG = 4      # added to the above while the stock path is ramping in
+# 8  OUT_FILTER_FLAG -- latcontrol_torque.py, output filter active
+# 16 STALL_MOD_FLAG  -- latcontrol_torque.py, unloading a stalled rack
+# 32 NNFF_FLAG       -- neural_network_feedforward.py, NNFF produced this frame
 
 
 class TiLateralPlant:

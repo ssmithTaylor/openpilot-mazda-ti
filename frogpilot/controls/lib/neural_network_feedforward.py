@@ -167,11 +167,23 @@ def sign(x):
 def similarity(s1: str, s2: str) -> float:
   return SequenceMatcher(None, s1, s2).ratio()
 
+# Added to plantState on every frame NNFF produced, so a drive with the controller flipped part
+# way through splits cleanly into NNFF and plant-branch populations. Without it NNFF frames log as
+# plantState 0, which is indistinguishable from 'no actuator state known' -- the two arms of a
+# comparison were previously separable only by which drive they came from. See lateral_plant.py
+# for the full bit allocation.
+NNFF_FLAG = 32
+
 class LatControlNNFF(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
     self.lat_torque_nn_model = get_nn_model(CP.carFingerprint, str(next((fw.fwVersion for fw in CP.carFw if fw.ecu == "eps"), "")).replace("\\", ""))
     self.nnff_loaded = self.lat_torque_nn_model is not None
+
+    # Observed, never steered by: NNFF computes its own feedforward. This is here only so NNFF
+    # frames carry the same actuator-state label the plant branch writes, using the same
+    # classifier -- a comparison between the two is worthless if each labels its frames its own way.
+    self.plant = getattr(CI, "lateral_plant", None)
 
     self.torque_params = CP.lateralTuning.torque
     self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
@@ -217,6 +229,26 @@ class LatControlNNFF(LatControl):
     self.past_future_len = len(self.past_times) + len(self.nn_future_times)
     self.roll_deque = deque(maxlen=history_check_frames[0])
 
+  def reset(self):
+    super().reset()
+    if self.plant is not None:
+      # re-arm ramp-in for the next engagement, exactly as the plant branch does
+      self.plant.reset()
+
+  def _plant_state(self, active, CS, fp_car_state, frogpilot_toggles):
+    """Byte-for-byte the plant branch's classifier (LatControlTorque._plant_state). Unknown state
+    (frogpilotCarState stale) is read as 'everything is working', which under-labels authority
+    rather than over-claiming it."""
+    if self.plant is None:
+      return 0
+    ti_max = getattr(frogpilot_toggles, "ti_steer_max", None)
+    if ti_max is not None and abs(ti_max - self.plant.ti_steer_max) > 0.5:
+      self.plant.set_ti_steer_max(ti_max)
+    if fp_car_state is None:
+      return self.plant.update_state(CS.vEgo, False, 0.0, True, active=active)
+    return self.plant.update_state(CS.vEgo, fp_car_state.lkasBlocked, fp_car_state.lkasEffective,
+                                   fp_car_state.tiActive, active=active)
+
   def update_live_delay(self, lateral_delay):
     self.nn_future_times = [time + lateral_delay for time in self.future_times]
     self.past_future_len = len(self.past_times) + len(self.nn_future_times)
@@ -228,9 +260,16 @@ class LatControlNNFF(LatControl):
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay, llk, model_data, frogpilot_toggles, fp_car_state=None):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
+    # version 2 marks the struct as carrying plantState; the plant branch sets the same value, so
+    # any filter that selects on it now keeps NNFF frames instead of silently dropping them.
+    pid_log.version = 2
+    plant_state = self._plant_state(active, CS, fp_car_state, frogpilot_toggles)
+    pid_log.plantState = int(plant_state) + NNFF_FLAG
     if not active:
       output_torque = 0.0
       pid_log.active = False
+      if self.plant is not None:
+        self.plant.u_prev = 0.0
     else:
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -370,6 +409,11 @@ class LatControlNNFF(LatControl):
       pid_log.actualLateralAccel = float(actual_lateral_accel)
       pid_log.desiredLateralAccel = float(desired_lateral_accel)
       pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_safety, curvature_limited))
+      if self.plant is not None:
+        # Same wire convention as the plant branch (actuators.steer is positive left), in counts.
+        # The dead-stock and ramp-settle tests compare LKAS_EFFECTIVE against the command that
+        # asked for it, so leaving this at zero would make the stock path look dead under NNFF.
+        self.plant.u_prev = -float(output_torque) * self.plant.ti_steer_max
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
