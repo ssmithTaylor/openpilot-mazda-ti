@@ -72,14 +72,14 @@ def advisory_speed_kph(curvature, v_kph, wheelbase, steer_ratio,
   Returns 0.0 when the corner is already within it, or when the answer is outside the range the
   fit covers -- better to show nothing than a number the model cannot support."""
   angle = required_angle_deg(curvature, wheelbase, steer_ratio)
-  if angle < MIN_ANGLE_DEG or v_kph <= MIN_MODELLED_KPH:
+  if angle < MIN_ANGLE_DEG or v_kph <= MIN_ADVISORY_FLOOR_KPH:
     return 0.0
   target = ceiling - margin
   if sat_torque(angle, v_kph) <= target:
     return 0.0
   # Torque rises monotonically with speed at fixed angle, so bisect. 40 iterations is exact to
   # far below display resolution and costs nothing at 20 Hz.
-  lo, hi = MIN_MODELLED_KPH, float(v_kph)
+  lo, hi = MIN_ADVISORY_FLOOR_KPH, float(v_kph)
   if sat_torque(angle, lo) > target:
     return 0.0     # even the slowest speed we model will not fit: out of range, say nothing
   for _ in range(40):
@@ -91,6 +91,8 @@ def advisory_speed_kph(curvature, v_kph, wheelbase, steer_ratio,
   advised = 0.5 * (lo + hi)
   if v_kph - advised > MAX_SLOWDOWN_KPH:
     return 0.0
+  if v_kph - advised < MIN_MEANINGFUL_SLOWDOWN_KPH:
+    return 0.0
   return advised
 
 
@@ -98,29 +100,53 @@ def torque_headroom(angle_deg, v_kph, ceiling=CEILING_COUNTS):
   """Counts of column torque still available at this angle and speed. Negative means past the latch."""
   return ceiling - sat_torque(angle_deg, v_kph)
 
-# Lateral acceleration available at the ceiling angle. Calibrated at one point -- the observed
-# 22.0 deg / 2.65 m/s^2 latch at 73 km/h -- and scaled as v^2, since lateral acceleration for a
-# given steering angle is kinematic. Note this RISES with speed: slowing reduces what the car can
-# hold as well as what the corner demands, which is why the two do not cancel and why a naive
-# "demand scales as v^2" estimate asks for far too little slowing.
-LA_PER_DEG_AT_73 = 0.1205    # m/s^2 per degree of steering at 73 km/h
+# CORRECTED 2026-08-19. This previously converted a ceiling ANGLE to lateral acceleration with a
+# pure v^2 map, giving a ceiling that rose with speed (2.21 at 52 km/h to 3.29 at 90). That was a
+# double-count: the fitted SAT slope already contains the understeer denominator (L + K*v^2), and
+# the deviation of its exponent from 2 *is* that denominator, so converting again with v^2 applied
+# it twice.
+#
+# Done consistently the torque ceiling is a front-axle FORCE ceiling, which makes the lateral
+# acceleration ceiling flat in speed. Measured over 61 latch events (command pinned, rack stopped
+# 0.3 s, no hand within 4 s): the slope of delivered lateral acceleration against speed is
+# -0.003 m/s^2 per km/h -- flat -- against the +0.028 the old model assumed. The single 113 km/h
+# latch delivers 2.62, sitting inside the 72-73 km/h cluster rather than the 3.9 the rising model
+# predicted.
+#
+# The old model's failure mode was a FALSE NEGATIVE at speed: a corner demanding 3.2 m/s^2 at
+# 90 km/h scored as fitting comfortably when in fact the car cannot hold it.
+CEILING_LA = 2.55            # m/s^2, speed-flat, zero-bank. Observed range 2.4-2.7.
 
-# How much lateral room the shortfall is allowed to eat. This is the number that separates a corner
-# the car tracks from a corner the car completes: five recorded passes ran 0.4-0.9 m wide of the
-# planned line and finished comfortably, because the lane had 0.7-2.0 m of outside margin. Demanding
-# zero shortfall would advise slowing on every one of them.
+# Below the EPS's own LKAS gate (~45-52 km/h with hysteresis) the stock path drops out entirely and
+# authority falls by 3-4x. That is the one regime where slowing genuinely costs more than it buys,
+# so the advisory never recommends entering it.
+MIN_ADVISORY_FLOOR_KPH = 55.0
+
+# How much lateral room the shortfall is allowed to eat. This is what separates a corner the car
+# tracks from a corner the car completes: five recorded passes ran 0.4-0.9 m wide of the planned
+# line and finished comfortably, because the lane had 0.7-2.0 m of outside margin. Demanding zero
+# shortfall would advise slowing on every one of them.
 ALLOWED_DRIFT_M = 1.0
 PEAK_DURATION_S = 2.0        # nominal time the shortfall acts for; see the caveat in the module doc
 
+# Do not display a slowdown too small to act on. Both constants above come from measurement, not
+# from fitting: a joint sweep over ceiling and drift budget scored better on the 22-pass corpus, but
+# it won by picking a ceiling below the measured range and a drift budget wider than the lane, and
+# the winning cell then missed a 3.2 m/s^2 corner at 90 km/h entirely. The corpus holds no fast hard
+# corners, so it cannot see that failure. Trimming trivial advisories at the display is honest;
+# moving the physics to win a 22-point fit is not.
+MIN_MEANINGFUL_SLOWDOWN_KPH = 2.0
 
-def la_at_ceiling(v_kph, ceiling=CEILING_COUNTS):
-  """Lateral acceleration the car can hold at a speed, m/s^2."""
-  v = float(np.clip(v_kph, SAT_SPEED_KPH[0], SAT_SPEED_KPH[-1]))
-  slope = float(np.interp(v, SAT_SPEED_KPH, SAT_SLOPE))
-  intercept = float(np.interp(v, SAT_SPEED_KPH, SAT_INTERCEPT))
-  angle_max = max(0.0, (ceiling - intercept) / max(slope, 1e-3))
-  return angle_max * LA_PER_DEG_AT_73 * (v / 73.0) ** 2
 
+def la_at_ceiling(v_kph=None, ceiling=None):
+  """Lateral acceleration the car can hold, m/s^2.
+
+  Speed-flat above the LKAS gate. The argument is accepted and ignored above the floor, kept so
+  callers read naturally and so the speed dependence has one obvious place to come back if it is
+  ever measured rather than assumed."""
+  if v_kph is not None and v_kph < MIN_ADVISORY_FLOOR_KPH:
+    return CEILING_LA * 0.3      # stock path gone; a floor, not a calibrated number
+  return CEILING_LA
 
 def predicted_drift_m(demand_la, v_kph, duration_s=PEAK_DURATION_S):
   """How far wide of the planned line the car ends up, if it simply runs out of steering."""
@@ -134,11 +160,11 @@ def advisory_speed_margin(demand_la, v_kph, allowed_drift=ALLOWED_DRIFT_M,
 
   This is the criterion that matches what actually happened on the road, rather than the stricter
   "the car tracks the plan exactly". Returns 0.0 when the corner already fits."""
-  if v_kph <= MIN_MODELLED_KPH or demand_la <= 0.0:
+  if v_kph <= MIN_ADVISORY_FLOOR_KPH or demand_la <= 0.0:
     return 0.0
   if predicted_drift_m(demand_la, v_kph, duration_s) <= allowed_drift:
     return 0.0
-  lo, hi = MIN_MODELLED_KPH, float(v_kph)
+  lo, hi = MIN_ADVISORY_FLOOR_KPH, float(v_kph)
   scaled = lambda v: demand_la * (v / float(v_kph)) ** 2      # a corner is a fixed radius
   if predicted_drift_m(scaled(lo), lo, duration_s) > allowed_drift:
     return 0.0     # out of the range the fit covers; say nothing rather than guess
@@ -154,5 +180,7 @@ def advisory_speed_margin(demand_la, v_kph, allowed_drift=ALLOWED_DRIFT_M,
       lo = mid
   advised = 0.5 * (lo + hi)
   if v_kph - advised > MAX_SLOWDOWN_KPH:
+    return 0.0
+  if v_kph - advised < MIN_MEANINGFUL_SLOWDOWN_KPH:
     return 0.0
   return advised
