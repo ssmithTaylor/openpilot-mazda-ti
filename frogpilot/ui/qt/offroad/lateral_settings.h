@@ -27,7 +27,7 @@ private:
   QSet<QString> advancedLateralTuneKeys = {"ForceAutoTune", "ForceAutoTuneOff", "ForceTorqueController", "SteerDelay", "SteerFriction", "SteerLatAccel", "SteerKP", "SteerRatio"};
   QSet<QString> aolKeys = {"AlwaysOnLateralLKAS", "AlwaysOnLateralMain", "PauseAOLOnBrake"};
   QSet<QString> laneChangeKeys = {"LaneChangeTime", "LaneDetectionWidth", "MinimumLaneChangeSpeed", "NudgelessLaneChange", "OneLaneChange"};
-  QSet<QString> lateralTuneKeys = {"NNFF", "NNFFLite", "TurnDesires"};
+  QSet<QString> lateralTuneKeys = {"TurnDesires"};
   QSet<QString> qolKeys = {"PauseLateralSpeed"};
   // Every TI control must appear here. This set decides both which sub-panel a control lands in and
   // whether the parent stays reachable at all -- a key omitted here is a control that silently
@@ -37,7 +37,8 @@ private:
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
                                          "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
                                          "LatOutputFilter", "LatNoFrictionRelay",
-                                         "LatStallModulation", "SteerAuthorityAdvisory"};
+                                         "LatStallModulation", "SteerAuthorityAdvisory",
+                                         "NNFF", "NNFFLite"};
 
   QSet<QString> parentKeys;
 

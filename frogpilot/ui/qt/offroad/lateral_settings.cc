@@ -77,6 +77,8 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"TiSteerDeltaDown", tr("Ramp-Down Rate"), tr("<b>How quickly steering effort is allowed to release.</b> Raise to hand control back faster when openpilot backs off; lower for smoother corner exits."), ""},
     {"TiSteerDriverAllowance", tr("Driver Torque Allowance"), tr("<b>How firmly you can hold the wheel before openpilot starts easing off.</b> Raise if assist fades just from resting a hand on the wheel; lower to hand over control sooner."), ""},
     {"TiSteerDriverMultiplier", tr("Driver Torque Backoff"), tr("<b>How sharply assist drops once you push past the allowance.</b> Lower it if steering gives up on you mid-corner; raise it to hand over control more readily. At the default of 40, assist is gone almost immediately."), ""},
+    {"NNFF", tr("Neural Network Feedforward (NNFF)"), tr("<b>Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses a trained neural network model to predict steering torque based on vehicle speed, roll, and past/future planned path data for smoother, model-based steering. Switchable while driving, so you can compare it against the standard controller on the same piece of road rather than across two different drives."), ""},
+    {"NNFFLite", tr("Neural Network Feedforward (NNFF) Lite"), tr("<b>A lightweight version of Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses the \"look-ahead\" planned lateral jerk logic from the full model to help smoothen steering adjustments in curves, but does not use the full neural network for torque calculation. Switchable while driving."), ""},
     {"LatOutputFilter", tr("Smooth Steering Output"), tr("<b>Low-pass the steering command before it goes out.</b> About a third of the command's movement is faster than the steering rack can follow, so it becomes torque you feel at the rim rather than motion of the car. Smoothing it removes that without changing how firmly openpilot holds the lane. Safe to switch on and off while driving, so you can feel the difference on the same piece of road."), ""},
     {"SteerAuthorityAdvisory", tr("Corner Speed Advisory"), tr("<b>Tell me how much to slow for the corner ahead.</b> This car's steering has a hard limit on how hard it can turn, and some corners need more than it has — it runs wide and you have to catch it. When one of those is coming, this shows the speed to set the cruise control to so the steering can hold the corner on its own. It only appears when the corner genuinely exceeds what the car can do; on recorded drives it stayed silent on every corner the car completed unaided. It also warns the moment the steering stops moving mid-corner."), ""},
     {"LatNoFrictionRelay", tr("Disable Centring Nudge"), tr("<b>Stop adding a constant nudge toward the lane centre.</b> openpilot adds a small steady torque in whichever direction it is correcting, on straight road as much as anywhere. On this car it is active about two thirds of the time on a straight and does little except add movement you feel at the rim. Turning it off should make the wheel calmer; if the car starts wandering slightly within the lane instead, turn it back on. Safe to switch while driving."), ""},
@@ -100,8 +102,6 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
 
     {"LateralTune", tr("Lateral Tuning"), tr("<b>Miscellaneous steering control changes</b> to fine-tune how openpilot drives."), "../../frogpilot/assets/toggle_icons/icon_lateral_tune.png"},
     {"TurnDesires", tr("Force Turn Desires Below Lane Change Speed"), tr("<b>While driving below the minimum lane change speed with an active turn signal, instruct openpilot to turn left/right.</b>"), ""},
-    {"NNFF", tr("Neural Network Feedforward (NNFF)"), tr("<b>Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses a trained neural network model to predict steering torque based on vehicle speed, roll, and past/future planned path data for smoother, model-based steering."), ""},
-    {"NNFFLite", tr("Neural Network Feedforward (NNFF) Lite"), tr("<b>A lightweight version of Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses the \"look-ahead\" planned lateral jerk logic from the full model to help smoothen steering adjustments in curves, but does not use the full neural network for torque calculation."), ""},
 
     {"QOLLateral", tr("Quality of Life"), tr("<b>Steering control changes to fine-tune how openpilot drives.</b>"), "../../frogpilot/assets/toggle_icons/icon_quality_of_life.png"},
     {"PauseLateralSpeed", tr("Pause Steering Below"), tr("<b>Pause steering below the set speed.</b>"), ""}
@@ -287,14 +287,15 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   // the running processes to re-read it -- that only happens when the settings window hides. A
   // drive meant to compare the output filter on against off ran with it off for all 21 minutes
   // because of this, and only the plantState flag showed it. Notify on the flip itself.
-  QSet<QString> liveUpdateKeys = {"LatOutputFilter", "LatNoFrictionRelay", "LatStallModulation"};
+  QSet<QString> liveUpdateKeys = {"LatOutputFilter", "LatNoFrictionRelay", "LatStallModulation",
+                                  "NNFF", "NNFFLite"};
   for (const QString &key : liveUpdateKeys) {
     QObject::connect(static_cast<ToggleControl*>(toggles[key]), &ToggleControl::toggleFlipped, [](bool) {
       updateFrogPilotToggles();
     });
   }
 
-  QSet<QString> rebootKeys = {"AlwaysOnLateral", "ForceTorqueController", "NNFF", "NNFFLite"};
+  QSet<QString> rebootKeys = {"AlwaysOnLateral", "ForceTorqueController"};
   for (const QString &key : rebootKeys) {
     QObject::connect(static_cast<ToggleControl*>(toggles[key]), &ToggleControl::toggleFlipped, [key, this](bool state) {
       if (started) {
@@ -624,11 +625,16 @@ void FrogPilotLateralPanel::updateToggles() {
     else if (key == "NNFF") {
       setVisible &= parent->hasNNFFLog;
       setVisible &= !parent->isAngleCar;
+      // The backend still gates nnff on the LateralTune param (frogpilot_variables.py), so
+      // without this the control would sit in the TI panel looking flippable while doing
+      // nothing -- the present-but-inert failure this panel has already been burned by.
+      setVisible &= params.getBool("LateralTune");
     }
 
     else if (key == "NNFFLite") {
       setVisible &= !usingNNFF;
       setVisible &= !parent->isAngleCar;
+      setVisible &= params.getBool("LateralTune");
     }
 
     else if (key == "SteerDelay") {
