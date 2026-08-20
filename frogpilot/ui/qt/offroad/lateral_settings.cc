@@ -79,6 +79,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
     {"TiSteerDriverMultiplier", tr("Driver Torque Backoff"), tr("<b>How sharply assist drops once you push past the allowance.</b> Lower it if steering gives up on you mid-corner; raise it to hand over control more readily. At the default of 40, assist is gone almost immediately."), ""},
     {"NNFF", tr("Neural Network Feedforward (NNFF)"), tr("<b>Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses a trained neural network model to predict steering torque based on vehicle speed, roll, and past/future planned path data for smoother, model-based steering. Switchable while driving, so you can compare it against the standard controller on the same piece of road rather than across two different drives."), ""},
     {"NNFFLite", tr("Neural Network Feedforward (NNFF) Lite"), tr("<b>A lightweight version of Twilsonco's \"Neural Network FeedForward\" controller.</b> Uses the \"look-ahead\" planned lateral jerk logic from the full model to help smoothen steering adjustments in curves, but does not use the full neural network for torque calculation. Switchable while driving."), ""},
+    {"NNFFGainCorrection", tr("Match NNFF To This Car"), tr("<b>Rescale the neural network's steering effort to what this car actually delivers.</b> The network was trained on a different Mazda, and asks for a given amount of turn as though the steering were stronger than yours is, so it under-delivers. This measures the gap against the car's own measured steering model, every frame, and closes it. It only rescales effort the clip and the interceptor still bound, and it fades in and out over a second, so it is safe to switch while driving."), ""},
     {"LatOutputFilter", tr("Smooth Steering Output"), tr("<b>Low-pass the steering command before it goes out.</b> About a third of the command's movement is faster than the steering rack can follow, so it becomes torque you feel at the rim rather than motion of the car. Smoothing it removes that without changing how firmly openpilot holds the lane. Safe to switch on and off while driving, so you can feel the difference on the same piece of road."), ""},
     {"SteerAuthorityAdvisory", tr("Corner Speed Advisory"), tr("<b>Tell me how much to slow for the corner ahead.</b> This car's steering has a hard limit on how hard it can turn, and some corners need more than it has — it runs wide and you have to catch it. When one of those is coming, this shows the speed to set the cruise control to so the steering can hold the corner on its own. It only appears when the corner genuinely exceeds what the car can do; on recorded drives it stayed silent on every corner the car completed unaided. It also warns the moment the steering stops moving mid-corner."), ""},
     {"LatNoFrictionRelay", tr("Disable Centring Nudge"), tr("<b>Stop adding a constant nudge toward the lane centre.</b> openpilot adds a small steady torque in whichever direction it is correcting, on straight road as much as anywhere. On this car it is active about two thirds of the time on a straight and does little except add movement you feel at the rim. Turning it off should make the wheel calmer; if the car starts wandering slightly within the lane instead, turn it back on. Safe to switch while driving."), ""},
@@ -288,7 +289,7 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   // drive meant to compare the output filter on against off ran with it off for all 21 minutes
   // because of this, and only the plantState flag showed it. Notify on the flip itself.
   QSet<QString> liveUpdateKeys = {"LatOutputFilter", "LatNoFrictionRelay", "LatStallModulation",
-                                  "NNFF", "NNFFLite"};
+                                  "NNFF", "NNFFLite", "NNFFGainCorrection"};
   for (const QString &key : liveUpdateKeys) {
     QObject::connect(static_cast<ToggleControl*>(toggles[key]), &ToggleControl::toggleFlipped, [](bool) {
       updateFrogPilotToggles();
@@ -635,6 +636,11 @@ void FrogPilotLateralPanel::updateToggles() {
       setVisible &= !usingNNFF;
       setVisible &= !parent->isAngleCar;
       setVisible &= params.getBool("LateralTune");
+    }
+
+    else if (key == "NNFFGainCorrection") {
+      // Only means anything while the full network is the one driving.
+      setVisible &= usingNNFF;
     }
 
     else if (key == "SteerDelay") {

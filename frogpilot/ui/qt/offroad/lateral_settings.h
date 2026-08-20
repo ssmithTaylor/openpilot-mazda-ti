@@ -38,7 +38,7 @@ private:
                                          "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
                                          "LatOutputFilter", "LatNoFrictionRelay",
                                          "LatStallModulation", "SteerAuthorityAdvisory",
-                                         "NNFF", "NNFFLite"};
+                                         "NNFF", "NNFFLite", "NNFFGainCorrection"};
 
   QSet<QString> parentKeys;
 

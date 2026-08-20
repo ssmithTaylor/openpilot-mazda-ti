@@ -72,6 +72,7 @@ STATE_RAMP_FLAG = 4      # added to the above while the stock path is ramping in
 # 8  OUT_FILTER_FLAG -- latcontrol_torque.py, output filter active
 # 16 STALL_MOD_FLAG  -- latcontrol_torque.py, unloading a stalled rack
 # 32 NNFF_FLAG       -- neural_network_feedforward.py, NNFF produced this frame
+# 64 NNFF_GAIN_FLAG  -- neural_network_feedforward.py, gain correction moved the command
 
 
 class TiLateralPlant:

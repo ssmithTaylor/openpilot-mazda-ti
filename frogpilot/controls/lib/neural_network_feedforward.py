@@ -173,6 +173,30 @@ def similarity(s1: str, s2: str) -> float:
 # comparison were previously separable only by which drive they came from. See lateral_plant.py
 # for the full bit allocation.
 NNFF_FLAG = 32
+NNFF_GAIN_FLAG = 64  # added while the gain correction is actually moving the command
+
+# Gain correction. The model is trained on another car, and its own steady-state gain is not this
+# car's: MAZDA_CX9_2021 asks for a given lateral accel as though 1 unit of normalized torque buys
+# 2.0-2.5 m/s^2 (rising with speed), while this car's measured plant buys considerably less. That
+# is a pure scale error and it is the easy kind to fix -- but NOT with a constant. Every attempt to
+# pin one down this session compared quantities that turned out not to be the same quantity: a
+# torqued FRICTION carrying a 1.5 factor that params.toml does not, and a TLS small-signal slope
+# read against a network's steady-state gain, 24 % apart on the same car and the same data.
+#
+# So no constants. Both sides are measured on the same frame, in normalized torque, for the same
+# lateral accel: what the network asks for, against what the plant model -- fitted on THIS car,
+# and aware of speed and of which actuators are live -- says that lateral accel actually needs.
+# Agreement gives exactly 1.0 and changes nothing.
+GAIN_TAU = 1.0             # s, so a change in actuator state ramps rather than steps
+GAIN_MIN, GAIN_MAX = 0.7, 1.5
+# The ratio is taken at the lateral accel actually being asked for, because neither side is a
+# straight line: the network's own gain climbs with both speed and lateral accel (2.04 to 2.51
+# across the range for MAZDA_CX9_2021) and the plant is explicitly curved and clipped. A fixed
+# reference would correct the gain somewhere the car is not. Floored so it is never the ratio of
+# two near-zero numbers, and capped inside present authority so the inverse is not reading back
+# the ceiling.
+GAIN_REF_MIN = 0.5         # m/s^2
+GAIN_REF_CEIL = 0.9        # of la_max
 
 class LatControlNNFF(LatControl):
   def __init__(self, CP, CI, dt):
@@ -184,6 +208,9 @@ class LatControlNNFF(LatControl):
     # frames carry the same actuator-state label the plant branch writes, using the same
     # classifier -- a comparison between the two is worthless if each labels its frames its own way.
     self.plant = getattr(CI, "lateral_plant", None)
+    # 1.0 is 'no correction', which is also what it holds whenever the correction cannot be
+    # computed, so a missing plant or an unloaded model is a no-op rather than a surprise.
+    self.gain_ratio = FirstOrderFilter(1.0, GAIN_TAU, dt)
 
     self.torque_params = CP.lateralTuning.torque
     self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
@@ -234,6 +261,37 @@ class LatControlNNFF(LatControl):
     if self.plant is not None:
       # re-arm ramp-in for the next engagement, exactly as the plant branch does
       self.plant.reset()
+    self.gain_ratio.x = 1.0
+
+  def _model_steady_ff(self, v_ego, la, roll):
+    """The model's own steady-state feedforward for `la`, in normalized torque: no lateral jerk,
+    and every past and future lateral-accel and roll slot set to the present value. The 18 inputs
+    are v_ego, lateral_accel, lateral_jerk, roll, then lateral accel at t-0.3/-0.2/-0.1 and
+    t+0.3/+0.6/+1.0/+1.5, then roll at the same seven offsets. Holding them flat is what separates
+    the model's gain from its shape -- the lookahead is the part worth keeping, so it must not be
+    what the correction measures."""
+    return self.lat_torque_nn_model.evaluate([v_ego, la, 0.0, roll] + [la] * 3 + [la] * 4 +
+                                             [roll] * 3 + [roll] * 4)
+
+  def _gain_ratio(self, CS, roll, la_target, frogpilot_toggles):
+    """How much to scale the network's output so it lands where this car actually is."""
+    if (self.plant is None or not self.nnff_loaded
+        or not getattr(frogpilot_toggles, "nnff_gain_correction", False)):
+      return self.gain_ratio.update(1.0)
+
+    la_max = self.plant.la_max(CS.vEgo)
+    if not np.isfinite(la_max) or la_max <= 0.0:
+      return self.gain_ratio.update(1.0)
+    hi = max(GAIN_REF_CEIL * la_max, GAIN_REF_MIN)
+    ref = float(np.clip(abs(la_target), GAIN_REF_MIN, hi))
+
+    model_ff = float(self._model_steady_ff(CS.vEgo, ref, roll))
+    plant_ff = float(self.plant.inverse(ref, CS.vEgo)) / max(self.plant.ti_steer_max, 1.0)
+    # inverse() returns 0 when neither actuator is in play, and the network can sit near zero at
+    # low reference; either way there is no ratio to take, so hold at no-correction.
+    if abs(model_ff) < 1e-3 or abs(plant_ff) < 1e-3:
+      return self.gain_ratio.update(1.0)
+    return self.gain_ratio.update(float(np.clip(plant_ff / model_ff, GAIN_MIN, GAIN_MAX)))
 
   def _plant_state(self, active, CS, fp_car_state, frogpilot_toggles):
     """Byte-for-byte the plant branch's classifier (LatControlTorque._plant_state). Unknown state
@@ -375,6 +433,15 @@ class LatControlNNFF(LatControl):
           # apply friction override for cars with low NN friction response
           if self.nn_friction_override:
             pid_log.error += self.torque_from_lateral_accel(0.0, self.torque_params)
+
+          # Scale the network's output to this car. Both the feedforward and the error term come
+          # out of the same network in the same torque scale, so scaling only one would quietly
+          # change the loop gain by the same factor it was meant to correct.
+          gain = self._gain_ratio(CS, roll, desired_lateral_accel - lat_accel_offset, frogpilot_toggles)
+          if abs(gain - 1.0) > 1e-3:
+            ff *= gain
+            pid_log.error = float(pid_log.error) * gain
+            pid_log.plantState = int(pid_log.plantState) + NNFF_GAIN_FLAG
         else:
           torque_from_measurement = self.torque_from_lateral_accel(measurement, self.torque_params)
           torque_from_setpoint = self.torque_from_lateral_accel(setpoint, self.torque_params)
