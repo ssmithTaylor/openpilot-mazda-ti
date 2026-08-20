@@ -89,15 +89,19 @@ BREAKAWAY_MARGIN = 25.0    # counts of headroom before claiming the wheel will m
 # anything moved, and that figure is flat across load. 178 of 600 is 30 %. Sizing on p75 rather than
 # the median because a pulse that fails to release is wasted; sizing below p90 because every count of
 # unload is authority briefly given up.
-# Demand honesty ("Cap Steering Demand"). The rack statically stalls almost exclusively while the
-# command sits flat at the ceiling: over the whole recent corpus (hands-off, above 50 km/h, more
-# than 200 counts on the wire) 10.1 % of command-pinned frames are inside a stall against 0.03 %
-# of breathing frames. The command only sits flat because the lat-accel clip erases the loop's
-# texture whenever the ask exceeds what the actuators deliver -- the excess ask buys nothing (the
-# hands-off ceiling is the same ~2.55 m/s^2 in every pass), it only manufactures standing error,
-# windup and a du/dt of zero for static friction to win against. The one clean pass of the 73 km/h
-# reference corner (route 00000273, t=364) is the one whose ask stayed inside authority: command
-# breathing 400-600, feedback near zero, zero stalls, zero saturation events.
+# Demand honesty ("Cap Steering Demand"). Load-matched (column torque 150-300 counts, hands-off,
+# above 50 km/h) and at the same command magnitude (at the clip), the rack goes still only under
+# a FLAT command: 22 still-runs of 0.3 s+ in 68.9 s of flat-at-clip exposure (19/min, 17 of them
+# carrying a tracking deficit, spread over 7 routes) against zero in 45.4 s of moving-at-clip
+# exposure. Caveat stated honestly: sustained flatness and sustained over-ask are nearly the same
+# state in this controller, so the causal arrow rests on the separately measured release physics
+# -- a still rack needed the command to DROP a median 116 counts (p75 178) before it moved (410
+# recorded releases), the ~202-count static lock, and 1.40 s response from rest vs 0.70 s moving.
+# The excess ask buys nothing regardless (achieved is the same ~2.68 m/s^2 hands-off ceiling in
+# every recorded pass of the reference corner); it only manufactures standing error, windup, and
+# a du/dt of zero for static friction to win against. The one clean pass of that corner (route
+# 00000273, t=364) is the one whose ask stayed inside authority: command breathing 400-600,
+# feedback near zero, zero stalls, zero saturation events.
 #
 # So, optionally, never ask the loop to track more than the plant can deliver, and hold the
 # open-loop feedforward a little off the absolute clip so feedback keeps authority over du/dt at
