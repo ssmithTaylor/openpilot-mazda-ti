@@ -50,6 +50,23 @@ CEILING_COUNTS = 205.0     # where the rack stops answering, both actuators satu
 # part of that is this margin, and if it persists after this change the remainder is presentation
 # (how long the alert stays on screen), not detection.
 LATCH_DEBOUNCE_FRAMES = 6
+
+# "Running wide" -- the deficit-based out-of-torque alert. The predictive advisory's forecast
+# cannot see demand escalation (measured: it read at most 2.99 on the corner that dropped the TI,
+# against a ~3.15 firing threshold -- silent for the entire drive), and raw deficit alone fires
+# on every entry ramp (61 times in 42 min: transient plant lag is not torque exhaustion). The
+# discriminator is the ceiling: deficit while the command is already at max IS being out of
+# torque. Calibrated over 5.7 h / 7 routes: 35 fires, every one at a genuine 2.3-4.0 m/s^2 ask,
+# ~6/h on corner-heavy roads, one on the clean reference-corner drive (a real >3 corner).
+RUNWIDE_DEFICIT = 0.4      # m/s^2 the car is short of the ask
+RUNWIDE_CEIL = 0.96        # of max command: only counts as out-of-torque at the ceiling
+RUNWIDE_HOLD_FRAMES = 16   # 0.8 s at the 20 Hz planner rate
+RUNWIDE_MIN_KPH = 40.0
+
+# TI dropout: the interceptor leaving RUN mid-drive removes most of the car's steering authority
+# instantly (measured on the 0x11 event: achieved lateral accel 2.6 -> 0.3 within half a second,
+# 32 s to self-recover). The alert latches for a few seconds so it cannot flash unseen.
+TI_DROPOUT_HOLD_FRAMES = 60   # 3 s at 20 Hz
 TARGET_MARGIN = 15.0       # counts of headroom to aim for, so the advice is not knife-edge
 
 MIN_ADVISORY_KPH = 30.0    # below this the plant is a different animal and the fit does not reach

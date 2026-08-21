@@ -1154,6 +1154,22 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .4),
   },
 
+  FrogPilotEventName.tiDropout: {
+    ET.WARNING: Alert(
+      "Steering Assist Dropped",
+      "Take the wheel — interceptor offline",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .5),
+  },
+
+  FrogPilotEventName.steerRunningWide: {
+    ET.WARNING: Alert(
+      "Running Wide — Slow Down",
+      "Steering is at its limit",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, .4),
+  },
+
   FrogPilotEventName.torqueNNLoad: {
     ET.PERMANENT: torque_nn_load_alert,
   },

@@ -119,6 +119,19 @@ class TestFFLookahead:
     assert log_on.f == pytest.approx(want, abs=0.15)
     assert abs(log_off.f) < 0.05
 
+  def test_small_demand_uses_short_lead(self):
+    """Road-tested failure (route 00000277): a constant 0.84 s lead over-leads the ~0.35 s
+    small-signal plant and weaves the lane. With gentle upcoming demand the gate must hold the
+    lead at the learned delay, so the FF reads the plan at ~t+0.3, not t+0.84."""
+    import numpy as np
+    gentle = plan(lambda t: 0.25 * t)          # 0.075 at 0.3 s, 0.21 at 0.84 s; mag@0.6 = 0.15
+    c, VM = fresh()
+    _, _, log_on = run(c, VM, 0.0, gentle, 800, look=True)
+    at_short = float(np.interp(LAT_DELAY, ModelConstants.T_IDXS[:CONTROL_N],
+                               [0.25 * t for t in ModelConstants.T_IDXS[:CONTROL_N]]))
+    assert log_on.f == pytest.approx(at_short, abs=0.05)
+    assert log_on.f < 0.15                     # decisively not the full-lead value (~0.21)
+
   def test_fallback_without_model(self):
     """No plan (or a short one): outputs identical to the toggle being off, frame for frame."""
     for bad in (None, SimpleNamespace(acceleration=SimpleNamespace(y=[0.0] * (CONTROL_N - 1)))):

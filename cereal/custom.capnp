@@ -99,6 +99,8 @@ struct FrogPilotCarEvent @0x81c2f05a394cf4af {
     # Steering authority (mazda-ti)
     steerAuthorityAdvisory @29;
     steerLatchedWarning @30;
+    tiDropout @31;
+    steerRunningWide @32;
   }
 }
 

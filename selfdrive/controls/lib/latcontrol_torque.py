@@ -130,10 +130,19 @@ DEMAND_CAP_FLAG = 128      # added to plantState while the cap is actually movin
 # torque EARLIER, never ask for more of it. The setpoint/error path is untouched -- its delay
 # alignment is correct as-is; only the open-loop term gains the lead.
 FF_LOOKAHEAD_EXTRA = 0.5   # s on top of the learned delay: 0.34 learned + 0.5 = 0.84, inside the
-                           # measured 0.67-0.93 window
+                           # measured 0.67-0.93 window -- FOR LARGE MOVES ONLY, see the gate below
 FF_LOOKAHEAD_MIN = 0.2     # s, floor and ceiling on the total lead; the plan is trustworthy to
 FF_LOOKAHEAD_MAX = 1.2     # 2.5 s (T_IDXS[CONTROL_N-1]) but corner shape decorrelates well before
 FF_LOOKAHEAD_RAMP = 1.0    # s to fade the plan in and out, so flipping mid-drive never steps
+# The extra lead is gated by upcoming demand. Road-tested 2026-08-20 (route 00000277): a CONSTANT
+# 0.84 s lead doubled lane sd on ordinary road (0.44 vs 0.23) -- measured f-led-des by 0.54 s
+# against a plant whose small-signal response is only ~0.35 s, so the car turned before the plan
+# and the plan corrected it, a slow path weave. The 0.7-1.4 s friction lag the lead was sized for
+# only applies to LARGE moves; so the extra lead now scales in with the plan's near-horizon
+# magnitude and ordinary road runs at the learned delay alone.
+FF_LOOKAHEAD_GATE_LO = 0.8   # m/s^2 of |plan la at t+0.6|: extra lead begins here
+FF_LOOKAHEAD_GATE_HI = 1.6   # and is fully in here (real corner entries)
+FF_LOOKAHEAD_GATE_TAU = 0.5  # s low-pass on the gate so the lead never jumps frame to frame
 FF_LOOKAHEAD_FLAG = 256    # added to plantState while the lookahead is carrying the feedforward
 
 # Friction compensation ("Compensate Steering Friction"). The steady map has no friction term,
@@ -203,6 +212,7 @@ class LatControlTorque(LatControl):
     self.ff_plan_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
     self.look_blend = 0.0        # 0 = instantaneous setpoint, 1 = plan at t+lead; ramped
     self.fric_gate_filter = FirstOrderFilter(0.0, FRIC_COMP_GATE_TAU, self.dt)
+    self.look_gate_filter = FirstOrderFilter(0.0, FF_LOOKAHEAD_GATE_TAU, self.dt)
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
@@ -268,9 +278,15 @@ class LatControlTorque(LatControl):
     look_on = bool(getattr(frogpilot_toggles, "lat_ff_lookahead", False))
     model_good = model_data is not None and len(model_data.acceleration.y) >= CONTROL_N
     if model_good:
-      lead = float(np.clip(lat_delay + FF_LOOKAHEAD_EXTRA, FF_LOOKAHEAD_MIN, FF_LOOKAHEAD_MAX))
-      plan_la = float(np.interp(lead, ModelConstants.T_IDXS[:CONTROL_N],
-                                list(model_data.acceleration.y)[:CONTROL_N]))
+      plan_ay = list(model_data.acceleration.y)[:CONTROL_N]
+      # demand gate: extra lead only when a real corner is coming (see FF_LOOKAHEAD_GATE_LO)
+      near_mag = abs(float(np.interp(0.6, ModelConstants.T_IDXS[:CONTROL_N], plan_ay)))
+      gate = float(np.clip((near_mag - FF_LOOKAHEAD_GATE_LO) /
+                           (FF_LOOKAHEAD_GATE_HI - FF_LOOKAHEAD_GATE_LO), 0.0, 1.0))
+      gate = self.look_gate_filter.update(gate)
+      lead = float(np.clip(lat_delay + FF_LOOKAHEAD_EXTRA * gate,
+                           FF_LOOKAHEAD_MIN, FF_LOOKAHEAD_MAX))
+      plan_la = float(np.interp(lead, ModelConstants.T_IDXS[:CONTROL_N], plan_ay))
       # The plan is pre-clip_curvature: bound it by the same ISO envelope so the lookahead can
       # move torque earlier but never ask beyond what the limiter would allow.
       plan_la = float(np.clip(plan_la, -MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation,

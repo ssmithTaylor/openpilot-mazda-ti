@@ -8,6 +8,7 @@ from openpilot.selfdrive.controls.lib.events import ET, EVENT_NAME, FROGPILOT_EV
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
 from openpilot.frogpilot.common.frogpilot_variables import CRUISING_SPEED, NON_DRIVING_GEARS, params, params_memory
+from openpilot.frogpilot.controls.lib import steer_authority
 
 DEJA_VU_G_FORCE = 0.75
 RANDOM_EVENTS_CHANCE = 0.01 * DT_MDL
@@ -30,6 +31,9 @@ class FrogPilotEvents:
     self.max_acceleration = 0
     self.random_event_timer = 0
     self.tracked_lead_distance = 0
+    self.ti_was_active = False
+    self.ti_dropout_hold = 0
+    self.runwide_frames = 0
 
     self.played_events = set()
 
@@ -229,3 +233,30 @@ class FrogPilotEvents:
       self.events.add(FrogPilotEventName.steerAuthorityAdvisory)
     if self.frogpilot_planner.steer_latched:
       self.events.add(FrogPilotEventName.steerLatchedWarning)
+
+    # TI dropout: the interceptor left RUN while lateral was active. On the recorded 0x11 event
+    # this removed most of the steering instantly (achieved la 2.6 -> 0.3) and took 32 s to
+    # self-recover, all silently. Latched for a few seconds so it cannot flash unseen.
+    lat_active = sm["carControl"].latActive
+    ti_now = bool(sm["frogpilotCarState"].tiActive)
+    if lat_active and self.ti_was_active and not ti_now:
+      self.ti_dropout_hold = steer_authority.TI_DROPOUT_HOLD_FRAMES
+    self.ti_was_active = ti_now
+    if self.ti_dropout_hold > 0:
+      self.ti_dropout_hold -= 1
+      self.events.add(FrogPilotEventName.tiDropout)
+
+    # Running wide: sustained deficit WHILE the command is at its ceiling -- out of torque, as
+    # opposed to the transient lag-deficit every corner entry shows. See steer_authority.py for
+    # the calibration. Rides the advisory toggle, like the rest of the authority family.
+    v_ego = sm["carState"].vEgo
+    des_la = abs(sm["controlsState"].desiredCurvature) * v_ego ** 2
+    act_la = abs(sm["controlsState"].curvature) * v_ego ** 2
+    at_ceil = abs(sm["carControl"].actuators.steer) >= steer_authority.RUNWIDE_CEIL
+    runwide_now = (lat_active and ti_now and at_ceil
+                   and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
+                   and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT)
+    self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
+    if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
+        and getattr(frogpilot_toggles, "steer_authority_advisory", True)):
+      self.events.add(FrogPilotEventName.steerRunningWide)
