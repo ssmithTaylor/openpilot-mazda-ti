@@ -130,7 +130,7 @@ class FrogPilotPlanner:
     stopped = abs(sm["carState"].steeringRateDeg) < 2.0
     loaded = column_torque > steer_authority.CEILING_COUNTS - 25.0
     self.latch_frames = self.latch_frames + 1 if (at_clip and stopped and loaded) else 0
-    self.steer_latched = bool(advisory_on and self.latch_frames >= 15)
+    self.steer_latched = bool(advisory_on and self.latch_frames >= steer_authority.LATCH_DEBOUNCE_FRAMES)
 
     self.road_curvature_detected = (1 / abs(self.road_curvature))**0.5 < v_ego > CRUISING_SPEED and not (sm["carState"].leftBlinker or sm["carState"].rightBlinker)
 

@@ -40,6 +40,16 @@ SAT_SLOPE = [7.07, 9.39, 11.83, 14.08, 19.15]
 SAT_INTERCEPT = [-37.3, -42.3, -54.7, -54.7, -67.4]
 
 CEILING_COUNTS = 205.0     # where the rack stops answering, both actuators saturated
+
+# Debounce for the "steering has stopped mid-corner" latch, in 20 Hz planner frames. It should
+# sit at the duration that DEFINES a stall -- 0.30 s sustained; shorter is a direction reversal --
+# not above it. Replayed over the corpus (~14 h, 12 ceiling-limited corners): the original 15
+# frames (0.75 s) latched in 9 of the 12 and 24 times overall; 6 frames (0.30 s) latches in 12 of
+# 12 and 72 times overall, every one at the clip with the wheel stopped and the column loaded,
+# i.e. moments the driver already feels. The driver's report was silence on hard right-handers;
+# part of that is this margin, and if it persists after this change the remainder is presentation
+# (how long the alert stays on screen), not detection.
+LATCH_DEBOUNCE_FRAMES = 6
 TARGET_MARGIN = 15.0       # counts of headroom to aim for, so the advice is not knife-edge
 
 MIN_ADVISORY_KPH = 30.0    # below this the plant is a different animal and the fit does not reach
