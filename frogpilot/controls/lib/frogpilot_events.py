@@ -221,3 +221,11 @@ class FrogPilotEvents:
       self.events.add(FrogPilotEventName.turningLeft)
     elif sm["frogpilotModelV2"].turnDirection == TurnDirection.turnRight:
       self.events.add(FrogPilotEventName.turningRight)
+
+    # Steering-authority advisory and the stopped-steering latch. The planner has computed and
+    # published both on frogpilotPlan since the feature landed, but nothing ever consumed them --
+    # the driver's "it never warns me" was literal. These adds are the entire display path.
+    if self.frogpilot_planner.steer_advisory_speed > 0:
+      self.events.add(FrogPilotEventName.steerAuthorityAdvisory)
+    if self.frogpilot_planner.steer_latched:
+      self.events.add(FrogPilotEventName.steerLatchedWarning)
