@@ -75,7 +75,8 @@ STATE_RAMP_FLAG = 4      # added to the above while the stock path is ramping in
 # 64  NNFF_GAIN_FLAG  -- neural_network_feedforward.py, gain correction moved the command
 # 128 DEMAND_CAP_FLAG -- latcontrol_torque.py, demand cap actually binding
 # 256 FF_LOOKAHEAD_FLAG -- latcontrol_torque.py, feedforward following the plan at t+lead
-# next free: 512
+# 512 FRIC_COMP_FLAG    -- latcontrol_torque.py, friction compensation actually contributing
+# next free: 1024
 
 
 class TiLateralPlant:

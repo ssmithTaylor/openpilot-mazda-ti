@@ -307,6 +307,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatStallModulation", "1", 3, "1"),
   ("LatDemandCap", "0", 3, "0"),
   ("LatFFLookahead", "0", 3, "0"),
+  ("LatFrictionComp", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -724,6 +725,12 @@ class FrogPilotVariables:
     toggle.lat_ff_lookahead = (params.get_bool("LatFFLookahead")
                                if toggle.tuning_level >= level["LatFFLookahead"]
                                else default.get_bool("LatFFLookahead"))
+    # Adds the rack's measured friction to the command in the demand's direction, gated to zero
+    # on straights and tapered out below the clip; bounded by the same limits as everything else,
+    # so safe to flip while driving.
+    toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
+                                if toggle.tuning_level >= level["LatFrictionComp"]
+                                else default.get_bool("LatFrictionComp"))
     # Display only -- it computes an advisory and shows it. It cannot touch the command, which is
     # why it is not gated on parked and sits at a lower tuning level than the tuning controls.
     toggle.steer_authority_advisory = (params.get_bool("SteerAuthorityAdvisory")

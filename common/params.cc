@@ -387,6 +387,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"LatStallModulation", PERSISTENT},
     {"LatDemandCap", PERSISTENT},
     {"LatFFLookahead", PERSISTENT},
+    {"LatFrictionComp", PERSISTENT},
     {"SteerAuthorityAdvisory", PERSISTENT},
     {"NNFFGainCorrection", PERSISTENT},
     {"LastMapsUpdate", PERSISTENT},

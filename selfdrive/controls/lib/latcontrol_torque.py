@@ -136,6 +136,38 @@ FF_LOOKAHEAD_MAX = 1.2     # 2.5 s (T_IDXS[CONTROL_N-1]) but corner shape decorr
 FF_LOOKAHEAD_RAMP = 1.0    # s to fade the plan in and out, so flipping mid-drive never steps
 FF_LOOKAHEAD_FLAG = 256    # added to plantState while the lookahead is carrying the feedforward
 
+# Friction compensation ("Compensate Steering Friction"). The steady map has no friction term,
+# and the rack eats a measured, stable slice of every command before anything moves: identified
+# on 1.05M stall-excluded quasi-steady state-3 frames across four plant routes (warm, cold, wet),
+# the implied command-domain friction is route-stable (47/45/45/48 counts median), direction-
+# symmetric (47 left / 50 right), speed-flat (40-50 across 45-120 km/h), and load-dependent --
+# ~36 counts at light command rising to ~75-80 at heavy, u_fric ~= 30 + 0.09*|u|. Two other
+# instruments independently produce the same number: the breaker study's "median 30 counts more
+# than it was getting" (p75 63-91), and the integrator's standing +/-0.08 la trim (~ comp times
+# the local slope), which is the loop today paying for this term reactively on every curve.
+#
+# Applied on the COMMAND after the plant inverse, in the demand's direction, smoothly gated
+# through zero so straights stay untouched, and tapered out approaching the clip so it can never
+# re-pin the command the demand cap keeps breathing. Deliberately NOT inside the plant model:
+# forward(), la_max and the NNFF gain-correction reference stay pure measured maps.
+FRIC_COMP_BASE = 30.0      # counts, the Coulomb part
+FRIC_COMP_LOAD = 0.09      # counts per count of command, the load-dependent part
+FRIC_COMP_MAX = 85.0       # cap near the identified p75; beyond is breaker/stall territory
+# The zero gate works on a LOW-PASSED demand with a deadzone, not the instantaneous one: straight
+# road carries +-0.1 m/s^2 of demand dither, and a bare tanh gate would turn that into 15-30
+# counts of direction-flipping torque at the rim (measured on route 276's straights) -- on
+# exactly the roads whose calm is the plant branch's best quality. Filtered and deadzoned, a
+# dithering straight reads ~0 while sustained cornering passes the gate within half a second;
+# the reactive relay and breaker still own the transients the filter delays.
+FRIC_COMP_GATE_TAU = 0.5   # s, low-pass on the demand feeding the gate
+FRIC_COMP_LA_DEAD = 0.08   # m/s^2 of filtered demand below which the compensation is exactly zero
+FRIC_COMP_LA_SOFT = 0.15   # m/s^2, tanh softness above the deadzone (full by ~0.4 sustained)
+FRIC_COMP_KEEPOUT = 0.95   # of u_max: the compensation contributes nothing above this. Sits
+                           # BELOW the demand cap's own FF ceiling (inverse(la_max - CAP_HEADROOM)
+                           # ~= 0.97 of u_max at 73 km/h) so the two never fight over the same
+                           # headroom: near the ceiling, friction is the breaker's problem
+FRIC_COMP_FLAG = 512       # added to plantState while the compensation is actually contributing
+
 STALL_MOD_CLIP = 0.995     # fraction of u_max at or above which the command counts as clipped
 STALL_MOD_DEPTH = 0.30     # fraction of u_max to unload -- the p75 of what actually releases a rack
 # Period is set by the car controller's slew limits, not by preference: TiSteerDeltaDown 15/frame
@@ -170,6 +202,7 @@ class LatControlTorque(LatControl):
     # the delay line and silently cancel the error path's delay compensation.
     self.ff_plan_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
     self.look_blend = 0.0        # 0 = instantaneous setpoint, 1 = plan at t+lead; ramped
+    self.fric_gate_filter = FirstOrderFilter(0.0, FRIC_COMP_GATE_TAU, self.dt)
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
@@ -317,6 +350,18 @@ class LatControlTorque(LatControl):
     u_max = self.plant.ti_steer_max
     command = self.plant.inverse(output_lataccel, CS.vEgo)
 
+    # Friction compensation, see FRIC_COMP_BASE above. Proactive (demand-direction), unlike the
+    # error-direction relay below; with the feedforward no longer arriving short, the relay and
+    # the integrator both have less to make up.
+    gate_la = self.fric_gate_filter.update(output_lataccel)
+    fric_comp = 0.0
+    if bool(getattr(frogpilot_toggles, "lat_friction_comp", False)) and la_max > CAP_MIN_AUTHORITY:
+      comp_mag = min(FRIC_COMP_BASE + FRIC_COMP_LOAD * abs(command), FRIC_COMP_MAX)
+      comp_mag = min(comp_mag, max(0.0, FRIC_COMP_KEEPOUT * u_max - abs(command)))
+      over = max(abs(gate_la) - FRIC_COMP_LA_DEAD, 0.0)
+      fric_comp = comp_mag * math.tanh(over / FRIC_COMP_LA_SOFT) * (1.0 if gate_la >= 0 else -1.0)
+      command = float(np.clip(command + fric_comp, -u_max, u_max))
+
     # Breakaway friction, in torque space: what it compensates is stiction in the rack, which is a
     # torque, and in lateral-accel space the same relay becomes hundreds of counts wherever the
     # plant is soft. The dead-zone keeps it from chattering on measurement noise. With no actuator
@@ -393,6 +438,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(pid_log.plantState) + DEMAND_CAP_FLAG
     if self.look_blend > 0.5:
       pid_log.plantState = int(pid_log.plantState) + FF_LOOKAHEAD_FLAG
+    if abs(fric_comp) > 1.0:
+      pid_log.plantState = int(pid_log.plantState) + FRIC_COMP_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
