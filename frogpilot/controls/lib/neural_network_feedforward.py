@@ -41,7 +41,9 @@ LAT_PLAN_MIN_IDX = 5
 
 class FluxModel:
   def __init__(self, params_file):
-    with open(params_file, "r") as f:
+    # explicit encoding: the file carries non-ASCII activation names ("σ"), and the locale
+    # default is only UTF-8 on the device -- a Windows checkout reads mojibake without this
+    with open(params_file, "r", encoding="utf-8") as f:
       params = json.load(f)
 
     self.input_size = params["input_size"]
@@ -198,6 +200,19 @@ NNFF_KP, NNFF_KI = 1.0, 0.3
 
 GAIN_TAU = 1.0             # s, so a change in actuator state ramps rather than steps
 GAIN_MIN, GAIN_MAX = 0.7, 1.5
+# Below Mazda's ~45 km/h LKAS gate the stock EPS path is dead (measured: 100 % of engaged clean
+# frames below 45 km/h are TI-only, lkas_block set) and the car has roughly half its highway
+# authority. The network cannot know this: it was trained on stock-Mazda data, and stock LKAS
+# never operates below that speed, so the regime is absent from its training set and it asks as
+# though the stock path were helping. The required correction, measured against the state-aware
+# plant, is 2.0-2.8 in TI-only (against 1.03-1.27 with both actuators, where the 1.5 cap never
+# binds). Capped at 1.5 the feedforward delivered ~0.71 of need, and the car delivered 0.74 of
+# asked lateral accel below 45 km/h against the plant branch's 0.98 -- felt as "no steering
+# pulling away from a stoplight". The cap exists to keep a ratio of two near-zero numbers sane,
+# not to veto a legitimate measurement, so in the TI-only state it widens to cover what the
+# physics requires. Still a cap, still filtered through GAIN_TAU, and the result still cannot
+# exceed what the plant branch itself would command for the same demand.
+GAIN_MAX_TI_ONLY = 3.0
 # The ratio is taken at the lateral accel actually being asked for, because neither side is a
 # straight line: the network's own gain climbs with both speed and lateral accel (2.04 to 2.51
 # across the range for MAZDA_CX9_2021) and the plant is explicitly curved and clipped. A fixed
@@ -304,7 +319,11 @@ class LatControlNNFF(LatControl):
     # low reference; either way there is no ratio to take, so hold at no-correction.
     if abs(model_ff) < 1e-3 or abs(plant_ff) < 1e-3:
       return self.gain_ratio.update(1.0)
-    return self.gain_ratio.update(float(np.clip(plant_ff / model_ff, GAIN_MIN, GAIN_MAX)))
+    # See GAIN_MAX_TI_ONLY: with the stock path dead the measured ratio legitimately reaches
+    # ~2.8, and the flat cap was what under-steered every launch. The GAIN_TAU filter smooths
+    # the cap change across the LKAS gate the same way it smooths the ratio itself.
+    gain_max = GAIN_MAX if getattr(self.plant, "stock_active", True) else GAIN_MAX_TI_ONLY
+    return self.gain_ratio.update(float(np.clip(plant_ff / model_ff, GAIN_MIN, gain_max)))
 
   def _plant_state(self, active, CS, fp_car_state, frogpilot_toggles):
     """Byte-for-byte the plant branch's classifier (LatControlTorque._plant_state). Unknown state
