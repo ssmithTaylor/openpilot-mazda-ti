@@ -1,5 +1,3 @@
-#include <QDateTime>
-
 #include "frogpilot/ui/qt/offroad/lateral_settings.h"
 
 FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : FrogPilotListWidget(parent), parent(parent) {
@@ -42,20 +40,12 @@ FrogPilotLateralPanel::FrogPilotLateralPanel(FrogPilotSettingsWindow *parent) : 
   lateralLayout->addWidget(qolPanel);
   lateralLayout->addWidget(torqueInterceptorPanel);
 
-  // Live counters at the top of the TI panel, so a change can be judged on the spot rather than by
-  // pulling an rlog afterwards. Populated by updateTorqueInterceptorStats().
+  // The panel once carried live counters here (command cut, limiters, output, TI health, MCP
+  // address). Removed 2026-08-22: every one is reconstructable from the rlogs or the tuning-stats
+  // params, TI health has a driver alert now (tiDropout), and the panel reads better as controls
+  // only. The refs stay for the panel-open check driving the buttons' feedback below.
   lateralLayoutRef = lateralLayout;
   torqueInterceptorPanelRef = torqueInterceptorPanel;
-  tiCommandCutLabel = new LabelControl(tr("Command Cut"), "—", tr("How often openpilot sent less than it wanted to. Lower is better."));
-  tiLimitedByLabel = new LabelControl(tr("Limited By"), "—", tr("Which limiter did the cutting. Rate points at Ramp-Up Rate; driver points at Driver Torque Backoff."));
-  tiOutputLabel = new LabelControl(tr("Output"), "—", tr("Peak bias actually reaching the EPS, and time spent pinned at the interceptor's 600 clip."));
-  tiHealthLabel = new LabelControl(tr("Interceptor Health"), "—", tr("Frames where the TI left RUN or ramped itself down. Both should stay at zero."));
-  torqueInterceptorList->addItem(tiCommandCutLabel);
-  torqueInterceptorList->addItem(tiLimitedByLabel);
-  torqueInterceptorList->addItem(tiOutputLabel);
-  tiMcpLabel = new LabelControl(tr("Telemetry Address"), tr("not running"), tr("Read-only telemetry service. Point an MCP client at this address to query tuning data from a laptop on the same network."));
-  torqueInterceptorList->addItem(tiHealthLabel);
-  torqueInterceptorList->addItem(tiMcpLabel);
 
   const std::vector<std::tuple<QString, QString, QString, QString>> lateralToggles {
     {"AdvancedLateralTune", tr("Advanced Lateral Tuning"), tr("<b>Advanced steering control changes to fine-tune how openpilot drives.</b>"), "../../frogpilot/assets/toggle_icons/icon_advanced_lateral_tune.png"},
@@ -407,12 +397,12 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
   }
 
   if (lateralLayoutRef != nullptr && lateralLayoutRef->currentWidget() == torqueInterceptorPanelRef) {
-    // Hold off the inactivity timeout while this panel is open. It would otherwise drop back to
-    // the driving view precisely when you are watching the counters rather than touching anything.
+    // Hold off the inactivity timeout while this panel is open, so it does not drop back to the
+    // driving view mid-adjustment.
     device()->resetInteractiveTimeout();
 
-    // The counters are only written once a second, so reading the param file at the full UI rate
-    // would buy nothing.
+    // The params behind the button feedback are only written once a second, so reading them at
+    // the full UI rate would buy nothing.
     if (++tiStatsTick >= 20) {
       tiStatsTick = 0;
       updateTorqueInterceptorStats();
@@ -421,49 +411,8 @@ void FrogPilotLateralPanel::updateState(const UIState &s) {
 }
 
 void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
-  // Live counters come off tmpfs, where the car controller refreshes them every second. The flash
-  // copy is only written once a minute now, so reading it here would show a run lagging by up to
-  // that; fall back to it only when tmpfs is empty, which is the case before the first drive of a
-  // boot. The previous run is a persisted snapshot and has no live counterpart.
-  std::string curRaw = params_memory.get("TiTuningStats");
-  if (curRaw.empty()) {
-    curRaw = params.get("TiTuningStats");
-  }
-  QJsonObject cur = QJsonDocument::fromJson(QString::fromStdString(curRaw).toUtf8()).object();
-  QJsonObject prev = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStatsPrevious")).toUtf8()).object();
-
-  auto pct = [](const QJsonObject &o, const QString &key) {
-    double engaged = o.value("engaged").toDouble();
-    return engaged > 0.0 ? 100.0 * o.value(key).toDouble() / engaged : -1.0;
-  };
-  auto fmt = [](double v) { return v < 0.0 ? QString("—") : QString::number(v, 'f', 1) + "%"; };
-
-  // Mean deficit alongside the percentage. How OFTEN the command was cut and how FAR short it
-  // fell are different questions, and only the second tracks whether the car actually got what
-  // openpilot asked for -- a change can shrink the deficit without moving the percentage at all.
-  auto perFrame = [](const QJsonObject &o, const QString &key) {
-    double engaged = o.value("engaged").toDouble();
-    return engaged > 0.0 ? o.value(key).toDouble() / engaged : -1.0;
-  };
-  auto fmtCounts = [](double v) { return v < 0.0 ? QString("—") : QString::number(v, 'f', 1); };
-
-  if (cur.value("engaged").toDouble() <= 0.0) {
-    tiCommandCutLabel->setText(tr("no engaged driving recorded yet"));
-  } else {
-    QString text = QString(tr("%1, short by %2"))
-                     .arg(fmt(pct(cur, "short")), fmtCounts(perFrame(cur, "deficit")));
-    double was = perFrame(prev, "deficit");
-    if (was >= 0.0) {
-      text += QString(tr(" (was %1)")).arg(fmtCounts(was));
-    }
-    tiCommandCutLabel->setText(text);
-  }
-
-  tiLimitedByLabel->setText(QString(tr("rate %1, driver %2"))
-                            .arg(fmt(pct(cur, "rate_limited")), fmt(pct(cur, "driver_limited"))));
-  tiOutputLabel->setText(QString(tr("peak bias %1, %2 at clip"))
-                         .arg(QString::number(cur.value("peak_bias").toInt()), fmt(pct(cur, "at_clip"))));
-
+  // Only the two buttons' feedback survives here; the informational counter labels this function
+  // once fed were removed (the rlogs and the tuning-stats params carry all of it).
   // The car controller clears TiFlagMoment once it has recorded the flag, within a second. Until
   // then the button reads FLAGGED, so a tap still in flight looks different from one that landed
   // -- and the count going up is the confirmation that it did.
@@ -483,29 +432,6 @@ void FrogPilotLateralPanel::updateTorqueInterceptorStats() {
     tiClearButton->setText(!pending ? tr("START") : (started ? tr("STARTING") : tr("AT NEXT START")));
     int runs = QJsonDocument::fromJson(QString::fromStdString(params.get("TiTuningStatsHistory")).toUtf8()).array().size();
     tiClearButton->setValue(runs > 0 ? tr("%1 runs kept").arg(runs) : QString());
-  }
-
-  // Address is republished every 5s, so anything older than 15s means the service is not running.
-  // On tmpfs: it is regenerated at every startup and never needed across a boot, so there was no
-  // reason for a heartbeat to be writing to flash at that rate.
-  QJsonObject mcp = QJsonDocument::fromJson(QString::fromStdString(params_memory.get("TiMcpAddress")).toUtf8()).object();
-  qint64 age = QDateTime::currentSecsSinceEpoch() - (qint64)mcp.value("heartbeat").toDouble();
-  if (mcp.isEmpty() || age > 15) {
-    tiMcpLabel->setText(tr("not running"));
-  } else if (!mcp.value("reachable_remotely").toBool()) {
-    tiMcpLabel->setText(tr("localhost only — set TI_MCP_HOST=0.0.0.0"));
-  } else {
-    tiMcpLabel->setText(mcp.value("url").toString());
-  }
-
-  int notRun = cur.value("not_run").toInt();
-  int ramp = cur.value("ramp").toInt();
-  int viol = cur.value("viol").toInt();
-  if (notRun == 0 && ramp == 0 && viol == 0) {
-    tiHealthLabel->setText(tr("RUN, no violations"));
-  } else {
-    tiHealthLabel->setText(QString(tr("%1 not in RUN, %2 ramping, violation 0x%3"))
-                           .arg(notRun).arg(ramp).arg(viol, 2, 16, QChar('0')));
   }
 }
 

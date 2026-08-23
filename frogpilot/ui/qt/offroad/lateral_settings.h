@@ -52,11 +52,6 @@ private:
 
   QStackedLayout *lateralLayoutRef = nullptr;
   QWidget *torqueInterceptorPanelRef = nullptr;
-  LabelControl *tiCommandCutLabel = nullptr;
-  LabelControl *tiLimitedByLabel = nullptr;
-  LabelControl *tiOutputLabel = nullptr;
-  LabelControl *tiHealthLabel = nullptr;
-  LabelControl *tiMcpLabel = nullptr;
   // Held so its text can be put back once the car controller has consumed the flag, which is the
   // only feedback the driver gets that the tap actually landed.
   ButtonControl *tiFlagButton = nullptr;
