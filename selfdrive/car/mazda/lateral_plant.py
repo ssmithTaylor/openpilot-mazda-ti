@@ -77,9 +77,10 @@ STATE_RAMP_FLAG = 4      # added to the above while the stock path is ramping in
 # 256 RETIRED (was FF_LOOKAHEAD_FLAG: lookahead FF -- wandered on the road in both forms)
 # 512 FRIC_COMP_FLAG    -- latcontrol_torque.py, friction compensation actually contributing
 # 1024 COMMIT_FLAG      -- latcontrol_torque.py, committed setpoint blended in ("Hold the Corner Line")
+# 2048 DAMP_FLAG        -- latcontrol_torque.py, damping toggle on ("Damp Steering Swings")
 # Retired bits are frozen forever: recorded rlogs carry them with the old meanings, and the
 # analysis decoders keep reading them. Allocate new behaviours from "next free" only.
-# next free: 2048
+# next free: 4096
 
 
 class TiLateralPlant:

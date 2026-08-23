@@ -306,6 +306,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatNoFrictionRelay", "0", 3, "0"),
   ("LatFrictionComp", "0", 3, "0"),
   ("LatCommitSetpoint", "0", 3, "0"),
+  ("LatDamping", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -718,6 +719,11 @@ class FrogPilotVariables:
     toggle.lat_commit_setpoint = (params.get_bool("LatCommitSetpoint")
                                   if toggle.tuning_level >= level["LatCommitSetpoint"]
                                   else default.get_bool("LatCommitSetpoint"))
+    # Rate feedback on the measurement (the PID's D term, deadzoned at rest). It opposes swings,
+    # never sustains them, and lives inside the same output limits, so safe to flip while driving.
+    toggle.lat_damping = (params.get_bool("LatDamping")
+                          if toggle.tuning_level >= level["LatDamping"]
+                          else default.get_bool("LatDamping"))
     toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
                                 if toggle.tuning_level >= level["LatFrictionComp"]
                                 else default.get_bool("LatFrictionComp"))

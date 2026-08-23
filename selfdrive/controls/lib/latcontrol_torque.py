@@ -55,8 +55,31 @@ BREAK_STICK_RATE = 2.0     # deg/s: below this the wheel counts as not moving
 BREAK_FREE_RATE = 4.0      # deg/s: above this it is moving and the boost lets go
 BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes through zero rate on every
                            # direction reversal, and that is not the same thing as being stuck
-BREAK_MAX = 0.15           # normalized torque, ~90 counts at a 600 ceiling: the p90 of what was needed
+# UPSIZED 2026-08-23, 0.15 -> 0.30. The 90-count boost was deliberately held small until the
+# stuck-detector rework could be judged alone; that hold expired with the evidence on route
+# 0000027e t=712-715: the rack parked 1-5 deg off-center for three seconds, wheel rate exactly
+# zero, while a 100-200 count ask plus the 90-count boost stayed inside the ~200-count static
+# band and the car drifted off line with 0.5-0.7 m/s^2 of standing error. The driver-free release
+# need is median 30 / p75 63-91 / p90 184 counts; 0.30 (~180) covers to the p90.
+BREAK_MAX = 0.30           # normalized torque, ~180 counts at a 600 ceiling
 BREAK_RAMP = 0.25          # s to reach full boost, so it is never a step onto the wheel
+
+# Damping ("Damp Steering Swings"). The scallop's engine is stick-slip with ZERO loop damping:
+# frame-level traces of two corners on route 0000027e show breakaway overshoot of 0.4-0.45 m/s^2
+# past the ask, a command reversal of +600 to -567 counts in 1.1 s on release, and post-corner
+# ringing carried entirely by the P term (p swings 1.7 while the integrator swings 0.06-0.21 --
+# the integrator is exonerated). The PID has always had the damping input plumbed
+# (error_rate = -measurement_rate, filtered at ~2 Hz) with k_d = 0. This turns it on.
+#
+# Sized by replay on 0000027e: at KD = 0.06 the D term's ring-window rms is 0.071 m/s^2 (24 % of
+# P's 0.302) with peaks of 0.175 opposing the ~0.4 overshoot; on straight road it contributes
+# ~0.018 rms (~6 counts) on only 10 % of frames because of the rate deadzone, and exactly zero at
+# rest. The deadzone is the friction-comp lesson re-applied: a bare gate turns sensor dither into
+# rim texture on precisely the roads whose calm is the plant branch's best quality.
+# In a stall the wheel rate is zero, so the D term never fights the breaker.
+DAMP_KD = 0.06             # la per (m/s^3) of measurement rate
+DAMP_RATE_DEADZONE = 0.3   # m/s^3: below this the damping contributes exactly nothing
+DAMP_FLAG = 2048           # added to plantState while the toggle is on (for the A/B split)
 
 # Optional smoothing of the finished command ("Smooth Steering Output"). Measured on straight
 # road above 60 km/h, the command carries 33 counts RMS above 0.5 Hz -- a third of its total
@@ -167,7 +190,11 @@ class LatControlTorque(LatControl):
     self.torque_params = CP.lateralTuning.torque
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
-    self.pid = PIDController(self.torque_params.kp, self.torque_params.ki, rate=1/self.dt)
+    # The plant lookup happens before the PID so the damping gain can be plant-branch-only: the
+    # stock path keeps k_d = 0 and its error_rate input stays inert, exactly as upstream.
+    self.plant = getattr(CI, "lateral_plant", None)
+    self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
+                             k_d=(DAMP_KD if self.plant is not None else 0.), rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES = int(1 / self.dt)
@@ -175,9 +202,9 @@ class LatControlTorque(LatControl):
     self.previous_measurement = 0.0
     self.measurement_rate_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * (MAX_LAT_JERK_UP - 0.5)), self.dt)
 
-    # A car whose torque -> lateral acceleration relationship is worth inverting properly (more
-    # than one actuator, or non-linear) hands us a model of it; see CarInterfaceBase.lateral_plant.
-    self.plant = getattr(CI, "lateral_plant", None)
+    # self.plant was looked up above (see the PID construction); a car whose torque -> lateral
+    # acceleration relationship is worth inverting properly (more than one actuator, or
+    # non-linear) hands us a model of it via CarInterfaceBase.lateral_plant.
     self.ff_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
     self.fric_gate_filter = FirstOrderFilter(0.0, FRIC_COMP_GATE_TAU, self.dt)
     # Committed reference: one ratchet for the feedforward source, one for the delayed setpoint
@@ -290,9 +317,15 @@ class LatControlTorque(LatControl):
     # below. latAccelOffset is what the car does at zero torque (device roll misalignment).
     ff = ff_lat_accel - roll_compensation - lat_accel_offset
 
+    # Damping, see DAMP_KD above. Deadzoned so rest is exactly untouched; gated by the toggle so
+    # the A/B is clean. With the toggle off the error_rate input is zero and the D term is inert,
+    # bit-identical to the pre-damping controller.
+    damp_on = bool(getattr(frogpilot_toggles, "lat_damping", False))
+    damp_rate = apply_center_deadzone(measurement_rate, DAMP_RATE_DEADZONE) if damp_on else 0.0
+
     freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
     output_lataccel = self.pid.update(error_lsf,
-                                      -measurement_rate,
+                                      -damp_rate,
                                       feedforward=ff,
                                       speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator)
@@ -371,6 +404,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(pid_log.plantState) + FRIC_COMP_FLAG
     if self.commit_blend > 0.5:
       pid_log.plantState = int(pid_log.plantState) + COMMIT_FLAG
+    if damp_on:
+      pid_log.plantState = int(pid_log.plantState) + DAMP_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
