@@ -117,6 +117,50 @@ FRIC_COMP_MIN_AUTHORITY = 0.5  # m/s^2: below this the actuator set is absent or
                                # the inverse already commands almost nothing
 FRIC_COMP_FLAG = 512       # added to plantState while the compensation is actually contributing
 
+# Committed setpoint ("Hold the Corner Line"). Measured on routes 0000027a/00000276: in the
+# corner-oscillation band (0.4-3 s) the model plan is not an independent target -- it TRAILS the
+# car's own motion by 0.1-0.3 s and keeps only ~half its promises at 1 s (self-commitment
+# r~0.47). The scallop cycle needs that: rack sticks -> error grows -> breakaway overshoot ->
+# the plan eases IN SYMPATHY with the car's swing -> command unloads -> rack re-sticks. This
+# filter attacks exactly the sympathetic-release step: the reference the controller tracks (and
+# the feedforward it holds) may DEEPEN at the plan's own pace but RELEASES slowly, so one
+# overshoot cannot talk the controller out of the corner.
+#
+# The obvious alternative -- a symmetric low-pass on the reference -- was replayed over the same
+# corners and falsified before it reached the car: the mirror and the road overlap in frequency,
+# so tau 0.3-0.6 s bought only 3-13 % oscillation-band rejection while adding 250-910 ms to
+# every corner entry. The ratchet replays at 70-100 ms median entry cost.
+COMMIT_TAU_DEEPEN = 0.10   # s: toward a deeper ask (or any sign conflict) the reference is fast
+COMMIT_TAU_RELEASE = 0.60  # s: easing off is slow -- the commitment
+# Two hard guards, both from the replay's tail: without them the worst exit overhang was 4.2-4.5 s
+# (the ratchet holding an old direction through an S-transition); with them, max 120-160 ms and
+# p90 <= 128 ms over 92 corner exits on three routes, while the in-corner commitment stays
+# ~+0.045 m/s^2.
+COMMIT_MAX_EXTRA = 0.5     # m/s^2 the committed reference may exceed the live ask by, at most
+                           #   (the sign-conflict fast path is the other guard, in the filter)
+COMMIT_GATE_TAU = 0.5      # s low-pass on |request| feeding the gate, as the friction comp does
+COMMIT_GATE_ON = 1.0       # m/s^2 where the commitment starts blending in
+COMMIT_GATE_FULL = 1.8     # fully committed here -- real corners, never straights
+COMMIT_BLEND_RAMP = 0.5    # s, so the gate's motion and the mid-drive toggle never step
+COMMIT_FLAG = 1024         # added to plantState while the commitment is blended in
+
+
+class CommitFilter:
+  """The asymmetric ratchet: fast toward a deeper (or opposite-signed) ask, slow easing off,
+  never more than COMMIT_MAX_EXTRA beyond the live ask. Pure, so it can be replayed and tested."""
+
+  def __init__(self, dt):
+    self.a_deepen = 1.0 - math.exp(-dt / COMMIT_TAU_DEEPEN)
+    self.a_release = 1.0 - math.exp(-dt / COMMIT_TAU_RELEASE)
+    self.x = 0.0
+
+  def update(self, v):
+    fast = (v * self.x) < 0.0 or abs(v) > abs(self.x)
+    self.x += (self.a_deepen if fast else self.a_release) * (v - self.x)
+    lim = abs(v) + COMMIT_MAX_EXTRA
+    self.x = float(np.clip(self.x, -lim, lim))
+    return self.x
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -136,6 +180,13 @@ class LatControlTorque(LatControl):
     self.plant = getattr(CI, "lateral_plant", None)
     self.ff_filter = FirstOrderFilter(0.0, FF_SMOOTH_SECONDS, self.dt)
     self.fric_gate_filter = FirstOrderFilter(0.0, FRIC_COMP_GATE_TAU, self.dt)
+    # Committed reference: one ratchet for the feedforward source, one for the delayed setpoint
+    # (the same signal at two delays -- sharing one instance would double-step its state), plus
+    # the gate and the blend. All kept warm while inactive so engaging mid-corner is continuous.
+    self.commit_ff_filter = CommitFilter(self.dt)
+    self.commit_sp_filter = CommitFilter(self.dt)
+    self.commit_gate_filter = FirstOrderFilter(0.0, COMMIT_GATE_TAU, self.dt)
+    self.commit_blend = 0.0
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
@@ -190,7 +241,22 @@ class LatControlTorque(LatControl):
     future_lateral_accel = self.ff_filter.update(desired_curvature * CS.vEgo ** 2)
     self.requested_lateral_accel_buffer.append(future_lateral_accel)
     roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
-    ff_lat_accel = future_lateral_accel
+
+    # Committed reference, see COMMIT_TAU_DEEPEN above. Both ratchets, the gate and the blend run
+    # while inactive too (same rationale as the request filter above: engaging mid-corner must
+    # start from the truth). The setpoint is read here rather than below for the same reason.
+    delay_frames = int(np.clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
+    setpoint = self.requested_lateral_accel_buffer[-delay_frames]
+    commit_ff = self.commit_ff_filter.update(future_lateral_accel)
+    commit_sp = self.commit_sp_filter.update(setpoint)
+    commit_on = bool(getattr(frogpilot_toggles, "lat_commit_setpoint", False))
+    commit_gate = float(np.clip((self.commit_gate_filter.update(abs(future_lateral_accel)) - COMMIT_GATE_ON) /
+                                (COMMIT_GATE_FULL - COMMIT_GATE_ON), 0.0, 1.0))
+    commit_step = self.dt / COMMIT_BLEND_RAMP
+    self.commit_blend += float(np.clip((commit_gate if commit_on else 0.0) - self.commit_blend,
+                                       -commit_step, commit_step))
+    ff_lat_accel = future_lateral_accel + self.commit_blend * (commit_ff - future_lateral_accel)
+    tracked_setpoint = setpoint + self.commit_blend * (commit_sp - setpoint)
 
     plant_state = self._plant_state(active, CS, fp_car_state, frogpilot_toggles)
     pid_log.plantState = int(plant_state)
@@ -207,19 +273,16 @@ class LatControlTorque(LatControl):
     measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
     self.previous_measurement = measurement
 
-    # Compare like with like: the request from lat_delay ago is the one the car has had time to
-    # answer, so that is what the error is against (upstream master does the same).
-    delay_frames = int(np.clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
-    setpoint = self.requested_lateral_accel_buffer[-delay_frames]
-
     # Wind the integrator against the authority this car actually has in its current state -- at
     # low speed, or with the stock LKAS path blocked, that is a fraction of what it has on the
     # highway, and winding past it only delays the recovery.
     la_max = self.plant.la_max(CS.vEgo)
     self.pid.set_limits(la_max, -la_max)
 
+    # The error tracks the delay-aligned request (the one the car has had time to answer, as
+    # upstream does) -- committed in corners, raw otherwise; both computed above.
     lat_accel_offset = self.torque_params.latAccelOffset
-    error = setpoint - measurement
+    error = tracked_setpoint - measurement
     low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
     error_lsf = error + low_speed_factor / self.torque_params.kp * error
 
@@ -306,6 +369,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(plant_state) + OUT_FILTER_FLAG   # so a drive can be split on it
     if abs(fric_comp) > 1.0:
       pid_log.plantState = int(pid_log.plantState) + FRIC_COMP_FLAG
+    if self.commit_blend > 0.5:
+      pid_log.plantState = int(pid_log.plantState) + COMMIT_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)

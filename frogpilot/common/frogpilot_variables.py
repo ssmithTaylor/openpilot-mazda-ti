@@ -305,6 +305,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatOutputFilter", "0", 3, "0"),
   ("LatNoFrictionRelay", "0", 3, "0"),
   ("LatFrictionComp", "0", 3, "0"),
+  ("LatCommitSetpoint", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -711,6 +712,12 @@ class FrogPilotVariables:
     # Adds the rack's measured friction to the command in the demand's direction, gated to zero
     # on straights and tapered out below the clip; bounded by the same limits as everything else,
     # so safe to flip while driving.
+    # Ratchets the tracked reference in corners: deepens at the plan's pace, releases slowly,
+    # bounded to the live ask plus a fixed margin and blended through a demand gate. Only shapes
+    # the reference inside existing limits, so safe to flip while driving.
+    toggle.lat_commit_setpoint = (params.get_bool("LatCommitSetpoint")
+                                  if toggle.tuning_level >= level["LatCommitSetpoint"]
+                                  else default.get_bool("LatCommitSetpoint"))
     toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
                                 if toggle.tuning_level >= level["LatFrictionComp"]
                                 else default.get_bool("LatFrictionComp"))
