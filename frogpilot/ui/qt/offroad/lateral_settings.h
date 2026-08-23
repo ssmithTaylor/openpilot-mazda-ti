@@ -37,7 +37,6 @@ private:
                                          "TiSteerDriverMultiplier", "TiSteerThreshold", "ResetTorqueParams",
                                          "ClearTiStats", "TiFlagMoment", "TiMcpEnabled",
                                          "LatOutputFilter", "LatNoFrictionRelay",
-                                         "LatStallModulation", "LatDemandCap", "LatFFLookahead",
                                          "LatFrictionComp", "SteerAuthorityAdvisory",
                                          "NNFF", "NNFFLite", "NNFFGainCorrection"};
 

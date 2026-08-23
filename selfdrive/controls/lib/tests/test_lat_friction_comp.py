@@ -67,9 +67,8 @@ class FakeCI:
 
 
 def toggles(fric, cap=False):
-  return SimpleNamespace(lat_friction_comp=fric, lat_demand_cap=cap, lat_ff_lookahead=False,
-                         lat_output_filter=False, lat_no_friction_relay=True,
-                         lat_stall_modulation=False, ti_steer_max=U_MAX)
+  return SimpleNamespace(lat_friction_comp=fric, lat_output_filter=False,
+                         lat_no_friction_relay=True, ti_steer_max=U_MAX)
 
 
 def fp_state():
@@ -148,13 +147,11 @@ class TestFrictionComp:
       deltas.append(abs(o_on - o_off) * U_MAX)
     assert max(deltas[200:]) < 4.0
 
-  def test_keepout_never_repins_the_clip(self):
-    """Near the ceiling the compensation tapers out: with the demand cap holding the FF off the
-    clip, adding friction compensation must not push it back on."""
-    c, (out, _, pid_log) = settled(True, 3.4, 2.25, cap=True)
-    assert abs(out) < 1.0 - 1e-6 or abs(out) * U_MAX <= FRIC_COMP_KEEPOUT * U_MAX + 1e-6
-    # and the compensation near the clip is (almost) nothing: command matches cap-only run
-    c2, (out2, _, _) = settled(False, 3.4, 2.25, cap=True)
+  def test_keepout_adds_nothing_near_the_clip(self):
+    """Near the ceiling the compensation tapers out: a command already close to the clip must not
+    be pushed harder by the compensation -- headroom there belongs to feedback."""
+    c, (out, _, pid_log) = settled(True, 3.4, 2.25)
+    c2, (out2, _, _) = settled(False, 3.4, 2.25)
     assert (abs(out) - abs(out2)) * U_MAX < 8.0
 
   def test_off_means_identical(self):

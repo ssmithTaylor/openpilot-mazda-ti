@@ -304,9 +304,6 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LaneLinesWidth", "4", 2, "2"),
   ("LatOutputFilter", "0", 3, "0"),
   ("LatNoFrictionRelay", "0", 3, "0"),
-  ("LatStallModulation", "1", 3, "1"),
-  ("LatDemandCap", "0", 3, "0"),
-  ("LatFFLookahead", "0", 3, "0"),
   ("LatFrictionComp", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
@@ -711,20 +708,6 @@ class FrogPilotVariables:
     toggle.lat_no_friction_relay = (params.get_bool("LatNoFrictionRelay")
                                     if toggle.tuning_level >= level["LatNoFrictionRelay"]
                                     else default.get_bool("LatNoFrictionRelay"))
-    toggle.lat_stall_modulation = (params.get_bool("LatStallModulation")
-                                   if toggle.tuning_level >= level["LatStallModulation"]
-                                   else default.get_bool("LatStallModulation"))
-    # Caps the tracked setpoint and feedforward at the plant's deliverable lateral accel; it can
-    # only reduce the command, so like the others it is safe to flip while driving.
-    toggle.lat_demand_cap = (params.get_bool("LatDemandCap")
-                             if toggle.tuning_level >= level["LatDemandCap"]
-                             else default.get_bool("LatDemandCap"))
-    # Moves feedforward torque earlier (the plan at t+lead), never asks for more of it -- the plan
-    # is bounded by the same ISO envelope as the setpoint, and the blend fades over a second, so
-    # it is safe to flip while driving.
-    toggle.lat_ff_lookahead = (params.get_bool("LatFFLookahead")
-                               if toggle.tuning_level >= level["LatFFLookahead"]
-                               else default.get_bool("LatFFLookahead"))
     # Adds the rack's measured friction to the command in the demand's direction, gated to zero
     # on straights and tapered out below the clip; bounded by the same limits as everything else,
     # so safe to flip while driving.

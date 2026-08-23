@@ -70,12 +70,14 @@ STATE_TI_ONLY = 2
 STATE_TI_STOCK = 3
 STATE_RAMP_FLAG = 4      # added to the above while the stock path is ramping in
 # 8   OUT_FILTER_FLAG -- latcontrol_torque.py, output filter active
-# 16  STALL_MOD_FLAG  -- latcontrol_torque.py, unloading a stalled rack
+# 16  RETIRED (was STALL_MOD_FLAG: stall modulation -- never once triggered in 5 h of logs)
 # 32  NNFF_FLAG       -- neural_network_feedforward.py, NNFF produced this frame
 # 64  NNFF_GAIN_FLAG  -- neural_network_feedforward.py, gain correction moved the command
-# 128 DEMAND_CAP_FLAG -- latcontrol_torque.py, demand cap actually binding
-# 256 FF_LOOKAHEAD_FLAG -- latcontrol_torque.py, feedforward following the plan at t+lead
+# 128 RETIRED (was DEMAND_CAP_FLAG: demand cap -- tripped the TI 0x11 watchdog on the road)
+# 256 RETIRED (was FF_LOOKAHEAD_FLAG: lookahead FF -- wandered on the road in both forms)
 # 512 FRIC_COMP_FLAG    -- latcontrol_torque.py, friction compensation actually contributing
+# Retired bits are frozen forever: recorded rlogs carry them with the old meanings, and the
+# analysis decoders keep reading them. Allocate new behaviours from "next free" only.
 # next free: 1024
 
 
