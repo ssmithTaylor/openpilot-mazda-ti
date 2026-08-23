@@ -32,6 +32,8 @@ So the advisory here is the conservative one: the speed at which the car can act
 plan. Expect it to ask for more slowing than strictly needed until the margin model earns its place;
 `TARGET_MARGIN` is the knob, and the logged prediction-versus-outcome is what should move it.
 """
+from collections import deque
+
 import numpy as np
 
 # Fitted SAT slope and intercept against speed. Torque = slope * |angle_deg| + intercept.
@@ -51,17 +53,29 @@ CEILING_COUNTS = 205.0     # where the rack stops answering, both actuators satu
 # (how long the alert stays on screen), not detection.
 LATCH_DEBOUNCE_FRAMES = 6
 
-# "Running wide" -- the deficit-based out-of-torque alert. The predictive advisory's forecast
-# cannot see demand escalation (measured: it read at most 2.99 on the corner that dropped the TI,
-# against a ~3.15 firing threshold -- silent for the entire drive), and raw deficit alone fires
-# on every entry ramp (61 times in 42 min: transient plant lag is not torque exhaustion). The
-# discriminator is the ceiling: deficit while the command is already at max IS being out of
-# torque. Calibrated over 5.7 h / 7 routes: 35 fires, every one at a genuine 2.3-4.0 m/s^2 ask,
-# ~6/h on corner-heavy roads, one on the clean reference-corner drive (a real >3 corner).
-RUNWIDE_DEFICIT = 0.4      # m/s^2 the car is short of the ask
+# "Running wide" -- the deficit-based out-of-torque alert. Raw deficit alone fires on every entry
+# ramp (61 times in 42 min: transient plant lag is not torque exhaustion). The discriminator is
+# the ceiling: deficit while the command is already at max IS being out of torque.
+#
+# RECALIBRATED 2026-08-22 on route 0000027a (the 92-min drive that road-tested the first cut).
+# As shipped (deficit 0.4, sustain 0.8 s) the alert fired 1.9-10.5 s AFTER the command pinned --
+# by the time 0.4 m/s^2 of shortfall accrues the driver is already correcting -- and missed one
+# episode outright. Replayed over 26 saturation episodes on 3 routes (3.9 engaged hours):
+# deficit > 0.15 sustained 0.4 s hits 25/26 with median lead +2.0 s after pin (the physics floor
+# for a deficit-confirmed alert: the shortfall takes ~2 s to become measurable) and ZERO fires
+# outside episode windows. Saturation alone cannot replace the deficit term: the corpus's best
+# corner pass held the clip 1.3 s with no deficit at all.
+RUNWIDE_DEFICIT = 0.15     # m/s^2 the car is short of the ask
 RUNWIDE_CEIL = 0.96        # of max command: only counts as out-of-torque at the ceiling
-RUNWIDE_HOLD_FRAMES = 16   # 0.8 s at the 20 Hz planner rate
+RUNWIDE_HOLD_FRAMES = 8    # 0.4 s at the 20 Hz planner rate
 RUNWIDE_MIN_KPH = 40.0
+# Once triggered, the EVENT stays asserted this long so the alert is readable. Without it the
+# trigger flaps with the stick-slip cycle: measured on route 0000027a the displayed alert came in
+# 0.2-0.9 s bursts alternating with the latch text several times per corner, each replaying its
+# chime -- unreadable chatter, reported by the driver as "not being alerted" despite 20 logged
+# event transitions.
+RUNWIDE_DISPLAY_HOLD_FRAMES = 60   # 3 s at 20 Hz
+LATCH_DISPLAY_HOLD_FRAMES = 40     # 2 s; the latch condition itself clears on one frame of rack motion
 
 # TI dropout: the interceptor leaving RUN mid-drive removes most of the car's steering authority
 # instantly (measured on the 0x11 event: achieved lateral accel 2.6 -> 0.3 within half a second,
@@ -156,6 +170,31 @@ MIN_ADVISORY_FLOOR_KPH = 55.0
 ALLOWED_DRIFT_M = 1.0
 PEAK_DURATION_S = 2.0        # nominal time the shortfall acts for; see the caveat in the module doc
 
+# The FIRING threshold for the spoken advisory, separate from the drift budget above and much
+# lower. Requiring the full 1.0 m budget before speaking demands a forecast above ~3.05 m/s^2,
+# and the model's far horizon under-forecasts its own escalation -- measured on 92 minutes of
+# route 0000027a it exceeded that on none of 8 saturation episodes: the advisory spoke once, 1.5 s
+# LATE. At 0.3 m (forecast ~2.7) it reaches 3.5-4.3 s of lead on the repeat-offender S-bend
+# corners. Every fire at this threshold across 3.9 engaged hours / 3 routes was a genuine
+# >=2.75 m/s^2 ask (the three "false" fires on route 00000277 were 3.2-3.4 asks the driver was
+# already handling by hand). Coverage is structurally partial -- 11 of 26 episodes -- because the
+# forecast is the model's own plan; the running-wide alert above is the reliable reactive layer.
+#
+# TRIGGERED ONLY AGAINST THE SPEED-FLAT CEILING AND ONLY AT/ABOVE THE ADVISORY FLOOR SPEED.
+# Below 55 km/h la_at_ceiling() returns the uncalibrated 0.3x floor, and a momentary forecast
+# blip against that floor reads as metres of drift: both recorded phantom spikes (5.0 m of
+# "drift" on a straight road) were this branch at 49-55 km/h.
+ADVISORY_FIRE_DRIFT_M = 0.3
+# Occupancy trigger, not a plain sustain: the forecast crosses the threshold in sub-0.2 s blips
+# during approach (a plain 0.75 s sustain erased every early lead in replay). Fire when the
+# threshold held for ADVISORY_OCC_NEED of the last ADVISORY_OCC_WINDOW planner frames.
+ADVISORY_OCC_WINDOW = 30     # 1.5 s at 20 Hz
+ADVISORY_OCC_NEED = 4        # 0.2 s cumulative
+# Once fired, the advisory speed stays displayed this long (refreshed while the trigger holds),
+# and the displayed number may only fall during a hold -- the raw value dithered 42/41/40 at
+# 10 Hz on the one occasion it displayed, re-chiming on every change.
+ADVISORY_HOLD_FRAMES = 80    # 4 s at 20 Hz
+
 # Do not display a slowdown too small to act on. Both constants above come from measurement, not
 # from fitting: a joint sweep over ceiling and drift budget scored better on the 22-pass corpus, but
 # it won by picking a ceiling below the measured range and a drift budget wider than the lane, and
@@ -179,6 +218,41 @@ def predicted_drift_m(demand_la, v_kph, duration_s=PEAK_DURATION_S):
   """How far wide of the planned line the car ends up, if it simply runs out of steering."""
   deficit = max(0.0, float(demand_la) - la_at_ceiling(v_kph))
   return 0.5 * deficit * duration_s ** 2
+
+
+class AdvisoryTrigger:
+  """When to SAY the advisory, and what number to hold on screen. Pure 20 Hz logic so it can be
+  replayed and tested off the car; the planner owns one and feeds it per frame.
+
+  Fire on threshold occupancy (the forecast crosses in sub-0.2 s blips on approach -- a plain
+  sustain erased every early lead in replay), hold the display ADVISORY_HOLD_FRAMES, and only
+  ever revise the shown speed downward while it is showing. Trigger judged against the
+  speed-flat ceiling at advisory speeds only; the sub-55 km/h ceiling branch turned forecast
+  blips into 5 m phantom drifts on straight road, twice, in one drive."""
+
+  def __init__(self):
+    self.occ = deque(maxlen=ADVISORY_OCC_WINDOW)
+    self.hold = 0
+    self.shown_kph = 0.0
+
+  def update(self, active, forecast_la, v_kph):
+    """Returns the advisory speed to display in km/h, 0.0 for silence."""
+    flat_drift = 0.5 * max(0.0, float(forecast_la) - CEILING_LA) * PEAK_DURATION_S ** 2
+    self.occ.append(bool(active) and v_kph >= MIN_ADVISORY_FLOOR_KPH
+                    and flat_drift > ADVISORY_FIRE_DRIFT_M)
+    if sum(self.occ) >= ADVISORY_OCC_NEED:
+      # a drift budget consistent with the firing threshold, not the 1.0 m completion budget --
+      # the completion budget yields a speed the under-forecasting model can rarely justify
+      advised = advisory_speed_margin(forecast_la, v_kph, allowed_drift=ADVISORY_FIRE_DRIFT_M)
+      if advised > 0:
+        self.hold = ADVISORY_HOLD_FRAMES
+        if self.shown_kph == 0.0 or advised < self.shown_kph:
+          self.shown_kph = advised
+    if self.hold > 0:
+      self.hold -= 1
+      if self.hold == 0:
+        self.shown_kph = 0.0
+    return self.shown_kph
 
 
 def advisory_speed_margin(demand_la, v_kph, allowed_drift=ALLOWED_DRIFT_M,

@@ -34,6 +34,8 @@ class FrogPilotEvents:
     self.ti_was_active = False
     self.ti_dropout_hold = 0
     self.runwide_frames = 0
+    self.runwide_display_hold = 0
+    self.latch_display_hold = 0
 
     self.played_events = set()
 
@@ -231,8 +233,6 @@ class FrogPilotEvents:
     # the driver's "it never warns me" was literal. These adds are the entire display path.
     if self.frogpilot_planner.steer_advisory_speed > 0:
       self.events.add(FrogPilotEventName.steerAuthorityAdvisory)
-    if self.frogpilot_planner.steer_latched:
-      self.events.add(FrogPilotEventName.steerLatchedWarning)
 
     # TI dropout: the interceptor left RUN while lateral was active. On the recorded 0x11 event
     # this removed most of the steering instantly (achieved la 2.6 -> 0.3) and took 32 s to
@@ -259,4 +259,18 @@ class FrogPilotEvents:
     self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
     if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
         and getattr(frogpilot_toggles, "steer_authority_advisory", True)):
+      self.runwide_display_hold = steer_authority.RUNWIDE_DISPLAY_HOLD_FRAMES
+    if self.runwide_display_hold > 0:
+      self.runwide_display_hold -= 1
       self.events.add(FrogPilotEventName.steerRunningWide)
+
+    # The latch rides its own display hold, and defers to running-wide entirely: both flap with
+    # the physical stick-slip cycle (the latch clears on ONE frame of rack motion), and on route
+    # 0000027a they alternated on screen in 0.2-0.9 s bursts, each replaying its chime. Running
+    # wide carries the actionable message; the latch only speaks when running wide is not.
+    if self.frogpilot_planner.steer_latched:
+      self.latch_display_hold = steer_authority.LATCH_DISPLAY_HOLD_FRAMES
+    if self.latch_display_hold > 0:
+      self.latch_display_hold -= 1
+      if self.runwide_display_hold == 0:
+        self.events.add(FrogPilotEventName.steerLatchedWarning)

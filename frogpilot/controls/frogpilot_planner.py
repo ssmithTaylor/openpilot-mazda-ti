@@ -38,6 +38,7 @@ class FrogPilotPlanner:
     self.latch_frames = 0
     self.steer_advisory_speed = 0.0
     self.steer_predicted_drift = 0.0
+    self.advisory_trigger = steer_authority.AdvisoryTrigger()
     self.model_stopped = False
     self.road_curvature_detected = False
     self.slower_lead = False
@@ -119,7 +120,7 @@ class FrogPilotPlanner:
     forecast_la = abs(self.road_curvature) * max(v_ego, 1.0) ** 2
     self.steer_predicted_drift = steer_authority.predicted_drift_m(forecast_la, v_kph)
     advisory_on = getattr(frogpilot_toggles, "steer_authority_advisory", True)
-    advisory_kph = steer_authority.advisory_speed_margin(forecast_la, v_kph) if advisory_on else 0.0
+    advisory_kph = self.advisory_trigger.update(advisory_on, forecast_la, v_kph)
     self.steer_advisory_speed = advisory_kph * CV.KPH_TO_MS if advisory_kph > 0 else 0.0
 
     # Latched: the rack has stopped while the command is at its clip and the column is loaded near

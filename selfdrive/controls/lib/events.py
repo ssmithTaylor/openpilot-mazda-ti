@@ -255,8 +255,13 @@ def below_steer_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
 def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
   # The number is the point: the cruise setpoint is the only lever this car has for a corner
   # beyond its steering, and the driver needs it before the corner, not a feeling during it.
+  # Floored to a 5-unit step: the raw value dithered 42/41/40 at 10 Hz the one time it displayed,
+  # and each change replayed the chime. Advice reads in round numbers; flooring never advises
+  # faster than computed.
+  unit_speed = sm['frogpilotPlan'].steerAdvisorySpeed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
+  shown = max(5 * int(unit_speed // 5), 5)
   return Alert(
-    f"Slow to {get_display_speed(sm['frogpilotPlan'].steerAdvisorySpeed, metric)} for the corner ahead",
+    f"Slow to {shown} {'km/h' if metric else 'mph'} for the corner ahead",
     "The steering cannot hold it at this speed",
     AlertStatus.userPrompt, AlertSize.mid,
     Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.4)
@@ -1163,11 +1168,13 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   FrogPilotEventName.steerRunningWide: {
+    # MID so it outranks the advisory when both are live: the advisory holds for seconds around a
+    # corner, and the reactive out-of-torque call must not be hidden behind it.
     ET.WARNING: Alert(
       "Running Wide — Slow Down",
       "Steering is at its limit",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, .4),
+      Priority.MID, VisualAlert.steerRequired, AudibleAlert.prompt, .4),
   },
 
   FrogPilotEventName.torqueNNLoad: {

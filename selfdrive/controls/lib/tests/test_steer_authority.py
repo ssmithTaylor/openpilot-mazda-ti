@@ -114,5 +114,80 @@ class TestDrift(unittest.TestCase):
     self.assertGreater(rescued, SA.ALLOWED_DRIFT_M)
 
 
+class TestAdvisoryTrigger(unittest.TestCase):
+  """The display logic that made the advisory audible: occupancy firing, the hold, and the
+  monotone-down shown value. Calibrated on route 0000027a (see steer_authority.py)."""
+
+  def _run(self, trig, frames):
+    out = []
+    for active, fla, v in frames:
+      out.append(trig.update(active, fla, v))
+    return out
+
+  def test_fires_on_blippy_crossings(self):
+    # The forecast crosses the threshold in sub-0.2 s blips on approach; a plain consecutive
+    # sustain erased every early lead in replay. Interleave crossings with sub-threshold frames:
+    # 4 crossings inside the 30-frame window must fire.
+    trig = SA.AdvisoryTrigger()
+    frames = []
+    for _ in range(4):
+      frames.append((True, 2.9, 74.0))     # over threshold (flat drift 0.7)
+      frames.append((True, 2.0, 74.0))     # back under
+      frames.append((True, 2.0, 74.0))
+    out = self._run(trig, frames)
+    self.assertGreater(out[-1], 0.0, "four blips in the window did not fire")
+
+  def test_needs_occupancy_not_one_frame(self):
+    trig = SA.AdvisoryTrigger()
+    out = self._run(trig, [(True, 2.9, 74.0)] + [(True, 2.0, 74.0)] * 29)
+    self.assertEqual(out[-1], 0.0, "a single crossing fired the advisory")
+
+  def test_silent_below_the_floor_speed(self):
+    # The phantom-drift guard: both recorded false fires were forecast blips at 49-55 km/h read
+    # against the uncalibrated low-speed ceiling. Below the floor the trigger must not arm, no
+    # matter how large the forecast.
+    trig = SA.AdvisoryTrigger()
+    out = self._run(trig, [(True, 5.0, 50.0)] * 60)
+    self.assertTrue(all(x == 0.0 for x in out))
+
+  def test_silent_when_toggled_off(self):
+    trig = SA.AdvisoryTrigger()
+    out = self._run(trig, [(False, 3.5, 74.0)] * 60)
+    self.assertTrue(all(x == 0.0 for x in out))
+
+  def test_silent_under_threshold(self):
+    # flat-ceiling drift at 2.6 m/s^2 is 0.1 m -- under ADVISORY_FIRE_DRIFT_M.
+    trig = SA.AdvisoryTrigger()
+    out = self._run(trig, [(True, 2.6, 74.0)] * 60)
+    self.assertTrue(all(x == 0.0 for x in out))
+
+  def test_holds_after_the_trigger_clears(self):
+    # 0.4 s of display was unreadable on the road. Once fired, the value must survive the trigger
+    # dropping, for ADVISORY_HOLD_FRAMES, then clear.
+    trig = SA.AdvisoryTrigger()
+    self._run(trig, [(True, 2.9, 74.0)] * 10)          # fire
+    after = self._run(trig, [(True, 0.0, 74.0)] * (SA.ADVISORY_HOLD_FRAMES - 5))
+    self.assertGreater(after[-1], 0.0, "the hold did not carry the display")
+    cleared = self._run(trig, [(True, 0.0, 74.0)] * 20)
+    self.assertEqual(cleared[-1], 0.0, "the hold never released")
+
+  def test_shown_speed_never_rises_while_showing(self):
+    # The raw value dithered 42/41/40 at 10 Hz on the road, re-chiming each change. While showing,
+    # the number may only fall.
+    trig = SA.AdvisoryTrigger()
+    shown = self._run(trig, [(True, 2.9, 74.0)] * 10 + [(True, 3.4, 74.0)] * 10
+                            + [(True, 2.9, 74.0)] * 10)
+    showing = [x for x in shown if x > 0.0]
+    self.assertGreater(len(showing), 5)
+    for a, b in zip(showing, showing[1:]):
+      self.assertLessEqual(b, a + 1e-9, "the shown advisory speed rose while displayed")
+
+  def test_advised_speed_is_meaningfully_slower(self):
+    trig = SA.AdvisoryTrigger()
+    out = self._run(trig, [(True, 3.4, 74.0)] * 10)
+    self.assertGreater(out[-1], 0.0)
+    self.assertLess(out[-1], 74.0 - SA.MIN_MEANINGFUL_SLOWDOWN_KPH + 1e-6)
+
+
 if __name__ == "__main__":
   unittest.main()
