@@ -55,14 +55,21 @@ BREAK_STICK_RATE = 2.0     # deg/s: below this the wheel counts as not moving
 BREAK_FREE_RATE = 4.0      # deg/s: above this it is moving and the boost lets go
 BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes through zero rate on every
                            # direction reversal, and that is not the same thing as being stuck
-# UPSIZED 2026-08-23, 0.15 -> 0.30. The 90-count boost was deliberately held small until the
-# stuck-detector rework could be judged alone; that hold expired with the evidence on route
-# 0000027e t=712-715: the rack parked 1-5 deg off-center for three seconds, wheel rate exactly
-# zero, while a 100-200 count ask plus the 90-count boost stayed inside the ~200-count static
-# band and the car drifted off line with 0.5-0.7 m/s^2 of standing error. The driver-free release
-# need is median 30 / p75 63-91 / p90 184 counts; 0.30 (~180) covers to the p90.
-BREAK_MAX = 0.30           # normalized torque, ~180 counts at a 600 ceiling
-BREAK_RAMP = 0.25          # s to reach full boost, so it is never a step onto the wheel
+# ESCALATING, 2026-08-25. History: 0.15 (~90 counts) was deliberately small; 2026-08-23 raised
+# it flat to 0.30 (~180, the p90 release need) after a rack sat parked off-centre for 3 s inside
+# the 90-count reach (route 0000027e t=712-715). One drive falsified the FLAT p90: the release
+# need is a DISTRIBUTION (median 30 / p75 63-91 / p90 184), and firing 180 counts at every stuck
+# moment overdrives the median case 6x -- route 00000283 shows full-180 kicks with 21-38 deg/s
+# lurches on mild 2.0-2.5 corners the car was making anyway, one corner cycling boost for 9.8 s
+# ("trouble caused by recovery attempts", the driver said, precisely). So the boost now
+# ESCALATES: ramp to BREAK_STAGE1 (~the p75) over BREAK_RAMP as before, then grow toward
+# BREAK_MAX (~the p90) over BREAK_ESCALATE only while the wheel STAYS stuck. Median stalls get
+# the gentle kick and release before stage 2; only the stubborn tail ever meets 180. Release on
+# motion is unchanged, so a kick that works is withdrawn just as fast as before.
+BREAK_STAGE1 = 0.15        # normalized, ~90 counts: the first-stage kick, covers to ~p75
+BREAK_MAX = 0.30           # normalized, ~180 counts: the escalation ceiling, covers to the p90
+BREAK_RAMP = 0.25          # s to reach stage 1, so it is never a step onto the wheel
+BREAK_ESCALATE = 1.5       # s of CONTINUED stuck to grow from stage 1 to the ceiling
 
 # Damping ("Damp Steering Swings"). The scallop's engine is stick-slip with ZERO loop damping:
 # frame-level traces of two corners on route 0000027e show breakaway overshoot of 0.4-0.45 m/s^2
@@ -357,29 +364,50 @@ class LatControlTorque(LatControl):
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
     command = float(np.clip(command + friction_torque, -u_max, u_max))
 
-    # Stiction breaker. Only while the wheel is genuinely stuck: the driver is not steering, the
-    # error is worth acting on, the wheel is not moving, and it has been that way long enough that a
-    # zero-crossing mid-reversal cannot trigger it. Ramped in and out so it never steps, and it lets
-    # go the moment the wheel moves -- the plant is a full 2x quicker once it is already sliding.
+    # Is the rack at its AUTHORITY latch rather than merely stuck by stiction? Column torque at or
+    # above the ~202-count breakaway ceiling means the rack has wound up against self-aligning
+    # torque and the tyre -- a grip/geometry limit no interceptor boost can move (route 00000283
+    # t=1394-1405: wheel parked 22.5 deg for 11 s at col ~200, breaker jackhammered 180 counts
+    # 16 times, achieved la stuck at 2.5 while the ask climbed to 3.1 -- "trouble caused by
+    # recovery attempts"). Firing the breaker here is useless AND is the felt disturbance, so the
+    # breaker must stand down. This is the authority ceiling (slow down), not stiction (break it).
+    col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
+    will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
+    at_authority_latch = col_trq >= BREAKAWAY_TORQUE
+
+    # Stiction breaker. Only while the wheel is genuinely stuck by STICTION (not grip): the driver
+    # is not steering, the error is worth acting on, the wheel is not moving, it has been that way
+    # long enough that a zero-crossing mid-reversal cannot trigger it, AND the column is not
+    # already loaded to the authority latch. Ramped in and out so it never steps, and it lets go
+    # the moment the wheel moves -- the plant is a full 2x quicker once it is already sliding.
     wheel_rate = abs(float(CS.steeringRateDeg))
     stuck = (abs(error) > BREAK_ERR and wheel_rate < BREAK_STICK_RATE
-             and not CS.steeringPressed and not steer_limited_by_safety)
+             and not CS.steeringPressed and not steer_limited_by_safety
+             and not at_authority_latch)
     self.break_frames = self.break_frames + 1 if stuck else 0
     engaged_long_enough = self.break_frames * self.dt >= BREAK_DEBOUNCE
     if engaged_long_enough and wheel_rate < BREAK_FREE_RATE:
       direction = np.sign(command) if command != 0.0 else np.sign(error)
-      target = BREAK_MAX * u_max * float(direction)
+      # Escalation, see BREAK_STAGE1 above: the p75 kick first, growing toward the p90 ceiling
+      # only while the wheel has STAYED stuck past the stage-1 point.
+      stuck_s = self.break_frames * self.dt - BREAK_DEBOUNCE
+      escalation = float(np.clip(stuck_s / BREAK_ESCALATE, 0.0, 1.0))
+      target = (BREAK_STAGE1 + (BREAK_MAX - BREAK_STAGE1) * escalation) * u_max * float(direction)
     else:
       target = 0.0
-    step = BREAK_MAX * u_max * self.dt / BREAK_RAMP
-    self.break_boost += float(np.clip(target - self.break_boost, -step, step))
+    # Grow at the stage-1 rate (gentle onset); withdraw at the old full rate, so a kick that
+    # worked -- or a driver hand -- sheds the whole boost in <= 0.25 s exactly as before.
+    step_up = BREAK_STAGE1 * u_max * self.dt / BREAK_RAMP
+    step_down = BREAK_MAX * u_max * self.dt / BREAK_RAMP
+    delta = target - self.break_boost
+    toward_zero = abs(target) < abs(self.break_boost) or (target * self.break_boost) < 0
+    step = step_down if toward_zero else step_up
+    self.break_boost += float(np.clip(delta, -step, step))
     command = float(np.clip(command + self.break_boost, -u_max, u_max))
 
-    # Below the breakaway threshold the rack frees itself; this feeds the saturation report so a
-    # lightly-loaded clip does not raise a warning. A missing reading (0, e.g. gen2) reads as
-    # not-recovering, which falls through to the old always-warn behaviour.
-    col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
-    will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
+    # (col_trq / will_recover computed above the breaker; will_recover feeds the saturation report
+    # below -- a lightly-loaded clip does not warn, a missing reading (0, e.g. gen2) falls through
+    # to the old always-warn behaviour.)
 
     # Optional output smoothing. The filter tracks the command even while it is switched off, so
     # turning it on mid-corner continues from where the command already is instead of stepping
