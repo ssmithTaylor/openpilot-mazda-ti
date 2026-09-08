@@ -43,8 +43,20 @@ The records distinguish a late model request, retained reference, persistent int
 
 ## Local validation
 
+Audit explicit identities in original uncompressed rlogs before interpreting a new drive:
+
 ```text
-python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_verify_replay.py
+python -m tools.mazda_ti.audit_diagnostics --data-root PATH/TO/rlogs --rlogs ROUTE--3/rlog ROUTE--4/rlog --start-ns 262000000000 --end-ns 285000000000 --output NEW-coverage.json
+```
+
+Use integer monotonic nanoseconds and a half-open scoring window. Supply one route and continuous card lifetime, with adjacent segments containing preceding inputs. The auditor joins each scored carOutput publication to its actual carControl, controlsState and eight input identities. It preserves repeated prior-apply publications and reports sequence gaps/resets, changed repeated payloads, missing events, version-zero/unsupported diagnostics, future references and validity mismatches. Unseen inputs are incomplete coverage. Invalid/liveness/frequency health remains distinct from identity availability; inspect the health counts even when all links resolve.
+
+Exit zero requires complete identities for the scored publications and at least one active controller record. Inactive-only coverage, empty windows and absent instrumentation exit nonzero. JSON includes exact identities, issues, source/runtime/input hashes and limitations. Relocating identical input bytes under the same relative names produces identical reports. Existing output is preserved. Duplicate identities or malformed inputs abort rather than selecting an arbitrary message.
+
+This check does not reconstruct commands or judge lane motion. It cannot certify unrecorded leading/trailing time, controller publications never applied by card, CAN reception, or compatibility with process-replay timestamp rewriting. Its CLI and failure cases are exercised with serialized production-schema fixtures; original pre-instrumentation VW logs correctly fail coverage. Qualification on a new active drive remains required.
+
+```text
+python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_verify_replay.py
 ```
 
 The diagnostic tests require numpy, pycapnp and pytest. They serialize real schemas, exercise the actual controller and targeted controlsd/card/Mazda steering source blocks, and replace hardware/transport edges. They cover both turn directions, command decomposition, runtime settings, TI gating, prior-apply alignment, skipped/failed applies, and stale/invalid input snapshots. They are not full process or device tests.
