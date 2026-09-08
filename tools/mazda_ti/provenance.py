@@ -18,6 +18,7 @@ REPLAY_SOURCE_FILES = {
   'selfdrive/controls/lib/vehicle_model.py',
   'selfdrive/controls/lib/drive_helpers.py',
   'selfdrive/car/mazda/lateral_reference.py',
+  'selfdrive/car/mazda/friction_release.py',
   'selfdrive/car/mazda/lateral_diagnostics.py',
   'selfdrive/car/mazda/lateral_plant.py',
   'selfdrive/car/mazda/carcontroller.py',
@@ -70,6 +71,7 @@ def source_snapshot():
   paths = {ROOT / name for name in names if name and (ROOT / name).is_file()}
   paths.update((ROOT / 'tools/mazda_ti').glob('*.py'))
   paths.add(ROOT / 'selfdrive/car/mazda/lateral_reference.py')
+  paths.add(ROOT / 'selfdrive/car/mazda/friction_release.py')
   paths.add(ROOT / 'selfdrive/car/mazda/lateral_diagnostics.py')
   return {p.relative_to(ROOT).as_posix(): sha256(p) for p in sorted(paths)}
 

@@ -61,6 +61,8 @@ def instrument(source):
       lane_position_permitted=getattr(getattr(self,"lane_release",None),"position_permitted",False),
       lane_permitted=getattr(getattr(self,"lane_release",None),"permitted",False),
       lane_removed=list(getattr(getattr(self,"lane_release",None),"removed",[0.0,0.0])),
+      friction_withdrawal=getattr(getattr(self,"friction_release",None),"removed",0.0),
+      friction_episode_completed=getattr(getattr(self,"friction_release",None),"completed",False),
       tracked_setpoint=tracked_setpoint, setpoint=setpoint, ff_lat_accel=ff_lat_accel,
       future_lateral_accel=future_lateral_accel, fric_comp=fric_comp,
       pre_break_command=self._replay_pre_break_command, break_target=target,
@@ -100,6 +102,21 @@ class Streams:
 def distribution(values):
   values = np.asarray(values)
   return dict(zip(['median', 'p95', 'p99', 'max'], map(float, np.quantile(np.abs(values), [0.5, 0.95, 0.99, 1])), strict=False))
+
+
+def switch_controller(ctrl, controller_class, cp, previous_active):
+  """Retain controller state and initialize fields introduced by a candidate."""
+  fresh = controller_class(cp, TestInterface(), DT)
+  for name, value in vars(fresh).items():
+    if not hasattr(ctrl, name):
+      if name == '_plant_measurement_initialized':
+        # Legacy observers skipped inactive samples. Only an immediately preceding
+        # active sample is valid history; existing new observers remain untouched.
+        value = previous_active
+        if not previous_active:
+          ctrl.measurement_rate_filter.x = 0.0
+      setattr(ctrl, name, value)
+  ctrl.__class__ = controller_class
 
 
 def run(args):
@@ -151,6 +168,7 @@ def run(args):
   history = deque([0.0] * 3, maxlen=3)
   limited = False
   previous_output = None
+  previous_active = False
   rows, skipped = [], 0
   i_anchor = None
   for mono, event in streams.rows['controlsState']:
@@ -202,11 +220,7 @@ def run(args):
     if variant_active and ctrl.__class__ is not module.LatControlTorque:
       # Switch methods on the SAME controller instance; every filter, PID,
       # plant and breaker state is preserved at the intervention boundary.
-      fresh = module.LatControlTorque(cp, TestInterface(), DT)
-      for name, value in vars(fresh).items():
-        if not hasattr(ctrl, name):
-          setattr(ctrl, name, value)
-      ctrl.__class__ = module.LatControlTorque
+      switch_controller(ctrl, module.LatControlTorque, cp, previous_active)
     toggles.lat_commit_setpoint = not args.no_commit
     toggles.lat_damping = not args.no_damping
     toggles.lat_friction_comp = not args.no_friction_comp
@@ -277,6 +291,7 @@ def run(args):
     # and compares its own recent requests. Never mix the two conventions.
     limited = all(abs(req - co.actuatorsOutput.steer) > 1e-2 for req in history)
     history.append(float(np.float32(steer)) if software_active else float(observed.output))
+    previous_active = active
     if software_active:
       cc_index = bisect_right(streams.times['carControl'], mono)
       if cc_index == len(streams.times['carControl']):

@@ -59,7 +59,7 @@ Each prefix identifies a `.jsonl` control trace and a `-sends.json` integer-send
 The optional test command requires pytest. Its explicit configuration boundary excludes hardware-dependent repository fixtures and plugins; the verifier itself needs no openpilot runtime or third-party packages. The full shared checks are:
 
 ```text
-python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_workflow.py tools/mazda_ti/test_verify_replay.py tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py tools/mazda_ti/test_recorded_feedback.py tools/mazda_ti/test_measurement_history.py
+python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_workflow.py tools/mazda_ti/test_verify_replay.py tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py tools/mazda_ti/test_recorded_feedback.py tools/mazda_ti/test_measurement_history.py tools/mazda_ti/test_controller_switch.py tools/mazda_ti/test_friction_release.py
 ```
 
 The verifier requires identical active frame identities, controller/reference/geometry fields, integer sends and their coverage. The optional4096 allowance verifies the newly added lane-release log flag on precisely the reference-removal frames. It cannot waive a torque or reference difference. The TI600-count and15-count adjacent-send bounds are checked for this campaign's configuration.
@@ -67,3 +67,14 @@ The verifier requires identical active frame identities, controller/reference/ge
 Reports contain byte hashes and no wall-clock timestamps or absolute machine paths, so the same input bytes produce the same report. Existing output files are preserved. Version2 verification also checks the broader repository source map and the candidate's saved artifact hashes; it does not execute or compare the current runtime environment. Changed source, missing frames, changed commands or non-finite JSON produce a nonzero exit. Source hashes deliberately cover actual file bytes; line-ending conversion may require a fresh integration run rather than reusing an old source lock.
 
 Keep raw drives and large generated traces outside Git. Share the tool, tests and skill; provide evidence artifacts separately when another reviewer needs to reproduce a particular comparison.
+
+When replay changes controller classes at activation, `switch_controller` preserves existing
+state and initializes newly introduced fields. For the plant measurement observer, legacy
+history is valid only when the immediately preceding replayed update was active. Otherwise
+the new observer starts without a derivative and clears the stale rate filter. An already
+initialized newer observer retains its history through inactive updates. Tests exercise these
+three cases against real controller implementations; initialization must not create or hide a
+candidate transient. The optional trace fields `friction_withdrawal` and
+`friction_episode_completed` expose the new friction policy during active updates. Inactive
+rows lack active-loop fields; absence is not a measured zero. Source locks include the new
+friction helper, so older preparations require fresh qualification before candidate execution.

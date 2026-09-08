@@ -4,6 +4,7 @@ from collections import deque
 
 from cereal import log
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.selfdrive.car.mazda.friction_release import FrictionRelease
 from openpilot.selfdrive.car.mazda.lateral_reference import LANE_RELEASE_FLAG, LaneContext, LaneObserver, LaneRelease
 from openpilot.selfdrive.car.interfaces import FRICTION_THRESHOLD
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, apply_center_deadzone, get_friction
@@ -219,6 +220,7 @@ class LatControlTorque(LatControl):
     self.commit_gate_filter = FirstOrderFilter(0.0, COMMIT_GATE_TAU, self.dt)
     self.commit_blend = 0.0
     self.lane_release = LaneRelease()
+    self.friction_release = FrictionRelease()
     self.lane_observer = LaneObserver()
     self._release_context = LaneContext()
     self._model_context_now_ns = 0
@@ -343,6 +345,7 @@ class LatControlTorque(LatControl):
 
     if not active:
       self.lane_release.reset()
+      self.friction_release.reset()
       self.plant.u_prev = 0.0
       self.break_frames = 0
       self.break_boost = 0.0
@@ -400,7 +403,12 @@ class LatControlTorque(LatControl):
       comp_mag = min(comp_mag, max(0.0, FRIC_COMP_KEEPOUT * u_max - abs(command)))
       over = max(abs(gate_la) - FRIC_COMP_LA_DEAD, 0.0)
       fric_comp = comp_mag * math.tanh(over / FRIC_COMP_LA_SOFT) * (1.0 if gate_la >= 0 else -1.0)
+      fric_comp = self.friction_release.update(
+        fric_comp, future_lateral_accel, desired_curvature * CS.vEgo ** 2, measurement,
+        self.lane_release.permitted, self.lane_release.elapsed[0], CS.steeringRateDeg, self.dt)
       command = float(np.clip(command + fric_comp, -u_max, u_max))
+    else:
+      self.friction_release.reset()
 
     # Breakaway friction, in torque space: what it compensates is stiction in the rack, which is a
     # torque, and in lateral-accel space the same relay becomes hundreds of counts wherever the
