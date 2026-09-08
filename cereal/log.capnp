@@ -868,6 +868,10 @@ struct ControlsState @0x97ff69c53601abf1 {
     commitGate @58 :Float64;  # filtered absolute demand, before threshold/blend
     modelContextNow @59 :UInt64;  # CLOCK_MONOTONIC at context update (model event identity clock)
     cameraContextNow @60 :UInt64;  # CLOCK_BOOTTIME at context update (camerad EOF clock)
+    frictionReleaseVersion @61 :UInt16;  # 0 absent; 1 includes reset state on inactive plant updates
+    frictionWithdrawal @62 :Float64;  # nonnegative TI counts removed from proactive compensation
+    frictionReleaseCompleted @63 :Bool;  # unwind observed; wait for a fresh tightening request
+    frictionReleaseDirection @64 :Int8;  # right-positive -1/0/+1; zero after reset
 
     struct InputSnapshot {
       service @0 :Service;

@@ -305,6 +305,7 @@ class LatControlTorque(LatControl):
 
     diag = pid_log.init('mazdaDiagnostics')
     diag.version = 1
+    diag.frictionReleaseVersion = 1
     diag.rawRequest = float(desired_curvature * CS.vEgo ** 2)
     diag.filteredRequest = float(future_lateral_accel)
     diag.delayedRequest = float(setpoint)
@@ -520,6 +521,9 @@ class LatControlTorque(LatControl):
     diag.inverseCommand = float(inverse_command)
     diag.frictionGate = float(gate_la)
     diag.frictionCompensation = float(fric_comp)
+    diag.frictionWithdrawal = float(self.friction_release.removed)
+    diag.frictionReleaseCompleted = bool(self.friction_release.completed)
+    diag.frictionReleaseDirection = int(self.friction_release.direction)
     diag.frictionRelay = float(friction_torque)
     diag.breakerBoost = float(self.break_boost)
     diag.breakerTarget = float(target)

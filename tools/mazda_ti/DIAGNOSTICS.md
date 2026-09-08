@@ -31,6 +31,34 @@ Acceleration fields use m/s², measurement rate uses m/s³, lane offset uses met
 
 `inverseCommand`, proactive `frictionCompensation`, `frictionRelay`, `breakerBoost`, `commandBeforeSmoothing`, and the output filter/blend describe successive command stages. Each stage retains its existing clipping. Summing every contribution without those clips is incorrect. The historical `frictionTorque` field combines relay and breaker, normalized by TI maximum; it does not include proactive friction compensation.
 
+### Friction release state extension
+
+Read `frictionReleaseVersion` independently of the parent version. Zero means this state
+was not recorded, even when `mazdaDiagnostics.version == 1`; it cannot establish that no
+withdrawal or completed episode existed. Version1 records the helper's post-update state:
+
+| Field | Meaning |
+| --- | --- |
+| `frictionWithdrawal` | Nonnegative TI counts removed from the existing proactive compensation |
+| `frictionReleaseCompleted` | The helper observed unwind after withdrawal began and latched completion |
+| `frictionReleaseDirection` | Right-positive direction: -1 left, +1 right, 0 after reset |
+
+The signed contribution that existed before withdrawal is `frictionCompensation +
+frictionReleaseDirection * frictionWithdrawal`. This is a command decomposition, not
+delivered motor torque. A completed episode prevents repeated withdrawal until a fresh
+tightening request rearms it; it does not identify a road corner or successful recovery.
+Direction reversal, inactive updates and disabled/ineligible compensation reset the helper.
+On inactive plant updates, extension version1 explicitly represents reset state: zero
+withdrawal/direction and false completion. Other inactive active-loop fields retain their
+unavailable meaning. Completion may remain true after withdrawal has returned to zero.
+
+`test_friction_diagnostics.py` serializes actual controller results in both directions,
+compares existing fields and outputs against the pinned pre-extension implementation,
+and exercises completion, rearming and nonzero-to-reset transitions. Original drive28f
+logs have extension version0. Local replay qualification covers22,700 updates/applies,
+including2,022 inactive updates: only the four extension fields differ. This is not a
+device-build or physical-handling qualification; verify new recorded fields after deployment.
+
 `integralBefore`, `integralAfter`, the PID input error/feedforward, gains and output permit inspection of accumulated error and anti-windup. `freezeReasons` bits are: 0 limiter feedback, 1 steeringPressed, 2 speed below 5 m/s. The steeringPressed input can be TI-contaminated and is not evidence of hand contact. `plantLimit` is the controller model's current limit, not a measured tire-grip ceiling.
 
 `settings` bits are: 0 commitment, 1 damping, 2 proactive friction compensation, 3 output smoothing, 4 friction relay disabled. These report the toggles actually seen on that update. Float64 values preserve controller precision where Float32 rounding can change an eventual integer command.
