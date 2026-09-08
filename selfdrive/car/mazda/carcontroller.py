@@ -379,6 +379,8 @@ class CarController(CarControllerBase):
 
     apply_steer = 0
     ti_apply_steer = 0
+    new_steer = ti_new_steer = 0
+    stock_previous, ti_previous = self.apply_steer_last, self.ti_apply_steer_last
 
     if CC.latActive:
       # calculate steer and also set limits due to driver torque
@@ -546,4 +548,25 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     Timer.tick()
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      diag = car.CarOutput.MazdaActuatorDiagnostics.new_message()
+      diag.version = 1
+      diag.latActive = CC.latActive
+      diag.tiAllowed = bool(CS.ti_lkas_allowed)
+      diag.stockRequested = int(new_steer)
+      diag.stockLimited = int(apply_steer)
+      diag.tiRequested = int(ti_new_steer)
+      diag.tiLimited = int(ti_apply_steer)
+      diag.stockPrevious = int(stock_previous)
+      diag.tiPrevious = int(ti_previous)
+      diag.driverTorque = float(CS.out.steeringTorque)
+      diag.tiMax = float(self.ccp.TI_STEER_MAX)
+      diag.tiDeltaUp = float(self.ccp.TI_STEER_DELTA_UP)
+      diag.tiDeltaDown = float(self.ccp.TI_STEER_DELTA_DOWN)
+      diag.tiDriverAllowance = float(self.ccp.TI_STEER_DRIVER_ALLOWANCE)
+      diag.tiDriverMultiplier = float(self.ccp.TI_STEER_DRIVER_MULTIPLIER)
+      diag.tiDeltaUpKnee = float(self.ccp.TI_STEER_DELTA_UP_KNEE)
+      diag.tiDeltaUpHigh = float(self.ccp.TI_STEER_DELTA_UP_HIGH)
+      self.lateral_diagnostics = diag
+
     return new_actuators, can_sends

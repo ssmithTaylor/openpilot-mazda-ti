@@ -4,6 +4,7 @@ from collections import deque
 
 from cereal import log
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.selfdrive.car.mazda.lateral_reference import LANE_RELEASE_FLAG, LaneContext, LaneObserver, LaneRelease
 from openpilot.selfdrive.car.interfaces import FRICTION_THRESHOLD
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, apply_center_deadzone, get_friction
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
@@ -216,6 +217,11 @@ class LatControlTorque(LatControl):
     self.commit_sp_filter = CommitFilter(self.dt)
     self.commit_gate_filter = FirstOrderFilter(0.0, COMMIT_GATE_TAU, self.dt)
     self.commit_blend = 0.0
+    self.lane_release = LaneRelease()
+    self.lane_observer = LaneObserver()
+    self._release_context = LaneContext()
+    self._model_context_now_ns = 0
+    self._camera_context_now_ns = 0
     self.friction_torque = FRICTION_TORQUE
     self.break_frames = 0        # how long the wheel has been stuck with an error worth acting on
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
@@ -237,6 +243,7 @@ class LatControlTorque(LatControl):
 
   def reset(self):
     super().reset()
+    self.lane_release.reset()
     self.break_frames = 0
     self.break_boost = 0.0
     self.out_filter.x = 0.0
@@ -247,6 +254,12 @@ class LatControlTorque(LatControl):
   def update_limits(self):
     self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
                         self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
+
+  def update_model_context(self, model, model_mono, valid, now_ns, camera_now_ns=None):
+    if self.plant is not None:
+      self._model_context_now_ns = now_ns
+      self._camera_context_now_ns = now_ns if camera_now_ns is None else camera_now_ns
+      self._release_context = self.lane_observer.update(model, model_mono, valid, now_ns, self._camera_context_now_ns)
 
   def _plant_state(self, active, CS, fp_car_state, frogpilot_toggles):
     """Tell the plant model which actuators are live. Unknown state (the car state message is
@@ -287,10 +300,39 @@ class LatControlTorque(LatControl):
     ff_lat_accel = future_lateral_accel + self.commit_blend * (commit_ff - future_lateral_accel)
     tracked_setpoint = setpoint + self.commit_blend * (commit_sp - setpoint)
 
+    diag = pid_log.init('mazdaDiagnostics')
+    diag.version = 1
+    diag.rawRequest = float(desired_curvature * CS.vEgo ** 2)
+    diag.filteredRequest = float(future_lateral_accel)
+    diag.delayedRequest = float(setpoint)
+    diag.committedFeedforward = float(ff_lat_accel)
+    diag.committedSetpoint = float(tracked_setpoint)
+    diag.commitBlend = float(self.commit_blend)
+    diag.commitFilterFeedforward = float(commit_ff)
+    diag.commitFilterSetpoint = float(commit_sp)
+    diag.commitGate = float(self.commit_gate_filter.x)
+    diag.delayFrames = delay_frames
+    diag.fpStateUsed = fp_car_state is not None
+    diag.curvatureLimited = bool(curvature_limited)
+    diag.settings = sum(int(bool(getattr(frogpilot_toggles, name, False))) << bit for bit, name in enumerate(
+      ('lat_commit_setpoint', 'lat_damping', 'lat_friction_comp', 'lat_output_filter', 'lat_no_friction_relay')))
+    context = self._release_context
+    diag.laneValid = context.valid
+    diag.laneReason = context.reason
+    diag.cameraAge = context.age
+    diag.modelContextNow = self._model_context_now_ns
+    diag.cameraContextNow = self._camera_context_now_ns
+    diag.laneOffset = context.offset
+    diag.laneHeading10 = context.heading10
+    diag.laneHeading20 = context.heading20
+    diag.laneCurvature10 = context.curvature10
+    diag.laneCurvature20 = context.curvature20
+
     plant_state = self._plant_state(active, CS, fp_car_state, frogpilot_toggles)
     pid_log.plantState = int(plant_state)
 
     if not active:
+      self.lane_release.reset()
       self.plant.u_prev = 0.0
       self.break_frames = 0
       self.break_boost = 0.0
@@ -301,6 +343,12 @@ class LatControlTorque(LatControl):
     measurement = measured_curvature * CS.vEgo ** 2
     measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
     self.previous_measurement = measurement
+
+    # Withdraw only retained commitment when the lane and both request horizons
+    # support unwinding. The PID continues to integrate the resulting tracking error.
+    ff_lat_accel, tracked_setpoint = self.lane_release.update(
+      future_lateral_accel, setpoint, ff_lat_accel, tracked_setpoint, measurement, commit_on, self.dt,
+      self._release_context, CS.vEgo, CS.steeringRateDeg, desired_curvature * CS.vEgo ** 2)
 
     # Wind the integrator against the authority this car actually has in its current state -- at
     # low speed, or with the stock LKAS path blocked, that is a fraction of what it has on the
@@ -326,6 +374,7 @@ class LatControlTorque(LatControl):
     damp_rate = apply_center_deadzone(measurement_rate, DAMP_RATE_DEADZONE) if damp_on else 0.0
 
     freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+    integral_before = self.pid.i
     output_lataccel = self.pid.update(error_lsf,
                                       -damp_rate,
                                       feedforward=ff,
@@ -334,6 +383,7 @@ class LatControlTorque(LatControl):
 
     u_max = self.plant.ti_steer_max
     command = self.plant.inverse(output_lataccel, CS.vEgo)
+    inverse_command = command
 
     # Friction compensation, see FRIC_COMP_BASE above. Proactive (demand-direction), unlike the
     # error-direction relay below; with the feedforward no longer arriving short, the relay and
@@ -406,6 +456,7 @@ class LatControlTorque(LatControl):
     # down to a stale value. It cannot raise anything: the clip below and the rate limiter and
     # the interceptor's own bounds all still apply.
     smooth = bool(getattr(frogpilot_toggles, "lat_output_filter", False))
+    command_before_smoothing = command
     filtered = self.out_filter.update(command)
     # Blend rather than switch. Enabling is continuous either way because the filter tracks the
     # command while it is off, but DISABLING would hand back the raw command in one frame -- a step
@@ -426,6 +477,8 @@ class LatControlTorque(LatControl):
       pid_log.plantState = int(pid_log.plantState) + COMMIT_FLAG
     if damp_on:
       pid_log.plantState = int(pid_log.plantState) + DAMP_FLAG
+    if max(self.lane_release.removed) > 1e-9:
+      pid_log.plantState = int(pid_log.plantState) + LANE_RELEASE_FLAG
     pid_log.active = True
     pid_log.error = float(error_lsf)
     pid_log.p = float(self.pid.p)
@@ -436,6 +489,42 @@ class LatControlTorque(LatControl):
     pid_log.actualLateralAccel = float(measurement)
     pid_log.desiredLateralAccel = float(setpoint)
     pid_log.frictionTorque = float((friction_torque + self.break_boost) / u_max)
+    diag.effectiveFeedforward = float(ff_lat_accel)
+    diag.effectiveSetpoint = float(tracked_setpoint)
+    diag.removedFeedforward = self.lane_release.removed[0]
+    diag.removedSetpoint = self.lane_release.removed[1]
+    diag.dwellFeedforward = self.lane_release.elapsed[0]
+    diag.dwellSetpoint = self.lane_release.elapsed[1]
+    diag.motionPermitted = bool(self.lane_release.motion_permitted)
+    diag.positionPermitted = bool(self.lane_release.position_permitted)
+    diag.measurement = float(measurement)
+    diag.measurementRate = float(measurement_rate)
+    diag.integralBefore = float(integral_before)
+    diag.integralAfter = float(self.pid.i)
+    diag.freezeReasons = int(bool(steer_limited_by_safety)) | (int(CS.steeringPressed) << 1) | (int(CS.vEgo < 5) << 2)
+    diag.pidOutput = float(output_lataccel)
+    diag.plantLimit = float(la_max)
+    diag.inverseCommand = float(inverse_command)
+    diag.frictionGate = float(gate_la)
+    diag.frictionCompensation = float(fric_comp)
+    diag.frictionRelay = float(friction_torque)
+    diag.breakerBoost = float(self.break_boost)
+    diag.breakerTarget = float(target)
+    diag.breakerFrames = self.break_frames
+    diag.breakerEligible = bool(stuck)
+    diag.columnLatch = bool(at_authority_latch)
+    diag.commandBeforeSmoothing = float(command_before_smoothing)
+    diag.outputFilter = float(filtered)
+    diag.outputFilterBlend = float(self.out_filter_on)
+    diag.command = float(command)
+    diag.tiMax = float(u_max)
+    diag.kp = float(self.pid.k_p)
+    diag.ki = float(self.pid.k_i)
+    diag.kd = float(self.pid.k_d)
+    diag.accelOffset = float(lat_accel_offset)
+    diag.stockTorqueModel = float(self.plant.e_used)
+    diag.error = float(error_lsf)
+    diag.feedforward = float(ff)
     # The rack is loaded well below where it stops answering, so it is going to move: sitting at the
     # clip here is not a loss of control and does not deserve a warning. 0 means the car did not
     # publish a reading, which falls through to the old behaviour.

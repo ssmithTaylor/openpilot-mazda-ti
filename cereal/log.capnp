@@ -799,7 +799,97 @@ struct ControlsState @0x97ff69c53601abf1 {
     version @12 :Int32;
     frictionTorque @13 :Float32;  # friction/breakaway term, normalized torque (see plantState cars)
     plantState @14 :Int32;        # lateral plant model state: 0 none, 1 stock only, 2 TI only, 3 TI+stock, +4 ramping in
+    mazdaDiagnostics @15 :MazdaLateralDiagnostics;
    }
+
+  # Observational controller state. Version 0 means absent (including older logs).
+  # Acceleration is m/s^2, positive right. Commands are TI counts, positive right,
+  # BEFORE the wire sign inversion and carcontroller's integer/rate/driver limits.
+  # Float64 preserves controller precision at integer-command rounding boundaries.
+  struct MazdaLateralDiagnostics {
+    version @0 :UInt16;
+    inputs @1 :List(InputSnapshot);
+    rawRequest @2 :Float64;
+    filteredRequest @3 :Float64;
+    delayedRequest @4 :Float64;
+    committedFeedforward @5 :Float64;
+    committedSetpoint @6 :Float64;
+    effectiveFeedforward @7 :Float64;
+    effectiveSetpoint @8 :Float64;
+    commitBlend @9 :Float64;
+    delayFrames @10 :UInt16;
+    removedFeedforward @11 :Float64;
+    removedSetpoint @12 :Float64;
+    dwellFeedforward @13 :Float64;  # seconds
+    dwellSetpoint @14 :Float64;
+    motionPermitted @15 :Bool;
+    positionPermitted @16 :Bool;
+    laneValid @17 :Bool;
+    laneReason @18 :Text;
+    cameraAge @19 :Float64;  # seconds at the lane observer update
+    laneOffset @20 :Float64;  # metres, positive right of lane centre
+    laneHeading10 @21 :Float64;  # radians
+    laneHeading20 @22 :Float64;
+    laneCurvature10 @23 :Float64;  # 1/metres
+    laneCurvature20 @24 :Float64;
+    measurement @25 :Float64;
+    measurementRate @26 :Float64;  # m/s^3, filtered
+    integralBefore @27 :Float64;
+    integralAfter @28 :Float64;
+    freezeReasons @29 :UInt8;  # bit 0 limited, 1 steeringPressed, 2 speed < 5 m/s; NOT hand-contact truth
+    pidOutput @30 :Float64;
+    plantLimit @31 :Float64;  # model's current limit, NOT measured physical authority
+    inverseCommand @32 :Float64;
+    frictionGate @33 :Float64;
+    frictionCompensation @34 :Float64;  # separate from historical frictionTorque
+    frictionRelay @35 :Float64;
+    breakerBoost @36 :Float64;
+    breakerTarget @37 :Float64;
+    breakerFrames @38 :UInt32;
+    breakerEligible @39 :Bool;
+    columnLatch @40 :Bool;
+    commandBeforeSmoothing @41 :Float64;
+    outputFilter @42 :Float64;
+    outputFilterBlend @43 :Float64;
+    command @44 :Float64;
+    settings @45 :UInt16;  # bits: commitment, damping, friction comp, output smoothing, relay disabled
+    tiMax @46 :Float64;
+    kp @47 :Float64;
+    ki @48 :Float64;
+    kd @49 :Float64;
+    accelOffset @50 :Float64;
+    stockTorqueModel @51 :Float64;  # plant e_used, counts
+    fpStateUsed @52 :Bool;
+    curvatureLimited @53 :Bool;
+    error @54 :Float64;  # includes low-speed factor, PID input
+    feedforward @55 :Float64;  # roll/offset compensated PID input
+    commitFilterFeedforward @56 :Float64;  # ratchet state before blend
+    commitFilterSetpoint @57 :Float64;
+    commitGate @58 :Float64;  # filtered absolute demand, before threshold/blend
+    modelContextNow @59 :UInt64;  # CLOCK_MONOTONIC at context update (model event identity clock)
+    cameraContextNow @60 :UInt64;  # CLOCK_BOOTTIME at context update (camerad EOF clock)
+
+    struct InputSnapshot {
+      service @0 :Service;
+      logMonoTime @1 :UInt64;  # identity actually held by SubMaster, not inferred publication order
+      valid @2 :Bool;
+      alive @3 :Bool;
+      frequencyOk @4 :Bool;
+      checksPassed @5 :Bool;  # includes configured SubMaster ignore rules
+      updated @6 :Bool;
+      seen @7 :Bool;
+      enum Service {
+        carState @0;
+        frogpilotCarState @1;
+        modelV2 @2;
+        liveParameters @3;
+        liveTorqueParameters @4;
+        liveDelay @5;
+        carOutput @6;
+        liveLocationKalman @7;
+      }
+    }
+  }
 
   struct LateralLQRState {
     active @0 :Bool;

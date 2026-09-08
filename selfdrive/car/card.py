@@ -40,6 +40,11 @@ class Car:
     self.initialized_prev = False
 
     self.last_actuators_output = car.CarControl.Actuators.new_message()
+    self.last_applied_car_control_mono = 0
+    self.last_apply_mono = 0
+    self.apply_sequence = 0
+    self.last_applied_car_control_checks = False
+    self.last_mazda_diagnostics = None
 
     self.params = Params()
 
@@ -172,6 +177,12 @@ class Car:
     co_send = messaging.new_message('carOutput')
     co_send.valid = self.sm.all_checks(['carControl'])
     co_send.carOutput.actuatorsOutput = self.last_actuators_output
+    co_send.carOutput.appliedCarControlMonoTime = self.last_applied_car_control_mono
+    co_send.carOutput.appliedAtMonoTime = self.last_apply_mono
+    co_send.carOutput.applySequence = self.apply_sequence
+    co_send.carOutput.appliedCarControlChecksPassed = self.last_applied_car_control_checks
+    if self.last_mazda_diagnostics is not None:
+      co_send.carOutput.mazdaDiagnostics = self.last_mazda_diagnostics
     self.pm.send('carOutput', co_send)
 
     # kick off controlsd step while we actuate the latest carControl packet
@@ -202,6 +213,11 @@ class Car:
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, self.frogpilot_toggles)
+      self.last_applied_car_control_mono = self.sm.logMonoTime['carControl']
+      self.last_apply_mono = now_nanos
+      self.apply_sequence += 1
+      self.last_applied_car_control_checks = self.sm.all_checks(['carControl'])
+      self.last_mazda_diagnostics = getattr(self.CI.CC, 'lateral_diagnostics', None)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC

@@ -29,6 +29,7 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.selfdrive.car.mazda.lateral_diagnostics import record_inputs
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
 from openpilot.frogpilot.tinygrad_modeld.tinygrad_modeld import LAT_SMOOTH_SECONDS
@@ -744,6 +745,9 @@ class Controls:
       # frogpilotCarState carries the car's lateral actuator state (Mazda TI: LKAS_BLOCK, LKAS_EFFECTIVE,
       # TI RUN). Pass it only while it is alive and valid; the controllers treat None as "unknown".
       fp_car_state = self.sm['frogpilotCarState'] if self.sm.all_checks(['frogpilotCarState']) else None
+      if isinstance(self.LaC, LatControlTorque):
+        self.LaC.update_model_context(model_v2, self.sm.logMonoTime['modelV2'],
+                                      self.sm.all_checks(['modelV2']), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))
       steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                          self.steer_limited_by_safety, self.desired_curvature,
                                                          curvature_limited, lat_delay,
@@ -751,6 +755,8 @@ class Controls:
                                                          self.sm['modelV2'],
                                                          self.frogpilot_toggles,
                                                          fp_car_state)
+      if isinstance(self.LaC, LatControlTorque) and self.LaC.plant is not None:
+        record_inputs(lac_log.mazdaDiagnostics, self.sm)
       actuators.steer = float(steer)
       actuators.steeringAngleDeg = float(steeringAngleDeg)
 
@@ -1011,6 +1017,7 @@ class Controls:
     cc_send = messaging.new_message('carControl')
     cc_send.valid = CS.canValid
     cc_send.carControl = CC
+    cc_send.carControl.controlsStateMonoTime = dat.logMonoTime
     self.pm.send('carControl', cc_send)
 
     # frogpilotControlsState

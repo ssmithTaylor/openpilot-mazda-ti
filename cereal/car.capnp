@@ -329,6 +329,7 @@ struct CarControl {
 
   # Actuator commands as computed by controlsd
   actuators @6 :Actuators;
+  controlsStateMonoTime @17 :UInt64;  # matching controller diagnostics event; 0 if unavailable
 
   # moved to CarOutput
   actuatorsOutputDEPRECATED @10 :Actuators;
@@ -429,6 +430,36 @@ struct CarOutput {
   # the CarController are reflected in actuatorsOutput
   # and matches what is sent to the car
   actuatorsOutput @0 :CarControl.Actuators;
+  # Identity and apply-time of the command represented by actuatorsOutput.
+  # card publishes this previous-apply snapshot before applying the next command.
+  # Sequence 0 means no apply yet; repeated sequence means no new apply.
+  appliedCarControlMonoTime @1 :UInt64;
+  appliedAtMonoTime @2 :UInt64;
+  applySequence @3 :UInt64;
+  appliedCarControlChecksPassed @4 :Bool;
+  mazdaDiagnostics @5 :MazdaActuatorDiagnostics;
+
+  # Integer commands passed to the CAN packer, not measured motor torque.
+  # Counts here use the wire convention: positive left. Zero version = absent.
+  struct MazdaActuatorDiagnostics {
+    version @0 :UInt16;
+    latActive @1 :Bool;
+    tiAllowed @2 :Bool;
+    stockRequested @3 :Int32;
+    stockLimited @4 :Int32;
+    tiRequested @5 :Int32;
+    tiLimited @6 :Int32;
+    stockPrevious @7 :Int32;
+    tiPrevious @8 :Int32;
+    driverTorque @9 :Float64;  # limiter input; TI can contaminate it, NOT hand-contact truth
+    tiMax @10 :Float64;
+    tiDeltaUp @11 :Float64;
+    tiDeltaDown @12 :Float64;
+    tiDriverAllowance @13 :Float64;
+    tiDriverMultiplier @14 :Float64;
+    tiDeltaUpKnee @15 :Float64;
+    tiDeltaUpHigh @16 :Float64;
+  }
 }
 
 # ****** car param ******
