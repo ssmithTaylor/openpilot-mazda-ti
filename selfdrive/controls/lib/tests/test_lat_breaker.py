@@ -1,18 +1,10 @@
-"""Tests for the escalating stiction breaker.
-
-The lesson being pinned (route 00000283): the release need is a distribution (median 30 /
-p75 63-91 / p90 184 counts), and firing the p90 flat at every stuck moment kicked mild corners
-with 180-count lurches ("trouble caused by recovery attempts"). The boost must start at the
-p75-sized stage 1, escalate to the ceiling only while the wheel STAYS stuck, withdraw at the old
-fast rate, and re-stick starts gentle again.
-"""
+"""Escalation, withdrawal and column-load gate contracts; no vehicle-motion prediction."""
 import math
 
 import numpy as np
 import pytest
 
 from cereal import car, log
-from openpilot.common.mock.generators import generate_liveLocationKalman
 from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   LatControlTorque, BREAK_STAGE1, BREAK_MAX, BREAK_RAMP, BREAK_ESCALATE, BREAK_DEBOUNCE,
   BREAKAWAY_TORQUE,
@@ -80,9 +72,8 @@ def step_stuck(c, VM, desired_la, measured_la, rate_deg=0.0, column_torque=0.0):
   CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-curv, V, 0.0))
   CS.steeringRateDeg = rate_deg
   params = log.LiveParametersData.new_message()
-  llk = generate_liveLocationKalman()
   return c.update(True, CS, VM, params, False, desired_la / V ** 2, False, 0.3,
-                  llk, None, toggles(), fp_state(column_torque))
+                  None, None, toggles(), fp_state(column_torque))
 
 
 def boost_of(c):
@@ -154,17 +145,15 @@ class TestEscalatingBreaker:
     assert boost_of(c) < 5.0
 
   def test_stands_down_at_the_authority_latch(self):
-    # The route-00000283 lesson: a rack wound to the ~202-count SAT ceiling is grip-limited, not
-    # stiction-stuck. The breaker must NOT fire there -- boosting is useless and is the felt
-    # disturbance. Same stuck geometry as the escalation tests, but with the column at the latch.
+    # Preserve the high-column-load gate with the same geometry as the escalation tests.
+    # This input threshold does not independently identify a physical grip limit.
     c, VM = make_controller()
     for _ in range(int((BREAK_DEBOUNCE + BREAK_ESCALATE) / DT) + 100):
       step_stuck(c, VM, 3.0, 2.4, rate_deg=0.0, column_torque=BREAKAWAY_TORQUE + 20)
-    assert boost_of(c) < 5.0, "breaker fired into a grip-limited (authority-latched) rack"
+    assert boost_of(c) < 5.0, "breaker fired above the column-load stand-down threshold"
 
   def test_still_fires_below_the_latch(self):
-    # Control for the above: the SAME stuck geometry with the column BELOW the latch is real
-    # stiction and must still get a kick.
+    # Below the threshold, the existing error/rate conditions must still permit assistance.
     c, VM = make_controller()
     boosts = self._hold_stuck(c, VM, int((BREAK_DEBOUNCE + BREAK_ESCALATE) / DT) + 50)
     # _hold_stuck uses column_torque=0 (missing reading -> treated as not-at-latch)

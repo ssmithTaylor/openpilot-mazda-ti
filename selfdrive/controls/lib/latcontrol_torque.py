@@ -364,25 +364,23 @@ class LatControlTorque(LatControl):
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
     command = float(np.clip(command + friction_torque, -u_max, u_max))
 
-    # Is the rack at its AUTHORITY latch rather than merely stuck by stiction? Column torque at or
-    # above the ~202-count breakaway ceiling means the rack has wound up against self-aligning
-    # torque and the tyre -- a grip/geometry limit no interceptor boost can move (route 00000283
-    # t=1394-1405: wheel parked 22.5 deg for 11 s at col ~200, breaker jackhammered 180 counts
-    # 16 times, achieved la stuck at 2.5 while the ask climbed to 3.1 -- "trouble caused by
-    # recovery attempts"). Firing the breaker here is useless AND is the felt disturbance, so the
-    # breaker must stand down. This is the authority ceiling (slow down), not stiction (break it).
+    # Preserve the empirical high-column-load stand-down threshold. Column load does not by itself
+    # identify tire grip or prove that another steering shape cannot recover. In the cited route
+    # 00000283 plateau, changing internal boost was clipped away from the constant outgoing command.
     col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
     will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
     at_authority_latch = col_trq >= BREAKAWAY_TORQUE
 
-    # Stiction breaker. Only while the wheel is genuinely stuck by STICTION (not grip): the driver
-    # is not steering, the error is worth acting on, the wheel is not moving, it has been that way
-    # long enough that a zero-crossing mid-reversal cannot trigger it, AND the column is not
-    # already loaded to the authority latch. Ramped in and out so it never steps, and it lets go
-    # the moment the wheel moves -- the plant is a full 2x quicker once it is already sliding.
+    # The breaker needs sustained tracking error, low wheel rate and no pressed/limiting gate.
+    # The TI-derived pressed flag is a controller input, not independent evidence of hand contact.
+    # Holding/feedforward torque can oppose tracking error legitimately: a new tighter reference
+    # reaches feedforward before the delayed target. Suppress additional breakaway help only when
+    # its command direction opposes BOTH effective references. Existing boost still withdraws at
+    # the bounded rate below; the guard neither reverses it nor changes the holding command.
     wheel_rate = abs(float(CS.steeringRateDeg))
     stuck = (abs(error) > BREAK_ERR and wheel_rate < BREAK_STICK_RATE
              and not CS.steeringPressed and not steer_limited_by_safety
+             and (command * error >= 0.0 or command * (ff_lat_accel - measurement) >= 0.0)
              and not at_authority_latch)
     self.break_frames = self.break_frames + 1 if stuck else 0
     engaged_long_enough = self.break_frames * self.dt >= BREAK_DEBOUNCE
