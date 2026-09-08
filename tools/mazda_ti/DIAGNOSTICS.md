@@ -47,6 +47,28 @@ The records distinguish a late model request, retained reference, persistent int
 
 ## Local validation
 
+After checking applied-output identities, reproduce the lane observer from the actual consumed
+model events and both recorded clocks:
+
+```text
+python -m tools.mazda_ti.audit_lane_context --data-root PATH/TO/rlogs --rlogs ROUTE--13/rlog --start-ns 835000000000 --end-ns 855000000000 --output NEW-lane-context.json
+```
+
+This executes the current production `LaneObserver` and compares its reason, validity, age,
+offset, headings and curvatures with logged diagnostics. The absolute comparison tolerance
+is 1e-10 for those geometry/age fields only. Reports include the exact consumed model identity,
+lane probabilities, separate input health, reference signals and source/raw/runtime hashes.
+Invalid geometry produces a null offset in the report, rather than a measured lane-center zero.
+Missing consumed events, invalid clocks, duplicate identities and changed recorded results
+fail the audit. Existing evidence is preserved. Input file order does not select a newer model
+in place of the consumed one; age is rechecked even when a model identity repeats.
+
+The auditor is qualified on 15,200 recorded controller publications spanning the drive28f
+approach and both VW directions, plus serialized clock/identity/failure cases. This establishes
+lane-observer reproduction only. A correct fit of low-confidence or incorrectly selected lane
+boundaries is not proof of a correct physical path. Controller command reproduction, release
+state history and rider-confirmed lane outcomes remain separate requirements.
+
 Audit explicit identities in original uncompressed rlogs before interpreting a new drive:
 
 ```text
@@ -60,7 +82,7 @@ Exit zero requires complete identities for the scored publications and at least 
 This check does not reconstruct commands or judge lane motion. It cannot certify unrecorded leading/trailing time, controller publications never applied by card, CAN reception, or compatibility with process-replay timestamp rewriting. Its CLI and failure cases are exercised with serialized production-schema fixtures; original pre-instrumentation VW logs correctly fail coverage. Qualification on a new active drive remains required.
 
 ```text
-python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_verify_replay.py
+python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py tools/mazda_ti/test_verify_replay.py
 ```
 
 The diagnostic tests require numpy, pycapnp and pytest. They serialize real schemas, exercise the actual controller and targeted controlsd/card/Mazda steering source blocks, and replace hardware/transport edges. They cover both turn directions, command decomposition, runtime settings, TI gating, prior-apply alignment, skipped/failed applies, and stale/invalid input snapshots. They are not full process or device tests.
