@@ -149,3 +149,19 @@ The diagnostic tests require numpy, pycapnp and pytest. They serialize real sche
 Preserve source hashes with corpus comparisons. Include the controller, lane helper, diagnostic helper, PID, plant, carcontroller, card, controlsd and both schemas. Logging-only changes still require fresh equivalence evidence. Stock process-replay tooling rewrites event timestamps; its nested identity handling must be qualified before using these links on generated process-replay logs. Original rlogs retain the actual identities.
 
 Before a drive, verify the remote-backed build, new schema parsing, runtime cost and identity-chain coverage on the device. Do not claim future road logs contain these fields until the running build and actual recorded events confirm it.
+
+For the synthetic controller workload after a build, run:
+
+```text
+python -m tools.mazda_ti.benchmark_controller --output NEW-controller-benchmark.json
+```
+
+This runs2,400 updates with repeated easing, completion, rearming and inactive phases,
+fitting lane geometry every fifth update and serializing the resulting controlsState.
+It uses controlsd's actual subscription list and a separate carState event. Serialized
+fields are checked against the controller's state outside the timed region. The report
+records source/runtime identity, exercised states, event size and timing percentiles;
+exit zero requires every state to be exercised and p99 below10ms. Timing results vary
+with machine load and are not deterministic artifacts. This controlled workload does
+not measure full process transport, concurrent onroad load or actual lane performance.
+Keep its result with the build record, then verify real onroad logs separately.
