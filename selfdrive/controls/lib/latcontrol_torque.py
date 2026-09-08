@@ -55,19 +55,14 @@ BREAK_STICK_RATE = 2.0     # deg/s: below this the wheel counts as not moving
 BREAK_FREE_RATE = 4.0      # deg/s: above this it is moving and the boost lets go
 BREAK_DEBOUNCE = 0.20      # s the condition must hold -- the wheel passes through zero rate on every
                            # direction reversal, and that is not the same thing as being stuck
-# ESCALATING, 2026-08-25. History: 0.15 (~90 counts) was deliberately small; 2026-08-23 raised
-# it flat to 0.30 (~180, the p90 release need) after a rack sat parked off-centre for 3 s inside
-# the 90-count reach (route 0000027e t=712-715). One drive falsified the FLAT p90: the release
-# need is a DISTRIBUTION (median 30 / p75 63-91 / p90 184), and firing 180 counts at every stuck
-# moment overdrives the median case 6x -- route 00000283 shows full-180 kicks with 21-38 deg/s
-# lurches on mild 2.0-2.5 corners the car was making anyway, one corner cycling boost for 9.8 s
-# ("trouble caused by recovery attempts", the driver said, precisely). So the boost now
-# ESCALATES: ramp to BREAK_STAGE1 (~the p75) over BREAK_RAMP as before, then grow toward
-# BREAK_MAX (~the p90) over BREAK_ESCALATE only while the wheel STAYS stuck. Median stalls get
-# the gentle kick and release before stage 2; only the stubborn tail ever meets 180. Release on
-# motion is unchanged, so a kick that works is withdrawn just as fast as before.
-BREAK_STAGE1 = 0.15        # normalized, ~90 counts: the first-stage kick, covers to ~p75
-BREAK_MAX = 0.30           # normalized, ~180 counts: the escalation ceiling, covers to the p90
+# Escalating breaker: the target starts near 90 counts and grows toward the existing 180-count
+# maximum while the low-rate/error conditions persist. Onset uses the smaller ramp rate;
+# withdrawal keeps the previous full ramp rate. This is a bounded command-shaping policy,
+# not a demonstrated physical release percentile. Historical release estimates depended on
+# TI-contaminated contact classifications, and internal boost variation can clip away before
+# transmission. Judge effectiveness from actual outgoing commands and rider-marked motion.
+BREAK_STAGE1 = 0.15        # normalized, ~90 counts: initial target
+BREAK_MAX = 0.30           # normalized, ~180 counts: unchanged maximum target
 BREAK_RAMP = 0.25          # s to reach stage 1, so it is never a step onto the wheel
 BREAK_ESCALATE = 1.5       # s of CONTINUED stuck to grow from stage 1 to the ceiling
 
@@ -386,15 +381,14 @@ class LatControlTorque(LatControl):
     engaged_long_enough = self.break_frames * self.dt >= BREAK_DEBOUNCE
     if engaged_long_enough and wheel_rate < BREAK_FREE_RATE:
       direction = np.sign(command) if command != 0.0 else np.sign(error)
-      # Escalation, see BREAK_STAGE1 above: the p75 kick first, growing toward the p90 ceiling
-      # only while the wheel has STAYED stuck past the stage-1 point.
+      # Grow the target only while the low-rate/error conditions remain satisfied.
       stuck_s = self.break_frames * self.dt - BREAK_DEBOUNCE
       escalation = float(np.clip(stuck_s / BREAK_ESCALATE, 0.0, 1.0))
       target = (BREAK_STAGE1 + (BREAK_MAX - BREAK_STAGE1) * escalation) * u_max * float(direction)
     else:
       target = 0.0
     # Grow at the stage-1 rate (gentle onset); withdraw at the old full rate, so a kick that
-    # worked -- or a driver hand -- sheds the whole boost in <= 0.25 s exactly as before.
+    # worked -- or a closing eligibility gate -- sheds the whole boost in <= 0.25 s as before.
     step_up = BREAK_STAGE1 * u_max * self.dt / BREAK_RAMP
     step_down = BREAK_MAX * u_max * self.dt / BREAK_RAMP
     delta = target - self.break_boost
