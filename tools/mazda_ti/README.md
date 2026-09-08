@@ -2,6 +2,11 @@
 
 For structured rlog fields, the identity-coverage audit command, sign conventions and logging tests, read [DIAGNOSTICS.md](DIAGNOSTICS.md). Verify the recorded diagnostic versions and vehicle source separately from the analyzer's current checkout.
 
+For instrumented-drive candidate replay, that guide also documents `RecordedTiFeedback`,
+the shared library for coupling candidate requests to software TI feedback through exact
+consumed-output and applied-command identities. It is separate from the historical runner
+below and requires a caller that reconstructs controller inputs and state.
+
 `verify_replay.py` checks that an integrated controller reproduces an already-qualified reference replay, and that the source files still match the integration run's recorded hashes. It runs with Python3.11+ and the standard library on Windows or Linux. It reads local files and performs no network, vehicle or deployment operations.
 
 The shared runner now prepares input identities and runs baseline/candidate replay directly from raw rlogs. It has been checked against the qualified VW window under both compatible request histories and a second window containing an actuator-state transition. Preparation and candidate artifacts reproduced byte-for-byte after relocating the raw inputs. This does not yet qualify every older corpus case or predict improved lane tracking.
@@ -54,7 +59,7 @@ Each prefix identifies a `.jsonl` control trace and a `-sends.json` integer-send
 The optional test command requires pytest. Its explicit configuration boundary excludes hardware-dependent repository fixtures and plugins; the verifier itself needs no openpilot runtime or third-party packages. The full shared checks are:
 
 ```text
-python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_workflow.py tools/mazda_ti/test_verify_replay.py tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py
+python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_workflow.py tools/mazda_ti/test_verify_replay.py tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py tools/mazda_ti/test_recorded_feedback.py tools/mazda_ti/test_measurement_history.py
 ```
 
 The verifier requires identical active frame identities, controller/reference/geometry fields, integer sends and their coverage. The optional4096 allowance verifies the newly added lane-release log flag on precisely the reference-removal frames. It cannot waive a torque or reference difference. The TI600-count and15-count adjacent-send bounds are checked for this campaign's configuration.

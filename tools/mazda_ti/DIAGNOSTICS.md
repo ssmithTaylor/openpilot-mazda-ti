@@ -47,6 +47,37 @@ The records distinguish a late model request, retained reference, persistent int
 
 ## Local validation
 
+For candidate controller replay with these explicit identities, `recorded_feedback.py`
+provides the software TI feedback boundary. It is a library; the historical `run replay`
+CLI still uses its declared sampling histories. After auditing the input chain, construct
+`RecordedTiFeedback(outputs, commands, activation_ns, end_ns, limiter)` with serialized
+carOutput events paired with event timestamps, a carControl event map keyed by timestamp,
+and the pinned production limiter. Times are integer nanoseconds.
+
+Before each controller update, use `output_for(consumed_carOutput_mono)` for the exact
+output identity in its diagnostic inputs. Publish the resulting normalized steering with
+`publish(controlsState_mono, steer)`. Use `history_request(mono, replayed, recorded)` for
+the controller's request-history comparison, preserving recorded requests and feedback
+together before activation. Call `finish()` after all required controller outputs are
+published to obtain sequential apply results. Retain the controller's actual limiter-feedback
+update order; the helper does not implement controlsd's surrounding state machine.
+
+Construction verifies original serialized requests, sequential TI limits, previous-command
+continuity, repeated-apply payloads and feedback values. Simulation retains its own previous
+limited command. A post-activation publication can still represent a pre-activation apply;
+the represented apply determines which feedback is used. Missing identities, changed repeated
+applies, nonfinite signals, unsupported settings and active stock fallback while TI is
+unavailable fail explicitly. Recorded physical observations, driver torque, actuator permission
+and the apply schedule remain fixed; software feedback is not a vehicle-motion prediction.
+
+The helper reproduced the local exact-identity prototype's controller traces byte-for-byte
+and its TI results on three original-drive windows with baseline and four individual probes
+(76,000 scored rows total). Fourteen serialized-event tests cover activation boundaries,
+candidate-owned feedback, delayed consumed identities, and malformed/incomplete inputs.
+This qualifies the feedback component, not an arbitrary new controller or full replay runner.
+Preserve caller, dependency, runtime and raw-log hashes and independently reproduce the
+recorded baseline before interpreting a candidate.
+
 After checking applied-output identities, reproduce the lane observer from the actual consumed
 model events and both recorded clocks:
 

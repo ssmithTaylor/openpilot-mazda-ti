@@ -203,6 +203,7 @@ class LatControlTorque(LatControl):
     self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES = int(1 / self.dt)
     self.requested_lateral_accel_buffer = deque([0.] * self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES , maxlen=self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES)
     self.previous_measurement = 0.0
+    self._plant_measurement_initialized = False
     self.measurement_rate_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * (MAX_LAT_JERK_UP - 0.5)), self.dt)
 
     # self.plant was looked up above (see the PID construction); a car whose torque -> lateral
@@ -331,6 +332,15 @@ class LatControlTorque(LatControl):
     plant_state = self._plant_state(active, CS, fp_car_state, frogpilot_toggles)
     pid_log.plantState = int(plant_state)
 
+    # Keep the damping observer warm during disengagement. Otherwise the first
+    # active update divides all intervening vehicle motion by one control tick.
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    measurement = measured_curvature * CS.vEgo ** 2
+    rate = (measurement - self.previous_measurement) / self.dt if self._plant_measurement_initialized else 0.0
+    measurement_rate = self.measurement_rate_filter.update(rate)
+    self.previous_measurement = measurement
+    self._plant_measurement_initialized = True
+
     if not active:
       self.lane_release.reset()
       self.plant.u_prev = 0.0
@@ -338,11 +348,6 @@ class LatControlTorque(LatControl):
       self.break_boost = 0.0
       pid_log.active = False
       return 0.0, 0.0, pid_log
-
-    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    measurement = measured_curvature * CS.vEgo ** 2
-    measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
-    self.previous_measurement = measurement
 
     # Withdraw only retained commitment when the lane and both request horizons
     # support unwinding. The PID continues to integrate the resulting tracking error.
