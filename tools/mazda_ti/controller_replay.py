@@ -119,6 +119,22 @@ def switch_controller(ctrl, controller_class, cp, previous_active):
   ctrl.__class__ = controller_class
 
 
+def publish_paired_request(feedback, streams, mono, curvature, recorded_output, candidate_output, active):
+  """Publish the original carControl identity paired with a controller update."""
+  cc_index = bisect_right(streams.times['carControl'], mono)
+  if cc_index == len(streams.times['carControl']):
+    raise RuntimeError('Missing paired carControl publication')
+  cc_mono, cc_event = streams.rows['carControl'][cc_index]
+  if not feedback.fixture.start_ns < cc_mono <= feedback.fixture.end_ns:
+    return
+  if cc_event.carControl.actuators.steer != recorded_output or cc_event.carControl.actuators.curvature != curvature:
+    raise RuntimeError('CarControl pairing does not match recorded controller output')
+  # A post-activation publication can use pre-activation consumed input, or even
+  # a pre-activation controller update. Publication and computation are separate.
+  steer = candidate_output if mono >= feedback.fixture.start_ns else recorded_output
+  feedback.publish_request(cc_mono, steer, active)
+
+
 def run(args):
   paths = [Path(p) for p in args.rlogs]
   streams = Streams(paths)
@@ -290,17 +306,11 @@ def run(args):
     # Software mode instead generates feedback from the candidate's own sends
     # and compares its own recent requests. Never mix the two conventions.
     limited = all(abs(req - co.actuatorsOutput.steer) > 1e-2 for req in history)
-    history.append(float(np.float32(steer)) if software_active else float(observed.output))
+    candidate_request = feedback is not None and mono >= feedback.fixture.start_ns
+    history.append(float(np.float32(steer)) if candidate_request else float(observed.output))
     previous_active = active
-    if software_active:
-      cc_index = bisect_right(streams.times['carControl'], mono)
-      if cc_index == len(streams.times['carControl']):
-        raise RuntimeError('Missing paired carControl publication')
-      cc_mono, cc_event = streams.rows['carControl'][cc_index]
-      if cc_event.carControl.actuators.steer != observed.output or cc_event.carControl.actuators.curvature != c.desiredCurvature:
-        raise RuntimeError('CarControl pairing does not match recorded controller output')
-      if cc_mono <= feedback.fixture.end_ns:
-        feedback.publish_request(cc_mono, steer, active)
+    if feedback is not None:
+      publish_paired_request(feedback, streams, mono, c.desiredCurvature, observed.output, steer, active)
     previous_output = steer
   selected = [r for r in rows if args.start <= r['mono'] <= args.end and r['active']]
   if not selected:

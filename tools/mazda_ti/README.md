@@ -43,6 +43,20 @@ python -m tools.mazda_ti.run replay --prepared evidence/prepared --data-root PAT
 
 Repeat baseline and candidate with `latest` and distinct output directories. These are two compatible sampling histories, not bounds on all possible histories. Candidate execution uses its own commands and software TI feedback after activation; recorded vehicle motion remains fixed. The schema's newly logged input identities are not yet consumed by this historical-log runner.
 
+At activation, separate controller computation, consumed-input time and command publication.
+`publish_paired_request` publishes each paired carControl inside the feedback window even
+when its controller consumed an older input. A computation before activation retains its
+recorded request; one after activation uses the replay request. Feedback reads still use
+the audited input cutoff. Gating publication on that cutoff can omit the first request
+needed by card. Serialized-message tests cover both sides of this boundary.
+
+If baseline differences cluster immediately after activation, test whether the integral
+anchor leaves enough settling time before scoring. Declare the earlier anchor before
+rerunning, preserve the failed output, and keep activation, scoring, settings and the
+exact-send requirement unchanged. In two older hard-corner cases, moving the anchor from
+one to eleven seconds before activation removed the initial one-count differences under
+both histories. This result does not justify accepting other one-count failures.
+
 Preparation writes the resolved spec, input audit, identity mapping, request sampling maps and `preparation.json`. Replay writes `trace.json`, `trace.jsonl`, `trace-sends.json` and `result.json`. The baseline requires non-empty coverage, identical integer sends, matching plant flags, and less than one count of controller-output residual. The residual allowance is separate from the exact integer-command requirement. Failed evidence is retained, and candidates are refused when their baseline is unqualified. The isolated historical Float32 rounding exception is not implemented in this shared runner; it must fail rather than silently accept one-count mismatches.
 
 Use a new output directory for every run. Changed source, runtime, prepared artifacts or raw-log bytes require fresh preparation and qualification. Paths are relative in reports, which allows identical bytes at a different data root. Raw logs, generated traces and large result manifests should remain outside Git.
@@ -59,7 +73,7 @@ Each prefix identifies a `.jsonl` control trace and a `-sends.json` integer-send
 The optional test command requires pytest. Its explicit configuration boundary excludes hardware-dependent repository fixtures and plugins; the verifier itself needs no openpilot runtime or third-party packages. The full shared checks are:
 
 ```text
-python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti/test_workflow.py tools/mazda_ti/test_verify_replay.py tools/mazda_ti/test_diagnostics.py tools/mazda_ti/test_audit_diagnostics.py tools/mazda_ti/test_audit_lane_context.py tools/mazda_ti/test_recorded_feedback.py tools/mazda_ti/test_measurement_history.py tools/mazda_ti/test_controller_switch.py tools/mazda_ti/test_friction_release.py
+python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti
 ```
 
 The verifier requires identical active frame identities, controller/reference/geometry fields, integer sends and their coverage. The optional4096 allowance verifies the newly added lane-release log flag on precisely the reference-removal frames. It cannot waive a torque or reference difference. The TI600-count and15-count adjacent-send bounds are checked for this campaign's configuration.
