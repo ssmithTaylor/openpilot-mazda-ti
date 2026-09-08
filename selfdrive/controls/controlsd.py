@@ -132,6 +132,8 @@ class Controls:
       self.params.remove("ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
+    self.car_state_event = None
+    self.car_state_updated = False
     self.AM = AlertManager()
     self.events = Events()
 
@@ -540,6 +542,9 @@ class Controls:
     """Receive data from sockets"""
 
     car_state = messaging.recv_one(self.car_state_sock)
+    self.car_state_updated = car_state is not None
+    if car_state is not None:
+      self.car_state_event = car_state
     CS = car_state.carState if car_state else self.CS_prev
 
     self.sm.update(0)
@@ -756,7 +761,7 @@ class Controls:
                                                          self.frogpilot_toggles,
                                                          fp_car_state)
       if isinstance(self.LaC, LatControlTorque) and self.LaC.plant is not None:
-        record_inputs(lac_log.mazdaDiagnostics, self.sm)
+        record_inputs(lac_log.mazdaDiagnostics, self.sm, self.car_state_event, self.car_state_updated)
       actuators.steer = float(steer)
       actuators.steeringAngleDeg = float(steeringAngleDeg)
 

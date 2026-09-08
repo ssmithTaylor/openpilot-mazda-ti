@@ -6,12 +6,16 @@ The working-tree instrumentation adds structured records to existing `controlsSt
 
 1. Read `carOutput.appliedCarControlMonoTime` to identify the `carControl` event represented by that output.
 2. Read that command's `controlsStateMonoTime` to identify its `controlsState` event.
-3. Read `controlsState.lateralControlState.torqueState.mazdaDiagnostics.inputs` to identify the messages held by SubMaster for that controller update. Each row records event validity, liveness, frequency status, updated/seen status, and `all_checks` after configured ignore rules.
+3. Read `controlsState.lateralControlState.torqueState.mazdaDiagnostics.inputs` to identify the messages used for that controller update. Seven rows come from SubMaster and record event validity, liveness, frequency status, updated/seen status, and `all_checks` after configured ignore rules. The carState row comes from its dedicated socket, as described below.
 4. Compare controller references and command contributions with `carOutput.mazdaDiagnostics`, then use the recorded CAN and vehicle/lane observations to assess what happened physically.
 
 `card` publishes its previous applied output before its next apply. The identity fields deliberately follow that previous output. `applySequence` increments only after `CI.apply` returns; repeated sequence numbers describe the same apply. `appliedAtMonoTime` is the timestamp passed to `CI.apply`, not a hardware receipt timestamp. The existing event `valid` refers to current publication health; `appliedCarControlChecksPassed` preserves health at the represented apply. Neither should be substituted for the other.
 
 At a segment boundary, referenced inputs or commands can be in the preceding segment. Load adjacent segments before declaring a reference missing. Do not substitute nearest timestamps when an explicit identity is absent. Old logs have zero/default identity fields and need the older, explicitly qualified sampling reconstruction.
+
+`controlsd` receives carState through a separate blocking socket; it is absent from its SubMaster. Its snapshot preserves the exact last received event identity and validity when `CS_prev` is reused on timeout. `seen` means an event has arrived; `updated` and `alive` mean an event arrived on this iteration. `frequencyOk` is always false because this socket has no SubMaster frequency estimate; it does not indicate measured low frequency. `checksPassed` means a new event arrived with event validity and `carState.canValid` both true. These are diagnostic definitions, not additional control gates. Before first receipt, identity is zero and `seen` is false.
+
+The original instrumentation in `1f56328` incorrectly looked up carState in SubMaster and crashed controlsd before publishing the first controller diagnostic. The regression test now obtains the real subscriber list from controlsd's constructor and exercises its real receive/fallback method; an invented all-services fixture cannot qualify this boundary.
 
 ## Controller record
 

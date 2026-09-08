@@ -84,7 +84,7 @@ def test_controlsd_records_snapshot_at_actual_call_site_only_for_plant():
   ]
   boundary = min(candidates, key=lambda node: len(list(ast.walk(node))))
   code = compile(ast.Module(body=[boundary], type_ignores=[]), 'controlsd-diagnostics-boundary', 'exec')
-  host = NS(LaC=synthetic_controller(), sm=InputFixture())
+  host = NS(LaC=synthetic_controller(), sm=actual_controlsd_inputs(), car_state_event=None, car_state_updated=False)
   for enabled in (True, False):
     if not enabled:
       host.LaC.plant = None
@@ -164,6 +164,19 @@ class InputFixture:
     return all(self.alive[s] for s in services)
 
 
+def actual_controlsd_inputs():
+  tree = ast.parse((ROOT / 'selfdrive/controls/controlsd.py').read_text(encoding='utf-8'))
+  cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Controls')
+  init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '__init__')
+  assignment = next(node for node in init.body if isinstance(node, ast.Assign) and
+                    any(isinstance(target, ast.Attribute) and target.attr == 'sm' for target in node.targets))
+  host = NS(camera_packets=[], sensor_packets=[])
+  exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'actual-controlsd-subscriptions', 'exec'),
+       dict(self=host, messaging=NS(SubMaster=lambda services, **kwargs: InputFixture(services)), ignore=[], DT_CTRL=0.01))
+  assert 'carState' not in host.sm.logMonoTime
+  return host.sm
+
+
 def test_input_snapshot_preserves_identity_health_and_serializes():
   sm = InputFixture()
   sm.updated['carState'] = True
@@ -173,18 +186,50 @@ def test_input_snapshot_preserves_identity_health_and_serializes():
   msg = log.ControlsState.LateralTorqueState.new_message()
   diag = msg.init('mazdaDiagnostics')
   diag.version = 1
-  record_inputs(diag, sm)
+  cs_event = log.Event.new_message(logMonoTime=sm.logMonoTime['carState'], valid=True)
+  cs_event.init('carState').canValid = True
+  record_inputs(diag, sm, cs_event, True)
   sm.logMonoTime['carState'] += 100  # snapshot must not alias later SubMaster state
   with log.ControlsState.LateralTorqueState.from_bytes(msg.to_bytes()) as reader:
     rows = {str(row.service): row for row in reader.mazdaDiagnostics.inputs}
     assert tuple(rows) == INPUT_SERVICES
     assert rows['carState'].logMonoTime == 123456789123456789
     assert rows['carState'].updated
+    assert not rows['carState'].frequencyOk  # unavailable on the direct socket
     assert not rows['frogpilotCarState'].alive
     assert not rows['frogpilotCarState'].checksPassed
     assert not rows['modelV2'].valid
     assert not rows['liveParameters'].frequencyOk
     assert rows['carOutput'].checksPassed
+
+
+def test_actual_car_state_sampling_preserves_identity_on_timeout_and_invalid_receipt():
+  tree = ast.parse((ROOT / 'selfdrive/controls/controlsd.py').read_text(encoding='utf-8'))
+  method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == 'data_sample')
+  good = log.Event.new_message(logMonoTime=123456789, valid=True)
+  good.init('carState').canValid = True
+  bad = log.Event.new_message(logMonoTime=123456799, valid=False)
+  bad.init('carState').canValid = False
+  arrivals = iter([None, good.as_reader(), None, bad.as_reader(), None])
+  env = dict(messaging=NS(recv_one=lambda sock: next(arrivals)))
+  exec(compile(ast.Module(body=[method], type_ignores=[]), 'actual-car-state-sampling', 'exec'), env)
+  host = NS(sm=actual_controlsd_inputs(), car_state_sock=object(), initialized=True, enabled=False,
+            CS_prev=car.CarState.new_message(), car_state_event=None, car_state_updated=False)
+  host.sm.update = lambda timeout: None
+  expected = [(0, False, False, False), (123456789, True, True, True), (123456789, True, False, False),
+              (123456799, True, True, False), (123456799, True, False, False)]
+  for mono, seen, updated, checks in expected:
+    cs = env['data_sample'](host)
+    host.CS_prev = cs  # same handoff as Controls.step
+    msg = log.ControlsState.LateralTorqueState.new_message()
+    record_inputs(msg.mazdaDiagnostics, host.sm, host.car_state_event, host.car_state_updated)
+    row = msg.mazdaDiagnostics.inputs[0]
+    assert (row.logMonoTime, row.seen, row.updated, row.checksPassed) == (mono, seen, updated, checks)
+    assert row.alive == updated
+    assert not row.frequencyOk
+    if seen:
+      assert row.valid == host.car_state_event.valid
+      assert cs.canValid == host.car_state_event.carState.canValid
 
 
 def test_absent_diagnostics_are_not_mistaken_for_zero_control_state():
