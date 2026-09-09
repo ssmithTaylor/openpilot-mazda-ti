@@ -223,7 +223,6 @@ def inject_transition_harness(events, log):
   services = ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
-  deferred_stale = []
   retained = [event for event in events if event.which() != 'pandaStates']
   events[:] = retained
   for index, car_state in enumerate(car_states):
@@ -232,8 +231,8 @@ def inject_transition_harness(events, log):
     # and re-entry in 17. Exercise health failures after the final re-entry.
     if index == 16_200:
       status = 'missing'
-    elif index == 16_200:
-      status = 'stale'
+    elif 14_900 <= index < 16_150:
+      status = 'stale_gap'
     elif index == 16_360:
       status = 'invalid'
     ti_active = not (9_966 <= index < 10_151)
@@ -242,13 +241,11 @@ def inject_transition_harness(events, log):
     # declared controlsAllowed fixture.  This is an input to the process, not
     # a CAN sender or a vehicle state change.
     for offset, service in enumerate(services, start=1):
-      if status == 'missing' and service == 'frogpilotCarState':
-        generated.append({'service': service, 'status': status, 'source_mono_time': None, 'frame': index,
+      if status in ('missing', 'stale_gap') and service == 'frogpilotCarState':
+        generated.append({'service': service, 'status': 'stale' if status == 'stale_gap' else status, 'source_mono_time': None, 'frame': index,
                           'source_car_state_mono_time': int(car_state.logMonoTime), 'derived_from': 'recorded_carState'})
         continue
       mono = int(car_state.logMonoTime) - offset
-      if status == 'stale' and service == 'frogpilotCarState':
-        mono -= 6_000_000_000
       event = log.Event.new_message(logMonoTime=mono, valid=not (status == 'invalid' and service == 'frogpilotCarState'))
       event.init(service, 1) if service == 'pandaStates' else event.init(service)
       if service == 'pandaStates':
@@ -258,10 +255,7 @@ def inject_transition_harness(events, log):
         event.frogpilotCarState.alwaysOnLateralEnabled = 10_160 <= index < 15_000
       if service == 'frogpilotPlan':
         event.frogpilotPlan.lateralCheck = True
-      if status == 'stale' and service == 'frogpilotCarState':
-        deferred_stale.append((int(car_state.logMonoTime), event.as_reader()))
-      else:
-        events.append(event.as_reader())
+      events.append(event.as_reader())
       generated.append({'service': service, 'status': status if service == 'frogpilotCarState' else 'valid',
                         'source_mono_time': mono, 'frame': index, 'source_car_state_mono_time': int(car_state.logMonoTime),
                         'derived_from': 'recorded_carState',
@@ -271,7 +265,7 @@ def inject_transition_harness(events, log):
     # Enable pulses counter unrelated retained user-disable events; the four
     # bounded inactive windows make the fault observations explicit rather
     # than relying on a later inactive frame by inference.
-    inactive_windows = ((15_000, 15_100), (15_490, 16_110), (16_190, 16_220), (16_350, 16_400))
+    inactive_windows = ((14_890, 16_160), (16_190, 16_220), (16_350, 16_400))
     action = None
     for start, end in inactive_windows:
       if index == start:
@@ -295,10 +289,6 @@ def inject_transition_harness(events, log):
       generated.append({'service': 'carState', 'status': 'valid', 'source_mono_time': int(car_state.logMonoTime),
                         'frame': index, 'event': action, 'derived_from': 'recorded_carState'})
   events.sort(key=lambda event: int(event.logMonoTime))
-  for target_mono, stale_event in deferred_stale:
-    target = next(index for index, event in enumerate(events)
-                  if event.which() == 'carState' and int(event.logMonoTime) == target_mono)
-    events.insert(target, stale_event)
   return generated
 
 
