@@ -46,7 +46,7 @@ def canonical_request(value, resolved=False):
   histories = ('exact',) if case['method'] == 'instrumented' else ('earliest', 'latest')
   if case['history'] not in histories or case['origin'] not in ('recorded', 'synthetic'):
     raise Unsupported('Unsupported history or evidence origin')
-  if request['candidate_revision'] == 'worktree':
+  if resolved and request['candidate_revision'] == 'worktree':
     raise Unsupported('This slice requires a committed candidate controller revision')
   keys = ('format_version', 'name', 'rlogs', 'window', 'baseline_controller', 'warmup_controller', 'limiter',
           'settings', 'fpcs_sample_at', 'force_offset') + (('candidate_controller',) if resolved else ())

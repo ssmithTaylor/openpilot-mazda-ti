@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from . import batch
 from .batch import evaluate_batch
 from .example_fixture import create_example
 from .provenance import read_json, write_json
@@ -114,6 +115,90 @@ def test_branch_reference_is_frozen_and_unisolated_process_group_runs_serially(t
   assert result['status'] == 'completed_checks'
   assert result['execution']['workers'] == 1
   assert all(len(row['frozen_request']['candidate_revision']) == 40 for row in result['canonical']['cases'])
+
+
+@pytest.mark.parametrize('change', ['settings', 'candidate', 'input'])
+def test_changed_request_dependencies_do_not_reuse_same_case_attempt(tmp_path, change):
+  cases = requests(tmp_path, count=1)
+  corpus = manifest(tmp_path, cases, workers=1)
+  first = evaluate_batch(corpus, tmp_path / 'raw', tmp_path / 'output', cache_root=tmp_path / 'cache', workers=1)
+  assert first['status'] == 'completed_checks'
+
+  request_path = tmp_path / cases[0]['request']
+  request = read_json(request_path)
+  if change == 'settings':
+    request['case']['experiment']['settings']['SteerKP'] = 1.234
+  elif change == 'candidate':
+    request['candidate_revision'] = 'HEAD'
+  else:
+    request['case']['input_sha256']['synthetic--0/rlog'] = '0' * 64
+  request_path.unlink()
+  write_json(request_path, request)
+
+  second = evaluate_batch(corpus, tmp_path / 'raw', tmp_path / 'output', cache_root=tmp_path / 'cache', workers=1)
+  row = second['execution']['cases'][0]
+  assert row['reused'] is False
+  assert (tmp_path / 'output/cases/case-0/attempt-002/result.json').exists()
+
+
+def test_worktree_candidate_is_frozen_to_head(tmp_path, monkeypatch):
+  cases = requests(tmp_path, count=1)
+  monkeypatch.setattr(batch, '_clean_worktree', lambda: None)
+  request_path = tmp_path / cases[0]['request']
+  request = read_json(request_path)
+  request['candidate_revision'] = 'worktree'
+  request_path.unlink()
+  write_json(request_path, request)
+
+  result = evaluate_batch(manifest(tmp_path, cases, workers=1), tmp_path / 'raw', tmp_path / 'output', workers=1)
+
+  assert result['status'] == 'completed_checks'
+  assert len(result['canonical']['cases'][0]['frozen_request']['candidate_revision']) == 40
+
+
+@pytest.mark.parametrize('dirty_name, content', [
+  ('tools/mazda_ti/README.md', b'\n'),
+  ('tools/mazda_ti/_review_untracked_source.py', b'# temporary source\n'),
+])
+def test_worktree_rejects_dirty_relevant_source(tmp_path, dirty_name, content):
+  cases = requests(tmp_path, count=1)
+  target = Path(dirty_name)
+  original = target.read_bytes() if target.exists() else None
+  try:
+    target.write_bytes((original or b'') + content)
+    request_path = tmp_path / cases[0]['request']
+    request = read_json(request_path)
+    request['candidate_revision'] = 'worktree'
+    request_path.unlink()
+    write_json(request_path, request)
+    with pytest.raises(ValueError, match='Worktree candidate is mutable'):
+      evaluate_batch(manifest(tmp_path, cases, workers=1), tmp_path / 'raw', tmp_path / 'output', workers=1)
+  finally:
+    if original is None:
+      target.unlink(missing_ok=True)
+    else:
+      target.write_bytes(original)
+
+
+def test_source_drift_after_freeze_rejects_batch(tmp_path, monkeypatch):
+  cases = requests(tmp_path, count=1)
+  snapshots = iter([{'source': 'before'}, {'source': 'after'}])
+  monkeypatch.setattr(batch, 'source_snapshot', lambda: next(snapshots))
+
+  with pytest.raises(RuntimeError, match='Source drift after batch freeze'):
+    evaluate_batch(manifest(tmp_path, cases, workers=1), tmp_path / 'raw', tmp_path / 'output', workers=1)
+
+
+def test_runtime_change_invalidates_completed_cache(tmp_path, monkeypatch):
+  cases = requests(tmp_path, count=1)
+  corpus = manifest(tmp_path, cases, workers=1)
+  evaluate_batch(corpus, tmp_path / 'raw', tmp_path / 'first', cache_root=tmp_path / 'cache', workers=1)
+  monkeypatch.setattr(batch, 'environment', lambda: {'changed': True})
+
+  result = evaluate_batch(corpus, tmp_path / 'raw', tmp_path / 'second', cache_root=tmp_path / 'cache', workers=1)
+
+  assert result['status'] == 'completed_checks'
+  assert result['execution']['cases'] == [{'id': 'case-0', 'reused': False}]
 
 
 @pytest.mark.parametrize('identity', ['.', '..', 'C:', '../escaped', 'case/child'])

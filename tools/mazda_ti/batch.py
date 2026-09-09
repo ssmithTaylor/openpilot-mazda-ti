@@ -14,10 +14,12 @@ import time
 
 from .evaluate import evaluate, verify_bundle
 from .evaluation_contract import canonical_request
-from .provenance import read_json, resolve_ref, sha256, source_snapshot, write_json
+from .provenance import environment, read_json, resolve_ref, source_snapshot, write_json
 
 
 FORMAT_VERSION = 1
+SOURCE_ROOTS = ('selfdrive', 'common', 'cereal', 'tools/mazda_ti')
+SOURCE_SUFFIXES = ('.py', '.capnp')
 
 
 def _inside(root, name):
@@ -61,9 +63,17 @@ def _manifest(path):
 
 
 def _clean_worktree():
-  for args in (['git', 'diff', '--quiet'], ['git', 'diff', '--cached', '--quiet']):
+  for args in (
+    ['git', 'diff', '--quiet', '--', *SOURCE_ROOTS],
+    ['git', 'diff', '--cached', '--quiet', '--', *SOURCE_ROOTS],
+  ):
     if subprocess.run(args, check=False).returncode:
       raise ValueError('Worktree candidate is mutable; commit or discard source changes before freezing')
+  untracked = subprocess.check_output(
+    ['git', 'ls-files', '--others', '--exclude-standard', '--', *SOURCE_ROOTS], text=True
+  ).splitlines()
+  if any(Path(name).suffix in SOURCE_SUFFIXES for name in untracked):
+    raise ValueError('Worktree candidate is mutable; commit or discard source changes before freezing')
 
 
 def _freeze(request_path):
@@ -83,6 +93,12 @@ def _key(request):
   return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
+def _resolved_request(request):
+  case = dict(request['case'])
+  case['experiment'] = dict(case['experiment'], candidate_controller=request['candidate_revision'])
+  return canonical_request(dict(request, case=case), resolved=True)
+
+
 def _attempt(root):
   root.mkdir(parents=True, exist_ok=True)
   number = 1
@@ -91,13 +107,17 @@ def _attempt(root):
   return root / f'attempt-{number:03d}'
 
 
-def _valid_attempt(root, data_root):
+def _valid_attempt(root, data_root, expected_request, current_runtime):
   if not root.exists():
     return None, None
   errors = []
   for path in sorted(root.glob('attempt-*'), reverse=True):
     try:
       result = verify_bundle(path, data_root)
+      if canonical_request(read_json(path / 'resolved-request.json'), resolved=True) != _resolved_request(expected_request):
+        raise ValueError('Attempt request identity differs from the current frozen request')
+      if result.get('runtime') != current_runtime:
+        raise ValueError('Attempt runtime differs from the current runtime')
       return path, result
     except (OSError, ValueError, KeyError, TypeError) as error:
       if (path / 'result.json').exists():
@@ -112,15 +132,17 @@ def _copy_complete(source, destination):
 
 def _case_worker(task):
   """Run one immutable case in a separate process when scheduler isolation permits."""
-  case, frozen, manifest_root, data_root, output, cache_root, frozen_sources = task
+  case, frozen, manifest_root, data_root, output, cache_root, frozen_sources, runtime_lock = task
   if source_snapshot() != frozen_sources:
     raise RuntimeError('Source drift after batch freeze')
+  if environment() != runtime_lock:
+    raise RuntimeError('Runtime changed after batch freeze')
   case_root = Path(output) / 'cases' / case['id']
-  existing, existing_result = _valid_attempt(case_root, Path(data_root))
+  existing, existing_result = _valid_attempt(case_root, Path(data_root), frozen, runtime_lock)
   if existing is not None:
     return {'id': case['id'], 'result': existing_result, 'reused': True, 'cache_invalidated': None, 'frozen_request': frozen}
   cache_case_root = Path(cache_root) / _key(frozen)
-  cached, cache_result = _valid_attempt(cache_case_root, Path(data_root))
+  cached, cache_result = _valid_attempt(cache_case_root, Path(data_root), frozen, runtime_lock)
   destination = _attempt(case_root)
   if cached is not None:
     result = _copy_complete(cached, destination)
@@ -177,9 +199,11 @@ def evaluate_batch(manifest_path, data_root, output, *, cache_root=None, workers
   output.mkdir(parents=True, exist_ok=True)
   cache_root = Path(cache_root) if cache_root is not None else output / 'cache'
   source_lock = source_snapshot()
+  runtime_lock = environment()
   active_workers = _workers(resources, cases, workers, stop_after_cases)
   started, records = time.perf_counter(), []
-  tasks = [(case, request, str(manifest_root), str(data_root), str(output), str(cache_root), source_lock) for case, request in frozen]
+  tasks = [(case, request, str(manifest_root), str(data_root), str(output), str(cache_root), source_lock, runtime_lock)
+           for case, request in frozen]
   if active_workers == 1:
     for task in tasks:
       if stop_after_cases is not None and len(records) >= stop_after_cases:
