@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-from .provenance import read_json, write_json
+from .provenance import read_json, sha256, write_json
 
 
 FORMAT_VERSION = 1
@@ -13,10 +13,14 @@ METRICS = ('request_counts', 'retained_reference_counts', 'integral_counts', 'co
            'clipped', 'constant_command', 'ti_command_counts', 'stock_command_counts', 'carryover_counts')
 
 
-def _bundle(path):
+def _bundle(path, evidence_root, data_root):
   path = Path(path)
-  result, metadata = read_json(path / 'result.json'), read_json(path / 'trace.json')
-  if result.get('format_version') != 1 or metadata.get('format_version') != FORMAT_VERSION:
+  full_root = path.parent if (path.parent / 'resolved-request.json').is_file() else None
+  if (path / 'resolved-request.json').is_file():
+    raise ValueError('Full evaluation bundles require an explicit retained arm directory')
+  result_path = (full_root or path) / 'result.json'
+  result, metadata = read_json(result_path), read_json(path / 'trace.json')
+  if result.get('format_version') != 1 or (full_root is None and metadata.get('format_version') != FORMAT_VERSION):
     raise ValueError('Unsupported retained trace bundle version')
   rows = [json.loads(line) for line in (path / 'trace.jsonl').read_text(encoding='utf-8').splitlines() if line]
   if not rows or any(type(row.get('mono')) not in (int, float) for row in rows):
@@ -26,8 +30,18 @@ def _bundle(path):
   provenance = metadata.get('provenance')
   valid_provenance = isinstance(provenance, dict) and all(isinstance(provenance.get(name), str) and re.fullmatch('[a-f0-9]{64}', provenance[name])
                                                           for name in ('source_sha256', 'input_sha256'))
-  return {'path': path.name, 'result': result, 'metadata': metadata, 'rows': rows,
-          'provenance': provenance if valid_provenance else None}
+  try:
+    reference = path.resolve().relative_to(evidence_root.resolve()).as_posix()
+  except ValueError:
+    raise ValueError('Evidence bundle escapes the declared evidence root')
+  artifacts = {'result.json': sha256(result_path), 'trace.json': sha256(path / 'trace.json'), 'trace.jsonl': sha256(path / 'trace.jsonl')}
+  level = 'content_bound_unqualified'
+  if data_root is not None and full_root is not None:
+    from .evaluate import verify_bundle
+    verify_bundle(full_root, data_root)
+    level = 'verified_full_bundle'
+  return {'path': reference, 'result': result, 'metadata': metadata, 'rows': rows,
+          'provenance': provenance if valid_provenance else None, 'artifacts': artifacts, 'identity_validation': level}
 
 
 def _phases(metadata, rows):
@@ -83,9 +97,10 @@ def _effect(left, right, metric, phase=None):
           'constant_exposure_frames': sum(bool(value) for value in left_values) if metric == 'constant_command' else None}
 
 
-def compare_trace_bundles(reference_path, candidate_path, current_control_path, output):
+def compare_trace_bundles(reference_path, candidate_path, current_control_path, output, *, data_root=None, evidence_root=None):
   """Compare retained, versioned traces; no metric is synthesized from absent fields."""
-  reference, candidate, control = _bundle(reference_path), _bundle(candidate_path), _bundle(current_control_path)
+  evidence_root = Path(evidence_root) if evidence_root is not None else Path(reference_path).resolve().parent
+  reference, candidate, control = (_bundle(path, evidence_root, data_root) for path in (reference_path, candidate_path, current_control_path))
   output = Path(output)
   output.mkdir(parents=True, exist_ok=False)
   try:
@@ -116,7 +131,11 @@ def compare_trace_bundles(reference_path, candidate_path, current_control_path, 
       invariants.append({'arm': 'current_control', 'finding': 'Retained arms have mismatched input provenance'})
   status = 'failed_check' if invariants else 'completed_checks'
   result = {'format_version': FORMAT_VERSION, 'status': status,
-            'provenance': {name: {'bundle': bundle['path'], **(bundle['provenance'] or {})} for name, bundle in arms.items()},
+            'identity_validation': ('verified_full_bundle' if all(bundle['identity_validation'] == 'verified_full_bundle' for bundle in arms.values())
+                                    else 'content_bound_unqualified'),
+            'provenance': {name: {'bundle': bundle['path'], 'artifact_sha256': bundle['artifacts'],
+                                  'identity_validation': bundle['identity_validation'], **(bundle['provenance'] or {})}
+                           for name, bundle in arms.items()},
             'phases': phases, 'metrics': metrics,
             'phase_effects': phase_effects,
             'command_effects': {'candidate_minus_reference': {name: metrics[name] for name in ('ti_command_counts', 'stock_command_counts')},
@@ -144,8 +163,11 @@ def main():
   parser.add_argument('--candidate', type=Path, required=True)
   parser.add_argument('--current-control', type=Path, required=True)
   parser.add_argument('--output', type=Path, required=True)
+  parser.add_argument('--data-root', type=Path)
+  parser.add_argument('--evidence-root', type=Path)
   args = parser.parse_args()
-  result = compare_trace_bundles(args.reference, args.candidate, args.current_control, args.output)
+  result = compare_trace_bundles(args.reference, args.candidate, args.current_control, args.output,
+                                 data_root=args.data_root, evidence_root=args.evidence_root)
   print(f"{result['status']}: {args.output / 'report.md'}")
   return 0 if result['status'] == 'completed_checks' else 1
 

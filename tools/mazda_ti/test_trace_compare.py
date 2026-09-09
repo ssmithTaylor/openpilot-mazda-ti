@@ -4,6 +4,8 @@ import json
 
 from .provenance import read_json, write_json
 from .trace_compare import compare_trace_bundles
+from .example_fixture import create_example
+from .evaluate import evaluate
 
 
 def bundle(root, name, rows, *, status='completed_checks', phases=None, provenance=None):
@@ -86,3 +88,27 @@ def test_invalid_declared_phase_writes_failed_result(tmp_path):
   result = compare_trace_bundles(reference, candidate, control, tmp_path / 'report')
   assert result['status'] == 'failed_check'
   assert 'Invalid phase' in result['findings']['invariants'][0]['finding']
+
+
+def test_content_hashes_and_unambiguous_references_keep_forged_metadata_unqualified(tmp_path):
+  left = tmp_path / 'left'
+  right = tmp_path / 'right'
+  left.mkdir(); right.mkdir()
+  reference = bundle(left, 'same-name', rows(10, 1, 2, 20))
+  candidate = bundle(right, 'same-name', rows(10, 1, 2, 20))
+  control = bundle(right, 'control', rows(10, 1, 2, 20))
+  result = compare_trace_bundles(reference, candidate, control, tmp_path / 'report', evidence_root=tmp_path)
+
+  assert result['status'] == 'completed_checks'
+  assert result['identity_validation'] == 'content_bound_unqualified'
+  assert result['provenance']['reference']['bundle'] != result['provenance']['candidate']['bundle']
+  assert result['provenance']['candidate']['artifact_sha256']['trace.jsonl']
+
+
+def test_verified_full_bundle_requires_an_explicit_retained_arm(tmp_path):
+  request = create_example(tmp_path / 'raw')
+  full = tmp_path / 'full'
+  assert evaluate(request, request.parent, full)['status'] == 'completed_checks'
+  result = compare_trace_bundles(full / 'candidate', full / 'candidate', full / 'candidate', tmp_path / 'report',
+                                 data_root=request.parent, evidence_root=tmp_path)
+  assert result['identity_validation'] == 'verified_full_bundle'
