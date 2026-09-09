@@ -58,10 +58,11 @@ def normalize_observations(events, source_events=()):
       refs.append({'service': service, 'log_mono_time': source_mono})
     if actuator is not None:
       ti_available, ti_source = bool(actuator.tiAllowed), 'carOutput_observation'
-    rows.append({'mono_time_ns': mono, 'active': bool(torque.active),
+    row = {'mono_time_ns': mono, 'active': bool(torque.active),
                  'ti_allowed': ti_available, 'ti_availability_source': ti_source,
                  'health': health, 'diagnostic_references': refs,
-                 'state_before': str(diagnostic.integralBefore), 'state_after': str(diagnostic.integralAfter)})
+                 'state_before': str(diagnostic.integralBefore), 'state_after': str(diagnostic.integralAfter)}
+    rows.append(row)
   rows.sort(key=lambda row: row['mono_time_ns'])
   return rows, findings
 

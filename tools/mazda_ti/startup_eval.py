@@ -214,13 +214,19 @@ def transition_stderr_diagnostics(stderr, expected_invalid_services=()):
   return records
 
 
-def inject_transition_harness(events, log):
+def inject_transition_harness(events, log, maximum=None):
   """Add only missing controlsd input schemas with declared per-message identities."""
   # These are all actual controlsd subscriptions absent from the recorded
   # cutout.  `testJoystick` remains deliberately absent: it is the one fake
   # service declared by the process-replay configuration and is retained as a
   # harness exclusion in the evidence.
   services = ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
+  short = maximum is not None and maximum <= 2_000
+  ti_start, ti_end = (200, 300) if short else (9_966, 10_151)
+  always_start, always_end = (310, 600) if short else (10_160, 15_000)
+  stale_start, stale_end = (700, 730) if short else (14_900, 16_150)
+  missing_frame, invalid_frame = ((800, 1_000) if short else (16_200, 16_360))
+  inactive_windows = ((690, 740), (790, 820), (990, 1_030)) if short else ((14_890, 16_160), (16_190, 16_220), (16_350, 16_400))
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
   # Once this harness declares ownership of an actual subscriber, remove any
@@ -232,13 +238,13 @@ def inject_transition_harness(events, log):
     status = 'valid'
     # The retained cutout spans activation in 15, TI bypass/disengage in 16,
     # and re-entry in 17. Exercise health failures after the final re-entry.
-    if index == 16_200:
+    if index == missing_frame:
       status = 'missing'
-    elif 14_900 <= index < 16_150:
+    elif stale_start <= index < stale_end:
       status = 'stale_gap'
-    elif index == 16_360:
+    elif index == invalid_frame:
       status = 'invalid'
-    ti_active = not (9_966 <= index < 10_151)
+    ti_active = not (ti_start <= index < ti_end)
     # Replay cold-starts controlsd, so recorded panda state cannot claim the
     # pre-existing engagement.  Supply the actual subscriber schema with a
     # declared controlsAllowed fixture.  This is an input to the process, not
@@ -255,7 +261,7 @@ def inject_transition_harness(events, log):
         event.pandaStates[0].controlsAllowed = True
       if service == 'frogpilotCarState':
         event.frogpilotCarState.tiActive = ti_active
-        event.frogpilotCarState.alwaysOnLateralEnabled = 10_160 <= index < 15_000
+        event.frogpilotCarState.alwaysOnLateralEnabled = always_start <= index < always_end
       if service == 'frogpilotPlan':
         event.frogpilotPlan.lateralCheck = True
       events.append(event.as_reader())
@@ -263,12 +269,11 @@ def inject_transition_harness(events, log):
                         'source_mono_time': mono, 'frame': index, 'source_car_state_mono_time': int(car_state.logMonoTime),
                         'derived_from': 'recorded_carState',
                         'ti_active': ti_active if service == 'frogpilotCarState' else None,
-                        'always_on_lateral': bool(10_160 <= index < 15_000) if service == 'frogpilotCarState' else None})
+                        'always_on_lateral': bool(always_start <= index < always_end) if service == 'frogpilotCarState' else None})
     # These are serialized carState events at the real dedicated subscriber.
     # Enable pulses counter unrelated retained user-disable events; the four
     # bounded inactive windows make the fault observations explicit rather
     # than relying on a later inactive frame by inference.
-    inactive_windows = ((14_890, 16_160), (16_190, 16_220), (16_350, 16_400))
     action = None
     for start, end in inactive_windows:
       if index == start:
@@ -293,6 +298,35 @@ def inject_transition_harness(events, log):
                         'frame': index, 'event': action, 'derived_from': 'recorded_carState'})
   events.sort(key=lambda event: int(event.logMonoTime))
   return generated
+
+
+def pace_transition_subscriptions(bounded, source_events, pubs):
+  """Republish retained valid subscriber payloads at their declared live rates."""
+  from cereal.services import SERVICE_LIST
+  owned = {'carState', 'managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay'}
+  expected_fake = {'testJoystick'}
+  seeds = {}
+  for event in source_events:
+    service = event.which()
+    if service in pubs and service not in owned and service not in expected_fake and event.valid:
+      seeds.setdefault(service, event)
+  missing = sorted(set(pubs) - owned - expected_fake - set(seeds))
+  if missing:
+    raise StartupUnsupported(f'live transition fixture lacks retained valid subscriber schemas: {missing}')
+  paced = [event for event in bounded if event.which() not in pubs or event.which() in owned]
+  car_states = [event for event in paced if event.which() == 'carState']
+  for index, car_state in enumerate(car_states):
+    mono = int(car_state.logMonoTime)
+    for offset, service in enumerate(sorted(seeds), start=10):
+      frequency = SERVICE_LIST[service].frequency
+      period = max(1, round(100 / frequency)) if frequency > 0 else len(car_states) + 1
+      if index % period:
+        continue
+      replayed = seeds[service].as_builder()
+      replayed.logMonoTime = mono - offset
+      paced.append(replayed.as_reader())
+  paced.sort(key=lambda event: int(event.logMonoTime))
+  return paced, sorted(seeds)
 
 
 def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, observer=None, all_segments=False,
@@ -329,7 +363,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
   events.sort(key=lambda event: int(event.logMonoTime))
   generated_harness = []
   if transition_harness:
-    generated_harness = inject_transition_harness(events, log)
+    generated_harness = inject_transition_harness(events, log, max_carstate_messages)
   startup_events = events if all_segments else _read_rlog_events(log, rlogs[-1].read_bytes())[0]
   bounded, cutoff = _bounded_startup_events(startup_events, max_carstate_messages)
   # Later route segments do not repeat carParams. Carry the exact earlier event
@@ -390,18 +424,14 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
   cfg.config_callback = configure_isolated_startup
   if transition_harness:
     cfg.pubs = [*cfg.pubs, 'frogpilotCarState', 'frogpilotPlan', 'liveDelay']
-    # Process replay normally declares SIMULATION, where SubMaster defines
-    # liveness as merely "seen" and frequency as always healthy. Transition
-    # fault evidence needs the process's real subscriber health accounting.
+    bounded, live_subscriptions = pace_transition_subscriptions(bounded, events, cfg.pubs)
     cfg.simulation = False
+  else:
+    live_subscriptions = []
   captured = {}
   original_run_step = ProcessContainer.run_step
   def diagnostic_run_step(container, *args, **kwargs):
     if transition_harness and args and args[0].which() == 'carState':
-      # Non-simulation SubMaster health uses wall-clock receive intervals.
-      # Process replay otherwise injects an entire rlog as fast as the host can
-      # execute it, which turns every real subscriber into a false frequency
-      # failure. This paces only the isolated schema-input transition profile.
       time.sleep(0.01)
     try:
       return original_run_step(container, *args, **kwargs)
@@ -457,6 +487,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
               'frogpilot_car_params': 'isolated schema-default fixture; no safety process is started',
               'process_replay_simulation': cfg.simulation,
               'subscriber_health_clock': 'wall_clock_paced_100Hz' if transition_harness else 'process_replay_default',
+              'republished_live_subscriptions': live_subscriptions,
               'torque_interceptor_enabled': True},
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
