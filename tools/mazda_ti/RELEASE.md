@@ -5,7 +5,8 @@ already-retained evidence records: a corpus result, a scenario result, a real
 process result, and a recorded comparison. The versioned `mazda-release-v1`
 profile requires every kind. Each declared kind is checked against its producer
 contract: a passed corpus profile, a synthetic scenario result, a
-`full_process_transition` result, and a trace comparison whose aggregate and
+`full_process_transition` result from the exact
+`selfdrive.test.process_replay.replay_process` interface, and a trace comparison whose aggregate and
 candidate arm both report `verified_full_bundle`. Each record must be completed,
 hash-identified, bound to the requested candidate commit, and contain source and
 input identities. Relabelled evidence, `content_bound_unqualified` comparisons,

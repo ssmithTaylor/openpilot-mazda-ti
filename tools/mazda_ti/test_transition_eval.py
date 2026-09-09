@@ -221,7 +221,7 @@ def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_pat
     assert transition_harness is False
     transition = assess(complete_rows())
     return {'startup_boundary': {
-      'interface': 'process_replay', 'no_vehicle_output': {'status': 'passed'},
+      'interface': 'selfdrive.test.process_replay.replay_process', 'no_vehicle_output': {'status': 'passed'},
       'runtime_source': {'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                          'identity': {'tools/mazda_ti/transition_eval.py': sha256(Path(__file__).with_name('transition_eval.py'))}},
       'input': {'rlogs': [{'label': 'retained/rlog', 'sha256': sha256(retained)}]},
@@ -231,7 +231,7 @@ def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_pat
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'completed_checks'
   assert result['profile'] == 'full_process_transition'
-  assert result['transition']['process_boundary']['interface'] == 'process_replay'
+  assert result['transition']['process_boundary']['interface'] == 'selfdrive.test.process_replay.replay_process'
   assert len(result['runtime_source']['git_head']) == 40
   assert result['input_sha256'] == {'retained/rlog': sha256(retained)}
 

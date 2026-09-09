@@ -18,6 +18,7 @@ PROFILE_VERSION = 1
 PROFILE = "mazda-release-v1"
 EVIDENCE_KINDS = ("corpus", "scenario", "process", "comparison")
 PROCESS_PROFILE = "full_process_transition"
+PROCESS_INTERFACE = "selfdrive.test.process_replay.replay_process"
 COMPARISON_IDENTITY = "verified_full_bundle"
 PHYSICAL_MANEUVERS = ("left_curve", "right_curve", "straight", "transition")
 PHYSICAL_MEASUREMENTS = ("driver_steering_intervention", "lane_position")
@@ -187,7 +188,7 @@ def _process_identity(record):
   transition = record["transition"]
   if (record["format_version"] != 2 or record["profile"] != PROCESS_PROFILE or not isinstance(transition, dict)
       or not isinstance(source, dict) or not isinstance(record["source_schema_sha256"], dict)
-      or transition.get("process_boundary", {}).get("interface") != "process_replay"):
+      or transition.get("process_boundary", {}).get("interface") != PROCESS_INTERFACE):
     raise ValueError("Record does not match the process evidence schema")
   return [source.get("git_head")], _digest_map(record["input_sha256"], "process"), []
 

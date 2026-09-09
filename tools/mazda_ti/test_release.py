@@ -34,7 +34,8 @@ def _record(kind, candidate=CANDIDATE, status="completed_checks", version=1):
     return {"format_version": 2, "profile": "full_process_transition", "status": status,
             "runtime_source": {"git_head": candidate, "identity": {"controlsd.py": DIGEST}},
             "input_sha256": {"route/rlog": DIGEST}, "source_schema_sha256": {"controlsd.py": DIGEST},
-            "transition": {"process_boundary": {"interface": "process_replay"}}, "isolation": {}, "findings": []}
+            "transition": {"process_boundary": {"interface": "selfdrive.test.process_replay.replay_process"}},
+            "isolation": {}, "findings": []}
   arm = {"bundle": "bundle/candidate", "artifact_sha256": {"result.json": DIGEST},
          "identity_validation": "verified_full_bundle", "source_identities": {"candidate_controller": candidate},
          "input_sha256": {"trace.json": DIGEST}}
@@ -221,6 +222,23 @@ def test_scenario_record_relabelled_as_process_is_rejected(tmp_path):
   assert any("process evidence schema" in finding for finding in result["findings"])
 
 
+def test_shortened_process_interface_alias_is_rejected(tmp_path):
+  request, root = _fixture(tmp_path)
+  path = root / "process.json"
+  process = _record("process")
+  process["transition"]["process_boundary"]["interface"] = "process_replay"
+  _rewrite(path, process)
+  value = read_json(request)
+  value["evidence"] = [{**row, "sha256": sha256(path)} if row["kind"] == "process" else row
+                       for row in value["evidence"]]
+  _rewrite(request, value)
+
+  result = qualify(request, root, tmp_path / "release")
+
+  assert result["status"] == "failed_check"
+  assert any("process evidence schema" in finding for finding in result["findings"])
+
+
 @pytest.mark.parametrize(("declared_kind", "actual_kind"),
                          [(declared, actual) for declared in EVIDENCE_KINDS for actual in EVIDENCE_KINDS
                           if declared != actual])
@@ -301,7 +319,8 @@ def test_actual_producer_results_satisfy_the_release_contract(tmp_path):
       )
     ])
     return {**transition, "startup_boundary": {
-      "interface": "process_replay", "runtime_source": {"git_head": candidate, "identity": {"controlsd.py": DIGEST}},
+      "interface": "selfdrive.test.process_replay.replay_process",
+      "runtime_source": {"git_head": candidate, "identity": {"controlsd.py": DIGEST}},
       "input": {"rlogs": [{"label": "retained/rlog", "sha256": sha256(retained)}]},
       "no_vehicle_output": {"status": "passed"},
     }}
