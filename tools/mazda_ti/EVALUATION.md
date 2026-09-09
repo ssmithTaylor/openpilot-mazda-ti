@@ -6,7 +6,8 @@ and write a structured bundle and readable comparison. It reuses the real-contro
 runner, TI limiter/feedback, state migration, source locks and exact-send verifier.
 It performs no network, vehicle, Params, CAN, deployment or source-write operations.
 The [instrumented adapter](INSTRUMENTED_EVALUATION.md) adds exact diagnostic identities and both actuator histories.
-Batching, worktree snapshots and process checks remain unsupported.
+Use [CORPUS.md](CORPUS.md) for serial mixed-corpus evaluation. Worktree snapshots and
+process checks remain unsupported by this single-case command.
 
 ## Reproducible references
 
