@@ -78,12 +78,14 @@ def test_actual_constructor_path_rejects_known_carstate_in_submaster_failure():
 
 def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inputs():
   from cereal import log
-  car_state = log.Event.new_message(logMonoTime=100)
-  car_state.init('carState')
-  car_state.carState.canValid = True
   raw_frog_state = log.Event.new_message(logMonoTime=50)
   raw_frog_state.init('frogpilotCarState')
-  events = [car_state.as_reader(), raw_frog_state.as_reader()]
+  events = [raw_frog_state.as_reader()]
+  for frame in range(100):
+    car_state = log.Event.new_message(logMonoTime=100 + frame * 10)
+    car_state.init('carState')
+    car_state.carState.canValid = True
+    events.append(car_state.as_reader())
   manifest = inject_transition_harness(events, log)
   generated_services = {row['service'] for row in manifest}
   assert generated_services == {'carState', 'managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay'}
@@ -91,7 +93,8 @@ def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inpu
   assert by_service['pandaStates'].pandaStates[0].controlsAllowed is True
   assert by_service['frogpilotPlan'].frogpilotPlan.lateralCheck is True
   assert any(row.get('event') == 'buttonEnable' and row['derived_from'] == 'recorded_carState' for row in manifest)
-  assert sum(event.which() == 'frogpilotCarState' for event in events) == 1
+  assert sum(event.which() == 'frogpilotCarState' for event in events) == 70
+  assert sum(row['service'] == 'frogpilotCarState' and row['status'] == 'missing' for row in manifest) == 30
   assert 'testJoystick' not in generated_services
 
 
@@ -107,7 +110,7 @@ def test_transition_harness_uses_declared_service_rates_for_generated_inputs():
   inject_transition_harness(events, log)
   counts = {service: sum(event.which() == service for event in events)
             for service in ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')}
-  assert counts == {'managerState': 2, 'pandaStates': 10, 'frogpilotCarState': 100,
+  assert counts == {'managerState': 2, 'pandaStates': 10, 'frogpilotCarState': 70,
                     'frogpilotPlan': 20, 'liveDelay': 4}
 
 

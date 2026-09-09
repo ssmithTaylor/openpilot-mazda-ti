@@ -236,7 +236,7 @@ def inject_transition_harness(events, log, maximum=None):
   ti_start, ti_end = (200, 300) if short else (9_966, 10_151)
   always_start, always_end = (310, 600) if short else (10_160, 15_000)
   stale_start, stale_end = (700, 730) if short else (14_900, 16_150)
-  missing_frame, invalid_frame = ((800, 1_000) if short else (16_200, 16_360))
+  missing_before, invalid_frame = ((30, 1_000) if short else (30, 16_360))
   inactive_windows = ((690, 740), (790, 820), (990, 1_030)) if short else ((14_890, 16_160), (16_190, 16_220), (16_350, 16_400))
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
@@ -249,7 +249,7 @@ def inject_transition_harness(events, log, maximum=None):
     status = 'valid'
     # The retained cutout spans activation in 15, TI bypass/disengage in 16,
     # and re-entry in 17. Exercise health failures after the final re-entry.
-    if index == missing_frame:
+    if index < missing_before:
       status = 'missing'
     elif stale_start <= index < stale_end:
       status = 'stale_gap'
@@ -522,7 +522,9 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     'runtime_source': {'root': str(ROOT), 'git_head': git_head, 'identity': source_identity()},
   }
   if observer is not None:
-    result['observed_transition'] = observer(events, outputs)
+    # Diagnose against the exact retimed input stream that crossed the process
+    # boundary, rather than the pre-pacing raw event list.
+    result['observed_transition'] = observer(bounded, outputs)
   return result
 
 
