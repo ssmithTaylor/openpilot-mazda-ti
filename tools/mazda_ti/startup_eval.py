@@ -397,6 +397,12 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
   captured = {}
   original_run_step = ProcessContainer.run_step
   def diagnostic_run_step(container, *args, **kwargs):
+    if transition_harness and args and args[0].which() == 'carState':
+      # Non-simulation SubMaster health uses wall-clock receive intervals.
+      # Process replay otherwise injects an entire rlog as fast as the host can
+      # execute it, which turns every real subscriber into a false frequency
+      # failure. This paces only the isolated schema-input transition profile.
+      time.sleep(0.01)
     try:
       return original_run_step(container, *args, **kwargs)
     except Exception as error:
@@ -450,6 +456,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
               'fingerprint_mode': 'explicit process_replay fixture; no live fingerprinting',
               'frogpilot_car_params': 'isolated schema-default fixture; no safety process is started',
               'process_replay_simulation': cfg.simulation,
+              'subscriber_health_clock': 'wall_clock_paced_100Hz' if transition_harness else 'process_replay_default',
               'torque_interceptor_enabled': True},
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
