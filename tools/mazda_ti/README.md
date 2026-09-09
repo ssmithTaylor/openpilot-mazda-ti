@@ -11,6 +11,11 @@ disengage/re-engage, TI bypass/re-entry, and unhealthy-message process evidence
 profile. It retains fixed availability limits when a recorded segment lacks a
 required transition.
 
+[`RELEASE.md`](RELEASE.md) documents the versioned release qualification
+boundary. It consumes hash-bound corpus, scenario, process, and comparison
+results, preserves concerns and a specific physical question, and emits device
+prerequisites as pending records. It never deploys or actuates.
+
 For one command that prepares a pinned historical or instrumented case, qualifies its baseline,
 evaluates a candidate, and writes a structured bundle plus readable report, see
 [EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
