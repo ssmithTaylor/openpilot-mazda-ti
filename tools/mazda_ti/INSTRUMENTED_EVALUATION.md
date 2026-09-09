@@ -81,6 +81,43 @@ a policy. A changed compensation mapping can change limiter feedback, freeze eli
 and subsequent integral history even after compensation itself returns to its old value.
 Use declared physical phase evidence; chronological quarters alone cannot label corners.
 
+### Isolate retained references, damping and release completion
+
+Declare each diagnostic ablation before execution and pin its source separately.
+Preserve an equivalent current-control arm and enough preceding active history to
+measure limiter-dependent integral carryover. The candidate loader replaces the
+controller class while retaining existing members; changing a constructor gain
+alone does not update an existing PID member at activation. Verify the intended
+term actually changed before interpreting a comparison.
+
+To isolate damping input, keep the measurement-rate observer updating and zero
+only the plant PID's damping input. Pure measurement-rate damping resists both
+turn buildup and unwind. Less command during recorded unwind cannot establish
+better handling; also measure additional demand during tightening and saturation.
+
+To isolate both commitment blends, keep the filters/gate/blend evolving but feed
+the filtered current request and delayed setpoint to the controller before its
+diagnostics and lane-release call. Keep lane permission and dwell execution: simply
+turning commitment off also disables that permission and changes friction-release
+eligibility. Identify this diagnostic source explicitly, since its enabled-setting
+bit no longer means production reference behavior. A combined FF/setpoint ablation
+cannot separate their individual effects. Subsequent compensation, breaker,
+limiter and integral changes are part of the resulting software trajectory.
+
+Join recorded PID P/D/I/F values and release diagnostics by exact controller
+publication and consumed carState identities. Assess the completed-episode latch
+separately from lane confidence: a brief wheel-rate crossing can finish withdrawal
+even while measured turning exceeds the latest request. Completion is a controller
+state definition, not proof of adequate physical unwind. The latch prevents repeated
+withdrawal during rate chatter; preserve that property when testing alternatives.
+
+Use exact publication identities for phase anchors and report a threshold's
+persistence rule and whether the arm was already below it at phase start. A value
+infinitesimally below an asymptotic compensation plateau is not meaningful release;
+use actual integer wire outputs for plateau/repeat exposure or a distinct lower
+controller threshold. Threshold timing and identical-message endpoint spans remain
+command descriptors, not lane-performance scores or firmware receipt duration.
+
 The default suite includes a serialized synthetic zero-command transition, adjacent
 segment joins and corrupted controller/apply/stock evidence. Independent nonzero
 `test_stock_feedback.py` expectations exercise candidate stock evolution under TI,
