@@ -160,6 +160,8 @@ def assess(rows, initial_findings=()):
 
 def actual_process_transition(rlog, max_carstate_messages=100, all_segments=False, transition_harness=False):
   """Observe real replay output without changing controlsd or adding a sender."""
+  if transition_harness and not all_segments:
+    raise ValueError('--schema-input-harness requires --all-segments')
   observed = {}
 
   def observer(inputs, outputs):

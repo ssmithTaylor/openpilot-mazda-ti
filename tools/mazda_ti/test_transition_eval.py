@@ -3,7 +3,7 @@
 from types import SimpleNamespace as NS
 
 from .startup_eval import StartupUnsupported
-from .transition_eval import assess, main, normalize_observations, opaque_state_id, run
+from .transition_eval import actual_process_transition, assess, main, normalize_observations, opaque_state_id, run
 
 
 def observation(mono, active, ti, health='valid', state='state-a', before=None, state_id=None, before_id=None):
@@ -185,6 +185,15 @@ def test_run_rejects_schema_harness_without_adjacent_segment_mode(tmp_path):
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'failed_execution'
   assert result['exception'] == 'ValueError: --schema-input-harness requires --rlog and --all-segments'
+
+
+def test_transition_boundary_rejects_harness_without_all_segments_before_opening_rlog():
+  try:
+    actual_process_transition('missing/rlog', transition_harness=True)
+  except ValueError as error:
+    assert str(error) == '--schema-input-harness requires --all-segments'
+  else:
+    raise AssertionError('process boundary accepted harness without --all-segments')
 
 
 def test_cli_rejects_schema_harness_without_adjacent_segment_mode(tmp_path, capsys):

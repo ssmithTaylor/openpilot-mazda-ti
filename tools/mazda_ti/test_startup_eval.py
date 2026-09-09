@@ -8,8 +8,8 @@ from types import SimpleNamespace as NS
 import pytest
 
 from .provenance import ROOT
-from .startup_eval import (construct_controlsd_subscriptions, inject_transition_harness, qualify_nested_timestamps, run,
-                           source_identity, transition_stderr_diagnostics)
+from .startup_eval import (actual_full_process, construct_controlsd_subscriptions, inject_transition_harness,
+                           qualify_nested_timestamps, run, source_identity, transition_stderr_diagnostics)
 
 
 def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform():
@@ -30,6 +30,11 @@ def test_runtime_source_lock_includes_and_changes_with_service_schema(monkeypatc
   changed = source_identity()
   assert baseline['cereal/services.py'] != changed['cereal/services.py']
   assert baseline['cereal/log.capnp'] == changed['cereal/log.capnp']
+
+
+def test_full_process_boundary_rejects_harness_without_all_segments_before_opening_rlog():
+  with pytest.raises(ValueError, match='--schema-input-harness requires --all-segments'):
+    actual_full_process('missing/rlog', transition_harness=True)
 
 
 def test_transition_profile_accepts_only_the_declared_fake_service_harness_exclusions():

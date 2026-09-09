@@ -347,6 +347,8 @@ def pace_transition_subscriptions(bounded, source_events, pubs):
 def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, observer=None, all_segments=False,
                         transition_harness=False):
   """Cold-start real controlsd under process_replay and verify inactive output."""
+  if transition_harness and not all_segments:
+    raise ValueError('--schema-input-harness requires --all-segments')
   from cereal import custom, log
   # These module-level flags must be present on controlsd's first import. The
   # normal process-replay launcher also sets them before ManagerProcess.prepare.
