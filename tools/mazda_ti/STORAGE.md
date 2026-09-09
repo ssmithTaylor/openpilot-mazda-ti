@@ -60,3 +60,36 @@ roots, reject raw-source and reparse-point traversal, and preserve the compact
 record outside the deletion target. Reclaim scratch after its comparisons and
 review are finished; retaining every historical full run indefinitely defeats
 the storage policy.
+
+### Pack and verify a cleanup plan
+
+Use `retention_pack` after analysis. Supply absolute paths; the durable pack and
+cleanup manifest must be outside the generated run. Repeat `--protected-root`
+for raw inputs and any active evidence that must remain available.
+
+```text
+python -m tools.mazda_ti.retention_pack pack --study-root ABSOLUTE-SCRATCH --run-root ABSOLUTE-SCRATCH/completed-run --pack ABSOLUTE-DURABLE/run.json.gz --protected-root ABSOLUTE-RAW --max-retained-file-bytes 262144 --max-retained-total-bytes 2097152
+python -m tools.mazda_ti.retention_pack verify-cleanup --study-root ABSOLUTE-SCRATCH --run-root ABSOLUTE-SCRATCH/completed-run --pack ABSOLUTE-DURABLE/run.json.gz --protected-root ABSOLUTE-RAW --manifest ABSOLUTE-DURABLE/cleanup.json
+```
+
+Generated run roots require the batch `cases/*/attempt-*/result.json` layout or
+an explicitly created `.mazda-generated-run.json` ownership marker. A marker
+records caller ownership; it is not authorization to discard unrelated data.
+The tool rejects traversal, reparse points, known raw-recording names and
+overlapping protected roots. Pass real scratch paths, not junction aliases.
+
+The deterministic gzip pack inventories every file's name, size and SHA-256.
+Embedded metadata prioritizes reproduction requests, then findings, then
+redundant nested result records. Per-file and total byte budgets bound embedded
+source bytes; the complete inventory and compression overhead are additional.
+Check actual pack size. Omitted metadata have explicit budget reasons. Store
+the study's human findings and reproduction manifest alongside the pack.
+
+`verify-cleanup` compares the current tree and regenerated pack byte for byte,
+then emits an exact resolved deletion root and file inventory. It never deletes.
+After confirming all writers have stopped, recheck the plan's pack hash and
+target inventory immediately before a native deletion of that one root. On
+Windows, use one PowerShell operation with `-LiteralPath` after checking the
+resolved root remains inside the intended scratch directory. Remove obsolete
+junction aliases separately without recursing through them. Keep the pack and
+a deletion receipt; later consumers must rebuild the pruned full bundle.
