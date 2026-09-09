@@ -41,6 +41,10 @@ Use it before attributing a plateau-related feedback or integral change to the p
 
 ## Raw-evidence ingestion
 
+Use [geographic matching](GEOGRAPHIC_MATCH.md) to locate a previously identified
+road window in another recorded drive. It retains direction, coverage and
+localization checks; matching a location does not transfer rider annotations.
+
 [`INGESTION.md`](INGESTION.md) defines the separate versioned inventory and explicit bounded collection command for raw drive evidence. It is offline-testable and does not evaluate a candidate, contact a device, or expose unrestricted Params.
 
 For structured rlog fields, the identity-coverage audit command, sign conventions and logging tests, read [DIAGNOSTICS.md](DIAGNOSTICS.md). Verify the recorded diagnostic versions and vehicle source separately from the analyzer's current checkout.
