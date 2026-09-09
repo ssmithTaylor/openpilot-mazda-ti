@@ -96,8 +96,15 @@ def assess(rows, initial_findings=()):
           findings.append(f'state changed while active TI bypass at {mono}')
         else:
           state_retention['active_to_ti_bypass'] = row['state_before']
+      elif previous['active'] and previous['ti_allowed'] and not row['ti_allowed']:
+        # The real plant controller makes the safe choice to deactivate while
+        # TI is unavailable. Keep that as a visible transition rather than
+        # requiring an unsafe active bypass solely to satisfy the fixture.
+        awaiting_ti_reentry = True
+        state_retention['ti_bypass_disengage_state'] = previous['state_after']
       if awaiting_ti_reentry and row['active'] and row['ti_allowed']:
         availability['ti_bypass_reentry'] += 1
+        state_retention['ti_reentry_state'] = row['state_before']
         awaiting_ti_reentry = False
       if not previous['active'] and row['active'] and 'disengage_state' in state_retention:
         availability['disengage_reengage'] += 1

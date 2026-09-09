@@ -229,9 +229,9 @@ def inject_transition_harness(events, log):
     status = 'valid'
     # The retained cutout spans activation in 15, TI bypass/disengage in 16,
     # and re-entry in 17. Exercise health failures after the final re-entry.
-    if index == 16_000:
+    if index == 16_200:
       status = 'missing'
-    elif 16_200 <= index < 16_280:
+    elif 15_500 <= index < 16_100:
       status = 'stale_gap'
     elif index == 16_360:
       status = 'invalid'
@@ -262,7 +262,7 @@ def inject_transition_harness(events, log):
     # Enable pulses counter unrelated retained user-disable events; the four
     # bounded inactive windows make the fault observations explicit rather
     # than relying on a later inactive frame by inference.
-    inactive_windows = ((15_000, 15_100), (15_990, 16_050), (16_190, 16_300), (16_350, 16_400))
+    inactive_windows = ((15_000, 15_100), (15_490, 16_110), (16_190, 16_220), (16_350, 16_400))
     action = None
     for start, end in inactive_windows:
       if index == start:

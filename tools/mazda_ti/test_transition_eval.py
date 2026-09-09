@@ -44,6 +44,20 @@ def test_unhealthy_input_that_remains_active_is_a_failed_check_not_a_hidden_comp
   assert result['findings'] == ['missing message remained active at 40', 'missing required fault handling: missing']
 
 
+def test_ti_unavailability_can_safely_deactivate_and_still_require_a_real_reentry():
+  rows = [
+    observation(10, False, True), observation(20, True, True, state='engaged'),
+    observation(30, False, False, state='bypass'), observation(40, True, True, state='reentered'),
+    observation(50, False, True, health='missing'), observation(60, False, True, health='stale'),
+    observation(70, False, True, health='invalid'),
+  ]
+  result = assess(rows)
+  assert result['status'] == 'completed_checks'
+  assert result['availability']['ti_bypass_reentry'] == 1
+  assert result['state_retention']['ti_bypass_disengage_state'] == 'engaged'
+  assert result['state_retention']['ti_reentry_state'] == 'reentered'
+
+
 def test_missing_required_transition_is_reported_in_the_common_failure_status():
   result = assess(complete_rows()[:2])
   assert result['status'] == 'failed_check'
