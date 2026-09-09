@@ -70,7 +70,9 @@ def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inpu
   car_state = log.Event.new_message(logMonoTime=100)
   car_state.init('carState')
   car_state.carState.canValid = True
-  events = [car_state.as_reader()]
+  raw_frog_state = log.Event.new_message(logMonoTime=50)
+  raw_frog_state.init('frogpilotCarState')
+  events = [car_state.as_reader(), raw_frog_state.as_reader()]
   manifest = inject_transition_harness(events, log)
   generated_services = {row['service'] for row in manifest}
   assert generated_services == {'carState', 'managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay'}
@@ -78,6 +80,7 @@ def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inpu
   assert by_service['pandaStates'].pandaStates[0].controlsAllowed is True
   assert by_service['frogpilotPlan'].frogpilotPlan.lateralCheck is True
   assert any(row.get('event') == 'buttonEnable' and row['derived_from'] == 'recorded_carState' for row in manifest)
+  assert sum(event.which() == 'frogpilotCarState' for event in events) == 1
   assert 'testJoystick' not in generated_services
 
 

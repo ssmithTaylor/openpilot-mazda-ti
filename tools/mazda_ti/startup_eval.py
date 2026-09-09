@@ -223,7 +223,10 @@ def inject_transition_harness(events, log):
   services = ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
-  retained = [event for event in events if event.which() != 'pandaStates']
+  # Once this harness declares ownership of an actual subscriber, remove any
+  # later retained publications of that same schema. Otherwise a purported
+  # gap can be silently filled by a raw duplicate from an adjacent segment.
+  retained = [event for event in events if event.which() not in services]
   events[:] = retained
   for index, car_state in enumerate(car_states):
     status = 'valid'
