@@ -1,0 +1,19 @@
+{
+  "end_ns": 518574902230,
+  "integral_anchor_start_ns": 457974902230,
+  "raw_sha256": {
+    "00000261--7120d4c827--5/rlog": "986b19e5117bd36c15a92843858ba9d1bed940050202a368ff110f33015a8ec2",
+    "00000261--7120d4c827--6/rlog": "e0cbf3f343c336a08674b8b664ef187b412d52cce48282e8d4251f391f73fdbc",
+    "00000261--7120d4c827--7/rlog": "aaca29b73501176ab66c8ec384c046cddc3049b4c430ba6e2057dfc8aa280058",
+    "00000261--7120d4c827--4/rlog": "4e3d4f7ccb45a433de05f5cf77d86f813b9f563ad63abd66be4aa2ba6fce3f0c"
+  },
+  "rlogs": [
+    "00000261--7120d4c827--4/rlog",
+    "00000261--7120d4c827--5/rlog",
+    "00000261--7120d4c827--6/rlog",
+    "00000261--7120d4c827--7/rlog"
+  ],
+  "score_start_ns": 458974902230,
+  "warmup_start_ns": 428974902230,
+  "coverage_note": "Preceding segment4 supplies pre-window input publications; selected window, anchor, algorithm and benchmark unchanged."
+}

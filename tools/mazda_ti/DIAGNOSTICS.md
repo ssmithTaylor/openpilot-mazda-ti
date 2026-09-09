@@ -275,3 +275,92 @@ The [instrumented evaluation adapter](INSTRUMENTED_EVALUATION.md) now promotes t
 behind the shared evaluation command. It requires complete exact identities, checks each applied
 carControl against its linked controller publication, and qualifies both limiter histories before
 evaluating a candidate. The standalone identity auditor remains an identity-coverage check.
+
+## Compare legacy recordings across lateral controllers
+
+Use this procedure when an older rider-confirmed comparison lacks the structured
+input identities required by the auditors above. A zero diagnostic version or
+pre-instrumentation controller flag is unavailable evidence, not a measured zero.
+
+The current `controller_replay.py` and `instrumented.py` adapters instantiate
+`LatControlTorque`. They do not reproduce a historical `LatControlNNFF` baseline.
+Loading its original neural model asset is only a feasibility check: qualifying
+that baseline also requires the original controller/PID/interface, plan and roll
+histories, parameter sampling and command/limiter reproduction. A mismatch from
+the torque adapter on an NNFF recording is not a handling verdict.
+
+The separate [legacy NNFF/PID probe](LEGACY_NNFF.md) now reproduces normalized
+output on three declared route261 windows. It includes source-derived receipt
+sequence checks and shared requests; it does not add NNFF to the full actuator
+or release adapters. Use its four timing choices and retain failed holdouts.
+
+For legacy NNFF source `2a098cdb`, distinguish raw `liveDelay.lateralDelay`
+passed to `update_live_delay` from the raw delay plus `LAT_SMOOTH_SECONDS`
+passed to the controller update. Future neural samples use the former; the
+desired-jerk calculation uses the latter. Pitch and demand/roll histories update
+only on active full-neural/model-good frames. The old base `reset()` only clears
+saturation time, and NNFF has no reset override; never assume inactive intervals
+reset its PID or histories. A feedforward-only reconstruction can use an explicit
+capture facade, but must label PID, final commands and vehicle response unqualified.
+
+For an original-source NNFF/PID reconstruction, warm the neural pitch/deques
+before applying one declared post-update recorded integral anchor. Anchoring I
+while neural history is still empty can alter anti-windup decisions and leave a
+persistent integral error after feedforward settles. Preserve the failed early
+anchor result; do not repeatedly reset I to the recording. In `2a098cdb`,
+`publish_logs` computes steering-limited from the current requested steer and
+received carOutput after the controller update, for use on the next cycle.
+Keep that order and retain separate carOutput receipt hypotheses. Saturation
+alert reproduction and applied CAN qualification are separate from PID output.
+
+[`legacy_input_constraints.py`](legacy_input_constraints.py) provides finite
+Float32 rounding intervals and `curvature_compatible` for source-verified legacy
+angle-model equations. Compare recomputed actual curvature and acceleration
+after serialization; check overlap between recorded desired curvature and
+desired acceleration rounding intervals at the candidate speed. Do not require
+the product of the already-rounded curvature to equal the recorded acceleration.
+These necessary conditions reject incompatible candidates without fitting P/I/F
+or output. They do not distinguish equal-valued publications, prove receipt,
+or remove numerical-runtime uncertainty. Preserve all remaining ambiguity and
+score declared timing choices separately. Focused checks:
+
+```text
+python -m pytest tools/mazda_ti/tests/test_legacy_input_constraints.py --confcutdir=tools/mazda_ti/tests -o addopts= -p no:cacheprovider --basetemp ABSOLUTE-OWNED-SCRATCH -q
+```
+
+1. Bind the rider's symptom and lane annotations to original route/segment/time
+   identities. Keep later clarifications as separate records rather than rewriting
+   the original annotation. Geographic matching does not establish lane identity
+   or transfer an outcome. Within-lane entry position remains a separate variable.
+2. Record startup settings, source cleanliness, speed and actuator availability.
+   A startup NNFF toggle supports configuration; verify source selection gates
+   before declaring effective mode. Do not interpret a controller switch as only
+   a change to one feedforward term.
+3. Compare original wheel, speed, yaw, model geometry and CAN publications with
+   their own timestamps, signs and availability. If exact consumed identities are
+   absent, label an as-of publication join explicitly and retain its ages. Never
+   fill missing history with future observations or silently score unavailable rows.
+4. For cross-drive wheel-angle comparisons, retain both raw angle and each drive's
+   learned center. Right-positive adjusted angle is
+   `-carState.steeringAngleDeg + liveParameters.angleOffsetDeg`. This is estimator
+   normalization, not independent steering-zero calibration. Preserve localizer
+   health, mixed ages and reported yaw-only uncertainty; do not divide correlated
+   uncertainty by the square root of the sample count.
+5. Inspect the recorded source's logging assignments before interpreting internal
+   targets or PID terms. For example, plant-controller revision
+   `2c50a68456d6f8eb18c5688a72a2c055a2572182` logs `desiredLateralAccel = setpoint`
+   while feedback uses the committed `tracked_setpoint`. Logged desired below
+   actual can coexist with positive P without proving a sign error. NNFF fields
+   require their own units and computation check.
+6. Validate a proposed symptom metric against rider-confirmed positive and negative
+   examples before using it to select changes. Wheel reversal count alone failed
+   this check in the September 2026 VW comparison: a smooth and a symptomatic
+   pass both had three reversals under the same existing definition. Preserve
+   magnitude, timing and lane context instead of relabeling the rider's outcome.
+
+Completion here means a reproducible descriptive comparison with explicit limits.
+It does not provide a candidate-responsive physical test. Keep compact requests,
+annotations, hashes, findings and reproduction instructions; lossless compression
+can retain full descriptive results while removing verified generated duplicates.
+Do not promote a local exploratory helper as a qualified shared runner without
+portable inputs and the corresponding command-level acceptance evidence.

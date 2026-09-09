@@ -72,6 +72,11 @@ Version2 runner records cover relevant repository dependencies (including PID, p
 
 ## Prepare and replay
 
+For older NNFF recordings, use the separate [historical NNFF/PID probe](LEGACY_NNFF.md).
+It covers normalized controller-output reconstruction on pinned source, with
+explicit legacy receipt assumptions. The full actuator/candidate adapters below
+remain distinct and do not inherit that qualification.
+
 Run these commands from the repository root. The runner needs numpy and pycapnp compatible with the chosen Python runtime; the verifier itself remains standard-library-only. It loads real controller/PID/filter/plant/limiter code with constant-only facades for hardware imports. It does not open sockets, invoke vehicle hardware or modify the checkout.
 
 Create an experiment JSON with these fields:
