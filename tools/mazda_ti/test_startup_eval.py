@@ -23,7 +23,7 @@ def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform
 
 def test_transition_profile_accepts_only_the_declared_fake_service_harness_exclusions():
   first = {'event': 'controlsd.initialized', 'error': True, 'invalid': [], 'not_freq_ok': [],
-           'not_alive': ['liveDelay', 'testJoystick', 'frogpilotCarState', 'frogpilotPlan']}
+           'not_alive': ['testJoystick']}
   second = {**first, 'event': 'commIssue'}
   payload = '\n'.join(json.dumps(row) for row in (first, second))
   assert transition_stderr_diagnostics(payload) == [first, second]

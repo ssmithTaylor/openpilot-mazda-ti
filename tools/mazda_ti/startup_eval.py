@@ -198,7 +198,7 @@ def transition_stderr_diagnostics(stderr):
   except json.JSONDecodeError:
     return None
   expected_events = {'controlsd.initialized', 'commIssue'}
-  expected_unavailable = {'liveDelay', 'testJoystick', 'frogpilotCarState', 'frogpilotPlan'}
+  expected_unavailable = {'testJoystick'}
   if len(records) != 2 or {record.get('event') for record in records if isinstance(record, dict)} != expected_events:
     return None
   for record in records:
@@ -210,7 +210,11 @@ def transition_stderr_diagnostics(stderr):
 
 def inject_transition_harness(events, log):
   """Add only missing controlsd input schemas with declared per-message identities."""
-  services = ('frogpilotCarState', 'frogpilotPlan', 'liveDelay')
+  # These are all actual controlsd subscriptions absent from the recorded
+  # cutout.  `testJoystick` remains deliberately absent: it is the one fake
+  # service declared by the process-replay configuration and is retained as a
+  # harness exclusion in the evidence.
+  services = ('managerState', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
   for index, car_state in enumerate(car_states):
