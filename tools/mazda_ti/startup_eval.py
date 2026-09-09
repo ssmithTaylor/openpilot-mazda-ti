@@ -4,12 +4,15 @@ import argparse
 import ast
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import importlib
 import json
 import os
 import platform
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -35,17 +38,58 @@ def capability():
   return {'schema_boundary_supported': not missing, 'full_process_supported': not missing, 'missing': missing}
 
 
-def controls_constructor_boundary():
-  tree = ast.parse((ROOT / 'selfdrive/controls/controlsd.py').read_text(encoding='utf-8'))
+@contextmanager
+def isolated_environment():
+  """Own Params/msgq state for one run and restore every ambient variable."""
+  keys = ('PARAMS_ROOT', 'OPENPILOT_PREFIX', 'REPLAY', 'SIMULATION')
+  original = {key: os.environ.get(key) for key in keys}
+  with tempfile.TemporaryDirectory(prefix='mazda-startup-params-') as params_root:
+    prefix = 'mazda-startup-' + uuid.uuid4().hex
+    os.environ.update(PARAMS_ROOT=params_root, OPENPILOT_PREFIX=prefix, REPLAY='1', SIMULATION='1')
+    try:
+      yield {'params_root': params_root, 'messaging_prefix': prefix}
+    finally:
+      for key, value in original.items():
+        if value is None:
+          os.environ.pop(key, None)
+        else:
+          os.environ[key] = value
+
+
+def construct_controlsd_subscriptions(source=None, messaging_module=None):
+  """Execute controlsd's real constructor subscription block and validate it."""
+  source = source or (ROOT / 'selfdrive/controls/controlsd.py').read_text(encoding='utf-8')
+  tree = ast.parse(source)
   controls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Controls')
   init = next(node for node in controls.body if isinstance(node, ast.FunctionDef) and node.name == '__init__')
-  direct = next(node for node in init.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute) and target.attr == 'car_state_sock' for target in node.targets))
-  if "sub_sock('carState'" not in ast.unparse(direct) and 'sub_sock("carState"' not in ast.unparse(direct):
-    raise ValueError('controlsd constructor lacks a dedicated carState subscriber')
-  submaster = next(node for node in init.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute) and target.attr == 'sm' for target in node.targets))
-  if "'carState'" in ast.unparse(submaster) or '"carState"' in ast.unparse(submaster):
+  start = next(index for index, node in enumerate(init.body) if isinstance(node, ast.Assign) and
+               any(isinstance(target, ast.Attribute) and target.attr == 'sensor_packets' for target in node.targets))
+  stop = next(index for index, node in enumerate(init.body) if isinstance(node, ast.Assign) and
+              any(isinstance(target, ast.Attribute) and target.attr == 'sm' for target in node.targets))
+  messaging = messaging_module
+  if messaging is None:
+    from cereal import messaging
+  class RecordingMessaging:
+    services = None
+    sub_sock = staticmethod(messaging.sub_sock)
+
+    @classmethod
+    def SubMaster(cls, services, **kwargs):
+      cls.services = tuple(services)
+      return messaging.SubMaster(services, **kwargs)
+
+  host = type('ConstructorSubscriptions', (), {})()
+  block = ast.Module(body=init.body[start:stop + 1], type_ignores=[])
+  exec(compile(block, 'controlsd-constructor-subscriptions', 'exec'),
+       {'self': host, 'messaging': RecordingMessaging, 'SIMULATION': True, 'REPLAY': True, 'DT_CTRL': 0.01})
+  services = set(RecordingMessaging.services or ())
+  if 'carState' in services:
     raise ValueError('carState must remain a dedicated subscriber, not a SubMaster service')
-  return direct
+  return host
+
+
+def controls_constructor_boundary():
+  return construct_controlsd_subscriptions()
 
 
 def qualify_nested_timestamps(before, after):
@@ -67,11 +111,8 @@ def actual_boundary():
   from openpilot.selfdrive.controls import controlsd
 
   messaging.toggle_fake_events(True)
-  messaging.set_fake_prefix('mazda-startup-' + uuid.uuid4().hex)
   try:
-    assignment = controls_constructor_boundary()
-    host = controlsd.Controls.__new__(controlsd.Controls)
-    exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'controlsd-dedicated-carstate', 'exec'), {'self': host, 'messaging': messaging})
+    host = construct_controlsd_subscriptions(messaging_module=messaging)
     publisher = messaging.PubMaster(['carState'])
     with ThreadPoolExecutor(max_workers=1) as executor:
       received = executor.submit(messaging.recv_one_retry, host.car_state_sock)
@@ -85,7 +126,6 @@ def actual_boundary():
       raise StartupUnsupported('carState schema message did not cross controlsd dedicated subscriber boundary')
     return {'schema': 'carState', 'cold_start': 'passed', 'inactive': 'passed'}
   finally:
-    messaging.delete_fake_prefix()
     messaging.toggle_fake_events(False)
 
 
@@ -153,8 +193,6 @@ def actual_full_process(rlog, max_carstate_messages=100):
   from cereal import custom, log
   # These module-level flags must be present on controlsd's first import. The
   # normal process-replay launcher also sets them before ManagerProcess.prepare.
-  os.environ['REPLAY'] = '1'
-  os.environ['SIMULATION'] = '1'
   from openpilot.selfdrive.controls import controlsd  # establish manager import order
   from openpilot.selfdrive.test.process_replay.process_replay import controlsd_config_callback, get_process_config, ProcessContainer, replay_process
 
@@ -193,11 +231,32 @@ def actual_full_process(rlog, max_carstate_messages=100):
   # replay seed; preserve the real recorded message and keep the run inactive.
   def configure_isolated_startup(params, _process_cfg, _events):
     params.put('ReplayControlsState', replay_controls_state.as_builder().to_bytes())
-    from openpilot.frogpilot.common.frogpilot_variables import FrogPilotVariables, get_frogpilot_toggles, params_memory
+    from openpilot.frogpilot.common.frogpilot_variables import (FrogPilotVariables, frogpilot_default_params,
+                                                                get_frogpilot_toggles, misc_tuning_levels,
+                                                                params_default, params_memory)
     # Build the complete toggle namespace from repository defaults without the
     # started=True blocking Params reads. Vehicle identity still comes from the
     # explicit Mazda process-replay fingerprint and recorded CarParams.
-    FrogPilotVariables().update('', False)
+    # Avoid FrogPilotVariables.__init__: it derives branch metadata and may emit
+    # host Git diagnostics that have no bearing on this repository-default,
+    # inactive fixture. Reproduce its Params default initialization explicitly.
+    variables = FrogPilotVariables.__new__(FrogPilotVariables)
+    variables.frogpilot_toggles = get_frogpilot_toggles()
+    variables.tuning_levels = {key: level for key, _, level, _ in frogpilot_default_params + misc_tuning_levels}
+    variables.development_branch = False
+    variables.release_branch = False
+    variables.staging_branch = False
+    variables.testing_branch = False
+    variables.vetting_branch = False
+    variables.frogpilot_toggles.block_user = False
+    variables.frogpilot_toggles.frogs_go_moo = False
+    variables.frogpilot_toggles.tuning_level = 3
+    variables.frogpilot_toggles.use_higher_bitrate = False
+    variables.frogpilot_toggles.use_konik_server = False
+    for key, value, _, _ in frogpilot_default_params:
+      params_default.put(key, value)
+    params_memory.put('FrogPilotTuningLevels', json.dumps(variables.tuning_levels))
+    variables.update('', False)
     toggles = get_frogpilot_toggles()
     toggles.startup_alert_top = str(toggles.startup_alert_top or '')
     toggles.startup_alert_bottom = str(toggles.startup_alert_bottom or '')
@@ -234,6 +293,14 @@ def actual_full_process(rlog, max_carstate_messages=100):
     raise ValueError('controlsd produced no carControl or controlsState messages')
   if len(inactive) != len(car_controls):
     raise ValueError(f'inactive startup produced {len(car_controls) - len(inactive)} active or steering-output carControl messages')
+  child_error = captured.get('controlsd', {}).get('err', '').strip()
+  if child_error:
+    raise ValueError(f'controlsd wrote stderr: {child_error}')
+
+  try:
+    git_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, stderr=subprocess.STDOUT).strip()
+  except (OSError, subprocess.CalledProcessError) as error:
+    raise StartupUnsupported(f'runtime checkout Git identity unavailable: {error}') from error
 
   transform = _diagnostic_timestamp_result(bounded, outputs)
   return {
@@ -248,12 +315,14 @@ def actual_full_process(rlog, max_carstate_messages=100):
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
     'process_output': captured.get('controlsd', {}), 'timestamp_transform': transform,
+    'runtime_source': {'root': str(ROOT), 'git_head': git_head, 'identity': source_identity()},
   }
 
 
 def source_identity():
   files = ('selfdrive/controls/controlsd.py', 'selfdrive/test/process_replay/process_replay.py',
-           'selfdrive/car/mazda/lateral_diagnostics.py', 'cereal/car.capnp', 'cereal/log.capnp')
+           'selfdrive/car/mazda/lateral_diagnostics.py', 'cereal/car.capnp', 'cereal/log.capnp',
+           'tools/mazda_ti/startup_eval.py')
   return {name: sha256(ROOT / name) for name in files}
 
 
@@ -263,34 +332,37 @@ def run(output, profile='full_process', rlog=None, max_carstate_messages=100, ca
   if profile not in ('full_process', 'schema_boundary'):
     raise ValueError('Unsupported startup evaluation profile')
   started = time.perf_counter()
-  capabilities = capability()
-  result = {
-    'format_version': 2, 'profile': profile,
-    'runtime': {'platform': platform.platform(), 'python': sys.version, 'executable': sys.executable},
-    'isolation': {'params': 'PARAMS_ROOT and OpenpilotPrefix temporary directories',
-                  'messaging': 'process_replay fake prefix', 'writable_state': 'temporary runtime only',
-                  'vehicle_connection': 'none', 'can_publisher': 'not constructed'},
-    'timing_scope': 'local process replay elapsed time; not full-system or device scheduling proof',
-    'source_schema_sha256': source_identity(), 'exception': None,
-  }
-  supported = capabilities[profile + '_supported']
-  if not supported:
-    result.update(status='unsupported', missing_capabilities=capabilities['missing'], boundary=None, timestamp_transform=None,
+  with isolated_environment() as owned_isolation:
+    capabilities = capability()
+    result = {
+      'format_version': 2, 'profile': profile,
+      'runtime': {'platform': platform.platform(), 'python': sys.version, 'executable': sys.executable},
+      'isolation': {'params': 'tool-owned temporary directory',
+                    'messaging': 'tool-owned unique fake prefix', 'writable_state': 'temporary runtime only',
+                    'vehicle_connection': 'none', 'can_publisher': 'not constructed'},
+      'timing_scope': 'local process replay elapsed time; not full-system or device scheduling proof',
+      'source_schema_sha256': source_identity(), 'exception': None,
+    }
+    supported = capabilities[profile + '_supported']
+    if not supported:
+      result.update(status='unsupported', missing_capabilities=capabilities['missing'], boundary=None, timestamp_transform=None,
                   scope='Required full-process integration is not satisfied; no vehicle, CAN sender, Params, or process replay was run.')
-  elif profile == 'full_process' and rlog is None:
-    result.update(status='unsupported', missing_capabilities=['mazda_rlog'], boundary=None, timestamp_transform=None,
+    elif profile == 'full_process' and rlog is None:
+      result.update(status='unsupported', missing_capabilities=['mazda_rlog'], boundary=None, timestamp_transform=None,
                   scope='A local Mazda rlog is required for the full-process integration profile.')
-  else:
-    try:
-      checked = boundary() if boundary is not None else (actual_full_process(rlog, max_carstate_messages) if profile == 'full_process' else actual_boundary())
-      result.update(status='completed_checks', missing_capabilities=[], boundary=checked,
+    else:
+      try:
+        checked = boundary() if boundary is not None else (actual_full_process(rlog, max_carstate_messages) if profile == 'full_process' else actual_boundary())
+        result.update(status='completed_checks', missing_capabilities=[], boundary=checked,
                     timestamp_transform=checked.get('timestamp_transform', {'status': 'not_applicable', 'reason': 'schema-only boundary has no generated diagnostics'}),
                     scope=('Actual isolated controlsd process replay with inactive Mazda inputs; command objects are observed, but no CAN publisher, vehicle connection, or physical behavior is exercised.'
                            if profile == 'full_process' else 'Actual isolated carState schema subscriber boundary only; no full process or scheduling claim.'))
-    except Exception as error:
-      result.update(status='failed_execution', missing_capabilities=[], boundary=None, timestamp_transform=None,
+      except Exception as error:
+        result.update(status='failed_execution', missing_capabilities=[], boundary=None, timestamp_transform=None,
                     exception=f'{type(error).__name__}: {error}', traceback=traceback.format_exc(),
                     scope='Isolated process-boundary attempt failed; full-process integration is not satisfied.')
+    result['isolation']['owned_params_root_removed_after_run'] = True
+    result['isolation']['owned_messaging_prefix'] = owned_isolation['messaging_prefix']
   result['elapsed_seconds'] = time.perf_counter() - started
   write_json(output / 'result.json', result)
   return result

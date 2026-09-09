@@ -11,7 +11,6 @@ file needed to supply the route's recorded `carParams`; the last file is the
 bounded startup stream. This example replays twenty recorded `carState` cycles:
 
 ```text
-PARAMS_ROOT=/tmp/mazda-startup-params \
 python -m tools.mazda_ti.startup_eval \
   --profile full_process \
   --rlog PATH/TO/ROUTE-START/rlog \
@@ -29,6 +28,11 @@ as symlinks before building; the checkout's text placeholders are not usable
 Linux packages. The result reports missing imports as unsupported rather than
 claiming completion.
 
+The tool creates a unique temporary `PARAMS_ROOT` and outer
+`OPENPILOT_PREFIX` for every invocation, restores any caller values, and
+removes its Params directory before returning. Process replay creates nested
+unique prefixes for the child.
+
 The full profile uses process replay's explicit Mazda fingerprint mode, the
 exact recorded `CarParams`, an isolated schema-default `FrogPilotCarParams`,
 repository-default FrogPilot toggles, and an isolated enabled-TI setting so the
@@ -37,9 +41,11 @@ temporary replay Params prefix. No safety process consumes them.
 
 A completed result requires all emitted `carControl` messages to remain
 inactive with zero steering, and rejects any observed `can` or `sendcan`
-service. The report hashes each input and all relevant process/schema sources.
-It captures process stdout/stderr and exceptions. Timing is local replay wall
-time; it is not full-system or device scheduling evidence.
+service. The report hashes each input and relevant process/schema file from the
+runtime checkout, and records that checkout's Git HEAD. It captures process
+stdout/stderr and exceptions; child stderr or unavailable runtime Git identity
+prevents a completed result. Timing is local replay wall time; it is not
+full-system or device scheduling evidence.
 
 Timestamp qualification comes from the generated
 `controlsState.lateralControlState.torqueState.mazdaDiagnostics.inputs` rows.
