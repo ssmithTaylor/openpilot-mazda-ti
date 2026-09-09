@@ -89,3 +89,21 @@ def completed_result(request, baseline, candidate, comparison):
           'source_identities': {**{k: spec[k] for k in ('baseline_controller', 'candidate_controller', 'warmup_controller', 'limiter')},
                                 'repository_sources': candidate['repository_sources'], 'controller_sources': sources},
           'input_sha256': candidate['input_sha256'], 'runtime': candidate['environment'], 'limitations': candidate['limitations'] + LIMITATIONS}
+
+
+def synthetic_result(request, status, comparison, findings, source_identities, input_sha256, runtime, limitations):
+  """Use the same top-level outcome contract for bounded synthetic evidence."""
+  case = request['case']
+  return {
+    'format_version': 1,
+    'status': status,
+    'case_id': case['id'],
+    'qualification': 'synthetic_controller_limiter',
+    'comparison': comparison,
+    'findings': findings,
+    'scope': evidence_scope(case['origin']),
+    'source_identities': source_identities,
+    'input_sha256': input_sha256,
+    'runtime': runtime,
+    'limitations': limitations,
+  }

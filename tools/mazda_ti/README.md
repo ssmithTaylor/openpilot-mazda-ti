@@ -42,6 +42,8 @@ Create an experiment JSON with these fields:
 
 Required settings are `TiSteerMax`, `TiSteerDeltaUp`, `TiSteerDeltaDown`, `TiSteerDriverAllowance`, `TiSteerDriverMultiplier`, `TiSteerDeltaUpKnee`, `TiSteerDeltaUpHigh`, `LatDamping`, `LatCommitSetpoint`, `LatFrictionComp`, `LatOutputFilter`, `LatNoFrictionRelay`, `TorqueInterceptorEnabled`, and `SteerKP`. Read these from raw `initData.params.entries`, not an extraction summary that may omit toggles. Only these whitelisted settings enter the report; other recorded Params can contain private information.
 
+[Synthetic controller scenarios](SCENARIOS.md) run fixed controller/limiter inputs locally. Their outcomes cover software command invariants only, not a vehicle path or handling result.
+
 The current runner requires TI600, interceptor enabled, output smoothing off, and the friction relay disabled. It checks the expected initial settings in every supplied segment. That does not prove those values persisted at runtime; baseline reproduction and recorded flags remain necessary, and newly instrumented drives can provide direct runtime settings. Configure enough preceding segments for reference, friction, integral and actuator-state history. An integral anchor is a declared state initialization, not a fitted correction on every frame.
 
 ```text
