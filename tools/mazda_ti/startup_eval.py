@@ -390,6 +390,10 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
   cfg.config_callback = configure_isolated_startup
   if transition_harness:
     cfg.pubs = [*cfg.pubs, 'frogpilotCarState', 'frogpilotPlan', 'liveDelay']
+    # Process replay normally declares SIMULATION, where SubMaster defines
+    # liveness as merely "seen" and frequency as always healthy. Transition
+    # fault evidence needs the process's real subscriber health accounting.
+    cfg.simulation = False
   captured = {}
   original_run_step = ProcessContainer.run_step
   def diagnostic_run_step(container, *args, **kwargs):
@@ -445,6 +449,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
               'fingerprint': car_params.carFingerprint,
               'fingerprint_mode': 'explicit process_replay fixture; no live fingerprinting',
               'frogpilot_car_params': 'isolated schema-default fixture; no safety process is started',
+              'process_replay_simulation': cfg.simulation,
               'torque_interceptor_enabled': True},
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
