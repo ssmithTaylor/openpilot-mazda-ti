@@ -189,8 +189,8 @@ def _diagnostic_timestamp_result(source_events, output_events):
   return result
 
 
-def transition_stderr_diagnostics(stderr):
-  """Allow only the two declared fake-service health records for transition replay."""
+def transition_stderr_diagnostics(stderr, expected_invalid_services=()):
+  """Accept only declared fake-service exclusions and requested invalid inputs."""
   if not stderr:
     return []
   try:
@@ -199,12 +199,18 @@ def transition_stderr_diagnostics(stderr):
     return None
   expected_events = {'controlsd.initialized', 'commIssue'}
   expected_unavailable = {'testJoystick'}
+  expected_invalid_services = set(expected_invalid_services)
   if len(records) != 2 or {record.get('event') for record in records if isinstance(record, dict)} != expected_events:
     return None
-  for record in records:
-    if (not isinstance(record, dict) or record.get('error') is not True or record.get('invalid') != [] or
-        record.get('not_freq_ok') != [] or set(record.get('not_alive', ())) != expected_unavailable):
-      return None
+  initialized = next(record for record in records if record.get('event') == 'controlsd.initialized')
+  comm_issue = next(record for record in records if record.get('event') == 'commIssue')
+  if (not isinstance(initialized, dict) or initialized.get('error') is not True or initialized.get('invalid') != [] or
+      initialized.get('not_freq_ok') != [] or set(initialized.get('not_alive', ())) != expected_unavailable):
+    return None
+  if (not isinstance(comm_issue, dict) or comm_issue.get('error') is not True or
+      set(comm_issue.get('invalid', ())) != expected_invalid_services or comm_issue.get('not_freq_ok') != [] or
+      set(comm_issue.get('not_alive', ())) != expected_unavailable):
+    return None
   return records
 
 
@@ -373,7 +379,8 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
   if require_inactive and len(inactive) != len(car_controls):
     raise ValueError(f'inactive startup produced {len(car_controls) - len(inactive)} active or steering-output carControl messages')
   child_error = captured.get('controlsd', {}).get('err', '').strip()
-  stderr_diagnostics = transition_stderr_diagnostics(child_error)
+  expected_invalid = {row['service'] for row in generated_harness if row['status'] == 'invalid'}
+  stderr_diagnostics = transition_stderr_diagnostics(child_error, expected_invalid)
   if child_error and (require_inactive or stderr_diagnostics is None):
     raise ValueError(f'controlsd wrote stderr: {child_error}')
 
@@ -399,7 +406,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
     'process_output': captured.get('controlsd', {}),
-    'process_output_classification': ('empty_stderr' if not child_error else 'expected_harness_exclusions'),
+    'process_output_classification': ('empty_stderr' if not child_error else 'expected_harness_exclusions_and_exercised_faults'),
     'transition_stderr_diagnostics': stderr_diagnostics, 'timestamp_transform': transform,
     'runtime_source': {'root': str(ROOT), 'git_head': git_head, 'identity': source_identity()},
   }

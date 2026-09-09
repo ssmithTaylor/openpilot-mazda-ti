@@ -32,6 +32,15 @@ def test_transition_profile_accepts_only_the_declared_fake_service_harness_exclu
   assert transition_stderr_diagnostics(payload + '\nnot-json') is None
 
 
+def test_transition_stderr_accepts_only_the_explicitly_injected_invalid_input():
+  first = {'event': 'controlsd.initialized', 'error': True, 'invalid': [], 'not_freq_ok': [], 'not_alive': ['testJoystick']}
+  invalid = {'event': 'commIssue', 'error': True, 'invalid': ['frogpilotCarState'], 'not_freq_ok': [], 'not_alive': ['testJoystick']}
+  payload = '\n'.join(json.dumps(row) for row in (first, invalid))
+  assert transition_stderr_diagnostics(payload, {'frogpilotCarState'}) == [first, invalid]
+  assert transition_stderr_diagnostics(payload) is None
+  assert transition_stderr_diagnostics(payload, {'unknownService'}) is None
+
+
 class FakeMessaging:
   @staticmethod
   def sub_sock(service, **kwargs):
