@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -44,7 +45,10 @@ def _manifest(path):
     allowed = required | {'process_group'}
     if not isinstance(case, dict) or not required <= set(case) or set(case) - allowed:
       raise ValueError('Invalid batch case')
-    if not isinstance(case['id'], str) or not case['id'] or '/' in case['id'] or '\\' in case['id']:
+    # This identity becomes an output-directory component. Requiring an initial
+    # alphanumeric character rules out both dot traversal spellings and drive
+    # prefixes, while the remainder keeps paths and platform separators out.
+    if not isinstance(case['id'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', case['id']):
       raise ValueError('Invalid batch case identity')
     if case['isolation'] not in ('demonstrated', 'unproven'):
       raise ValueError('Unknown process isolation state')

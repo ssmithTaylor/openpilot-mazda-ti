@@ -4,6 +4,8 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
+
 from .batch import evaluate_batch
 from .example_fixture import create_example
 from .provenance import read_json, write_json
@@ -112,3 +114,12 @@ def test_branch_reference_is_frozen_and_unisolated_process_group_runs_serially(t
   assert result['status'] == 'completed_checks'
   assert result['execution']['workers'] == 1
   assert all(len(row['frozen_request']['candidate_revision']) == 40 for row in result['canonical']['cases'])
+
+
+@pytest.mark.parametrize('identity', ['.', '..', 'C:', '../escaped', 'case/child'])
+def test_case_identity_cannot_escape_its_output_directory(tmp_path, identity):
+  cases = requests(tmp_path, count=1)
+  cases[0]['id'] = identity
+
+  with pytest.raises(ValueError, match='Invalid batch case identity'):
+    evaluate_batch(manifest(tmp_path, cases), tmp_path / 'raw', tmp_path / 'output')
