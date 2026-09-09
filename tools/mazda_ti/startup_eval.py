@@ -430,14 +430,23 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     live_subscriptions = []
   captured = {}
   original_run_step = ProcessContainer.run_step
+  last_carstate_step = None
   def diagnostic_run_step(container, *args, **kwargs):
-    if transition_harness and args and args[0].which() == 'carState':
-      time.sleep(0.01)
     try:
-      return original_run_step(container, *args, **kwargs)
+      result = original_run_step(container, *args, **kwargs)
     except Exception as error:
       process = container.process.proc
       raise RuntimeError(f'{error}; child_alive={process.is_alive()}; child_exitcode={process.exitcode}') from error
+    # ``run_step`` itself consumes a material part of a live control cycle. Pace
+    # after it so the start-to-start interval is 100 Hz; sleeping before it made
+    # every retained low-rate source slower than its declared service rate.
+    nonlocal last_carstate_step
+    if transition_harness and args and args[0].which() == 'carState':
+      now = time.monotonic()
+      if last_carstate_step is not None:
+        time.sleep(max(0.0, 0.01 - (now - last_carstate_step)))
+      last_carstate_step = time.monotonic()
+    return result
   ProcessContainer.run_step = diagnostic_run_step
   try:
     custom_params = {'CarParams': car_params.as_builder().to_bytes(),
