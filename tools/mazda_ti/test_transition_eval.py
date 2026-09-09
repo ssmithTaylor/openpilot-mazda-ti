@@ -188,7 +188,8 @@ def test_run_rejects_schema_harness_without_adjacent_segment_mode(tmp_path):
   result = run(tmp_path / 'evidence', rlog=['retained/rlog'], transition_harness=True,
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'failed_execution'
-  assert result['exception'] == 'ValueError: --schema-input-harness requires --rlog and --all-segments'
+  assert result['exception'] == 'ValueError'
+  assert read_json(tmp_path / 'evidence/execution.json')['exception_detail'] == 'ValueError: --schema-input-harness requires --rlog and --all-segments'
 
 
 def test_transition_boundary_rejects_harness_without_all_segments_before_opening_rlog():

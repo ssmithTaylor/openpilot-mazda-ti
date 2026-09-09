@@ -15,7 +15,8 @@ database. Run from the repository root:
 python -m tools.mazda_ti.fresh_session --candidate HEAD --output PATH/TO/NEW-OUTPUT
 ```
 
-The runner performs this local chain twice:
+The runner performs this local chain twice, starting a new Python interpreter
+for each pass:
 
 1. Generate independent, byte-identical historical and exact-identity
    instrumented fixtures at different paths.
@@ -23,14 +24,16 @@ The runner performs this local chain twice:
    a new raw root.
 3. Evaluate both adapters through the resumable batch API, then evaluate the
    mixed corpus with its retained excluded case.
-4. Run the controller scenario producer and the deterministic process-contract
-   producer, compare the verified instrumented trace arms, and bind the four
-   producer results through release qualification. The fixture process profile
-   is intentionally rejected by that release boundary.
+4. Run the controller scenario producer, the deterministic process-contract
+   producer, and the real declared-runtime process boundary. Compare the
+   verified instrumented trace arms and bind the real process result with the
+   other three producer results through release qualification.
 5. Repeat from the relocated fixture and raw roots with new evidence outputs
    and the shared validated case cache.
-6. Reject changed source, raw, manifest, runtime, and evidence identities, then
-   prove a missing full-process runtime produces an unqualified release.
+6. Reject changed source, raw, manifest, runtime, and evidence identities.
+   Corrupt a prepared cache artifact, preserve it, and demonstrate one affected
+   recomputation alongside one valid cache hit.
+7. Prove a missing full-process runtime produces an unqualified release.
 
 `result.json` and `report.md` are the portable acceptance boundary. They contain
 relative artifact names, statuses, SHA-256 identities, exclusions, and evidence
@@ -42,19 +45,23 @@ partial hit is `mixed`.
 ## Read the result
 
 A `completed_checks` infrastructure acceptance requires identical fixture bytes, canonical
-artifact hashes, and qualification decisions across both locations. Both replay
+artifact hashes, and qualification decisions across both locations and fresh
+interpreter processes. Both replay
 adapters must reproduce their baselines, the second batch must reuse every
-valid cached case, all five invalidation probes must reject changed evidence,
-and both the process fixture and intentionally unsupported process result must
-keep their releases unqualified.
+valid cached case, every invalidation probe must reject changed evidence, and a
+corrupted prepared cache artifact must be recomputed without hiding the valid
+cache contribution. Batch, corpus, scenario, process-fixture, and
+comparison stages must each complete; an expected unqualified release cannot
+hide an earlier producer failure.
 
 The completed process fixture demonstrates the transition producer contract,
-but it carries `process_transition_fixture`, which the release qualifier rejects.
-It cannot become `full_process_transition` through an injected capability or
-boundary. `execution.json` reports the host's actual process capability. A
-qualified release still requires separately retained evidence produced by the
-real process boundary in the declared Linux openpilot runtime with suitable
-Mazda rlogs.
+but it carries `process_transition_fixture` and cannot become
+`full_process_transition` through an injected capability or boundary. The
+release consumes the separate result produced by the real process boundary.
+`execution.json` reports the host's actual process capability. On an unsupported
+host, that process result and the release remain explicitly unsupported and
+unqualified. A qualified release requires a completed real process result in
+the declared Linux openpilot runtime with suitable Mazda rlogs.
 
 ## Diagnose a failure
 

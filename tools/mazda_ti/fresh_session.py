@@ -2,19 +2,22 @@
 
 import argparse
 import copy
+import os
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
+import sys
 import time
+import uuid
 
 from . import run as replay_run
 from .batch import evaluate_batch
 from .corpus import evaluate_corpus
 from .fresh_fixture import create_fresh_fixture, fixture_tree_sha256
 from .ingest import collect_inventory, discover
-from .provenance import check_sources, read_json, resolve_ref, sha256, write_json
+from .provenance import ROOT, check_sources, read_json, resolve_ref, sha256, write_json
 from .release import EVIDENCE_KINDS, PREREQUISITES, PROFILE, qualify
 from .scenarios import run as run_scenario
 from .startup_eval import capability as process_capability
@@ -25,7 +28,7 @@ from .transition_eval import assess, run as run_transition, source_identity
 FORMAT_VERSION = 1
 COMPONENT_PATHS = (
   "collected-inventory.json", "batch/canonical-001.json", "corpus/result.json", "corpus/report.md",
-  "scenario/result.json", "scenario/report.md", "process/result.json", "comparison/result.json",
+  "scenario/result.json", "scenario/report.md", "process-contract/result.json", "process/result.json", "comparison/result.json",
   "comparison/report.md", "release/result.json", "release/report.md",
 )
 SCOPE = (
@@ -33,9 +36,10 @@ SCOPE = (
   "fixtures. It does not predict lane motion, establish acceptable handling or driver contact, authorize deployment, "
   "connect to a device, publish CAN, or actuate a vehicle."
 )
+FIXTURE_PROCESS_REJECTION = "process: Record does not match the process evidence schema"
 
 
-def _fixture_process_boundary(candidate, rlogs):
+def _fixture_process_boundary(rlogs):
   """Exercise the process producer contract without claiming host process execution."""
   paths = [Path(path) for path in rlogs]
 
@@ -54,7 +58,7 @@ def _fixture_process_boundary(candidate, rlogs):
     return {**transition, "startup_boundary": {
       "interface": "selfdrive.test.process_replay.replay_process",
       "runtime_kind": "deterministic_process_contract_fixture",
-      "runtime_source": {"git_head": candidate, "identity": source_identity()},
+      "runtime_source": {"git_head": None, "kind": "current_worktree_fixture", "identity": source_identity()},
       "input": {"rlogs": [{"label": f"{path.parent.name}/{path.name}", "sha256": sha256(path)} for path in paths]},
       "no_vehicle_output": {"status": "passed"},
     }}
@@ -101,11 +105,12 @@ def _run_once(fixture_root, output, cache_root, candidate):
   )
   scenario = run_scenario(fixture_root / "scenario.json", output / "scenario")
   process_raw = output / "raw/instrumented--0/rlog"
-  process = run_transition(
-    output / "process", rlog=[process_raw], all_segments=True,
-    process_boundary=_fixture_process_boundary(candidate, [process_raw]),
+  process_contract = run_transition(
+    output / "process-contract", rlog=[process_raw], all_segments=True,
+    process_boundary=_fixture_process_boundary([process_raw]),
     capability=lambda: {"full_process_supported": True, "missing": []},
   )
+  process = run_transition(output / "process", rlog=[process_raw], all_segments=True)
   arm = output / "corpus/cases/fresh-instrumented/candidate"
   comparison = compare_trace_bundles(
     arm, arm, arm, output / "comparison", data_root=output / "raw", evidence_root=output,
@@ -115,13 +120,26 @@ def _run_once(fixture_root, output, cache_root, candidate):
   components = {name: sha256(output / name) for name in COMPONENT_PATHS}
   statuses = {
     "batch": batch["status"], "corpus": corpus["status"], "scenario": scenario["status"],
-    "process_contract_fixture": process["status"], "comparison": comparison["status"],
+    "process_contract_fixture": process_contract["status"], "process_declared_runtime": process["status"],
+    "comparison": comparison["status"],
     "release": release["status"], "release_decision": release["qualification"],
   }
   return {
     "components": components, "statuses": statuses,
-    "execution": {"elapsed_seconds": time.perf_counter() - started, "batch": batch["execution"]},
+    "release_findings": release["findings"],
+    "execution": {"elapsed_seconds": time.perf_counter() - started, "batch": batch["execution"],
+                  "worker_pid": os.getpid(), "session_identity": uuid.uuid4().hex},
   }
+
+
+def _run_in_fresh_process(fixture_root, output, cache_root, candidate):
+  """Run one pass in a new interpreter and read its retained summary."""
+  subprocess.run([
+    sys.executable, "-m", "tools.mazda_ti.fresh_session", "--worker",
+    "--fixture-root", str(fixture_root), "--output", str(output),
+    "--cache-root", str(cache_root), "--candidate", candidate,
+  ], cwd=ROOT, check=True)
+  return read_json(output / "session-summary.json")
 
 
 def _expect_rejection(check):
@@ -137,7 +155,7 @@ def _require_hash(path, expected):
     raise ValueError("Artifact identity changed")
 
 
-def _invalidation_checks(output, second, candidate):
+def _invalidation_checks(output, second, candidate, cache_root):
   historical = second / "corpus/cases/fresh-historical"
   result = read_json(historical / "result.json")
   sources = copy.deepcopy(result["source_identities"]["repository_sources"])
@@ -179,9 +197,27 @@ def _invalidation_checks(output, second, candidate):
   write_json(request_path, request)
   evidence = qualify(request_path, output, output / "invalidation/evidence-release")
   evidence_rejected = evidence["status"] == "failed_check" and evidence["qualification"] == "unqualified"
+
+  cache_case = sorted(path for path in cache_root.iterdir() if path.is_dir())[0]
+  corrupt_attempt = cache_case / "attempt-001"
+  prepared = corrupt_attempt / "prepared/spec.json"
+  prepared.write_bytes(prepared.read_bytes() + b" ")
+  recomputed = evaluate_batch(
+    output / "fixtures-b/batch.json", second / "raw", output / "invalidation/cache-recompute",
+    cache_root=cache_root, workers=1,
+  )
+  reused = [row["reused"] for row in recomputed["execution"]["cases"]]
+  cache_recomputed = (
+    recomputed["status"] == "completed_checks"
+    and recomputed["execution"]["timing_kind"] == "mixed"
+    and sorted(reused) == [False, True]
+    and len(recomputed["execution"]["cache_invalidations"]) == 1
+    and prepared.exists() and (cache_case / "attempt-002").is_dir()
+  )
   return {
     "source": source_rejected, "raw": raw_rejected, "manifest": manifest_rejected,
     "runtime": runtime_rejected, "evidence": evidence_rejected,
+    "prepared_artifact_cache": cache_recomputed,
   }
 
 
@@ -236,44 +272,92 @@ def _portable(paths):
   return True
 
 
+def _acceptance_checks(first, second, fixtures_equal, portable, invalidation, incomplete):
+  required = ("batch", "corpus", "scenario", "process_contract_fixture", "comparison")
+  first_reused = [row["reused"] for row in first["execution"]["batch"]["cases"]]
+  second_reused = [row["reused"] for row in second["execution"]["batch"]["cases"]]
+  process_status = first["statuses"]["process_declared_runtime"]
+  release_matches_process = (
+    first["statuses"]["process_declared_runtime"] == second["statuses"]["process_declared_runtime"]
+    and ((process_status == "completed_checks"
+          and first["statuses"]["release"] == second["statuses"]["release"] == "completed_checks"
+          and first["statuses"]["release_decision"] == second["statuses"]["release_decision"] == "qualified")
+         or (process_status in ("unsupported", "failed_check")
+             and first["statuses"]["release"] == second["statuses"]["release"] == "failed_check"
+             and first["statuses"]["release_decision"] == second["statuses"]["release_decision"] == "unqualified"))
+  )
+  return {
+    "fixture_bytes_equal_after_relocation": fixtures_equal,
+    "canonical_outputs_equal": first["components"] == second["components"] and first["statuses"] == second["statuses"],
+    "canonical_outputs_portable": portable,
+    "separate_interpreter_sessions": first["execution"]["session_identity"] != second["execution"]["session_identity"],
+    "required_component_stages_completed": all(first["statuses"][name] == second["statuses"][name] == "completed_checks"
+                                               for name in required),
+    "declared_runtime_result_explicit": process_status in ("completed_checks", "unsupported", "failed_check"),
+    "cold_run_executed_all_cases": first["execution"]["batch"]["timing_kind"] == "cold" and not any(first_reused),
+    "repeated_run_reused_all_cases": second["execution"]["batch"]["timing_kind"] == "repeated" and all(second_reused),
+    "release_decision_reproduced": first["statuses"]["release_decision"] == second["statuses"]["release_decision"],
+    "release_matches_declared_process_result": release_matches_process,
+    "incomplete_runtime_unqualified": incomplete["process_status"] == "unsupported"
+                                      and incomplete["release_status"] == "failed_check"
+                                      and incomplete["release_decision"] == "unqualified",
+    "all_invalidation_dimensions_rejected": all(invalidation.values()),
+  }
+
+
+def _report(result):
+  lines = ["# Mazda fresh-session acceptance", "", f"Status: **{result['status']}**.", "", result["scope"], "",
+           "## Acceptance checks", "", "| Check | Passed |", "| --- | --- |"]
+  lines.extend(f"| {name} | {str(passed).lower()} |" for name, passed in sorted(result["checks"].items()))
+  lines += ["", "## Component statuses", "", "| Component | Status |", "| --- | --- |"]
+  lines.extend(f"| {name} | {status} |" for name, status in sorted(result["component_statuses"].items()))
+  lines += ["", "## Canonical artifacts", "", "| Artifact | SHA-256 |", "| --- | --- |"]
+  lines.extend(f"| {name} | `{digest}` |" for name, digest in sorted(result["canonical_components"].items()))
+  lines += ["", "## Coverage and exclusions", "",
+            "- Historical command replay and exact-identity instrumented replay are required component stages.",
+            "- The instrumented fixture covers TI loss, stock fallback, TI re-entry, inactivity, and re-engagement.",
+            "- Source, raw bytes, manifest, runtime, and evidence mutation checks are reported above.",
+            "- Recorded physical outcomes and matched physical conditions remain unavailable and visible.",
+            "- Infrastructure completion leaves physical handling and predictive simulation unresolved.", ""]
+  if result["status"] == "completed_checks":
+    lines.append("Every required acceptance check passed.")
+  else:
+    lines.append("One or more required acceptance checks failed; inspect the false rows and retained evidence.")
+  lines += ["", f"Release decision: **{result['component_statuses']['release_decision']}**."]
+  if result["component_statuses"]["process_declared_runtime"] != "completed_checks":
+    lines.append("Actual declared-runtime process evidence is still required.")
+  lines += ["", "Measured timing, cache contribution, host capability, and machine paths are recorded only in `execution.json`.", ""]
+  return "\n".join(lines)
+
+
 def run(output, candidate="HEAD"):
   """Run two complete passes from relocated fixture bytes and retain every check."""
   output = Path(output)
-  output.mkdir(parents=True, exist_ok=False)
   candidate = resolve_ref(candidate)
+  if re.fullmatch(r"[a-f0-9]{40}", candidate) is None:
+    raise ValueError("Fresh-session acceptance requires a committed candidate revision")
+  output.mkdir(parents=True, exist_ok=False)
   fixture_a, fixture_b = output / "fixtures-a", output / "fixtures-b"
   create_fresh_fixture(fixture_a, candidate)
   create_fresh_fixture(fixture_b, candidate)
   fixtures_equal = fixture_tree_sha256(fixture_a) == fixture_tree_sha256(fixture_b)
   cache = output / "cache"
-  first = _run_once(fixture_a, output / "run-a", cache, candidate)
-  second = _run_once(fixture_b, output / "run-b", cache, candidate)
-  canonical_equal = first["components"] == second["components"] and first["statuses"] == second["statuses"]
-  invalidation = _invalidation_checks(output, output / "run-b", candidate)
+  first = _run_in_fresh_process(fixture_a, output / "run-a", cache, candidate)
+  second = _run_in_fresh_process(fixture_b, output / "run-b", cache, candidate)
+  invalidation = _invalidation_checks(output, output / "run-b", candidate, cache)
   incomplete = _incomplete_profile(output, output / "run-b", candidate)
   canonical_paths = [output / run / name for run in ("run-a", "run-b") for name in COMPONENT_PATHS]
   portable = _portable(canonical_paths)
   first_reused = [row["reused"] for row in first["execution"]["batch"]["cases"]]
   second_reused = [row["reused"] for row in second["execution"]["batch"]["cases"]]
-  checks = {
-    "fixture_bytes_equal_after_relocation": fixtures_equal,
-    "canonical_outputs_equal": canonical_equal,
-    "canonical_outputs_portable": portable,
-    "cold_run_executed_all_cases": first["execution"]["batch"]["timing_kind"] == "cold" and not any(first_reused),
-    "repeated_run_reused_all_cases": second["execution"]["batch"]["timing_kind"] == "repeated" and all(second_reused),
-    "release_decision_reproduced": first["statuses"]["release_decision"] == second["statuses"]["release_decision"],
-    "fixture_process_cannot_qualify_release": first["statuses"]["release_decision"] == "unqualified"
-                                               and second["statuses"]["release_decision"] == "unqualified",
-    "incomplete_runtime_unqualified": incomplete["process_status"] == "unsupported"
-                                      and incomplete["release_decision"] == "unqualified",
-    "all_invalidation_dimensions_rejected": all(invalidation.values()),
-  }
+  checks = _acceptance_checks(first, second, fixtures_equal, portable, invalidation, incomplete)
   result = {
     "format_version": FORMAT_VERSION, "status": "completed_checks" if all(checks.values()) else "failed_check",
     "candidate_revision": candidate, "checks": checks, "canonical_components": first["components"],
     "component_statuses": first["statuses"], "invalidation": invalidation, "incomplete_environment": incomplete,
+    "release_rejection_findings": first["release_findings"],
     "retained_exclusions": ["retained-unavailable-corner", "recorded physical outcomes", "matched physical conditions"],
-    "evidence_limits": [SCOPE, "The process record is a deterministic contract fixture and cannot qualify a release; host process support is reported separately."],
+    "evidence_limits": [SCOPE, "The deterministic process-contract fixture cannot qualify a release; release evidence comes from the declared process boundary."],
     "scope": SCOPE,
   }
   execution = {
@@ -292,21 +376,7 @@ def run(output, candidate="HEAD"):
   }
   write_json(output / "result.json", result)
   write_json(output / "execution.json", execution)
-  report = [
-    "# Mazda fresh-session acceptance", "", f"Status: **{result['status']}**.", "", SCOPE, "",
-    "Two independently generated fixture trees had identical bytes. Fresh output roots reproduced the same ingestion, "
-    "evaluation, corpus, scenario, process-contract, comparison, and release decisions and hashes.", "",
-    "The first batch executed every case; the relocated repeat reused every valid cached case. Measured timing and cache "
-    "contribution are recorded in `execution.json`, outside canonical evidence.", "", "## Coverage and exclusions", "",
-    "- Historical command replay and exact-identity instrumented replay both reproduce their baselines.",
-    "- The instrumented fixture covers TI loss, stock fallback, TI re-entry, inactivity, and re-engagement.",
-    "- Source, raw bytes, manifest, runtime, and evidence mutations are each rejected.",
-    "- Recorded physical outcomes and matched physical conditions remain unavailable and visible.",
-    "- A missing full-process runtime produces unsupported process evidence and an unqualified release.",
-    "- Infrastructure completion leaves physical handling and predictive simulation unresolved.", "",
-    "Release qualification remains unqualified until actual declared-runtime process evidence is supplied; no deployment prerequisite was performed.", "",
-  ]
-  (output / "report.md").write_text("\n".join(report), encoding="utf-8", newline="\n")
+  (output / "report.md").write_text(_report(result), encoding="utf-8", newline="\n")
   return result
 
 
@@ -314,8 +384,17 @@ def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--output", type=Path, required=True, help="new directory for the complete acceptance result")
   parser.add_argument("--candidate", default="HEAD", help="committed candidate revision (default: HEAD)")
+  parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+  parser.add_argument("--fixture-root", type=Path, help=argparse.SUPPRESS)
+  parser.add_argument("--cache-root", type=Path, help=argparse.SUPPRESS)
   args = parser.parse_args(argv)
   try:
+    if args.worker:
+      if args.fixture_root is None or args.cache_root is None:
+        raise ValueError("Worker requires fixture and cache roots")
+      summary = _run_once(args.fixture_root, args.output, args.cache_root, args.candidate)
+      write_json(args.output / "session-summary.json", summary)
+      return 0
     result = run(args.output, args.candidate)
   except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
     parser.exit(1, f"Fresh-session acceptance could not start: {error}\n")
