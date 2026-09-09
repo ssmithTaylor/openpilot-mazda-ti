@@ -229,10 +229,10 @@ def inject_transition_harness(events, log):
     status = 'valid'
     # The retained cutout spans activation in 15, TI bypass/disengage in 16,
     # and re-entry in 17. Exercise health failures after the final re-entry.
-    if index == 16_300:
+    if index == 16_000:
       status = 'missing'
-    elif index == 16_330:
-      status = 'stale'
+    elif 16_200 <= index < 16_280:
+      status = 'stale_gap'
     elif index == 16_360:
       status = 'invalid'
     ti_active = not (9_966 <= index < 10_151)
@@ -241,13 +241,11 @@ def inject_transition_harness(events, log):
     # declared controlsAllowed fixture.  This is an input to the process, not
     # a CAN sender or a vehicle state change.
     for offset, service in enumerate(services, start=1):
-      if status == 'missing' and service == 'frogpilotCarState':
-        generated.append({'service': service, 'status': status, 'source_mono_time': None, 'frame': index,
+      if status in ('missing', 'stale_gap') and service == 'frogpilotCarState':
+        generated.append({'service': service, 'status': 'stale' if status == 'stale_gap' else status, 'source_mono_time': None, 'frame': index,
                           'source_car_state_mono_time': int(car_state.logMonoTime), 'derived_from': 'recorded_carState'})
         continue
       mono = int(car_state.logMonoTime) - offset
-      if status == 'stale' and service == 'frogpilotCarState':
-        mono -= 2_000_000_000
       event = log.Event.new_message(logMonoTime=mono, valid=not (status == 'invalid' and service == 'frogpilotCarState'))
       event.init(service, 1) if service == 'pandaStates' else event.init(service)
       if service == 'pandaStates':
@@ -260,7 +258,25 @@ def inject_transition_harness(events, log):
       generated.append({'service': service, 'status': status if service == 'frogpilotCarState' else 'valid',
                         'source_mono_time': mono, 'frame': index, 'source_car_state_mono_time': int(car_state.logMonoTime),
                         'derived_from': 'recorded_carState'})
-    action = {15_000: 'buttonCancel', 15_100: 'buttonEnable'}.get(index)
+    # These are serialized carState events at the real dedicated subscriber.
+    # Enable pulses counter unrelated retained user-disable events; the four
+    # bounded inactive windows make the fault observations explicit rather
+    # than relying on a later inactive frame by inference.
+    inactive_windows = ((15_000, 15_100), (15_990, 16_050), (16_190, 16_300), (16_350, 16_400))
+    action = None
+    for start, end in inactive_windows:
+      if index == start:
+        action = 'buttonCancel'
+        break
+      if start < index < end:
+        action = None
+        break
+      if index == end:
+        action = 'buttonEnable'
+        break
+    else:
+      if index % 10 == 0:
+        action = 'buttonEnable'
     if action is not None:
       replaced = car_state.as_builder()
       replaced.carState.init('events', 1)

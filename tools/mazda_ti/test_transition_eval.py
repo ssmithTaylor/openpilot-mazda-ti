@@ -75,7 +75,8 @@ def test_normalization_derives_health_and_exact_diagnostic_references_from_seria
   output = event(12, 'carOutput', NS(appliedCarControlMonoTime=11, mazdaDiagnostics=output_diag))
   rows, findings = normalize_observations([event(9, 'carState'), controls, command, output])
   assert findings == []
-  assert rows == [{**observation(10, True, True, state='1.0'), 'state_before': '0.5'}]
+  assert rows == [{**observation(10, True, True, state='1.0'), 'state_before': '0.5',
+                   'ti_availability_source': 'carOutput_observation'}]
 
 
 def test_dedicated_carstate_uses_checks_passed_while_submaster_services_require_frequency_health():
@@ -86,11 +87,11 @@ def test_dedicated_carstate_uses_checks_passed_while_submaster_services_require_
   controls = event(10, 'controlsState', NS(lateralControlState=NS(torqueState=NS(active=True, mazdaDiagnostics=diagnostics))))
   command = event(11, 'carControl', NS(controlsStateMonoTime=10))
   output = event(12, 'carOutput', NS(appliedCarControlMonoTime=11, mazdaDiagnostics=NS(version=1, tiAllowed=True)))
-  rows, findings = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState')])
+  rows, findings = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState', NS(tiActive=True))])
   assert findings == []
   assert rows[0]['health'] == 'valid'
   frog_state.frequencyOk = False
-  rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState')])
+  rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState', NS(tiActive=True))])
   assert rows[0]['health'] == 'stale'
 
 
@@ -105,6 +106,18 @@ def test_normalization_keeps_recorded_inputs_as_identity_sources_not_duplicate_t
   rows, findings = normalize_observations([output, replayed, command], source_events=[event(9, 'carState'), original])
   assert findings == []
   assert [row['mono_time_ns'] for row in rows] == [14]
+
+
+def test_process_rows_bind_ti_availability_to_the_referenced_actual_subscriber_input_without_card():
+  event = lambda mono, service, value=None: NS(logMonoTime=mono, which=lambda: service, **({service: value} if value else {}))
+  frog = NS(service='frogpilotCarState', logMonoTime=9, seen=True, valid=True, alive=True, frequencyOk=True, checksPassed=True)
+  diagnostics = NS(version=1, inputs=[frog], integralBefore=0.0, integralAfter=0.0)
+  controls = event(10, 'controlsState', NS(lateralControlState=NS(torqueState=NS(active=True, mazdaDiagnostics=diagnostics))))
+  command = event(11, 'carControl', NS(controlsStateMonoTime=10))
+  rows, findings = normalize_observations([controls, command], source_events=[event(9, 'frogpilotCarState', NS(tiActive=True))])
+  assert findings == []
+  assert rows[0]['ti_allowed'] is True
+  assert rows[0]['ti_availability_source'] == 'frogpilotCarState_input'
 
 
 def test_run_preserves_isolation_and_keeps_elapsed_timing_outside_canonical_transition_result(tmp_path):

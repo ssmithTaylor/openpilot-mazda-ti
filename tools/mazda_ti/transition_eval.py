@@ -36,6 +36,7 @@ def normalize_observations(events, source_events=()):
     command = next((item for item in commands.values() if int(item.controlsStateMonoTime) == mono), None)
     actuator = output_by_control.get(next((key for key, value in commands.items() if value is command), -1))
     health, refs = 'valid', []
+    ti_available, ti_source = False, 'unavailable'
     for input_row in diagnostic.inputs:
       service, source_mono = str(input_row.service), int(input_row.logMonoTime)
       if input_row.seen and (service, source_mono) not in by_identity:
@@ -49,9 +50,16 @@ def normalize_observations(events, source_events=()):
       # frequencyOk is not staleness when its own checks have passed.
       elif service != 'carState' and (not input_row.alive or not input_row.frequencyOk):
         health = 'stale'
+      if service == 'frogpilotCarState' and input_row.seen:
+        source = by_identity.get((service, source_mono))
+        if source is not None and hasattr(source, 'frogpilotCarState'):
+          ti_available = bool(source.frogpilotCarState.tiActive)
+          ti_source = 'frogpilotCarState_input'
       refs.append({'service': service, 'log_mono_time': source_mono})
+    if actuator is not None:
+      ti_available, ti_source = bool(actuator.tiAllowed), 'carOutput_observation'
     rows.append({'mono_time_ns': mono, 'active': bool(torque.active),
-                 'ti_allowed': bool(actuator.tiAllowed) if actuator is not None else False,
+                 'ti_allowed': ti_available, 'ti_availability_source': ti_source,
                  'health': health, 'diagnostic_references': refs,
                  'state_before': str(diagnostic.integralBefore), 'state_after': str(diagnostic.integralAfter)})
   rows.sort(key=lambda row: row['mono_time_ns'])
