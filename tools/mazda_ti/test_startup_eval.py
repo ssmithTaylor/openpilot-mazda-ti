@@ -9,7 +9,7 @@ import pytest
 
 from .provenance import ROOT
 from .startup_eval import (construct_controlsd_subscriptions, inject_transition_harness, qualify_nested_timestamps, run,
-                           transition_stderr_diagnostics)
+                           source_identity, transition_stderr_diagnostics)
 
 
 def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform():
@@ -20,6 +20,16 @@ def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform
   assert result == {'status': 'qualified', 'outer_offset_ns': 50, 'records': 2}
   with pytest.raises(ValueError, match='nested'):
     qualify_nested_timestamps([{'id': 'a', 'outer_ns': 10, 'nested_ns': 100}], [{'id': 'a', 'outer_ns': 60, 'nested_ns': 101}])
+
+
+def test_runtime_source_lock_includes_and_changes_with_service_schema(monkeypatch):
+  from . import startup_eval
+  baseline = source_identity()
+  original = startup_eval.sha256
+  monkeypatch.setattr(startup_eval, 'sha256', lambda path: 'changed-services' if path.name == 'services.py' else original(path))
+  changed = source_identity()
+  assert baseline['cereal/services.py'] != changed['cereal/services.py']
+  assert baseline['cereal/log.capnp'] == changed['cereal/log.capnp']
 
 
 def test_transition_profile_accepts_only_the_declared_fake_service_harness_exclusions():

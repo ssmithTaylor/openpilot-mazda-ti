@@ -535,7 +535,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
 def source_identity():
   files = ('selfdrive/controls/controlsd.py', 'selfdrive/test/process_replay/process_replay.py',
            'selfdrive/car/mazda/lateral_diagnostics.py', 'cereal/car.capnp', 'cereal/log.capnp',
-           'tools/mazda_ti/startup_eval.py')
+           'cereal/services.py', 'tools/mazda_ti/startup_eval.py')
   return {name: sha256(ROOT / name) for name in files}
 
 

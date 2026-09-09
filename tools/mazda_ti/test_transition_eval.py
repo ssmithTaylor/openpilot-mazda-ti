@@ -3,14 +3,17 @@
 from types import SimpleNamespace as NS
 
 from .startup_eval import StartupUnsupported
-from .transition_eval import assess, normalize_observations, run
+from .transition_eval import assess, main, normalize_observations, opaque_state_id, run
 
 
-def observation(mono, active, ti, health='valid', state='state-a'):
+def observation(mono, active, ti, health='valid', state='state-a', before=None, state_id=None, before_id=None):
+  before = state if before is None else before
+  state_id = f'opaque:{state}' if state_id is None else state_id
+  before_id = f'opaque:{before}' if before_id is None else before_id
   return {
     'mono_time_ns': mono, 'active': active, 'ti_allowed': ti,
     'health': health, 'diagnostic_references': [{'service': 'carState', 'log_mono_time': mono - 1}],
-    'state_before': state, 'state_after': state,
+    'state_before': before, 'state_after': state, 'state_before_id': before_id, 'state_id': state_id,
   }
 
 
@@ -22,7 +25,7 @@ def complete_rows():
     observation(40, False, False, health='missing', state='inactive-reset'),
     observation(50, False, False, health='stale', state='inactive-reset'),
     observation(60, False, False, health='invalid', state='inactive-reset'),
-    observation(70, True, True, state='active-b'),
+    observation(70, True, True, state='active-b', before='active-a'),
   ]
 
 
@@ -34,6 +37,7 @@ def test_declared_transition_fixture_requires_active_disengage_reentry_and_ti_re
     'missing_rejected_inactive': 1, 'stale_rejected_inactive': 1, 'invalid_rejected_inactive': 1,
   }
   assert result['state_retention']['active_to_ti_bypass'] == 'active-a'
+  assert result['state_retention']['active_to_ti_bypass_id'] == 'opaque:active-a'
 
 
 def test_unhealthy_input_that_remains_active_is_a_failed_check_not_a_hidden_completion():
@@ -41,13 +45,14 @@ def test_unhealthy_input_that_remains_active_is_a_failed_check_not_a_hidden_comp
   rows[3]['active'] = True
   result = assess(rows)
   assert result['status'] == 'failed_check'
-  assert result['findings'] == ['missing message remained active at 40', 'missing required fault handling: missing']
+  assert 'missing message remained active at 40' in result['findings']
+  assert 'missing required fault handling: missing' in result['findings']
 
 
 def test_ti_unavailability_can_safely_deactivate_and_still_require_a_real_reentry():
   rows = [
     observation(10, False, True), observation(20, True, True, state='engaged'),
-    observation(30, False, False, state='bypass'), observation(40, True, True, state='reentered'),
+    observation(30, False, False, state='bypass'), observation(40, True, True, state='reentered', before='engaged'),
     observation(50, False, True, health='missing'), observation(60, False, True, health='stale'),
     observation(70, False, True, health='invalid'),
   ]
@@ -55,7 +60,7 @@ def test_ti_unavailability_can_safely_deactivate_and_still_require_a_real_reentr
   assert result['status'] == 'completed_checks'
   assert result['availability']['ti_bypass_reentry'] == 1
   assert result['state_retention']['ti_bypass_disengage_state'] == 'engaged'
-  assert result['state_retention']['ti_reentry_state'] == 'reentered'
+  assert result['state_retention']['ti_reentry_state'] == 'engaged'
 
 
 def test_missing_required_transition_is_reported_in_the_common_failure_status():
@@ -78,6 +83,31 @@ def test_observation_identities_are_strictly_monotonic_and_do_not_mask_state_res
   assert result['findings'] == ['state changed while active TI bypass at 30']
 
 
+def test_disengage_and_ti_loss_must_retain_both_state_and_opaque_identity_at_reentry():
+  rows = complete_rows()
+  rows[-1]['state_before'] = 'RESET'
+  rows[-1]['state_before_id'] = 'opaque:RESET'
+  result = assess(rows)
+  assert result['status'] == 'failed_check'
+  assert 'state changed across disengage/reengage at 70' in result['findings']
+  assert 'state changed across TI-loss/reentry at 70' in result['findings']
+
+  rows = complete_rows()
+  rows[-1]['state_before_id'] = 'opaque:mutated'
+  result = assess(rows)
+  assert result['status'] == 'failed_check'
+  assert 'opaque state_id changed across disengage/reengage at 70' in result['findings']
+  assert 'opaque state_id changed across TI-loss/reentry at 70' in result['findings']
+
+
+def test_assessment_rejects_rows_without_documented_opaque_state_identity():
+  rows = complete_rows()
+  del rows[1]['state_id']
+  result = assess(rows)
+  assert result['status'] == 'failed_check'
+  assert result['findings'] == ['missing opaque state_id at 20']
+
+
 def test_normalization_derives_health_and_exact_diagnostic_references_from_serialized_events():
   event = lambda mono, service, value=None: NS(logMonoTime=mono, which=lambda: service, **({service: value} if value else {}))
   snapshot = NS(service='carState', logMonoTime=9, seen=True, valid=True, alive=True, frequencyOk=True, checksPassed=True)
@@ -89,7 +119,8 @@ def test_normalization_derives_health_and_exact_diagnostic_references_from_seria
   output = event(12, 'carOutput', NS(appliedCarControlMonoTime=11, mazdaDiagnostics=output_diag))
   rows, findings = normalize_observations([event(9, 'carState'), controls, command, output])
   assert findings == []
-  assert rows == [{**observation(10, True, True, state='1.0'), 'state_before': '0.5',
+  assert rows == [{**observation(10, True, True, state='1.0', before='0.5',
+                                 state_id=opaque_state_id(1.0), before_id=opaque_state_id(.5)),
                    'ti_availability_source': 'carOutput_observation'}]
 
 
@@ -147,6 +178,23 @@ def test_run_preserves_isolation_and_keeps_elapsed_timing_outside_canonical_tran
   assert result['timing_scope'] == 'transition result excludes elapsed workload timing; device timing requires a separate device profile'
   assert 'elapsed_seconds' not in result['transition']
   assert result['elapsed_seconds'] >= 0
+
+
+def test_run_rejects_schema_harness_without_adjacent_segment_mode(tmp_path):
+  result = run(tmp_path / 'evidence', rlog=['retained/rlog'], transition_harness=True,
+               capability=lambda: {'full_process_supported': True, 'missing': []})
+  assert result['status'] == 'failed_execution'
+  assert result['exception'] == 'ValueError: --schema-input-harness requires --rlog and --all-segments'
+
+
+def test_cli_rejects_schema_harness_without_adjacent_segment_mode(tmp_path, capsys):
+  try:
+    main(['--rlog', 'retained/rlog', '--schema-input-harness', '--output', str(tmp_path / 'evidence')])
+  except SystemExit as error:
+    assert error.code == 2
+  else:
+    raise AssertionError('CLI accepted --schema-input-harness without --all-segments')
+  assert '--schema-input-harness requires --rlog and --all-segments' in capsys.readouterr().err
 
 
 def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_path):

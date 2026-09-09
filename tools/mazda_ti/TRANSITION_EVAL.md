@@ -6,6 +6,13 @@ the common evidence statuses: `completed_checks`, `failed_check`,
 constructs a CAN publisher, contacts a vehicle, or keeps Params/messaging state
 after the command exits.
 
+Every normalized row carries `state_before`/`state_after` plus opaque
+`state_before_id`/`state_id` tokens. The evaluator compares both forms: the
+last active post-state must equal the next re-engagement pre-state, and the
+last TI-available post-state must equal the TI re-entry pre-state. A `RESET`
+or token mutation therefore produces `failed_check`; an inactive interval is
+not treated as evidence that state was retained.
+
 The portable fixture profile is useful for deterministic failure tests. Its
 JSON list has a strictly increasing `mono_time_ns` identity, `active`,
 `ti_allowed`, `health` (`valid`, `missing`, `stale`, or `invalid`), an exact
@@ -56,6 +63,9 @@ stay healthy (stale), and sends one explicitly invalid schema event. These are
 reported as expected harness exclusions only when the parsed `controlsd`
 diagnostic names exactly those declared services; any extra service, stack
 trace, malformed stderr, or non-frequency health failure fails the run.
+It requires `--rlog` and `--all-segments`; the command rejects a single-segment
+invocation rather than silently rereading an unmodified raw segment after it
+has declared ownership of those subscriptions.
 
 This profile demonstrates process response to serialized schema inputs. It
 does not claim recorded TI availability beyond the fixed retained cutout, live

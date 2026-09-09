@@ -4,6 +4,7 @@ This is an evidence reader, not a controller, CAN sender, or vehicle interface.
 """
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -14,6 +15,11 @@ from .startup_eval import StartupUnsupported, actual_full_process, capability, i
 
 HEALTH = ('missing', 'stale', 'invalid')
 REQUIRED = ('active_operation', 'disengage_reengage', 'ti_bypass_reentry')
+
+
+def opaque_state_id(value):
+  """Return a stable, non-semantic identity for a serialized controller state."""
+  return 'sha256:' + hashlib.sha256(repr(float(value)).encode('ascii')).hexdigest()
 
 
 def normalize_observations(events, source_events=()):
@@ -63,7 +69,9 @@ def normalize_observations(events, source_events=()):
     row = {'mono_time_ns': mono, 'active': bool(torque.active),
                  'ti_allowed': ti_available, 'ti_availability_source': ti_source,
                  'health': health, 'diagnostic_references': refs,
-                 'state_before': str(diagnostic.integralBefore), 'state_after': str(diagnostic.integralAfter)}
+                 'state_before': str(diagnostic.integralBefore), 'state_after': str(diagnostic.integralAfter),
+                 'state_before_id': opaque_state_id(diagnostic.integralBefore),
+                 'state_id': opaque_state_id(diagnostic.integralAfter)}
     rows.append(row)
   rows.sort(key=lambda row: row['mono_time_ns'])
   return rows, findings
@@ -77,11 +85,16 @@ def assess(rows, initial_findings=()):
   integrity_error = False
   awaiting_ti_reentry = False
   last_active_ti = None
+  pending_disengage = None
   state_retention = {}
   for row in rows:
     mono = row['mono_time_ns']
     if previous is not None and mono <= previous['mono_time_ns']:
       findings.append(f'non-monotonic observation identity at {mono}')
+      integrity_error = True
+      continue
+    if not isinstance(row.get('state_before_id'), str) or not isinstance(row.get('state_id'), str):
+      findings.append(f'missing opaque state_id at {mono}')
       integrity_error = True
       continue
     if row['health'] in HEALTH:
@@ -92,14 +105,29 @@ def assess(rows, initial_findings=()):
     if previous is not None:
       if not previous['active'] and row['active']:
         availability['active_operation'] += 1
+        if pending_disengage is not None:
+          if pending_disengage['state_after'] != row['state_before']:
+            findings.append(f'state changed across disengage/reengage at {mono}')
+          elif pending_disengage['state_id'] != row['state_before_id']:
+            findings.append(f'opaque state_id changed across disengage/reengage at {mono}')
+          else:
+            availability['disengage_reengage'] += 1
+            state_retention['reengage_state_before'] = row['state_before']
+            state_retention['reengage_state_before_id'] = row['state_before_id']
+          pending_disengage = None
       if previous['active'] and not row['active']:
         state_retention['disengage_state'] = previous['state_after']
+        state_retention['disengage_state_id'] = previous['state_id']
+        pending_disengage = previous
       if previous['active'] and previous['ti_allowed'] and row['active'] and not row['ti_allowed']:
         awaiting_ti_reentry = True
         if previous['state_after'] != row['state_before']:
           findings.append(f'state changed while active TI bypass at {mono}')
+        elif previous['state_id'] != row['state_before_id']:
+          findings.append(f'opaque state_id changed while active TI bypass at {mono}')
         else:
           state_retention['active_to_ti_bypass'] = row['state_before']
+          state_retention['active_to_ti_bypass_id'] = row['state_before_id']
       elif not row['ti_allowed'] and last_active_ti is not None and not awaiting_ti_reentry:
         # The real plant controller makes the safe choice to deactivate while
         # TI is unavailable. Keep that as a visible transition rather than
@@ -107,13 +135,17 @@ def assess(rows, initial_findings=()):
         awaiting_ti_reentry = True
         state_retention['ti_bypass_disengage_state'] = last_active_ti['state_after']
       if awaiting_ti_reentry and row['active'] and row['ti_allowed']:
-        availability['ti_bypass_reentry'] += 1
-        state_retention['ti_reentry_state'] = row['state_before']
+        if last_active_ti['state_after'] != row['state_before']:
+          findings.append(f'state changed across TI-loss/reentry at {mono}')
+        elif last_active_ti['state_id'] != row['state_before_id']:
+          findings.append(f'opaque state_id changed across TI-loss/reentry at {mono}')
+        else:
+          availability['ti_bypass_reentry'] += 1
+          state_retention['ti_reentry_state'] = row['state_before']
+          state_retention['ti_reentry_state_before_id'] = row['state_before_id']
         awaiting_ti_reentry = False
       if row['active'] and row['ti_allowed']:
         last_active_ti = row
-      if not previous['active'] and row['active'] and 'disengage_state' in state_retention:
-        availability['disengage_reengage'] += 1
     previous = row
   if not integrity_error:
     for name in REQUIRED:
@@ -150,7 +182,10 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
   started = time.perf_counter()
   with isolated_environment() as owned:
     profile = 'full_process_transition' if rlog is not None else 'serialized_transition_fixture'
+    capabilities = {'full_process_supported': None, 'missing': []}
     try:
+      if transition_harness and (rlog is None or not all_segments):
+        raise ValueError('--schema-input-harness requires --rlog and --all-segments')
       if rlog is not None:
         capabilities = capability()
         if not capabilities['full_process_supported']:
@@ -159,7 +194,6 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
         transition = {name: process[name] for name in ('status', 'findings', 'availability', 'state_retention', 'observations')}
         transition['process_boundary'] = process['startup_boundary']
       else:
-        capabilities = {'full_process_supported': None, 'missing': []}
         if observations is None:
           observations, normalization_findings = normalize_observations(events or [])
         else:
@@ -204,6 +238,8 @@ def main(argv=None):
   args = parser.parse_args(argv)
   if (args.observations is None) == (not args.rlog):
     parser.error('supply exactly one of --observations or --rlog')
+  if args.schema_input_harness and (not args.rlog or not args.all_segments):
+    parser.error('--schema-input-harness requires --rlog and --all-segments')
   observations = json.loads(args.observations.read_text(encoding='utf-8')) if args.observations else None
   result = run(args.output, observations=observations, rlog=args.rlog, max_carstate_messages=args.max_carstate_messages,
                all_segments=args.all_segments, transition_harness=args.schema_input_harness)
