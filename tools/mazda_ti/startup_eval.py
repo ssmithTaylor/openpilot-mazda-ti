@@ -216,6 +216,7 @@ def transition_stderr_diagnostics(stderr, expected_invalid_services=()):
 
 def inject_transition_harness(events, log, maximum=None):
   """Add only missing controlsd input schemas with declared per-message identities."""
+  from cereal.services import SERVICE_LIST
   # These are all actual controlsd subscriptions absent from the recorded
   # cutout.  `testJoystick` remains deliberately absent: it is the one fake
   # service declared by the process-replay configuration and is retained as a
@@ -250,6 +251,10 @@ def inject_transition_harness(events, log, maximum=None):
     # declared controlsAllowed fixture.  This is an input to the process, not
     # a CAN sender or a vehicle state change.
     for offset, service in enumerate(services, start=1):
+      frequency = SERVICE_LIST[service].frequency
+      period = max(1, round(100 / frequency)) if frequency > 0 else len(car_states) + 1
+      if service != 'frogpilotCarState' and index % period:
+        continue
       if status in ('missing', 'stale_gap') and service == 'frogpilotCarState':
         generated.append({'service': service, 'status': 'stale' if status == 'stale_gap' else status, 'source_mono_time': None, 'frame': index,
                           'source_car_state_mono_time': int(car_state.logMonoTime), 'derived_from': 'recorded_carState'})

@@ -84,6 +84,22 @@ def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inpu
   assert 'testJoystick' not in generated_services
 
 
+def test_transition_harness_uses_declared_service_rates_for_generated_inputs():
+  from cereal import log
+  events = []
+  for frame in range(100):
+    car_state = log.Event.new_message(logMonoTime=1_000 + frame * 10)
+    car_state.init('carState')
+    car_state.carState.canValid = True
+    events.append(car_state.as_reader())
+
+  inject_transition_harness(events, log)
+  counts = {service: sum(event.which() == service for event in events)
+            for service in ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')}
+  assert counts == {'managerState': 2, 'pandaStates': 10, 'frogpilotCarState': 100,
+                    'frogpilotPlan': 20, 'liveDelay': 4}
+
+
 def test_required_full_process_profile_is_explicitly_unsupported_when_runtime_is_missing(tmp_path):
   capability = lambda: {'full_process_supported': False, 'schema_boundary_supported': False, 'missing': ['linux_openpilot_runtime']}
   result = run(tmp_path / 'evidence', capability=capability)
