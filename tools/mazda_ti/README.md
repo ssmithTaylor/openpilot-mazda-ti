@@ -5,6 +5,10 @@ evaluates a candidate, and writes a structured bundle plus readable report, see
 [EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
 settings, revisions, history, and scoring window.
 
+## Raw-evidence ingestion
+
+[`INGESTION.md`](INGESTION.md) defines the separate versioned inventory and explicit bounded collection command for raw drive evidence. It is offline-testable and does not evaluate a candidate, contact a device, or expose unrestricted Params.
+
 For structured rlog fields, the identity-coverage audit command, sign conventions and logging tests, read [DIAGNOSTICS.md](DIAGNOSTICS.md). Verify the recorded diagnostic versions and vehicle source separately from the analyzer's current checkout.
 
 For instrumented-drive candidate replay, that guide also documents `RecordedTiFeedback`,
