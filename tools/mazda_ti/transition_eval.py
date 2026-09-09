@@ -44,7 +44,10 @@ def normalize_observations(events, source_events=()):
         health = 'missing'
       elif not input_row.valid or not input_row.checksPassed:
         health = 'invalid'
-      elif not input_row.alive or not input_row.frequencyOk:
+      # carState is controlsd's dedicated blocking socket.  Its diagnostic
+      # producer intentionally has no SubMaster frequency estimate, so false
+      # frequencyOk is not staleness when its own checks have passed.
+      elif service != 'carState' and (not input_row.alive or not input_row.frequencyOk):
         health = 'stale'
       refs.append({'service': service, 'log_mono_time': source_mono})
     rows.append({'mono_time_ns': mono, 'active': bool(torque.active),

@@ -78,6 +78,22 @@ def test_normalization_derives_health_and_exact_diagnostic_references_from_seria
   assert rows == [{**observation(10, True, True, state='1.0'), 'state_before': '0.5'}]
 
 
+def test_dedicated_carstate_uses_checks_passed_while_submaster_services_require_frequency_health():
+  event = lambda mono, service, value=None: NS(logMonoTime=mono, which=lambda: service, **({service: value} if value else {}))
+  car_state = NS(service='carState', logMonoTime=9, seen=True, valid=True, alive=True, frequencyOk=False, checksPassed=True)
+  frog_state = NS(service='frogpilotCarState', logMonoTime=8, seen=True, valid=True, alive=True, frequencyOk=True, checksPassed=True)
+  diagnostics = NS(version=1, inputs=[car_state, frog_state], integralBefore=.5, integralAfter=1.0)
+  controls = event(10, 'controlsState', NS(lateralControlState=NS(torqueState=NS(active=True, mazdaDiagnostics=diagnostics))))
+  command = event(11, 'carControl', NS(controlsStateMonoTime=10))
+  output = event(12, 'carOutput', NS(appliedCarControlMonoTime=11, mazdaDiagnostics=NS(version=1, tiAllowed=True)))
+  rows, findings = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState')])
+  assert findings == []
+  assert rows[0]['health'] == 'valid'
+  frog_state.frequencyOk = False
+  rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState')])
+  assert rows[0]['health'] == 'stale'
+
+
 def test_normalization_keeps_recorded_inputs_as_identity_sources_not_duplicate_transition_rows():
   event = lambda mono, service, value=None: NS(logMonoTime=mono, which=lambda: service, **({service: value} if value else {}))
   snapshot = NS(service='carState', logMonoTime=9, seen=True, valid=True, alive=True, frequencyOk=True, checksPassed=True)
