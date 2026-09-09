@@ -64,6 +64,7 @@ def test_reference_fixture_passes_real_controller_limiter_transitions(tmp_path):
   assert all(row['limited_counts'] == 0 and row['integral'] == 0 for row in inactive)
   assert carryover[0]['limited_counts'] != 0 and carryover[0]['integral'] != 0
   assert all(len(result['source_identities'][key]) == 40 for key in ('baseline_controller', 'candidate_controller', 'limiter'))
+  assert 'execution.json' not in result['artifacts']
 
 
 def test_request_rejects_abbreviated_source_revision_without_copying_data(tmp_path):

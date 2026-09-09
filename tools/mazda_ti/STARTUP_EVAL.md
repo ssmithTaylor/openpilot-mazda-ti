@@ -45,7 +45,9 @@ service. The report hashes each input and relevant process/schema file from the
 runtime checkout, and records that checkout's Git HEAD. It captures process
 stdout/stderr and exceptions; child stderr or unavailable runtime Git identity
 prevents a completed result. Timing is local replay wall time; it is not
-full-system or device scheduling evidence.
+full-system or device scheduling evidence. Elapsed time, the absolute Python
+executable, output location, and unique messaging prefix are written to
+`execution.json`; the canonical `result.json` keeps portable runtime identity.
 
 Timestamp qualification comes from the generated
 `controlsState.lateralControlState.torqueState.mazdaDiagnostics.inputs` rows.

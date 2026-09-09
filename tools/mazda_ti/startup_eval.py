@@ -577,9 +577,15 @@ def run(output, profile='full_process', rlog=None, max_carstate_messages=100, ca
                     exception=f'{type(error).__name__}: {error}', traceback=traceback.format_exc(),
                     scope='Isolated process-boundary attempt failed; full-process integration is not satisfied.')
     result['isolation']['owned_params_root_removed_after_run'] = True
-    result['isolation']['owned_messaging_prefix'] = owned_isolation['messaging_prefix']
-  result['elapsed_seconds'] = time.perf_counter() - started
+  execution = {
+    'elapsed_seconds': time.perf_counter() - started,
+    'output_destination': str(output.resolve()),
+    'owned_messaging_prefix': owned_isolation['messaging_prefix'],
+    'python_executable': sys.executable,
+  }
+  result['runtime'].pop('executable')
   write_json(output / 'result.json', result)
+  write_json(output / 'execution.json', execution)
   return result
 
 

@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace as NS
 
-from .provenance import sha256
+from .provenance import read_json, sha256
 from .startup_eval import StartupUnsupported
 from .transition_eval import actual_process_transition, assess, main, normalize_observations, opaque_state_id, run
 
@@ -180,7 +180,8 @@ def test_run_preserves_isolation_and_keeps_elapsed_timing_outside_canonical_tran
   assert result['isolation']['vehicle_connection'] == 'none'
   assert result['timing_scope'] == 'transition result excludes elapsed workload timing; device timing requires a separate device profile'
   assert 'elapsed_seconds' not in result['transition']
-  assert result['elapsed_seconds'] >= 0
+  assert 'elapsed_seconds' not in result
+  assert read_json(tmp_path / 'evidence/execution.json')['elapsed_seconds'] >= 0
 
 
 def test_run_rejects_schema_harness_without_adjacent_segment_mode(tmp_path):

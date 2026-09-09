@@ -16,6 +16,8 @@ The result uses the evaluation result's top-level status, identity, source hash,
 runtime, scope, limitation, and artifact fields. `comparison.command_differences`
 is informational. `comparison.hard_invariant_failures` controls `failed_check`.
 The report retains all frames, including recovery and carryover, after a failure.
+Elapsed time and the absolute output destination live in `execution.json`; that
+machine-specific file is excluded from the canonical artifact hash map.
 
 Two scenarios are intentionally the complete public fixture set:
 

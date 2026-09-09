@@ -96,6 +96,7 @@ def test_invalid_cache_is_retained_and_recomputed_selectively(tmp_path):
   assert result['status'] == 'completed_checks'
   assert result['execution']['cache_invalidations']
   assert sorted(row['reused'] for row in result['execution']['cases']) == [False, True]
+  assert result['execution']['timing_kind'] == 'mixed'
   assert result['execution']['throughput_cases_per_second'] > 0
   assert cached.exists()
   assert len(list((tmp_path / 'cache').glob('*/attempt-*/result.json'))) > len(cases)

@@ -221,15 +221,18 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
       'runtime_source': runtime_source, 'input_sha256': input_sha256,
       'isolation': {'params': 'tool-owned temporary directory', 'messaging': 'tool-owned unique fake prefix',
                     'writable_state': 'temporary runtime only', 'vehicle_connection': 'none',
-                    'can_publisher': 'not constructed', 'owned_messaging_prefix': owned['messaging_prefix'],
-                    'owned_params_root_removed_after_run': True},
+                    'can_publisher': 'not constructed', 'owned_params_root_removed_after_run': True},
       'timing_scope': 'transition result excludes elapsed workload timing; device timing requires a separate device profile',
       'scope': ('Actual isolated controlsd process replay is required for this profile; its retained outputs qualify declared software transitions only.'
                 if rlog is not None else 'Serialized process observations qualify declared software transitions only; no vehicle, CAN sender, or device timing is exercised.'),
       'exception': exception,
     }
-  result['elapsed_seconds'] = time.perf_counter() - started
   write_json(output / 'result.json', result)
+  write_json(output / 'execution.json', {
+    'elapsed_seconds': time.perf_counter() - started,
+    'output_destination': str(output.resolve()),
+    'owned_messaging_prefix': owned['messaging_prefix'],
+  })
   return result
 
 

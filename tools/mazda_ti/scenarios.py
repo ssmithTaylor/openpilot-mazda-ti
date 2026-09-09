@@ -260,7 +260,7 @@ def run(request_path, output):
                                          'output_destination': str(output.resolve())})
   (output / 'report.md').write_text(_report(result), encoding='utf-8', newline='\n')
   result['artifacts'] = {path.relative_to(output).as_posix(): sha256(path)
-                         for path in sorted(output.rglob('*')) if path.is_file()}
+                         for path in sorted(output.rglob('*')) if path.is_file() and path.name != 'execution.json'}
   write_json(output / 'result.json', result)
   return result
 

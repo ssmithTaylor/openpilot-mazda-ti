@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from .provenance import ROOT
+from .provenance import ROOT, read_json
 from .startup_eval import (actual_full_process, construct_controlsd_subscriptions, inject_transition_harness,
                            qualify_nested_timestamps, run, source_identity, transition_stderr_diagnostics)
 
@@ -135,6 +135,9 @@ def test_required_full_process_profile_is_explicitly_unsupported_when_runtime_is
   assert result['status'] == 'unsupported'
   assert result['profile'] == 'full_process'
   assert result['missing_capabilities'] == ['linux_openpilot_runtime']
+  assert 'elapsed_seconds' not in result
+  assert 'executable' not in result['runtime']
+  assert read_json(tmp_path / 'evidence/execution.json')['elapsed_seconds'] >= 0
   assert 'full-process integration is not satisfied' in result['scope']
 
 

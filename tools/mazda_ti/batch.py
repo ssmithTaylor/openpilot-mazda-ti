@@ -223,8 +223,9 @@ def evaluate_batch(manifest_path, data_root, output, *, cache_root=None, workers
   statuses = [row['result']['status'] for row in records]
   status = 'interrupted' if interrupted else ('completed_checks' if statuses and all(item == 'completed_checks' for item in statuses) else 'failed_check')
   elapsed = time.perf_counter() - started
+  reused = [row['reused'] for row in records]
   execution = {'host': _host(), 'workers': active_workers, 'elapsed_seconds': elapsed,
-               'timing_kind': 'repeated' if any(row['reused'] for row in records) else 'cold',
+               'timing_kind': 'repeated' if reused and all(reused) else ('mixed' if any(reused) else 'cold'),
                'throughput_cases_per_second': len(records) / elapsed if elapsed else None,
                'cases': [{'id': row['id'], 'reused': row['reused']} for row in records],
                'cache_invalidations': [{'id': row['id'], 'reason': row['cache_invalidated']} for row in records if row['cache_invalidated']]}

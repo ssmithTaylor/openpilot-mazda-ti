@@ -1,5 +1,13 @@
 # Mazda TI replay evidence tools
 
+## Fresh-session acceptance
+
+[`FRESH_SESSION.md`](FRESH_SESSION.md) is the setup, run, and diagnosis guide for
+the public end-to-end acceptance. It generates deterministic fixtures, relocates
+their bytes into two fresh roots, exercises ingestion through release
+qualification, measures cold and all-cache runs separately, and demonstrates
+that incomplete process coverage remains unqualified.
+
 ## Isolated startup process boundary
 
 [`STARTUP_EVAL.md`](STARTUP_EVAL.md) documents the isolated real `controlsd`

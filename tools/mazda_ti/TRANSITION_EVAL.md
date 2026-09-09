@@ -85,9 +85,10 @@ Neither result satisfies the real integration profile. The existing startup
 pair is deliberately cold/inactive evidence and therefore cannot establish
 this transition profile by itself.
 
-`elapsed_seconds` is execution metadata outside the canonical `transition`
-result. It excludes workload outside this replay and does not establish device
-scheduling or latency. A release profile that needs device timing must record
-that separately on the target device. The report hashes the process/schema and
+`execution.json` holds `elapsed_seconds`, the absolute output destination, and
+the unique messaging prefix outside canonical `result.json`. The elapsed value
+excludes workload outside this replay and does not establish device scheduling
+or latency. A release profile that needs device timing must record that
+separately on the target device. The report hashes the process/schema and
 transition reader sources, preserves generated diagnostics/state identifiers,
 and records no raw rlog bytes in Git.
