@@ -58,6 +58,20 @@ unhealthy inputs, inactive defaults, repeated localizer samples and compact outp
 
 ### Recorded fields
 
+When testing a short lane-motion forecast as a possible release signal, freeze
+horizons and scoring windows first. Predict from currently consumed geometry and
+motion only; keep later observations exclusively in scoring. Camera-EOF horizons
+leave only `horizon - cameraAge` lead at issue. Report this mixed-time assumption
+and reject nonpositive lead. Transport3D points with an explicitly compatible
+coordinate frame, rejecting missing or nonmonotonic support rather than extrapolating.
+Compare persistence and simple heading prediction on exactly the same available
+rows. Future lane estimates share the visual system's errors and are not surveyed
+boundaries. Preserve unavailable rows, active-episode boundaries and scoring gaps.
+Require improvement before the relevant permission decision; aggregate forecast
+accuracy alone cannot justify an earlier release or revive retired raw-plan FF.
+If full rows are pruned, retained aggregates/hashes require row reconstruction
+before independent recomputation. A forecast is not a candidate-driven vehicle replay.
+
 `mazdaDiagnostics.version == 1` identifies this format. Version zero means absent, including non-plant controllers and old recordings. If the surrounding torque state is inactive, only request/filter/context/settings fields are populated; zero active-loop fields do not represent measured zero torque or acceleration.
 
 The reference sequence is:
