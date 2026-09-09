@@ -1,5 +1,9 @@
 # Mazda TI replay evidence tools
 
+For every replay, batch or large test run, follow [scratch and retention](STORAGE.md).
+Full outputs and caches are disposable; durable records remain compact and state
+when full evidence must be rebuilt before verification.
+
 ## Fresh-session acceptance
 
 [`FRESH_SESSION.md`](FRESH_SESSION.md) is the setup, run, and diagnosis guide for

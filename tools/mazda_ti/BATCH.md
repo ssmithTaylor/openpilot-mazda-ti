@@ -1,5 +1,9 @@
 # Resumable corpus execution
 
+Before allocating outputs, follow [the storage workflow](STORAGE.md): preflight
+capacity, use disposable scratch for full outputs/cache, and retain compact
+findings and reproduction records after analysis.
+
 Run a versioned corpus manifest through the existing historical or instrumented
 evaluation adapter:
 
