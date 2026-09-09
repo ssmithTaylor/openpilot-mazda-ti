@@ -84,16 +84,18 @@ def test_complete_instrumented_fixture_qualifies_both_paths_and_reports_transiti
 
 
 @pytest.mark.parametrize('corruption', ['missing_input', 'version', 'validity', 'sequence', 'stock_previous', 'ti_previous',
-                                       'controller_output', 'command_pair', 'active_pair'])
+                                       'controller_output', 'command_pair', 'active_pair', 'serialized_output', 'inactive_output'])
 def test_corrupted_serialized_evidence_cannot_score_a_candidate(tmp_path, corruption):
   request_path = instrumented_fixture(tmp_path / 'raw')
   request = read_json(request_path)
   name = request['case']['experiment']['rlogs'][0]
   raw = request_path.parent / name
   events = [e.as_builder() for e in log.Event.read_multiple_bytes(raw.read_bytes())]
-  control = next(e.controlsState.lateralControlState.torqueState for e in events if e.which() == 'controlsState' and e.logMonoTime == 1_143_000_000)
+  controller_mono = 1_173_000_000 if corruption == 'inactive_output' else 1_143_000_000
+  control = next(e.controlsState.lateralControlState.torqueState for e in events
+                 if e.which() == 'controlsState' and e.logMonoTime == controller_mono)
   output = next(e.carOutput for e in events if e.which() == 'carOutput' and e.logMonoTime == 1_146_000_000)
-  command = next(e.carControl for e in events if e.which() == 'carControl' and e.logMonoTime == 1_144_000_000)
+  command = next(e.carControl for e in events if e.which() == 'carControl' and e.logMonoTime == controller_mono + 1_000_000)
   if corruption == 'missing_input':
     control.mazdaDiagnostics.inputs[0].logMonoTime += 1
   elif corruption == 'version':
@@ -112,6 +114,9 @@ def test_corrupted_serialized_evidence_cannot_score_a_candidate(tmp_path, corrup
     command.actuators.steer = .0001  # Same rounded integer, but not the controller's serialized request.
   elif corruption == 'active_pair':
     command.latActive = output.mazdaDiagnostics.latActive = False
+  elif corruption in ('serialized_output', 'inactive_output'):
+    # Keep the controller/apply pair consistent and integer histories unchanged.
+    control.output = command.actuators.steer = .25 if corruption == 'inactive_output' else .0001
   raw.write_bytes(b''.join(e.to_bytes() for e in events))
   request['case']['input_sha256'][name] = sha256(raw)
   request_path.write_text(json.dumps(request))

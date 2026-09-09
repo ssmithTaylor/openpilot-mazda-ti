@@ -40,7 +40,8 @@ TI requests reset during bypass and restart on re-entry; the candidate stock his
 continues even while TI supplies feedback. Consumed feedback selects the exact previous
 apply, and limited-state history compares before appending the current request.
 
-Baseline qualification requires nonempty active coverage, controller command residual
+Baseline qualification requires nonempty active coverage, exact Float32-serialized
+controller output equality on every scored update (including inactivity), controller command residual
 below one count, matching plant/limited state, and **exact integer equality on both TI
 and stock paths**. The controller residual allowance cannot excuse a wire-count mismatch.
 The actual pinned limiters validate individual transitions, including legitimate bypass

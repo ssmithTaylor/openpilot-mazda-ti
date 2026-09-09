@@ -26,8 +26,9 @@ LIMITATIONS = [
 
 def validate_baseline(path, prep_hash, history, runtime):
   baseline = run.validate_baseline(path, prep_hash, history, runtime, replay_files=REPLAY_FILES)
-  if baseline.get('method') != 'instrumented' or baseline.get('both_command_histories_qualified') is not True:
-    raise ValueError('Instrumented baseline must qualify both TI and stock histories')
+  if (baseline.get('method') != 'instrumented' or baseline.get('both_command_histories_qualified') is not True
+      or baseline.get('serialized_controller_outputs_equal') is not True):
+    raise ValueError('Instrumented baseline must qualify controller outputs and both TI and stock histories')
   return baseline
 
 
@@ -62,7 +63,7 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
   from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
   from .controller_replay import switch_controller
   from .feedback import pure_limiter, pure_stock_limiter
-  from .recorded_feedback import RecordedTiFeedback
+  from .recorded_feedback import RecordedTiFeedback, serialized_steer
 
   streams = {name: {} for name in SERVICES | {'carParams'}}
   for e in events:
@@ -121,6 +122,7 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
     feedback.publish(mono, steer)
     if mono >= start:
       rows.append({'mono': mono, 'active': bool(observed.active), 'output': steer, 'recorded_output': float(observed.output),
+                   'serialized_output_match': serialized_steer(steer) == observed.output,
                    'command_residual': abs(actual.mazdaDiagnostics.command - d.command) if observed.active else None,
                    'plant_match': actual.plantState == observed.plantState,
                    'limited_match': limited == bool(d.freezeReasons & 1) if observed.active else True,
@@ -139,7 +141,8 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
   ti = [{'mono': a.applied_at, 'counts': int(feedback.counts[a.sequence]), 'recorded_counts': a.recorded} for a in feedback.applies]
   stock_sends = [{'mono': a.applied_at, 'counts': int(feedback.stock_counts[a.sequence]), 'recorded_counts': a.stock_recorded} for a in feedback.applies]
   residual = max(row['command_residual'] for row in rows if row['active'])
-  exact = residual < 1 and all(row['plant_match'] and row['limited_match'] for row in rows)
+  output_exact = all(row['serialized_output_match'] for row in rows)
+  exact = output_exact and residual < 1 and all(row['plant_match'] and row['limited_match'] for row in rows)
   exact = exact and all(row['counts'] == row['recorded_counts'] for row in ti + stock_sends)
   bounds = all(abs(row['counts']) <= 600 for row in ti + stock_sends)
   selected = [a for a in feedback.applies if a.applied_at >= start]
@@ -161,6 +164,7 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
   result = {'format_version': 2, 'stage': 'replayed', 'method': 'instrumented', 'variant': variant, 'history': 'exact',
             'qualification': ('exact_recorded_commands' if exact else 'failed_baseline') if variant == 'baseline' else 'candidate_commands_only',
             'both_command_histories_qualified': exact if variant == 'baseline' else True, 'command_bounds_pass': bounds,
+            'serialized_controller_outputs_equal': output_exact,
             'preparation_sha256': prep_hash, 'baseline_result_sha256': sha256(baseline_path) if baseline_path else None,
             'repository_sources': finish_sources(before), 'environment': runtime_before, 'input_sha256': preparation['input_sha256'],
             'controller_sources': {r: hashlib.sha256(controller_source(r).encode()).hexdigest() for r in (original_ref, ref)},
