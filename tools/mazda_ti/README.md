@@ -53,6 +53,11 @@ localization checks; matching a location does not transfer rider annotations.
 
 For structured rlog fields, the identity-coverage audit command, sign conventions and logging tests, read [DIAGNOSTICS.md](DIAGNOSTICS.md). Verify the recorded diagnostic versions and vehicle source separately from the analyzer's current checkout.
 
+For a suspected steering-angle measurement error, use the field guide's
+[exact consumed-yaw comparison](DIAGNOSTICS.md#check-the-angle-model-measurement-against-consumed-yaw).
+It emits compact descriptive evidence with measurement ages and uncertainty,
+without replaying commands or predicting a vehicle path.
+
 For instrumented-drive candidate replay, that guide also documents `RecordedTiFeedback`,
 the shared library for coupling candidate requests to software TI feedback through exact
 consumed-output and applied-command identities. It is separate from the historical runner

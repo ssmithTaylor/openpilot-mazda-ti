@@ -19,6 +19,45 @@ The original instrumentation in `1f56328` incorrectly looked up carState in SubM
 
 ## Controller record
 
+### Check the angle-model measurement against consumed yaw
+
+Before attributing a release delay to inflated steering-angle acceleration, use:
+
+```text
+python -m tools.mazda_ti.audit_measurement --data-root PATH/TO/rlogs --rlogs ROUTE--SEG/rlog --start-ns START --end-ns END --output NEW-measurement.json
+```
+
+This joins the original active torque diagnostics to exactly consumed carState and
+liveLocationKalman identities. It compares gross right-positive `measurement` to
+`angularVelocityCalibrated.value[2] * carState.vEgo`. Do not subtract roll or learned
+offset on just one side. Analyze stable and unwind windows separately, with windows
+declared before inspecting disagreement. A passing command means all supplied
+active measurements have valid identities, finite values and healthy inputs; it
+does not qualify a controller or establish physical handling.
+
+The compact report retains min/median/max, both publication ages, mixed-time
+separation, distinct localizer-message count, issue counts, bounded samples and
+source/raw/runtime hashes. `--sample-count` defaults to12 and accepts0–100; no full
+trace or cache is written. Metrics weight controller publications, including
+repeated localizer inputs. Inactive defaults and unhealthy measurements are excluded
+from statistics. Missing exact inputs are failures, never replaced with nearest
+messages. Maximum publication gap and actual first/last publication remain visible;
+coverage does not certify missing time or sensor exposure timing.
+Supply one original route: the CLI checks distinct paths, not common route naming.
+Health failures have aggregate counts; bounded unhealthy samples indicate rejection,
+but the individual flag at every rejected timestamp requires re-reading raw inputs.
+
+Yaw times speed approximates rotational acceleration; lateral velocity transients,
+mounting, speed and timing can contribute to disagreement. The reported yaw-only
+standard deviation times speed is not total uncertainty or a physical error bound.
+The fused localizer offers a route beyond steering angle, not independent ground
+truth. Do not fit lag to improve agreement or divide uncertainty by sqrt(sample count).
+Preserve this distinction when interpreting a small difference or selecting a new
+measurement source. Serialized tests cover wrong identities, malformed/invalid data,
+unhealthy inputs, inactive defaults, repeated localizer samples and compact output.
+
+### Recorded fields
+
 `mazdaDiagnostics.version == 1` identifies this format. Version zero means absent, including non-plant controllers and old recordings. If the surrounding torque state is inactive, only request/filter/context/settings fields are populated; zero active-loop fields do not represent measured zero torque or acceleration.
 
 The reference sequence is:
