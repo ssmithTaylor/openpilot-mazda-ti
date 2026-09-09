@@ -1,6 +1,6 @@
 # Mazda TI replay evidence tools
 
-For one command that prepares a pinned historical case, qualifies its baseline,
+For one command that prepares a pinned historical or instrumented case, qualifies its baseline,
 evaluates a candidate, and writes a structured bundle plus readable report, see
 [EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
 settings, revisions, history, and scoring window.
@@ -14,7 +14,8 @@ For structured rlog fields, the identity-coverage audit command, sign convention
 For instrumented-drive candidate replay, that guide also documents `RecordedTiFeedback`,
 the shared library for coupling candidate requests to software TI feedback through exact
 consumed-output and applied-command identities. It is separate from the historical runner
-below and requires a caller that reconstructs controller inputs and state.
+below. The [full-controller adapter](INSTRUMENTED_EVALUATION.md) resolves every consumed
+input and recorded clock and qualifies both command paths through TI loss and recovery.
 
 `verify_replay.py` checks that an integrated controller reproduces an already-qualified reference replay, and that the source files still match the integration run's recorded hashes. It runs with Python3.11+ and the standard library on Windows or Linux. It reads local files and performs no network, vehicle or deployment operations.
 

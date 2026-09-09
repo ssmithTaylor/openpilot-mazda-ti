@@ -66,7 +66,7 @@ def test_unrestricted_request_data_is_rejected_before_any_bundle_copy(tmp_path, 
 
 def test_unsupported_method_produces_a_readable_unscored_bundle(tmp_path):
   request = tmp_path / 'request.json'
-  write_json(request, {'format_version': 1, 'case': {'id': 'instrumented-example', 'method': 'instrumented'}})
+  write_json(request, {'format_version': 1, 'case': {'id': 'unsupported-example', 'method': 'future-adapter'}})
   output = tmp_path / 'evidence'
   result = evaluate(request, tmp_path / 'data', output)
   assert result['status'] == 'unsupported'

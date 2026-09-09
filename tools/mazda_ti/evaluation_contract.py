@@ -38,12 +38,13 @@ def canonical_request(value, resolved=False):
     raise ValueError('Evaluation request must be an object')
   if type(value.get('format_version')) is not int or value['format_version'] != 1:
     raise Unsupported('Unsupported evaluation request version')
-  if isinstance(value.get('case'), dict) and value['case'].get('method') != 'historical':
-    raise Unsupported('Only the historical replay adapter is supported')
+  if isinstance(value.get('case'), dict) and value['case'].get('method') not in ('historical', 'instrumented'):
+    raise Unsupported('Unsupported replay adapter')
   request = fields(value, ('format_version', 'candidate_revision', 'case'))
   case = fields(value['case'], ('id', 'method', 'history', 'experiment', 'input_sha256'), ('origin',))
   case['origin'] = value['case'].get('origin', 'recorded')
-  if case['history'] not in ('earliest', 'latest') or case['origin'] not in ('recorded', 'synthetic'):
+  histories = ('exact',) if case['method'] == 'instrumented' else ('earliest', 'latest')
+  if case['history'] not in histories or case['origin'] not in ('recorded', 'synthetic'):
     raise Unsupported('Unsupported history or evidence origin')
   if request['candidate_revision'] == 'worktree':
     raise Unsupported('This slice requires a committed candidate controller revision')
@@ -56,8 +57,9 @@ def canonical_request(value, resolved=False):
   spec['settings'] = fields(spec['settings'], sorted(set(LIMIT_KEYS.values()) | TOGGLE_KEYS))
   if any(type(v) not in (int, float) or not math.isfinite(v) for v in [*spec['window'].values(), *spec['settings'].values()]):
     raise ValueError('Settings and window values must be finite numbers')
-  if type(spec['force_offset']) is not bool or spec['fpcs_sample_at'] not in ('carState', 'controlsState'):
-    raise ValueError('Invalid historical sampling configuration')
+  samples = ('diagnostic',) if case['method'] == 'instrumented' else ('carState', 'controlsState')
+  if type(spec['force_offset']) is not bool or spec['fpcs_sample_at'] not in samples:
+    raise ValueError('Invalid sampling configuration for the replay method')
   refs = [request['candidate_revision'], spec['baseline_controller'], spec['warmup_controller'], spec['limiter']]
   if resolved:
     refs.append(spec['candidate_controller'])
@@ -88,7 +90,8 @@ def completed_result(request, baseline, candidate, comparison):
           'scope': evidence_scope(case['origin']),
           'source_identities': {**{k: spec[k] for k in ('baseline_controller', 'candidate_controller', 'warmup_controller', 'limiter')},
                                 'repository_sources': candidate['repository_sources'], 'controller_sources': sources},
-          'input_sha256': candidate['input_sha256'], 'runtime': candidate['environment'], 'limitations': candidate['limitations'] + LIMITATIONS}
+          'input_sha256': candidate['input_sha256'], 'runtime': candidate['environment'],
+          'limitations': candidate['limitations'] + (LIMITATIONS if case['method'] == 'historical' else LIMITATIONS[1:])}
 
 
 def synthetic_result(request, status, comparison, findings, source_identities, input_sha256, runtime, limitations):

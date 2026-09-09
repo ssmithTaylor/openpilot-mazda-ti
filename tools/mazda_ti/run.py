@@ -124,7 +124,7 @@ def prepare(args):
   print(f'Prepared {len(mapped)} mapped control frames and {sampling["summary"]["sends"]} sends')
 
 
-def validate_baseline(path, prep_hash, history, runtime):
+def validate_baseline(path, prep_hash, history, runtime, *, replay_files=REPLAY_FILES):
   baseline = read_json(path)
   if (
     baseline.get('format_version') != 2
@@ -141,7 +141,7 @@ def validate_baseline(path, prep_hash, history, runtime):
   if baseline.get('environment') != runtime:
     raise ValueError('Baseline runtime differs from current runtime')
   check_sources(baseline['repository_sources'])
-  check_artifacts(path.parent, baseline['output_sha256'], REPLAY_FILES)
+  check_artifacts(path.parent, baseline['output_sha256'], replay_files)
   return baseline
 
 

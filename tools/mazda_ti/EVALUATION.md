@@ -1,11 +1,12 @@
 # One recorded case from revision to report
 
 `python -m tools.mazda_ti.evaluate` implements [issue #2](https://github.com/ssmithTaylor/openpilot-mazda-ti/issues/2):
-prepare one historical case, qualify its original baseline, evaluate a pinned candidate,
+prepare one historical or instrumented case, qualify its original baseline, evaluate a pinned candidate,
 and write a structured bundle and readable comparison. It reuses the real-controller
 runner, TI limiter/feedback, state migration, source locks and exact-send verifier.
 It performs no network, vehicle, Params, CAN, deployment or source-write operations.
-Instrumented replay, batching, worktree snapshots and process checks are unsupported here.
+The [instrumented adapter](INSTRUMENTED_EVALUATION.md) adds exact diagnostic identities and both actuator histories.
+Batching, worktree snapshots and process checks remain unsupported.
 
 ## Reproducible references
 
@@ -53,8 +54,8 @@ A request contains `format_version: 1`, `candidate_revision`, and `case`:
 | Case field | Meaning |
 | --- | --- |
 | `id` | Stable case identity |
-| `method` | `historical` |
-| `history` | One explicit `earliest` or `latest` history; not bounds over all histories |
+| `method` | `historical` or `instrumented` |
+| `history` | Historical: one explicit `earliest` or `latest`; instrumented: `exact` |
 | `input_sha256` | SHA-256 for exactly every relative rlog path |
 | `experiment` | [Runner spec](README.md), excluding the candidate supplied by the request |
 | `origin` | `recorded` by default, or `synthetic`; persisted explicitly |
@@ -82,7 +83,8 @@ Only completed checks return CLI exit zero. Candidate comparison is absent after
 baseline failure blocks candidate execution. Partial evidence remains. An unwritable output
 cannot retain a bundle and produces stderr instead. No status establishes successful cornering.
 Exact integer commands, matching plant flags, nonempty coverage, output residual below one
-count, TI600 and 15-count adjacent-send bounds remain unchanged. A controller residual allowance
+count and TI600 remain unchanged. Historical replay retains its 15-count adjacent-send
+bound; instrumented replay checks each actual TI/stock limiter, including bypass and reset jumps. A controller residual allowance
 never permits a one-count send mismatch. Comparisons retain minimum/maximum and absolute
 command changes without a weighted handling score.
 
@@ -102,7 +104,7 @@ python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/
 
 The default suite runs the public end-to-end fixture plus structural rejection and tamper tests.
 GitHub Actions runs it on Windows and Linux. Set `MAZDA_EVAL_DATA_ROOT` to include the private
-recorded test; otherwise it reports an explicit skip. For an inaccessible Windows pytest temp
+recorded VW and TI-transition tests; otherwise each reports an explicit skip. For an inaccessible Windows pytest temp
 root, use `--basetemp` with a fresh directory under an existing writable parent.
 
 The public boundaries are `evaluate(request_path, data_root, output) -> result` and

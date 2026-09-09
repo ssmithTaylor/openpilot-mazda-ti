@@ -1,6 +1,6 @@
 # Standalone CLI imports precede the openpilot namespace facade.
 # ruff: noqa: TID251
-"""Evaluate one pinned historical case locally and retain its evidence bundle."""
+"""Evaluate one pinned recorded case locally and retain its evidence bundle."""
 
 import argparse
 import json
@@ -16,7 +16,7 @@ from .verify_replay import compare_sends
 from .evaluation_contract import Unsupported, canonical_request, completed_result, evidence_scope
 
 
-def compare_commands(baseline_path, candidate_path, window, same_source):
+def compare_commands(baseline_path, candidate_path, window, same_source, *, historical_bounds=True):
   """Compare integer wire commands at identical publications within scoring."""
   def selected(path):
     rows = read_json(path)['sends']
@@ -33,7 +33,7 @@ def compare_commands(baseline_path, candidate_path, window, same_source):
   changed = sum(d != 0 for d in deltas)
   if same_source and changed:
     raise ValueError('Same-source candidate did not reproduce baseline integer commands')
-  if same_source:
+  if same_source and historical_bounds:
     compare_sends(baseline_path, candidate_path, window['start'], window['end'])
   return {'sends': len(deltas), 'changed_sends': changed, 'max_absolute_change_counts': max(map(abs, deltas)),
           'minimum_change_counts': min(deltas), 'maximum_change_counts': max(deltas),
@@ -46,16 +46,22 @@ def verify_bundle(output, data_root):
   result = read_json(output / 'result.json')
   if result.get('format_version') != 1 or result.get('status') != 'completed_checks':
     raise ValueError('Only a completed version 1 evaluation can be verified')
+  request = canonical_request(read_json(output / 'resolved-request.json'), resolved=True)
+  adapter = run
+  if request['case']['method'] == 'instrumented':
+    from . import instrumented
+    adapter = instrumented
   required = {'request.json', 'resolved-request.json', 'experiment.json', 'prepared/preparation.json',
               'baseline/result.json', 'candidate/result.json'}
   required.update('prepared/' + name for name in run.PREPARED_FILES)
-  required.update(variant + '/' + name for variant in ('baseline', 'candidate') for name in run.REPLAY_FILES)
+  required.update(variant + '/' + name for variant in ('baseline', 'candidate') for name in adapter.REPLAY_FILES)
   check_artifacts(output, result['artifacts'], required)
-  request = canonical_request(read_json(output / 'resolved-request.json'), resolved=True)
   case, prepared = request['case'], output / 'prepared'
   prep = read_json(prepared / 'preparation.json')
   if prep.get('format_version') != 2 or prep.get('stage') != 'prepared':
     raise ValueError('Unsupported preparation record')
+  if case['method'] == 'instrumented' and prep.get('method') != 'instrumented':
+    raise ValueError('Preparation belongs to another replay method')
   check_sources(prep['repository_sources'])
   check_artifacts(prepared, prep['prepared_sha256'], run.PREPARED_FILES)
   if read_json(prepared / 'spec.json') != case['experiment']:
@@ -66,10 +72,12 @@ def verify_bundle(output, data_root):
     if sha256(under(data_root, name)) != digest:
       raise ValueError(f'Recording identity changed: {name}')
   baseline_path = output / 'baseline/result.json'
-  baseline = run.validate_baseline(baseline_path, sha256(prepared / 'preparation.json'), case['history'], prep['environment'])
+  baseline = adapter.validate_baseline(baseline_path, sha256(prepared / 'preparation.json'), case['history'], prep['environment'])
   if baseline.get('input_sha256') != prep['input_sha256']:
     raise ValueError('Baseline recording identities differ from preparation')
   candidate = read_json(output / 'candidate/result.json')
+  if case['method'] == 'instrumented' and candidate.get('method') != 'instrumented':
+    raise ValueError('Candidate belongs to another replay method')
   if (candidate.get('format_version') != 2 or candidate.get('stage') != 'replayed' or candidate.get('variant') != 'candidate'
       or candidate.get('qualification') != 'candidate_commands_only' or not candidate.get('command_bounds_pass')
       or candidate.get('frames', 0) <= 0 or candidate.get('sends', 0) <= 0
@@ -79,10 +87,11 @@ def verify_bundle(output, data_root):
       or candidate.get('input_sha256') != prep['input_sha256']):
     raise ValueError('Candidate evidence is incomplete or does not match its baseline')
   check_sources(candidate['repository_sources'])
-  check_artifacts(output / 'candidate', candidate['output_sha256'], run.REPLAY_FILES)
+  check_artifacts(output / 'candidate', candidate['output_sha256'], adapter.REPLAY_FILES)
   spec = case['experiment']
   same = baseline['controller_sources'][spec['baseline_controller']] == candidate['controller_sources'][spec['candidate_controller']]
-  comparison = compare_commands(output / 'baseline/trace-sends.json', output / 'candidate/trace-sends.json', spec['window'], same)
+  comparison = (adapter.compare(output, spec, same) if case['method'] == 'instrumented' else
+                compare_commands(output / 'baseline/trace-sends.json', output / 'candidate/trace-sends.json', spec['window'], same))
   if result != completed_result(request, baseline, candidate, comparison) | {'artifacts': result['artifacts']}:
     raise ValueError('Evaluation summary does not match its evidence')
   return result
@@ -135,7 +144,11 @@ def evaluate(request_path, data_root, output):
         raise FileNotFoundError(f'Missing required recording: {name}')
       if sha256(path) != case['input_sha256'][name]:
         raise ValueError(f'Recording identity changed: {name}')
-    historical(request, Path(data_root), output, result)
+    if case['method'] == 'instrumented':
+      from .instrumented import evaluate as instrumented_evaluate
+      instrumented_evaluate(request, Path(data_root), output, result)
+    else:
+      historical(request, Path(data_root), output, result)
   except Unsupported as error:
     result['status'] = 'unsupported'
     result['findings'].append(str(error))
@@ -161,6 +174,10 @@ def evaluate(request_path, data_root, output):
                f"\nBaseline controller: `{result['source_identities']['baseline_controller']}`.\n"
                f"Candidate controller: `{result['source_identities']['candidate_controller']}`.\n")
     report += ''.join(f'\n- {limit}\n' for limit in result['limitations'])
+    if 'stock' in comparison:
+      stock = comparison['stock']
+      report += f"\nStock: {stock['changed_sends']} of {stock['sends']} requests changed; maximum {stock['max_absolute_change_counts']} counts.\n"
+      report += f"\nRecorded availability: {comparison['availability']}.\n"
   report += '\nSee [structured result](result.json) and [execution metadata](execution.json). Artifact paths and hashes are in the result.\n'
   (output / 'report.md').write_text(report, encoding='utf-8', newline='\n')
   return result

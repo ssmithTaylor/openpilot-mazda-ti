@@ -217,3 +217,8 @@ exit zero requires every state to be exercised and p99 below10ms. Timing results
 with machine load and are not deterministic artifacts. This controlled workload does
 not measure full process transport, concurrent onroad load or actual lane performance.
 Keep its result with the build record, then verify real onroad logs separately.
+
+The [instrumented evaluation adapter](INSTRUMENTED_EVALUATION.md) now promotes the local full-controller caller
+behind the shared evaluation command. It requires complete exact identities, checks each applied
+carControl against its linked controller publication, and qualifies both limiter histories before
+evaluating a candidate. The standalone identity auditor remains an identity-coverage check.
