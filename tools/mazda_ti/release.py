@@ -17,6 +17,10 @@ FORMAT_VERSION = 1
 PROFILE_VERSION = 1
 PROFILE = "mazda-release-v1"
 EVIDENCE_KINDS = ("corpus", "scenario", "process", "comparison")
+PROCESS_PROFILE = "full_process_transition"
+COMPARISON_IDENTITY = "verified_full_bundle"
+PHYSICAL_MANEUVERS = ("left_curve", "right_curve", "straight", "transition")
+PHYSICAL_MEASUREMENTS = ("driver_steering_intervention", "lane_position")
 PROFILE_DEFINITION = {
   "name": PROFILE,
   "version": PROFILE_VERSION,
@@ -55,9 +59,38 @@ def _text(value, name, maximum=2000):
   return value
 
 
+def _physical_evaluation(value):
+  """Validate a small, objective physical-drive question contract."""
+  if not isinstance(value, dict):
+    raise ValueError("Invalid physical evaluation contract")
+  physical = _fields(value, ("route_segment", "maneuver", "target_speed_mps", "measurements",
+                             "maximum_driver_steering_interventions"))
+  route = physical["route_segment"]
+  if not isinstance(route, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{2,199}", route) is None:
+    raise ValueError("Invalid physical evaluation route segment identity")
+  if physical["maneuver"] not in PHYSICAL_MANEUVERS:
+    raise ValueError("Invalid physical evaluation maneuver")
+  speed = physical["target_speed_mps"]
+  if type(speed) not in (int, float) or speed != speed or speed in (float("inf"), float("-inf")) or not 0 < speed <= 60:
+    raise ValueError("Invalid physical evaluation target speed")
+  measurements = physical["measurements"]
+  if (not isinstance(measurements, list) or len(measurements) != len(set(measurements))
+      or set(measurements) != set(PHYSICAL_MEASUREMENTS)):
+    raise ValueError("Physical evaluation must measure lane position and driver steering intervention")
+  interventions = physical["maximum_driver_steering_interventions"]
+  if type(interventions) is not int or not 0 <= interventions <= 10:
+    raise ValueError("Invalid physical evaluation intervention threshold")
+  physical["measurements"] = sorted(measurements)
+  physical["question"] = (
+    f"On {route}, during a {physical['maneuver']} at {speed:g} m/s, does the candidate record lane position "
+    f"with no more than {interventions} driver steering interventions?"
+  )
+  return physical
+
+
 def canonical_request(value):
   """Validate the small, portable release request before reading evidence."""
-  request = _fields(value, ("format_version", "candidate_revision", "profile", "physical_question",
+  request = _fields(value, ("format_version", "candidate_revision", "profile", "physical_evaluation",
                              "settings", "evidence", "deployment_prerequisites"))
   if type(request["format_version"]) is not int or request["format_version"] != FORMAT_VERSION:
     raise Unsupported("Unsupported release request version")
@@ -65,7 +98,7 @@ def canonical_request(value):
     raise ValueError("candidate_revision must be a full 40-character Git revision")
   if request["profile"] != PROFILE:
     raise Unsupported("Unsupported release qualification profile")
-  _text(request["physical_question"], "physical evaluation question")
+  request["physical_evaluation"] = _physical_evaluation(request["physical_evaluation"])
   if not isinstance(request["settings"], dict) or not request["settings"]:
     raise ValueError("Release settings must be a nonempty object")
   for name, value in request["settings"].items():
@@ -109,47 +142,84 @@ def canonical_request(value):
   return request
 
 
-def _walk(value):
-  if isinstance(value, dict):
-    yield value
-    for child in value.values():
-      yield from _walk(child)
-  elif isinstance(value, list):
-    for child in value:
-      yield from _walk(child)
+def _required(record, names, kind):
+  if not isinstance(record, dict) or not set(names) <= set(record):
+    raise ValueError(f"Record does not match the {kind} evidence schema")
 
 
-def _candidate_identities(record, kind):
-  identities = set()
-  if _commit(record.get("candidate_revision")):
-    identities.add(record["candidate_revision"])
-  for obj in _walk(record):
-    for key in ("candidate", "candidate_controller", "candidate_revision"):
-      value = obj.get(key) if isinstance(obj, dict) else None
-      if _commit(value):
-        identities.add(value)
-    if kind == "process" and _commit(obj.get("git_head")):
-      identities.add(obj["git_head"])
-  return sorted(identities)
+def _digest(value):
+  return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
 
 
-def _input_identities(record):
-  identities = {}
-  for obj in _walk(record):
-    declared = obj.get("input_sha256") if isinstance(obj, dict) else None
-    if isinstance(declared, dict):
-      for name, digest in declared.items():
-        if isinstance(name, str) and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
-          identities[name] = digest
-    rlogs = obj.get("rlogs") if isinstance(obj, dict) else None
-    if isinstance(rlogs, list):
-      for row in rlogs:
-        if isinstance(row, dict) and isinstance(row.get("label"), str) and re.fullmatch(r"[a-f0-9]{64}", row.get("sha256", "")):
-          identities[row["label"]] = row["sha256"]
-    manifest = obj.get("manifest_sha256") if isinstance(obj, dict) else None
-    if isinstance(manifest, str) and re.fullmatch(r"[a-f0-9]{64}", manifest):
-      identities["manifest.json"] = manifest
-  return dict(sorted(identities.items()))
+def _digest_map(value, kind):
+  if (not isinstance(value, dict) or not value
+      or any(not isinstance(name, str) or not name or not _digest(digest) for name, digest in value.items())):
+    raise ValueError(f"Record does not match the {kind} evidence schema")
+  return {name: value[name] for name in sorted(value)}
+
+
+def _corpus_identity(record):
+  _required(record, ("format_version", "status", "profile_pass", "corpus_id", "corpus_version", "candidate_revision",
+                     "profile", "manifest_sha256", "manifest_artifact_sha256", "cases", "findings"), "corpus")
+  if (record["format_version"] != 1 or type(record["profile_pass"]) is not bool or not isinstance(record["profile"], str)
+      or not isinstance(record["cases"], list) or not _digest(record["manifest_sha256"])
+      or not _digest(record["manifest_artifact_sha256"])):
+    raise ValueError("Record does not match the corpus evidence schema")
+  blockers = [] if record["profile_pass"] else ["Corpus required profile did not pass"]
+  return [record["candidate_revision"]], {"manifest.json": record["manifest_sha256"]}, blockers
+
+
+def _scenario_identity(record):
+  _required(record, ("format_version", "status", "case_id", "qualification", "comparison", "findings", "scope",
+                     "source_identities", "input_sha256", "runtime", "limitations"), "scenario")
+  sources = record["source_identities"]
+  if (record["format_version"] != 1 or record["qualification"] != "synthetic_controller_limiter"
+      or not isinstance(record["case_id"], str) or not isinstance(record["comparison"], dict)
+      or not isinstance(sources, dict) or not isinstance(record["limitations"], list)):
+    raise ValueError("Record does not match the scenario evidence schema")
+  return [sources.get("candidate_controller")], _digest_map(record["input_sha256"], "scenario"), []
+
+
+def _process_identity(record):
+  _required(record, ("format_version", "profile", "status", "transition", "source_schema_sha256", "runtime_source",
+                     "input_sha256", "findings", "isolation"), "process")
+  source = record["runtime_source"]
+  transition = record["transition"]
+  if (record["format_version"] != 2 or record["profile"] != PROCESS_PROFILE or not isinstance(transition, dict)
+      or not isinstance(source, dict) or not isinstance(record["source_schema_sha256"], dict)
+      or transition.get("process_boundary", {}).get("interface") != "process_replay"):
+    raise ValueError("Record does not match the process evidence schema")
+  return [source.get("git_head")], _digest_map(record["input_sha256"], "process"), []
+
+
+def _comparison_identity(record):
+  _required(record, ("format_version", "status", "identity_validation", "provenance", "phases", "metrics",
+                     "phase_effects", "command_effects", "findings", "scope"), "comparison")
+  provenance = record["provenance"]
+  if (record["format_version"] != 1 or not isinstance(provenance, dict)
+      or set(provenance) != {"reference", "candidate", "current_control"}
+      or not isinstance(record["findings"], dict)):
+    raise ValueError("Record does not match the comparison evidence schema")
+  blockers = ([] if record["identity_validation"] == COMPARISON_IDENTITY else
+              [f"Comparison requires {COMPARISON_IDENTITY} identity validation"])
+  for name, arm in provenance.items():
+    if (not isinstance(arm, dict) or not isinstance(arm.get("bundle"), str)
+        or not isinstance(arm.get("artifact_sha256"), dict) or not isinstance(arm.get("source_identities"), dict)):
+      raise ValueError("Record does not match the comparison evidence schema")
+    _digest_map(arm["artifact_sha256"], "comparison")
+    _digest_map(arm.get("input_sha256"), "comparison")
+    if arm.get("identity_validation") != COMPARISON_IDENTITY:
+      blockers.append(f"Comparison {name} arm requires {COMPARISON_IDENTITY} identity validation")
+  candidate = provenance["candidate"]
+  return [candidate["source_identities"].get("candidate_controller")], _digest_map(candidate.get("input_sha256"), "comparison"), blockers
+
+
+IDENTITY_READERS = {
+  "corpus": _corpus_identity,
+  "scenario": _scenario_identity,
+  "process": _process_identity,
+  "comparison": _comparison_identity,
+}
 
 
 def _concerns(record):
@@ -175,9 +245,7 @@ def _load_evidence(item, root, candidate):
   if record.get("format_version") not in (1, 2):
     raise Unsupported(f"Unsupported evidence version: {item['id']}")
   status = record.get("status")
-  source = _candidate_identities(record, item["kind"])
-  inputs = _input_identities(record)
-  blockers = []
+  source, inputs, blockers = IDENTITY_READERS[item["kind"]](record)
   if status != "completed_checks":
     blockers.append(f"Evidence status is {status or 'missing'}")
   if source != [candidate]:
@@ -216,7 +284,7 @@ def qualify(request_path, evidence_root, output):
   try:
     request = canonical_request(read_json(Path(request_path)))
     result.update(candidate_revision=request["candidate_revision"], settings=request["settings"],
-                  physical_evaluation={"status": "pending", "question": request["physical_question"]},
+                  physical_evaluation={"status": "pending", **request["physical_evaluation"]},
                   deployment_prerequisites=request["deployment_prerequisites"])
     for item in request["evidence"]:
       try:

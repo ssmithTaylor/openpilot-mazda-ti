@@ -185,6 +185,7 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
   with isolated_environment() as owned:
     profile = 'full_process_transition' if rlog is not None else 'serialized_transition_fixture'
     capabilities = {'full_process_supported': None, 'missing': []}
+    runtime_source, input_sha256 = None, {}
     try:
       if transition_harness and (rlog is None or not all_segments):
         raise ValueError('--schema-input-harness requires --rlog and --all-segments')
@@ -195,6 +196,8 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
         process = process_boundary(rlog, max_carstate_messages, all_segments, transition_harness)
         transition = {name: process[name] for name in ('status', 'findings', 'availability', 'state_retention', 'observations')}
         transition['process_boundary'] = process['startup_boundary']
+        runtime_source = process['startup_boundary']['runtime_source']
+        input_sha256 = {row['label']: row['sha256'] for row in process['startup_boundary']['input']['rlogs']}
       else:
         if observations is None:
           observations, normalization_findings = normalize_observations(events or [])
@@ -215,6 +218,7 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
       'findings': transition['findings'] if transition else [], 'transition': transition,
       'missing_capabilities': capabilities['missing'],
       'source_schema_sha256': source_identity() | {'tools/mazda_ti/transition_eval.py': sha256(ROOT / 'tools/mazda_ti/transition_eval.py')},
+      'runtime_source': runtime_source, 'input_sha256': input_sha256,
       'isolation': {'params': 'tool-owned temporary directory', 'messaging': 'tool-owned unique fake prefix',
                     'writable_state': 'temporary runtime only', 'vehicle_connection': 'none',
                     'can_publisher': 'not constructed', 'owned_messaging_prefix': owned['messaging_prefix'],

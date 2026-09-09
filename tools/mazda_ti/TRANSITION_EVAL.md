@@ -50,6 +50,10 @@ those settings are copied only into tool-owned Params and must agree across the
 selection. At an active TI-bypass boundary it checks the exact
 serialized prior `integralAfter` against the bypass frame's `integralBefore`;
 the integral may evolve, but a reset cannot be hidden as retained state.
+The top-level result copies the process boundary's exact `runtime_source.git_head`
+and normalized `input_sha256` rlog map. Release qualification can therefore bind
+this process evidence to both the candidate revision and retained input bytes;
+the serialized fixture profile does not claim those full-process identities.
 
 `--schema-input-harness` is the bounded live-transition profile. It runs
 `controlsd` with process replay simulation disabled and paces the actual

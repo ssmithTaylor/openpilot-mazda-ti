@@ -115,6 +115,8 @@ def test_verified_full_bundle_requires_an_explicit_retained_arm(tmp_path):
                                  data_root=request.parent, evidence_root=tmp_path)
   assert result['identity_validation'] == 'verified_full_bundle'
   assert result['status'] == 'completed_checks'
+  assert result['provenance']['candidate']['source_identities'] == read_json(full / 'result.json')['source_identities']
+  assert result['provenance']['candidate']['input_sha256'] == read_json(full / 'result.json')['input_sha256']
   forged = full / 'forged'
   forged.mkdir()
   (forged / 'trace.json').write_bytes((full / 'candidate/trace.json').read_bytes())

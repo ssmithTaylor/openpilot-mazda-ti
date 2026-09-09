@@ -3,15 +3,37 @@
 `python -m tools.mazda_ti.release` prepares a portable release record from four
 already-retained evidence records: a corpus result, a scenario result, a real
 process result, and a recorded comparison. The versioned `mazda-release-v1`
-profile requires every kind. Each record must be completed, hash-identified,
-bound to the requested candidate commit, and contain source and input
-identities. Missing, stale, unsupported, failed, or unqualified evidence keeps
-the release unqualified and remains visible in the result.
+profile requires every kind. Each declared kind is checked against its producer
+contract: a passed corpus profile, a synthetic scenario result, a
+`full_process_transition` result, and a trace comparison whose aggregate and
+candidate arm both report `verified_full_bundle`. Each record must be completed,
+hash-identified, bound to the requested candidate commit, and contain source and
+input identities. Relabelled evidence, `content_bound_unqualified` comparisons,
+missing, stale, unsupported, or failed evidence keeps the release unqualified
+and remains visible in the result.
 
 The request also records the settings used for review, per-evidence concerns,
-and a specific physical question. The resulting record describes software and
-recorded-motion qualification only. It does not predict an acceptable corner
-path or establish driver contact.
+and a structured physical question. `physical_evaluation` requires a stable
+`route_segment` identity, a `maneuver` (`left_curve`, `right_curve`, `straight`,
+or `transition`), a positive `target_speed_mps`, both `lane_position` and
+`driver_steering_intervention` measurements, and an integer
+`maximum_driver_steering_interventions`. The tool renders those fields into the
+question in the portable result; it does not accept subjective question prose.
+
+```json
+{
+  "physical_evaluation": {
+    "route_segment": "route-28f:835-875",
+    "maneuver": "left_curve",
+    "target_speed_mps": 20,
+    "measurements": ["lane_position", "driver_steering_intervention"],
+    "maximum_driver_steering_interventions": 0
+  }
+}
+```
+
+The resulting record describes software and recorded-motion qualification only.
+It does not predict an acceptable corner path or establish driver contact.
 
 Deployment prerequisites are emitted as `pending` records:
 

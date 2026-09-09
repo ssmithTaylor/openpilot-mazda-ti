@@ -46,6 +46,7 @@ def _bundle(path, evidence_root, data_root):
     provenance = {'source_identities': result.get('source_identities'), 'input_sha256': result.get('input_sha256')}
     if not isinstance(provenance['source_identities'], dict) or not isinstance(provenance['input_sha256'], dict):
       raise ValueError('Verified bundle lacks source or input identities')
+    valid_provenance = True
     level = 'verified_full_bundle'
   return {'path': reference, 'result': result, 'metadata': metadata, 'rows': rows,
           'provenance': provenance if valid_provenance else None, 'artifacts': artifacts, 'identity_validation': level}

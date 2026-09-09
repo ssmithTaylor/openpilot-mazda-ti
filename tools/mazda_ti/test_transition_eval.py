@@ -1,7 +1,10 @@
 """Tests for declared, serialized control-transition evidence."""
 
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace as NS
 
+from .provenance import sha256
 from .startup_eval import StartupUnsupported
 from .transition_eval import actual_process_transition, assess, main, normalize_observations, opaque_state_id, run
 
@@ -207,19 +210,30 @@ def test_cli_rejects_schema_harness_without_adjacent_segment_mode(tmp_path, caps
 
 
 def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_path):
+  retained = tmp_path / 'retained/rlog'
+  retained.parent.mkdir()
+  retained.write_bytes(b'retained transition input')
+
   def boundary(rlog, maximum, all_segments, transition_harness):
-    assert rlog == ['retained/rlog']
+    assert rlog == [retained]
     assert maximum == 7
     assert all_segments is True
     assert transition_harness is False
     transition = assess(complete_rows())
-    return {'startup_boundary': {'interface': 'process_replay', 'no_vehicle_output': {'status': 'passed'}}, **transition}
+    return {'startup_boundary': {
+      'interface': 'process_replay', 'no_vehicle_output': {'status': 'passed'},
+      'runtime_source': {'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                         'identity': {'tools/mazda_ti/transition_eval.py': sha256(Path(__file__).with_name('transition_eval.py'))}},
+      'input': {'rlogs': [{'label': 'retained/rlog', 'sha256': sha256(retained)}]},
+    }, **transition}
 
-  result = run(tmp_path / 'evidence', rlog=['retained/rlog'], max_carstate_messages=7, all_segments=True, process_boundary=boundary,
+  result = run(tmp_path / 'evidence', rlog=[retained], max_carstate_messages=7, all_segments=True, process_boundary=boundary,
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'completed_checks'
   assert result['profile'] == 'full_process_transition'
   assert result['transition']['process_boundary']['interface'] == 'process_replay'
+  assert len(result['runtime_source']['git_head']) == 40
+  assert result['input_sha256'] == {'retained/rlog': sha256(retained)}
 
 
 def test_missing_real_process_capability_is_explicitly_unsupported(tmp_path):
