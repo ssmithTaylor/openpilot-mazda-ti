@@ -18,6 +18,7 @@ import traceback
 import uuid
 
 from .provenance import ROOT, sha256, write_json
+from .ingest import WHITELISTED_SETTINGS
 
 
 class StartupUnsupported(RuntimeError):
@@ -188,7 +189,61 @@ def _diagnostic_timestamp_result(source_events, output_events):
   return result
 
 
-def actual_full_process(rlog, max_carstate_messages=100):
+def transition_stderr_diagnostics(stderr):
+  """Allow only the two declared fake-service health records for transition replay."""
+  if not stderr:
+    return []
+  try:
+    records = [json.loads(line) for line in stderr.splitlines()]
+  except json.JSONDecodeError:
+    return None
+  expected_events = {'controlsd.initialized', 'commIssue'}
+  expected_unavailable = {'liveDelay', 'testJoystick', 'frogpilotCarState', 'frogpilotPlan'}
+  if len(records) != 2 or {record.get('event') for record in records if isinstance(record, dict)} != expected_events:
+    return None
+  for record in records:
+    if (not isinstance(record, dict) or record.get('error') is not True or record.get('invalid') != [] or
+        record.get('not_freq_ok') != [] or set(record.get('not_alive', ())) != expected_unavailable):
+      return None
+  return records
+
+
+def inject_transition_harness(events, log):
+  """Add only missing controlsd input schemas with declared per-message identities."""
+  services = ('frogpilotCarState', 'frogpilotPlan', 'liveDelay')
+  car_states = [event for event in events if event.which() == 'carState']
+  generated = []
+  for index, car_state in enumerate(car_states):
+    status = 'valid'
+    # The retained cutout spans activation in 15, TI bypass/disengage in 16,
+    # and re-entry in 17. Exercise health failures after the final re-entry.
+    if index == 16_300:
+      status = 'missing'
+    elif index == 16_330:
+      status = 'stale'
+    elif index == 16_360:
+      status = 'invalid'
+    ti_active = not (9_966 <= index < 10_151)
+    for offset, service in enumerate(services, start=1):
+      if status == 'missing' and service == 'frogpilotCarState':
+        generated.append({'service': service, 'status': status, 'source_mono_time': None, 'frame': index})
+        continue
+      mono = int(car_state.logMonoTime) - offset
+      if status == 'stale' and service == 'frogpilotCarState':
+        mono -= 2_000_000_000
+      event = log.Event.new_message(logMonoTime=mono, valid=not (status == 'invalid' and service == 'frogpilotCarState'))
+      event.init(service)
+      if service == 'frogpilotCarState':
+        event.frogpilotCarState.tiActive = ti_active
+      events.append(event.as_reader())
+      generated.append({'service': service, 'status': status if service == 'frogpilotCarState' else 'valid',
+                        'source_mono_time': mono, 'frame': index})
+  events.sort(key=lambda event: int(event.logMonoTime))
+  return generated
+
+
+def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, observer=None, all_segments=False,
+                        transition_harness=False):
   """Cold-start real controlsd under process_replay and verify inactive output."""
   from cereal import custom, log
   # These module-level flags must be present on controlsd's first import. The
@@ -200,13 +255,29 @@ def actual_full_process(rlog, max_carstate_messages=100):
   rlogs = [Path(path) for path in (rlog if isinstance(rlog, (list, tuple)) else [rlog])]
   per_file = []
   events = []
+  recorded_settings = None
   for path in rlogs:
     file_events, parse_exception = _read_rlog_events(log, path.read_bytes())
+    initial = next((event for event in file_events if event.which() == 'initData'), None)
+    if initial is None:
+      raise StartupUnsupported(f'supplied rlog has no initData settings snapshot: {path.parent.name}')
+    values = {str(entry.key): bytes(entry.value) for entry in initial.initData.params.entries
+              if str(entry.key) in WHITELISTED_SETTINGS}
+    missing_settings = sorted(WHITELISTED_SETTINGS - set(values))
+    if missing_settings:
+      raise StartupUnsupported(f'supplied rlog lacks whitelisted settings: {missing_settings}')
+    if recorded_settings is None:
+      recorded_settings = values
+    elif values != recorded_settings:
+      raise StartupUnsupported(f'whitelisted settings changed between supplied segments: {path.parent.name}')
     events.extend(file_events)
     per_file.append({'label': f'{path.parent.name}/{path.name}', 'sha256': sha256(path), 'bytes': path.stat().st_size,
                      'complete_events': len(file_events), 'trailing_parse_exception': parse_exception})
   events.sort(key=lambda event: int(event.logMonoTime))
-  startup_events, _ = _read_rlog_events(log, rlogs[-1].read_bytes())
+  generated_harness = []
+  if transition_harness:
+    generated_harness = inject_transition_harness(events, log)
+  startup_events = events if all_segments else _read_rlog_events(log, rlogs[-1].read_bytes())[0]
   bounded, cutoff = _bounded_startup_events(startup_events, max_carstate_messages)
   # Later route segments do not repeat carParams. Carry the exact earlier event
   # into the isolated startup input rather than synthesizing one.
@@ -261,7 +332,11 @@ def actual_full_process(rlog, max_carstate_messages=100):
     toggles.startup_alert_top = str(toggles.startup_alert_top or '')
     toggles.startup_alert_bottom = str(toggles.startup_alert_bottom or '')
     params_memory.put('FrogPilotToggles', json.dumps(toggles.__dict__))
+    for key, value in recorded_settings.items():
+      params.put(key, value)
   cfg.config_callback = configure_isolated_startup
+  if transition_harness:
+    cfg.pubs = [*cfg.pubs, 'frogpilotCarState', 'frogpilotPlan', 'liveDelay']
   captured = {}
   original_run_step = ProcessContainer.run_step
   def diagnostic_run_step(container, *args, **kwargs):
@@ -291,10 +366,11 @@ def actual_full_process(rlog, max_carstate_messages=100):
   inactive = [cc for cc in car_controls if not cc.latActive and not cc.longActive and cc.actuators.steer == 0.0]
   if not car_controls or not controls_states:
     raise ValueError('controlsd produced no carControl or controlsState messages')
-  if len(inactive) != len(car_controls):
+  if require_inactive and len(inactive) != len(car_controls):
     raise ValueError(f'inactive startup produced {len(car_controls) - len(inactive)} active or steering-output carControl messages')
   child_error = captured.get('controlsd', {}).get('err', '').strip()
-  if child_error:
+  stderr_diagnostics = transition_stderr_diagnostics(child_error)
+  if child_error and (require_inactive or stderr_diagnostics is None):
     raise ValueError(f'controlsd wrote stderr: {child_error}')
 
   try:
@@ -303,20 +379,29 @@ def actual_full_process(rlog, max_carstate_messages=100):
     raise StartupUnsupported(f'runtime checkout Git identity unavailable: {error}') from error
 
   transform = _diagnostic_timestamp_result(bounded, outputs)
-  return {
+  result = {
     'process': 'controlsd', 'interface': 'selfdrive.test.process_replay.replay_process',
     'cold_start': 'passed', 'inactive': {'status': 'passed', 'frames': len(inactive)},
     'input': {'rlogs': per_file, 'events': len(bounded),
               'carState_events': max_carstate_messages, 'cutoff_mono_time': cutoff, 'carName': car_params.carName,
-              'startup_source': len(rlogs) - 1, 'fingerprint': car_params.carFingerprint,
+              'startup_source': 'all_supplied_segments' if all_segments else len(rlogs) - 1,
+              'selected_segments': [path.parent.name for path in rlogs],
+              'recorded_settings': {key: value.decode('utf-8') for key, value in sorted(recorded_settings.items())},
+              'generated_harness_inputs': generated_harness if transition_harness else [],
+              'fingerprint': car_params.carFingerprint,
               'fingerprint_mode': 'explicit process_replay fixture; no live fingerprinting',
               'frogpilot_car_params': 'isolated schema-default fixture; no safety process is started',
               'torque_interceptor_enabled': True},
     'outputs': dict(sorted(counts.items())),
     'no_vehicle_output': {'status': 'passed', 'forbidden_services': ['can', 'sendcan'], 'observed': forbidden},
-    'process_output': captured.get('controlsd', {}), 'timestamp_transform': transform,
+    'process_output': captured.get('controlsd', {}),
+    'process_output_classification': ('empty_stderr' if not child_error else 'expected_harness_exclusions'),
+    'transition_stderr_diagnostics': stderr_diagnostics, 'timestamp_transform': transform,
     'runtime_source': {'root': str(ROOT), 'git_head': git_head, 'identity': source_identity()},
   }
+  if observer is not None:
+    result['observed_transition'] = observer(events, outputs)
+  return result
 
 
 def source_identity():

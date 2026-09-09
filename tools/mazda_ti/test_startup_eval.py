@@ -1,5 +1,6 @@
 """Contract tests for the isolated Mazda process-startup evidence boundary."""
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -7,7 +8,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from .provenance import ROOT
-from .startup_eval import construct_controlsd_subscriptions, qualify_nested_timestamps, run
+from .startup_eval import construct_controlsd_subscriptions, qualify_nested_timestamps, run, transition_stderr_diagnostics
 
 
 def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform():
@@ -18,6 +19,17 @@ def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform
   assert result == {'status': 'qualified', 'outer_offset_ns': 50, 'records': 2}
   with pytest.raises(ValueError, match='nested'):
     qualify_nested_timestamps([{'id': 'a', 'outer_ns': 10, 'nested_ns': 100}], [{'id': 'a', 'outer_ns': 60, 'nested_ns': 101}])
+
+
+def test_transition_profile_accepts_only_the_declared_fake_service_harness_exclusions():
+  first = {'event': 'controlsd.initialized', 'error': True, 'invalid': [], 'not_freq_ok': [],
+           'not_alive': ['liveDelay', 'testJoystick', 'frogpilotCarState', 'frogpilotPlan']}
+  second = {**first, 'event': 'commIssue'}
+  payload = '\n'.join(json.dumps(row) for row in (first, second))
+  assert transition_stderr_diagnostics(payload) == [first, second]
+  extra = {**second, 'not_alive': [*second['not_alive'], 'unknownService']}
+  assert transition_stderr_diagnostics('\n'.join(json.dumps(row) for row in (first, extra))) is None
+  assert transition_stderr_diagnostics(payload + '\nnot-json') is None
 
 
 class FakeMessaging:

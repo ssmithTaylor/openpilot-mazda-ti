@@ -6,6 +6,11 @@
 process-replay startup profile, its generated diagnostic timestamp checks, and
 the narrower `carState` schema/subscriber check.
 
+[`TRANSITION_EVAL.md`](TRANSITION_EVAL.md) documents the complementary active,
+disengage/re-engage, TI bypass/re-entry, and unhealthy-message process evidence
+profile. It retains fixed availability limits when a recorded segment lacks a
+required transition.
+
 For one command that prepares a pinned historical or instrumented case, qualifies its baseline,
 evaluates a candidate, and writes a structured bundle plus readable report, see
 [EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
