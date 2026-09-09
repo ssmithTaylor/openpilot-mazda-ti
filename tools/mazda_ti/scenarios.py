@@ -8,6 +8,7 @@ motion, interceptor behavior, or an acceptable corner path.
 
 import argparse
 import ast
+from collections import deque
 import json
 from pathlib import Path
 import re
@@ -21,7 +22,7 @@ from .runtime import DT, TestInterface, bootstrap, controller_source, load_contr
 
 
 FORMAT_VERSION = 1
-SCENARIOS = {'known_570_defect', 'reference_transitions'}
+SCENARIOS = {'known_570_defect', 'reference_transitions', 'feedback_transitions', 'reference_release'}
 LIMITS = {
   'TI_STEER_MAX': 600.0,
   'TI_STEER_DRIVER_ALLOWANCE': 60.0,
@@ -111,7 +112,27 @@ def _controller(revision):
   return module.LatControlTorque(cp, TestInterface(), DT)
 
 
-def _run_controller(revision, limiter_revision, defect):
+def _feedback_frames():
+  """Smooth fixed observations expose the compensation band between clip events."""
+  frames = [('inactive', False, 0.0, 0.0)] * 30
+  for phase, start, end in [('tightening', (0.0, 0.0), (2.8, 2.4)),
+                            ('unwind', (2.8, 2.4), (0.5, 0.7)),
+                            ('reversal', (0.5, 0.7), (-2.8, -2.4))]:
+    for index in range(200):
+      ratio = index / 199
+      frames.append((phase, True, start[0] + ratio * (end[0] - start[0]), start[1] + ratio * (end[1] - start[1])))
+  frames.extend(row for row in _frames() if row[0] in ('clipping', 'recovery', 'carryover'))
+  return frames
+
+
+def _release_frames():
+  return [(phase, active, desired, measured) for phase, count, active, desired, measured in (
+    ('inactive', 30, False, 0.0, 0.0), ('tightening', 400, True, 1.8, 1.8),
+    ('unwind', 100, True, 0.0, 0.0), ('reversal', 400, True, -1.8, -1.8),
+    ('recovery', 100, True, 0.0, 0.0), ('carryover', 100, True, 0.0, 0.0)) for _ in range(count)]
+
+
+def _run_controller(revision, limiter_revision, defect, *, feedback=False, frames=None, reference_probe=False, commitment=True):
   """Use real controller output followed by the exact pinned limiter function."""
   bootstrap()
   from cereal import car, log
@@ -122,16 +143,27 @@ def _run_controller(revision, limiter_revision, defect):
   vm = SimpleNamespace(calc_curvature=lambda angle, speed, roll: -angle)
   toggles = SimpleNamespace(lat_commit_setpoint=True, lat_damping=True, lat_friction_comp=True,
                             lat_output_filter=False, lat_no_friction_relay=True, ti_steer_max=600.0)
+  if reference_probe:
+    toggles.lat_commit_setpoint = commitment
+    toggles.lat_damping = toggles.lat_friction_comp = False
   fp = SimpleNamespace(lkasBlocked=False, lkasEffective=0.0, tiActive=True, columnTorque=0.0)
   limited = 0
+  limiter_feedback = False
+  requests = deque([0.0] * 3, maxlen=3)
   rows = []
-  for index, (phase, active, desired, measured) in enumerate(_frames()):
+  for index, (phase, active, desired, measured) in enumerate(_frames() if frames is None else frames):
     cs = car.CarState.new_message(vEgo=20.0, steeringPressed=False, steeringAngleDeg=0.0, steeringRateDeg=0.0)
     vm.calc_curvature = lambda angle, speed, roll, value=measured: -value / (speed * speed)
     if not active:
       controller.reset()
-    steer, _, diagnostic = controller.update(active, cs, vm, params, False, desired / (cs.vEgo * cs.vEgo), False,
+    consumed_feedback = -limited / LIMITS['TI_STEER_MAX']
+    input_limited = True if reference_probe else limiter_feedback if feedback else False
+    steer, _, diagnostic = controller.update(active, cs, vm, params, input_limited, desired / (cs.vEgo * cs.vEgo), False,
                                               0.49, None, None, toggles, fp)
+    # Declared synchronous fixture: consume the previous apply; compute next-cycle eligibility
+    # before appending this request, matching controlsd's three-request history update order.
+    limiter_feedback = all(abs(request - consumed_feedback) > 1e-2 for request in requests)
+    requests.append(steer)
     raw = int(round(-steer * LIMITS['TI_STEER_MAX']))
     # This is the fixed, historical defective compensation fixture, not production policy.  The
     # independent responsiveness invariant below is deliberately expressed only in raw/final wire
@@ -145,10 +177,20 @@ def _run_controller(revision, limiter_revision, defect):
       'desired_lateral_accel': desired,
       'measured_lateral_accel': measured,
       'raw_controller_counts': raw,
+      'returned_steer': steer,
       'mapped_counts': mapped,
       'limited_counts': limited,
       'integral': float(diagnostic.i),
       'command': float(diagnostic.mazdaDiagnostics.command),
+      'consumed_feedback_steer': consumed_feedback,
+      'limiter_feedback_limited': input_limited,
+      'inverse_command_counts': float(diagnostic.mazdaDiagnostics.inverseCommand) if active else None,
+      'compensation_counts': float(diagnostic.mazdaDiagnostics.frictionCompensation) if active else None,
+      'integral_before_mps2': float(diagnostic.mazdaDiagnostics.integralBefore) if active else None,
+      'integral_after_mps2': float(diagnostic.mazdaDiagnostics.integralAfter) if active else None,
+      'filtered_request_mps2': float(diagnostic.mazdaDiagnostics.filteredRequest),
+      'effective_feedforward_mps2': float(diagnostic.mazdaDiagnostics.effectiveFeedforward) if active else None,
+      'effective_setpoint_mps2': float(diagnostic.mazdaDiagnostics.effectiveSetpoint) if active else None,
     })
   return rows, limiter_hash
 
@@ -200,6 +242,25 @@ def _comparison(reference, candidate, failures):
   }
 
 
+def _release_metrics(rows):
+  result = {}
+  for phase, old_sign in [('unwind', 1), ('recovery', -1)]:
+    selected = [row for row in rows if row['phase'] == phase]
+    values = [old_sign * row['inverse_command_counts'] for row in selected]
+    metrics = {'frames': len(selected), 'duration_seconds': len(selected) * DT,
+               'peak_old_sign_inverse_counts': max(0.0, max(values)),
+               'integrated_old_sign_inverse_count_seconds': sum(max(0.0, value) * DT for value in values)}
+    for field, threshold in [('effective_feedforward_mps2', .01), ('inverse_command_counts', 1.0)]:
+      signed = [old_sign * row[field] for row in selected]
+      metrics[field] = {
+        'threshold': threshold,
+        'first_at_or_below_threshold_seconds': next((index * DT for index, value in enumerate(signed) if value <= threshold), None),
+        'first_zero_crossing_seconds': next((index * DT for index, value in enumerate(signed) if value <= 0.0), None),
+      }
+    result[phase] = metrics
+  return result
+
+
 def _report(result):
   report = (f"# Synthetic controller scenario: {result['case_id']}\n\n"
             f"Status: **{result['status']}**.\n\n{result['scope']}\n")
@@ -208,6 +269,13 @@ def _report(result):
              'These differences are not invariant failures.\n')
   report += ('\nSynthetic scenarios exercise software command behavior only; they do not establish vehicle handling '
              'or a corner path.\n')
+  if 'reference_probe' in result:
+    report += '\n## Reference persistence\n\nArm | Phase | Old-sign inverse count-seconds | First at/below 1 count (s)\n--- | --- | ---: | ---:\n'
+    for arm, phases in result['reference_probe']['metrics'].items():
+      for phase, metrics in phases.items():
+        report += (f"{arm} | {phase} | {metrics['integrated_old_sign_inverse_count_seconds']:.6f} | "
+                   f"{metrics['inverse_command_counts']['first_at_or_below_threshold_seconds']}\n")
+    report += '\nTimes start at each prescribed zero-request step. Null means not reached in that phase. This is not a physical error score.\n'
   return report
 
 
@@ -225,9 +293,14 @@ def run(request_path, output):
     result['case_id'] = case['id']
     write_json(output / 'request.json', request)
     before, runtime = source_snapshot(), environment()
-    reference, baseline_limiter_hash = _run_controller(case['baseline_controller'], case['limiter'], False)
+    feedback = case['scenario'] == 'feedback_transitions'
+    reference_probe = case['scenario'] == 'reference_release'
+    frames = _release_frames() if reference_probe else _feedback_frames() if feedback else _frames()
+    reference, baseline_limiter_hash = _run_controller(case['baseline_controller'], case['limiter'], False,
+                                                       feedback=feedback, frames=frames, reference_probe=reference_probe)
     defect = case['scenario'] == 'known_570_defect'
-    candidate, candidate_limiter_hash = _run_controller(request['candidate_revision'], case['limiter'], defect)
+    candidate, candidate_limiter_hash = _run_controller(request['candidate_revision'], case['limiter'], defect,
+                                                        feedback=feedback, frames=frames, reference_probe=reference_probe)
     if candidate_limiter_hash != baseline_limiter_hash:
       raise RuntimeError('Pinned limiter source changed while the scenario was running')
     failures = _invariants(candidate, defect)
@@ -246,9 +319,25 @@ def run(request_path, output):
       {'synthetic_request': sha256(request_path)}, runtime, [
         'Fixed synthetic inputs are not recorded vehicle motion or interceptor feedback.',
         'A command result does not establish an acceptable corner path or handling outcome.',
-        'The 570-count fixture represents a known defective mapping; it does not infer a watchdog timer or bypass '
-        'behavior.',
+        'The known_570_defect negative control injects a post-controller clip; it does not inspect production compensation.',
+        'Only feedback_transitions couples prior software applies to three-request limiter eligibility; its synchronous '
+        'schedule is declared, not inferred from a drive. Reference_release freezes integration; other scenarios force eligibility false.',
+        'Reference_release disables compensation/damping and freezes integration at zero to isolate reference persistence. '
+        'Measured acceleration is prescribed; an old-sign command is not by itself a physical tracking error.',
       ])
+    result['feedback_schedule'] = 'forced_integral_freeze' if reference_probe else (
+      'previous_apply_three_request_history' if feedback else 'forced_unlimited')
+    result['scope'] = ('Synthetic fixed-input controller/limiter fixture with ' + result['feedback_schedule'] +
+                       '; prescribed observations do not evolve with commands. No vehicle path or handling prediction.')
+    if reference_probe:
+      without_commitment, _ = _run_controller(request['candidate_revision'], case['limiter'], False,
+                                              frames=frames, reference_probe=True, commitment=False)
+      write_json(output / 'commitment-disabled-trace.json', without_commitment)
+      result['reference_probe'] = {'compensation': False, 'damping': False, 'integral_frozen_at_mps2': 0.0,
+                                   'additional_arm': 'same candidate with commitment toggle disabled',
+                                   'metrics': {'baseline': _release_metrics(reference), 'candidate': _release_metrics(candidate),
+                                               'candidate_commitment_disabled': _release_metrics(without_commitment)}}
+    write_json(output / 'reference-trace.json', reference)
     write_json(output / 'trace.json', candidate)
   except Unsupported as error:
     result['status'] = 'unsupported'

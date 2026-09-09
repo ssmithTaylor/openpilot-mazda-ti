@@ -3,8 +3,10 @@
 import subprocess
 import sys
 
+import pytest
+
 from .provenance import read_json, write_json
-from .scenarios import run
+from .scenarios import _feedback_frames, _run_controller, run
 
 
 def revision():
@@ -104,3 +106,84 @@ def test_cli_returns_failure_for_known_defect_after_writing_recovery_evidence(tm
   assert completed.returncode == 1
   assert completed.stdout.startswith('failed_check:')
   assert any(row['phase'] == 'carryover' for row in read_json(output / 'trace.json'))
+
+
+def test_feedback_scenario_uses_previous_apply_and_changes_integral_history(tmp_path):
+  request_path = tmp_path / 'feedback.json'
+  value = request('feedback-controller-transitions', 'feedback_transitions')
+  write_json(request_path, value)
+  result = run(request_path, tmp_path / 'feedback')
+  assert result['status'] == 'completed_checks', result['findings']
+  assert result['feedback_schedule'] == 'previous_apply_three_request_history'
+  rows = read_json(tmp_path / 'feedback/trace.json')
+  assert rows == read_json(tmp_path / 'feedback/reference-trace.json')
+  requests, eligibility, previous_apply = [0.0] * 3, False, 0
+  for row in rows:
+    assert row['consumed_feedback_steer'] == -previous_apply / 600.0
+    assert row['limiter_feedback_limited'] == eligibility
+    eligibility = all(abs(request - row['consumed_feedback_steer']) > 1e-2 for request in requests)
+    requests = (requests + [row['returned_steer']])[-3:]
+    previous_apply = row['limited_counts']
+    if row['active'] and row['limiter_feedback_limited']:
+      assert row['integral_before_mps2'] == row['integral_after_mps2']
+  assert any(row['active'] and row['limiter_feedback_limited'] for row in rows)
+  assert any(row['active'] and not row['limiter_feedback_limited'] for row in rows)
+  assert any(row['active'] and 485 < abs(row['inverse_command_counts']) < 570 for row in rows)
+  uncoupled, _ = _run_controller(value['candidate_revision'], value['case']['limiter'], False, frames=_feedback_frames())
+  assert any(a['integral_after_mps2'] != b['integral_after_mps2'] for a, b in zip(rows, uncoupled, strict=True))
+
+
+@pytest.mark.parametrize('matched_request,expected_limited', [(0.1, False), (0.2, False), (0.3, False), (0.9, True)])
+def test_prior_three_requests_control_next_cycle_eligibility(monkeypatch, matched_request, expected_limited):
+  from . import scenarios
+
+  factory = scenarios._controller
+
+  def controller_factory(revision):
+    controller = factory(revision)
+    update = controller.update
+    returned = iter([0.1, 0.2, 0.3, 0.4, 0.5])
+
+    def scripted_update(*args):
+      _, angle, diagnostic = update(*args)
+      return next(returned), angle, diagnostic
+
+    controller.update = scripted_update
+    return controller
+
+  applies = iter([0, 0, -600 * matched_request, 0, 0])
+  monkeypatch.setattr(scenarios, '_controller', controller_factory)
+  monkeypatch.setattr(scenarios, '_limiter', lambda revision: (lambda *args: next(applies), 'scripted-unit-fixture'))
+  source = revision()
+  rows, _ = scenarios._run_controller(source, source, False, feedback=True, frames=[('unit', True, 0.0, 0.0)] * 5)
+  assert rows[3]['consumed_feedback_steer'] == matched_request
+  assert rows[4]['limiter_feedback_limited'] == expected_limited
+
+
+def test_reference_release_isolates_commitment_from_friction_and_integral(tmp_path):
+  request_path = tmp_path / 'reference-release.json'
+  write_json(request_path, request('reference-release', 'reference_release'))
+  result = run(request_path, tmp_path / 'reference-release')
+  assert result['status'] == 'completed_checks', result['findings']
+  assert result['feedback_schedule'] == 'forced_integral_freeze'
+  assert 'forced_integral_freeze' in result['scope']
+  rows = read_json(tmp_path / 'reference-release/trace.json')
+  disabled = read_json(tmp_path / 'reference-release/commitment-disabled-trace.json')
+  assert all(row['integral_after_mps2'] == 0 and row['compensation_counts'] == 0 for row in rows + disabled if row['active'])
+  assert all(row['active'] == other['active'] and row['desired_lateral_accel'] == other['desired_lateral_accel']
+             and row['measured_lateral_accel'] == other['measured_lateral_accel'] for row, other in zip(rows, disabled, strict=True))
+  assert all(row['filtered_request_mps2'] == other['filtered_request_mps2'] for row, other in zip(rows, disabled, strict=True))
+  assert any(row['effective_feedforward_mps2'] > other['effective_feedforward_mps2'] + .01
+             for row, other in zip(rows, disabled, strict=True) if row['phase'] == 'unwind')
+  settled = [(row, other) for row, other in zip(rows, disabled, strict=True) if row['phase'] == 'tightening'][-30:]
+  assert all(abs(row['effective_feedforward_mps2'] - other['effective_feedforward_mps2']) < .001 for row, other in settled)
+  metrics = result['reference_probe']['metrics']
+  for phase in ('unwind', 'recovery'):
+    committed, off = metrics['candidate'][phase], metrics['candidate_commitment_disabled'][phase]
+    assert committed['integrated_old_sign_inverse_count_seconds'] > off['integrated_old_sign_inverse_count_seconds']
+    assert committed['peak_old_sign_inverse_counts'] >= off['peak_old_sign_inverse_counts']
+    assert off['effective_feedforward_mps2']['first_at_or_below_threshold_seconds'] <= committed['effective_feedforward_mps2']['first_at_or_below_threshold_seconds']
+    for key in ('effective_feedforward_mps2', 'inverse_command_counts'):
+      zero_cross = committed[key]['first_zero_crossing_seconds']
+      if zero_cross is not None:
+        assert off[key]['first_zero_crossing_seconds'] is not None and off[key]['first_zero_crossing_seconds'] <= zero_cross
