@@ -35,6 +35,10 @@ profiles, see [CORPUS.md](CORPUS.md).
 [TRACE_COMPARISON.md](TRACE_COMPARISON.md) documents the optional, versioned portable
 trace comparison report and its equivalent current-control arm.
 
+[SAMPLING_SENSITIVITY.md](SAMPLING_SENSITIVITY.md) compares a policy's incremental
+effects under both compatible historical request timings, with four verified bundles.
+Use it before attributing a plateau-related feedback or integral change to the policy.
+
 ## Raw-evidence ingestion
 
 [`INGESTION.md`](INGESTION.md) defines the separate versioned inventory and explicit bounded collection command for raw drive evidence. It is offline-testable and does not evaluate a candidate, contact a device, or expose unrestricted Params.
