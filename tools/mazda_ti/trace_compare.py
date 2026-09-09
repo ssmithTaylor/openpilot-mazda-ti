@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 import re
 
@@ -18,12 +19,15 @@ def _bundle(path, evidence_root, data_root):
   full_root = path.parent if (path.parent / 'resolved-request.json').is_file() else None
   if (path / 'resolved-request.json').is_file():
     raise ValueError('Full evaluation bundles require an explicit retained arm directory')
+  if full_root is not None and path.name not in ('baseline', 'candidate'):
+    raise ValueError('Verified evaluation bundles require baseline or candidate retained arms')
   result_path = (full_root or path) / 'result.json'
   result, metadata = read_json(result_path), read_json(path / 'trace.json')
   if result.get('format_version') != 1 or (full_root is None and metadata.get('format_version') != FORMAT_VERSION):
     raise ValueError('Unsupported retained trace bundle version')
   rows = [json.loads(line) for line in (path / 'trace.jsonl').read_text(encoding='utf-8').splitlines() if line]
-  if not rows or any(type(row.get('mono')) not in (int, float) for row in rows):
+  if (not rows or any(type(row.get('mono')) not in (int, float) or not math.isfinite(row['mono']) for row in rows) or
+      any(type(value) is float and not math.isfinite(value) for row in rows for value in row.values())):
     raise ValueError('Trace requires finite monotonic rows')
   if any(later['mono'] <= earlier['mono'] for earlier, later in zip(rows, rows[1:], strict=False)):
     raise ValueError('Trace timestamps must increase')
@@ -39,6 +43,9 @@ def _bundle(path, evidence_root, data_root):
   if data_root is not None and full_root is not None:
     from .evaluate import verify_bundle
     verify_bundle(full_root, data_root)
+    provenance = {'source_identities': result.get('source_identities'), 'input_sha256': result.get('input_sha256')}
+    if not isinstance(provenance['source_identities'], dict) or not isinstance(provenance['input_sha256'], dict):
+      raise ValueError('Verified bundle lacks source or input identities')
     level = 'verified_full_bundle'
   return {'path': reference, 'result': result, 'metadata': metadata, 'rows': rows,
           'provenance': provenance if valid_provenance else None, 'artifacts': artifacts, 'identity_validation': level}
@@ -123,10 +130,10 @@ def compare_trace_bundles(reference_path, candidate_path, current_control_path, 
                 if bundle['result'].get('status') != 'completed_checks']
   arms = {'reference': reference, 'candidate': candidate, 'current_control': control}
   for name, bundle in arms.items():
-    if bundle['provenance'] is None:
+    if bundle['provenance'] is None and bundle['identity_validation'] != 'verified_full_bundle':
       invariants.append({'arm': name, 'finding': 'Retained arm lacks valid source/input provenance'})
   if all(bundle['provenance'] is not None for bundle in arms.values()):
-    input_hashes = {bundle['provenance']['input_sha256'] for bundle in arms.values()}
+    input_hashes = {json.dumps(bundle['provenance']['input_sha256'], sort_keys=True) for bundle in arms.values()}
     if len(input_hashes) != 1:
       invariants.append({'arm': 'current_control', 'finding': 'Retained arms have mismatched input provenance'})
   status = 'failed_check' if invariants else 'completed_checks'

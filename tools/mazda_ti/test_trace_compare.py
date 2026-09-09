@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from .provenance import read_json, write_json
 from .trace_compare import compare_trace_bundles
 from .example_fixture import create_example
@@ -112,3 +114,22 @@ def test_verified_full_bundle_requires_an_explicit_retained_arm(tmp_path):
   result = compare_trace_bundles(full / 'candidate', full / 'candidate', full / 'candidate', tmp_path / 'report',
                                  data_root=request.parent, evidence_root=tmp_path)
   assert result['identity_validation'] == 'verified_full_bundle'
+  assert result['status'] == 'completed_checks'
+  forged = full / 'forged'
+  forged.mkdir()
+  (forged / 'trace.json').write_bytes((full / 'candidate/trace.json').read_bytes())
+  (forged / 'trace.jsonl').write_bytes((full / 'candidate/trace.jsonl').read_bytes())
+  with pytest.raises(ValueError, match='baseline or candidate'):
+    compare_trace_bundles(forged, full / 'candidate', full / 'candidate', tmp_path / 'forged-report',
+                          data_root=request.parent, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+def test_nonfinite_trace_values_are_rejected(tmp_path, value):
+  reference = bundle(tmp_path, 'reference', rows(10, 1, 2, 20))
+  candidate_rows = rows(10, 1, 2, 20)
+  candidate_rows[0]['integral_counts'] = value
+  candidate = bundle(tmp_path, 'candidate', candidate_rows)
+  control = bundle(tmp_path, 'control', rows(10, 1, 2, 20))
+  with pytest.raises(ValueError, match='finite'):
+    compare_trace_bundles(reference, candidate, control, tmp_path / 'report')
