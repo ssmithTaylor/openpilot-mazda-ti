@@ -3,6 +3,8 @@
 import argparse
 import copy
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
+import re
 import shutil
 import subprocess
 import time
@@ -205,11 +207,31 @@ def _incomplete_profile(output, second, candidate):
   }
 
 
-def _portable(paths, forbidden):
-  lowered = [str(path.resolve()).lower() for path in forbidden]
+WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+)")
+POSIX_PATH = re.compile(r"(?<![A-Za-z0-9_+:/])/(?!/)(?:[^/\s]+/)*[^/\s]+")
+
+
+def _absolute_path(value):
+  return isinstance(value, str) and (
+    PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
+    or WINDOWS_PATH.search(value) is not None or POSIX_PATH.search(value) is not None
+  )
+
+
+def _json_has_absolute_path(value):
+  if isinstance(value, dict):
+    return any(_json_has_absolute_path(key) or _json_has_absolute_path(item) for key, item in value.items())
+  if isinstance(value, list):
+    return any(_json_has_absolute_path(item) for item in value)
+  return _absolute_path(value)
+
+
+def _portable(paths):
   for path in paths:
-    text = path.read_text(encoding="utf-8").lower()
-    if any(value in text for value in lowered):
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".json" and _json_has_absolute_path(read_json(path)):
+      return False
+    if path.suffix != ".json" and (WINDOWS_PATH.search(text) or POSIX_PATH.search(text)):
       return False
   return True
 
@@ -230,7 +252,7 @@ def run(output, candidate="HEAD"):
   invalidation = _invalidation_checks(output, output / "run-b", candidate)
   incomplete = _incomplete_profile(output, output / "run-b", candidate)
   canonical_paths = [output / run / name for run in ("run-a", "run-b") for name in COMPONENT_PATHS]
-  portable = _portable(canonical_paths, (output, fixture_a, fixture_b))
+  portable = _portable(canonical_paths)
   first_reused = [row["reused"] for row in first["execution"]["batch"]["cases"]]
   second_reused = [row["reused"] for row in second["execution"]["batch"]["cases"]]
   checks = {
@@ -239,8 +261,9 @@ def run(output, candidate="HEAD"):
     "canonical_outputs_portable": portable,
     "cold_run_executed_all_cases": first["execution"]["batch"]["timing_kind"] == "cold" and not any(first_reused),
     "repeated_run_reused_all_cases": second["execution"]["batch"]["timing_kind"] == "repeated" and all(second_reused),
-    "complete_release_reproduced": first["statuses"]["release_decision"] == second["statuses"]["release_decision"]
-                                      == "qualified_for_separate_authorization",
+    "release_decision_reproduced": first["statuses"]["release_decision"] == second["statuses"]["release_decision"],
+    "fixture_process_cannot_qualify_release": first["statuses"]["release_decision"] == "unqualified"
+                                               and second["statuses"]["release_decision"] == "unqualified",
     "incomplete_runtime_unqualified": incomplete["process_status"] == "unsupported"
                                       and incomplete["release_decision"] == "unqualified",
     "all_invalidation_dimensions_rejected": all(invalidation.values()),
@@ -250,7 +273,7 @@ def run(output, candidate="HEAD"):
     "candidate_revision": candidate, "checks": checks, "canonical_components": first["components"],
     "component_statuses": first["statuses"], "invalidation": invalidation, "incomplete_environment": incomplete,
     "retained_exclusions": ["retained-unavailable-corner", "recorded physical outcomes", "matched physical conditions"],
-    "evidence_limits": [SCOPE, "The supported process record is a deterministic producer-contract fixture; host process support is reported separately."],
+    "evidence_limits": [SCOPE, "The process record is a deterministic contract fixture and cannot qualify a release; host process support is reported separately."],
     "scope": SCOPE,
   }
   execution = {
@@ -281,7 +304,7 @@ def run(output, candidate="HEAD"):
     "- Recorded physical outcomes and matched physical conditions remain unavailable and visible.",
     "- A missing full-process runtime produces unsupported process evidence and an unqualified release.",
     "- Infrastructure completion leaves physical handling and predictive simulation unresolved.", "",
-    "The qualified fixture release remains pending separate authorization; no deployment prerequisite was performed.", "",
+    "Release qualification remains unqualified until actual declared-runtime process evidence is supplied; no deployment prerequisite was performed.", "",
   ]
   (output / "report.md").write_text("\n".join(report), encoding="utf-8", newline="\n")
   return result

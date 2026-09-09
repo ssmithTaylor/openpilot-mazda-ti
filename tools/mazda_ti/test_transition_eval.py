@@ -210,7 +210,7 @@ def test_cli_rejects_schema_harness_without_adjacent_segment_mode(tmp_path, caps
   assert '--schema-input-harness requires --rlog and --all-segments' in capsys.readouterr().err
 
 
-def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_path):
+def test_injected_process_boundary_cannot_claim_the_full_process_profile(tmp_path):
   retained = tmp_path / 'retained/rlog'
   retained.parent.mkdir()
   retained.write_bytes(b'retained transition input')
@@ -226,15 +226,19 @@ def test_full_process_profile_only_uses_the_actual_boundary_observations(tmp_pat
       'runtime_source': {'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                          'identity': {'tools/mazda_ti/transition_eval.py': sha256(Path(__file__).with_name('transition_eval.py'))}},
       'input': {'rlogs': [{'label': 'retained/rlog', 'sha256': sha256(retained)}]},
+      'process_output': {'out': r'C:\unrelated\checkout\process.log'},
     }, **transition}
 
   result = run(tmp_path / 'evidence', rlog=[retained], max_carstate_messages=7, all_segments=True, process_boundary=boundary,
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'completed_checks'
-  assert result['profile'] == 'full_process_transition'
+  assert result['profile'] == 'process_transition_fixture'
   assert result['transition']['process_boundary']['interface'] == 'selfdrive.test.process_replay.replay_process'
   assert len(result['runtime_source']['git_head']) == 40
   assert result['input_sha256'] == {'retained/rlog': sha256(retained)}
+  assert 'process_output' not in result['transition']['process_boundary']
+  assert 'unrelated' not in str(result)
+  assert 'unrelated' in read_json(tmp_path / 'evidence/execution.json')['process_output']['out']
 
 
 def test_missing_real_process_capability_is_explicitly_unsupported(tmp_path):
@@ -245,7 +249,8 @@ def test_missing_real_process_capability_is_explicitly_unsupported(tmp_path):
                capability=lambda: {'full_process_supported': True, 'missing': []})
   assert result['status'] == 'unsupported'
   assert result['transition'] is None
-  assert 'msgq.ipc_pyx unavailable' in result['exception']
+  assert result['exception'] == 'StartupUnsupported'
+  assert 'msgq.ipc_pyx unavailable' in read_json(tmp_path / 'evidence/execution.json')['exception_detail']
 
 
 def test_declared_runtime_capability_prevents_a_full_profile_claim(tmp_path):

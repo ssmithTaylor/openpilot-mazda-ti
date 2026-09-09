@@ -183,9 +183,11 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
   output.mkdir(parents=True, exist_ok=False)
   started = time.perf_counter()
   with isolated_environment() as owned:
-    profile = 'full_process_transition' if rlog is not None else 'serialized_transition_fixture'
+    profile = ('full_process_transition' if rlog is not None and process_boundary is actual_process_transition else
+               'process_transition_fixture' if rlog is not None else 'serialized_transition_fixture')
     capabilities = {'full_process_supported': None, 'missing': []}
     runtime_source, input_sha256 = None, {}
+    exception_detail, process_output = None, None
     try:
       if transition_harness and (rlog is None or not all_segments):
         raise ValueError('--schema-input-harness requires --rlog and --all-segments')
@@ -194,6 +196,7 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
         if not capabilities['full_process_supported']:
           raise StartupUnsupported(', '.join(capabilities['missing']))
         process = process_boundary(rlog, max_carstate_messages, all_segments, transition_harness)
+        process_output = process['startup_boundary'].pop('process_output', None)
         transition = {name: process[name] for name in ('status', 'findings', 'availability', 'state_retention', 'observations')}
         transition['process_boundary'] = process['startup_boundary']
         runtime_source = process['startup_boundary']['runtime_source']
@@ -206,10 +209,12 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
         transition = assess(observations, normalization_findings)
       exception = None
     except StartupUnsupported as error:
-      transition, exception = None, f'{type(error).__name__}: {error}'
+      transition, exception = None, type(error).__name__
+      exception_detail = f'{type(error).__name__}: {error}'
       status = 'unsupported'
     except Exception as error:
-      transition, exception = None, f'{type(error).__name__}: {error}'
+      transition, exception = None, type(error).__name__
+      exception_detail = f'{type(error).__name__}: {error}'
       status = 'failed_execution'
     else:
       status = transition['status']
@@ -224,7 +229,8 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
                     'can_publisher': 'not constructed', 'owned_params_root_removed_after_run': True},
       'timing_scope': 'transition result excludes elapsed workload timing; device timing requires a separate device profile',
       'scope': ('Actual isolated controlsd process replay is required for this profile; its retained outputs qualify declared software transitions only.'
-                if rlog is not None else 'Serialized process observations qualify declared software transitions only; no vehicle, CAN sender, or device timing is exercised.'),
+                if profile == 'full_process_transition' else
+                'Injected or serialized process observations qualify a fixture contract only; they cannot satisfy release process evidence.'),
       'exception': exception,
     }
   write_json(output / 'result.json', result)
@@ -232,6 +238,8 @@ def run(output, observations=None, events=None, rlog=None, max_carstate_messages
     'elapsed_seconds': time.perf_counter() - started,
     'output_destination': str(output.resolve()),
     'owned_messaging_prefix': owned['messaging_prefix'],
+    'exception_detail': exception_detail,
+    'process_output': process_output,
   })
   return result
 

@@ -525,7 +525,7 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     'process_output': captured.get('controlsd', {}),
     'process_output_classification': ('empty_stderr' if not child_error else 'expected_harness_exclusions_and_exercised_faults'),
     'transition_stderr_diagnostics': stderr_diagnostics, 'timestamp_transform': transform,
-    'runtime_source': {'root': str(ROOT), 'git_head': git_head, 'identity': source_identity()},
+    'runtime_source': {'git_head': git_head, 'identity': source_identity()},
   }
   if observer is not None:
     # Diagnose against the exact retimed input stream that crossed the process
@@ -547,6 +547,7 @@ def run(output, profile='full_process', rlog=None, max_carstate_messages=100, ca
   if profile not in ('full_process', 'schema_boundary'):
     raise ValueError('Unsupported startup evaluation profile')
   started = time.perf_counter()
+  diagnostics = {}
   with isolated_environment() as owned_isolation:
     capabilities = capability()
     result = {
@@ -568,20 +569,25 @@ def run(output, profile='full_process', rlog=None, max_carstate_messages=100, ca
     else:
       try:
         checked = boundary() if boundary is not None else (actual_full_process(rlog, max_carstate_messages) if profile == 'full_process' else actual_boundary())
+        process_output = checked.pop('process_output', None)
+        if process_output:
+          diagnostics['process_output'] = process_output
         result.update(status='completed_checks', missing_capabilities=[], boundary=checked,
                     timestamp_transform=checked.get('timestamp_transform', {'status': 'not_applicable', 'reason': 'schema-only boundary has no generated diagnostics'}),
                     scope=('Actual isolated controlsd process replay with inactive Mazda inputs; command objects are observed, but no CAN publisher, vehicle connection, or physical behavior is exercised.'
                            if profile == 'full_process' else 'Actual isolated carState schema subscriber boundary only; no full process or scheduling claim.'))
       except Exception as error:
         result.update(status='failed_execution', missing_capabilities=[], boundary=None, timestamp_transform=None,
-                    exception=f'{type(error).__name__}: {error}', traceback=traceback.format_exc(),
+                    exception=type(error).__name__,
                     scope='Isolated process-boundary attempt failed; full-process integration is not satisfied.')
+        diagnostics.update(exception_detail=f'{type(error).__name__}: {error}', traceback=traceback.format_exc())
     result['isolation']['owned_params_root_removed_after_run'] = True
   execution = {
     'elapsed_seconds': time.perf_counter() - started,
     'output_destination': str(output.resolve()),
     'owned_messaging_prefix': owned_isolation['messaging_prefix'],
     'python_executable': sys.executable,
+    'diagnostics': diagnostics,
   }
   result['runtime'].pop('executable')
   write_json(output / 'result.json', result)

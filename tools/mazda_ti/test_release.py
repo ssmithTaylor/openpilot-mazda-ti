@@ -267,7 +267,7 @@ def test_physical_evaluation_requires_a_concrete_structured_question():
     canonical_request(request)
 
 
-def test_actual_producer_results_satisfy_the_release_contract(tmp_path):
+def test_actual_nonprocess_producers_and_injected_process_fixture_cannot_qualify_release(tmp_path):
   candidate = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
   root = tmp_path / "evidence"
   root.mkdir()
@@ -329,6 +329,7 @@ def test_actual_producer_results_satisfy_the_release_contract(tmp_path):
   process = run_transition(process_dir, rlog=[retained], all_segments=True, process_boundary=process_boundary,
                            capability=lambda: {"full_process_supported": True, "missing": []})
   assert process["status"] == "completed_checks", process
+  assert process["profile"] == "process_transition_fixture"
 
   arm = corpus_dir / "cases/release-corpus-case/candidate"
   comparison_dir = root / "comparison"
@@ -342,8 +343,9 @@ def test_actual_producer_results_satisfy_the_release_contract(tmp_path):
 
   result = qualify(release_request, root, tmp_path / "release")
 
-  assert result["status"] == "completed_checks", result["findings"]
-  assert result["qualification"] == "qualified_for_separate_authorization"
+  assert result["status"] == "failed_check"
+  assert result["qualification"] == "unqualified"
+  assert any("process evidence schema" in finding for finding in result["findings"])
 
   content_bound_dir = root / "content-bound-comparison"
   content_bound = compare_trace_bundles(arm, arm, arm, content_bound_dir, evidence_root=root)

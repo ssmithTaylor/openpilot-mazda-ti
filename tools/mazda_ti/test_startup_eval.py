@@ -141,6 +141,23 @@ def test_required_full_process_profile_is_explicitly_unsupported_when_runtime_is
   assert 'full-process integration is not satisfied' in result['scope']
 
 
+def test_failure_paths_and_traceback_are_execution_diagnostics_only(tmp_path):
+  capability = lambda: {'full_process_supported': True, 'schema_boundary_supported': True, 'missing': []}
+
+  def boundary():
+    raise RuntimeError(r'C:\unrelated\checkout\failed.py')
+
+  result = run(tmp_path / 'evidence', profile='schema_boundary', capability=capability, boundary=boundary)
+  execution = read_json(tmp_path / 'evidence/execution.json')
+
+  assert result['status'] == 'failed_execution'
+  assert result['exception'] == 'RuntimeError'
+  assert 'traceback' not in result
+  assert 'unrelated' not in json.dumps(result)
+  assert r'C:\unrelated\checkout\failed.py' in execution['diagnostics']['exception_detail']
+  assert execution['diagnostics']['traceback']
+
+
 def test_supported_boundary_records_isolation_schema_source_timing_and_cold_inactive_checks(tmp_path):
   result = run(
     tmp_path / 'evidence', profile='schema_boundary',

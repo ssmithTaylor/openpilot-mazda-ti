@@ -25,7 +25,8 @@ The runner performs this local chain twice:
    mixed corpus with its retained excluded case.
 4. Run the controller scenario producer and the deterministic process-contract
    producer, compare the verified instrumented trace arms, and bind the four
-   producer results through release qualification.
+   producer results through release qualification. The fixture process profile
+   is intentionally rejected by that release boundary.
 5. Repeat from the relocated fixture and raw roots with new evidence outputs
    and the shared validated case cache.
 6. Reject changed source, raw, manifest, runtime, and evidence identities, then
@@ -40,24 +41,30 @@ partial hit is `mixed`.
 
 ## Read the result
 
-A `completed_checks` acceptance requires identical fixture bytes, canonical
+A `completed_checks` infrastructure acceptance requires identical fixture bytes, canonical
 artifact hashes, and qualification decisions across both locations. Both replay
 adapters must reproduce their baselines, the second batch must reuse every
 valid cached case, all five invalidation probes must reject changed evidence,
-and the intentionally unsupported process result must keep its release
-unqualified.
+and both the process fixture and intentionally unsupported process result must
+keep their releases unqualified.
 
-The completed fixture release demonstrates that the real producer schemas bind
-together. Its process evidence is explicitly a deterministic contract fixture;
-it is not evidence that `controlsd` ran on the host. `execution.json` reports the
-host's actual process capability. Full process-transition evidence still
-requires the declared Linux openpilot runtime and suitable Mazda rlogs.
+The completed process fixture demonstrates the transition producer contract,
+but it carries `process_transition_fixture`, which the release qualifier rejects.
+It cannot become `full_process_transition` through an injected capability or
+boundary. `execution.json` reports the host's actual process capability. A
+qualified release still requires separately retained evidence produced by the
+real process boundary in the declared Linux openpilot runtime with suitable
+Mazda rlogs.
 
 ## Diagnose a failure
 
 - `Fresh-session acceptance could not start` usually means the output already
   exists, the candidate revision is unavailable locally, or Python dependencies
   are missing. Preserve the existing directory and choose a new output path.
+- `canonical_outputs_portable: false` means a canonical JSON value or report
+  contains an absolute Windows, UNC, or POSIX path. Full exception details,
+  tracebacks, unique messaging prefixes, and machine paths belong in execution
+  metadata.
 - `canonical_outputs_equal: false` means a canonical producer captured
   location, timing, task order, or another unstable value. Compare the named
   component hashes in `run-a` and `run-b`; timing differences belong only in
@@ -87,7 +94,7 @@ release binding. The public corpus deliberately retains a difficult-corner
 exclusion and declares recorded successful/failed physical outcomes and matched
 entry conditions unavailable.
 
-Infrastructure completion does not establish an acceptable lane path, driver
+Infrastructure completion and a reproduced `unqualified` decision do not establish an acceptable lane path, driver
 contact, tire grip, device readiness, or safe deployment. Physical handling is
 still answered by separately authorized, matched-condition drive evidence.
 Predictive simulation remains a separate research track with its own validation

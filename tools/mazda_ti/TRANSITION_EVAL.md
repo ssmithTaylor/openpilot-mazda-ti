@@ -54,6 +54,10 @@ The top-level result copies the process boundary's exact `runtime_source.git_hea
 and normalized `input_sha256` rlog map. Release qualification can therefore bind
 this process evidence to both the candidate revision and retained input bytes;
 the serialized fixture profile does not claim those full-process identities.
+Only the module's actual process boundary emits `full_process_transition`.
+An injected boundary emits `process_transition_fixture` even when a caller
+forces the capability result to supported, and release qualification rejects
+that fixture profile.
 
 `--schema-input-harness` is the bounded live-transition profile. It runs
 `controlsd` with process replay simulation disabled and paces the actual
@@ -85,8 +89,9 @@ Neither result satisfies the real integration profile. The existing startup
 pair is deliberately cold/inactive evidence and therefore cannot establish
 this transition profile by itself.
 
-`execution.json` holds `elapsed_seconds`, the absolute output destination, and
-the unique messaging prefix outside canonical `result.json`. The elapsed value
+`execution.json` holds `elapsed_seconds`, the absolute output destination, the
+unique messaging prefix, exception details, and captured process output outside
+canonical `result.json`. The elapsed value
 excludes workload outside this replay and does not establish device scheduling
 or latency. A release profile that needs device timing must record that
 separately on the target device. The report hashes the process/schema and
