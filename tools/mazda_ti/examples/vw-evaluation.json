@@ -1,0 +1,48 @@
+{
+  "case": {
+    "input_sha256": {
+      "0000028c--0ea8954ea3--3/rlog": "f2d0411e41caaa9bd1e3a9980b0680e680226a11d67ae4a73c66702e689a266f",
+      "0000028c--0ea8954ea3--4/rlog": "b4be056404cc2b850a934afc324106fd4847caaf7fa966e8d846e501a0fb167b"
+    },
+    "method": "historical",
+    "history": "earliest",
+    "id": "vw-continuous-28c",
+    "experiment": {
+      "format_version": 1,
+      "name": "vw-continuous",
+      "rlogs": [
+        "0000028c--0ea8954ea3--3/rlog",
+        "0000028c--0ea8954ea3--4/rlog"
+      ],
+      "window": {
+        "anchor_i_at": 225.0,
+        "activation": 230.0,
+        "start": 230.0,
+        "end": 290.0
+      },
+      "baseline_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+      "warmup_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+      "limiter": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+      "settings": {
+        "LatCommitSetpoint": 1.0,
+        "LatDamping": 1.0,
+        "LatFrictionComp": 1.0,
+        "LatNoFrictionRelay": 1.0,
+        "LatOutputFilter": 0.0,
+        "SteerKP": 0.8,
+        "TiSteerDeltaDown": 15.0,
+        "TiSteerDeltaUp": 10.0,
+        "TiSteerDeltaUpHigh": 9.0,
+        "TiSteerDeltaUpKnee": 630.0,
+        "TiSteerDriverAllowance": 15.0,
+        "TiSteerDriverMultiplier": 40.0,
+        "TiSteerMax": 600.0,
+        "TorqueInterceptorEnabled": 1.0
+      },
+      "fpcs_sample_at": "carState",
+      "force_offset": true
+    }
+  },
+  "candidate_revision": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+  "format_version": 1
+}

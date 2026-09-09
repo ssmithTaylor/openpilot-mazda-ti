@@ -252,7 +252,7 @@ def run(args):
     ctrl._replay_trace = {}
     if MODEL_CONTEXT_BUILDER is not None:
       ctrl._release_context = MODEL_CONTEXT_BUILDER(by_time['modelV2'].get(int(c.lateralPlanMonoTime)), mono)
-    if getattr(args, 'integrated_model_context', False) and variant_active:
+    if getattr(args, 'integrated_model_context', False) and variant_active and hasattr(ctrl, 'update_model_context'):
       model_event = by_time['modelV2'].get(int(c.lateralPlanMonoTime))
       ctrl.update_model_context(
         model_event.modelV2 if model_event is not None else None,

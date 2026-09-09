@@ -1,5 +1,10 @@
 # Mazda TI replay evidence tools
 
+For one command that prepares a pinned historical case, qualifies its baseline,
+evaluates a candidate, and writes a structured bundle plus readable report, see
+[EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
+settings, revisions, history, and scoring window.
+
 For structured rlog fields, the identity-coverage audit command, sign conventions and logging tests, read [DIAGNOSTICS.md](DIAGNOSTICS.md). Verify the recorded diagnostic versions and vehicle source separately from the analyzer's current checkout.
 
 For instrumented-drive candidate replay, that guide also documents `RecordedTiFeedback`,
