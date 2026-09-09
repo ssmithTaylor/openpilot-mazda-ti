@@ -120,8 +120,9 @@ Construction verifies original serialized requests, sequential TI limits, previo
 continuity, repeated-apply payloads and feedback values. Simulation retains its own previous
 limited command. A post-activation publication can still represent a pre-activation apply;
 the represented apply determines which feedback is used. Missing identities, changed repeated
-applies, nonfinite signals, unsupported settings and active stock fallback while TI is
-unavailable fail explicitly. Recorded physical observations, driver torque, actuator permission
+applies, nonfinite signals and unsupported settings fail explicitly. Active stock fallback
+requires the explicit stock configuration below; the default TI-only mode still rejects it.
+Recorded physical observations, driver torque, actuator permission
 and the apply schedule remain fixed; software feedback is not a vehicle-motion prediction.
 
 The helper reproduced the local exact-identity prototype's controller traces byte-for-byte
@@ -131,6 +132,31 @@ candidate-owned feedback, delayed consumed identities, and malformed/incomplete 
 This qualifies the feedback component, not an arbitrary new controller or full replay runner.
 Preserve caller, dependency, runtime and raw-log hashes and independently reproduce the
 recorded baseline before interpreting a candidate.
+
+### TI bypass and stock feedback
+
+GEN1 continues calculating the stock command while the TI operates. When TI permission is
+lost, `carOutput.actuatorsOutput.steer` selects the stock limited request divided by **600**.
+The EPS's measured ±308 response is a different quantity. Replacing unavailable TI feedback
+with zero loses the stock limiter history and can change the controller's anti-windup behavior.
+
+Use `pure_stock_limiter(pinned_revision)` from `feedback.py` to load the actual stock limiter,
+GEN1 constants and their source hashes without hardware imports. Pass its first two results
+as `stock_limiter=` and `stock_limits=` to `RecordedTiFeedback`. Record the returned source
+hashes with the caller's provenance. Only the explicit GEN1 stock600 settings are supported.
+
+This mode validates both recorded request/previous/limited sequences on every apply, including
+when the other actuator supplies the published feedback. Candidate requests advance both
+histories; `output_for` selects the appropriate normalized command using recorded TI permission.
+`counts` and `finish()` retain their existing TI-count meaning; `stock_counts` contains the
+separate stock counts keyed by apply sequence. Neither is motor-delivery measurement.
+
+Seven serialized-event tests cover the distinct rate limits, continuously retained stock
+history, TI reset/re-entry, inactive reset, old consumed identities, corrupt stock evidence
+and rejection of EPS308 normalization. A 7,000-update original-drive baseline covering a TI
+cutout, active stock fallback and recovery reproduces all TI and stock commands. Recorded
+availability still forces the same TI dropout in candidate replay; this cannot predict
+whether changed commands would avoid it or how the subsequent vehicle trajectory would differ.
 
 After checking applied-output identities, reproduce the lane observer from the actual consumed
 model events and both recorded clocks:

@@ -47,6 +47,29 @@ def pure_limiter(revision):
   return scope[node.name], hashlib.sha256(raw).hexdigest()
 
 
+def pure_stock_limiter(revision):
+  """Pinned GEN1 stock request limiter/settings; counts are not EPS delivery."""
+  raw = subprocess.check_output(['git', 'show', revision + ':selfdrive/car/__init__.py'], cwd=ROOT)
+  values = subprocess.check_output(['git', 'show', revision + ':selfdrive/car/mazda/values.py'], cwd=ROOT)
+  node = next(n for n in ast.parse(raw.decode()).body
+              if isinstance(n, ast.FunctionDef) and n.name == 'apply_driver_steer_torque_limits')
+  scope = {'clip': np.clip}
+  exec(compile(ast.Module(body=[node], type_ignores=[]), 'recorded_stock_limiter', 'exec'), scope)
+  cls = next(n for n in ast.parse(values.decode()).body if isinstance(n, ast.ClassDef) and n.name == 'CarControllerParams')
+  init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+  gen1 = next(n for n in init.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'CP.flags & MazdaFlags.GEN1')
+  required = {'STEER_MAX', 'STEER_DELTA_UP', 'STEER_DELTA_DOWN', 'STEER_DRIVER_ALLOWANCE',
+              'STEER_DRIVER_MULTIPLIER', 'STEER_DRIVER_FACTOR'}
+  constants = {n.targets[0].attr: ast.literal_eval(n.value) for n in gen1.body
+               if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute) and n.targets[0].attr in required}
+  if set(constants) != required:
+    raise ValueError('Missing pinned GEN1 stock limiter constants')
+  return scope[node.name], SimpleNamespace(**constants), {
+    'selfdrive/car/__init__.py': hashlib.sha256(raw).hexdigest(),
+    'selfdrive/car/mazda/values.py': hashlib.sha256(values).hexdigest(),
+  }
+
+
 class Fixture:
   """Immutable-in-use observations and schedule; no candidate state lives here."""
 

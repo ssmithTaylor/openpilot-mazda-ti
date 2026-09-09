@@ -42,6 +42,10 @@ class Apply:
   recorded: int
   driver_torque: float
   limits: SimpleNamespace
+  active: bool = False
+  ti_selected: bool = True
+  stock_previous: int = 0
+  stock_recorded: int = 0
 
 
 class RecordedTiFeedback:
@@ -49,14 +53,24 @@ class RecordedTiFeedback:
 
   `outputs` contains (event identity, Event) pairs; `commands` maps identities to Events.
   Construction verifies the recorded TI request, sequential limiter and serialized feedback
-  for every apply at/after activation published before end_ns. Existing stock-path fallback
-  while TI is unavailable and lateral control is active is intentionally unsupported.
+  for every apply at/after activation published before end_ns. Stock fallback requires
+  an explicit pinned stock limiter and GEN1 settings. Both limiter histories then run
+  on every apply, including while the other path supplies the published feedback.
   """
 
-  def __init__(self, outputs, commands, activation_ns, end_ns, limiter):
+  def __init__(self, outputs, commands, activation_ns, end_ns, limiter, *, stock_limiter=None, stock_limits=None):
     if not 0 < activation_ns < end_ns:
       raise ValueError('Require 0 < activation_ns < end_ns')
     self.activation_ns, self.end_ns, self.limiter = activation_ns, end_ns, limiter
+    if (stock_limiter is None) != (stock_limits is None):
+      raise ValueError('Provide both stock limiter and settings')
+    self.stock_limiter = stock_limiter
+    self.stock_limits = SimpleNamespace(**vars(stock_limits)) if stock_limits is not None else None
+    if self.stock_limits is not None:
+      expected = {'STEER_MAX': 600, 'STEER_DELTA_UP': 10, 'STEER_DELTA_DOWN': 25,
+                  'STEER_DRIVER_ALLOWANCE': 15, 'STEER_DRIVER_MULTIPLIER': 40, 'STEER_DRIVER_FACTOR': 1}
+      if vars(self.stock_limits) != expected:
+        raise ValueError('Only explicit pinned GEN1 stock600 settings are qualified')
     self.outputs, unique = {}, {}
     for mono, event in outputs:
       if mono >= end_ns:
@@ -82,7 +96,7 @@ class RecordedTiFeedback:
       cc = command_event.carControl
       if not 0 < cc.controlsStateMonoTime <= co.appliedCarControlMonoTime or bool(cc.latActive) != d['latActive']:
         raise ValueError('Invalid controller identity or lateral-active mismatch')
-      if cc.latActive and not d['tiAllowed']:
+      if cc.latActive and not d['tiAllowed'] and self.stock_limiter is None:
         raise ValueError('Active stock fallback while TI unavailable is not qualified')
       request = serialized_steer(cc.actuators.steer)
       allowed = bool(cc.latActive and d['tiAllowed'])
@@ -91,16 +105,24 @@ class RecordedTiFeedback:
       if not math.isfinite(d['driverTorque']):
         raise ValueError('Non-finite driver torque')
       apply = Apply(sequence, int(co.appliedAtMonoTime), int(cc.controlsStateMonoTime), request, allowed,
-                    int(d['tiPrevious']), int(d['tiLimited']), d['driverTorque'], limits_from_diagnostics(d))
+                    int(d['tiPrevious']), int(d['tiLimited']), d['driverTorque'], limits_from_diagnostics(d),
+                    bool(cc.latActive), bool(d['tiAllowed']), int(d['stockPrevious']), int(d['stockLimited']))
       if not -600 <= apply.previous <= 600 or not -600 <= apply.recorded <= 600:
         raise ValueError('Recorded TI command outside qualified envelope')
-      if float(co.actuatorsOutput.steer) != serialized_steer(apply.recorded / 600):
+      if self.stock_limiter is not None:
+        if (int(round(request * 600)) if cc.latActive else 0) != d['stockRequested']:
+          raise ValueError('Recorded stock request does not match applied carControl')
+        if not -600 <= apply.stock_previous <= 600 or not -600 <= apply.stock_recorded <= 600:
+          raise ValueError('Recorded stock command outside qualified envelope')
+      feedback = apply.recorded if self.stock_limiter is None or apply.ti_selected else apply.stock_recorded
+      if float(co.actuatorsOutput.steer) != serialized_steer(feedback / 600):
         raise ValueError('Recorded feedback does not represent the TI limited command')
       unique[sequence] = (apply, payload)
     self.applies = [pair[0] for _, pair in sorted(unique.items())]
     if not self.applies:
       raise ValueError('No recorded applies after activation')
     previous = self.applies[0].previous
+    stock_previous = self.applies[0].stock_previous
     for i, apply in enumerate(self.applies):
       if i and (apply.sequence != self.applies[i-1].sequence + 1 or apply.applied_at <= self.applies[i-1].applied_at):
         raise ValueError('Missing apply sequence or nonincreasing apply time')
@@ -109,11 +131,21 @@ class RecordedTiFeedback:
       previous = self._limit(apply, apply.request, previous)
       if previous != apply.recorded:
         raise ValueError('Production limiter does not reproduce recorded TI command')
+      if self.stock_limiter is not None:
+        if apply.stock_previous != stock_previous:
+          raise ValueError('Recorded previous stock command is inconsistent')
+        stock_previous = self._stock_limit(apply, apply.request, stock_previous)
+        if stock_previous != apply.stock_recorded:
+          raise ValueError('Production limiter does not reproduce recorded stock command')
     self.cursor, self.previous = 0, self.applies[0].previous
     self.requests, self.counts = {}, {}
+    self.stock_previous, self.stock_counts = self.applies[0].stock_previous, {}
 
   def _limit(self, apply, steer, previous):
     return self.limiter(int(round(steer * 600)), previous, apply.driver_torque, apply.limits) if apply.allowed else 0
+
+  def _stock_limit(self, apply, steer, previous):
+    return self.stock_limiter(int(round(steer * 600)), previous, apply.driver_torque, self.stock_limits) if apply.active else 0
 
   def publish(self, controller_mono, steer):
     if controller_mono <= 0 or controller_mono in self.requests:
@@ -135,6 +167,9 @@ class RecordedTiFeedback:
         steer = self.requests[apply.controller]
       self.previous = self._limit(apply, steer, self.previous)
       self.counts[apply.sequence] = self.previous
+      if self.stock_limiter is not None:
+        self.stock_previous = self._stock_limit(apply, steer, self.stock_previous)
+        self.stock_counts[apply.sequence] = self.stock_previous
       self.cursor += 1
     if sequence not in self.counts:
       raise ValueError('Requested apply is absent from the replay schedule')
@@ -146,6 +181,10 @@ class RecordedTiFeedback:
     if applied_at < self.activation_ns:
       return recorded
     self._advance(sequence)
+    if self.stock_limiter is not None:
+      apply = self.applies[sequence - self.applies[0].sequence]
+      if not apply.ti_selected:
+        return serialized_steer(self.stock_counts[sequence] / 600)
     return serialized_steer(self.counts[sequence] / 600)
 
   def finish(self):
