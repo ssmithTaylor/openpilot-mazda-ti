@@ -107,6 +107,12 @@ def test_dedicated_carstate_uses_checks_passed_while_submaster_services_require_
   frog_state.frequencyOk = False
   rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState', NS(tiActive=True))])
   assert rows[0]['health'] == 'stale'
+  frog_state.frequencyOk, frog_state.alive, frog_state.checksPassed = True, False, False
+  rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState', NS(tiActive=True))])
+  assert rows[0]['health'] == 'stale'
+  frog_state.alive = True
+  rows, _ = normalize_observations([controls, command, output], source_events=[event(9, 'carState'), event(8, 'frogpilotCarState', NS(tiActive=True))])
+  assert rows[0]['health'] == 'invalid'
 
 
 def test_normalization_keeps_recorded_inputs_as_identity_sources_not_duplicate_transition_rows():

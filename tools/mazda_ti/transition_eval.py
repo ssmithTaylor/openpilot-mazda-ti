@@ -43,13 +43,15 @@ def normalize_observations(events, source_events=()):
         findings.append(f'unknown diagnostic reference: {service}@{source_mono}')
       if not input_row.seen:
         health = 'missing'
-      elif not input_row.valid or not input_row.checksPassed:
+      elif not input_row.valid:
         health = 'invalid'
       # carState is controlsd's dedicated blocking socket.  Its diagnostic
       # producer intentionally has no SubMaster frequency estimate, so false
       # frequencyOk is not staleness when its own checks have passed.
       elif service != 'carState' and (not input_row.alive or not input_row.frequencyOk):
         health = 'stale'
+      elif not input_row.checksPassed:
+        health = 'invalid'
       if service == 'frogpilotCarState' and input_row.seen:
         source = by_identity.get((service, source_mono))
         if source is not None and hasattr(source, 'frogpilotCarState'):
