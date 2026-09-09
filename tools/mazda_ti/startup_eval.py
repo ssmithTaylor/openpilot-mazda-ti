@@ -189,8 +189,8 @@ def _diagnostic_timestamp_result(source_events, output_events):
   return result
 
 
-def transition_stderr_diagnostics(stderr, expected_invalid_services=()):
-  """Accept only declared fake-service exclusions and requested invalid inputs."""
+def transition_stderr_diagnostics(stderr, expected_invalid_services=(), expected_stale_services=()):
+  """Accept only declared fake exclusions and requested invalid/stale inputs."""
   if not stderr:
     return []
   try:
@@ -200,16 +200,26 @@ def transition_stderr_diagnostics(stderr, expected_invalid_services=()):
   expected_events = {'controlsd.initialized', 'commIssue'}
   expected_unavailable = {'testJoystick'}
   expected_invalid_services = set(expected_invalid_services)
-  if len(records) != 2 or {record.get('event') for record in records if isinstance(record, dict)} != expected_events:
+  if not records or any(not isinstance(record, dict) or record.get('event') not in expected_events for record in records):
     return None
-  initialized = next(record for record in records if record.get('event') == 'controlsd.initialized')
-  comm_issue = next(record for record in records if record.get('event') == 'commIssue')
+  initialized_records = [record for record in records if record.get('event') == 'controlsd.initialized']
+  comm_issues = [record for record in records if record.get('event') == 'commIssue']
+  if len(initialized_records) != 1 or not comm_issues:
+    return None
+  initialized = initialized_records[0]
+  allowed_unavailable = expected_unavailable | set(expected_stale_services)
   if (not isinstance(initialized, dict) or initialized.get('error') is not True or initialized.get('invalid') != [] or
-      initialized.get('not_freq_ok') != [] or set(initialized.get('not_alive', ())) != expected_unavailable):
+      initialized.get('not_freq_ok') != [] or not set(initialized.get('not_alive', ())).issubset(expected_unavailable)):
     return None
-  if (not isinstance(comm_issue, dict) or comm_issue.get('error') is not True or
-      set(comm_issue.get('invalid', ())) != expected_invalid_services or comm_issue.get('not_freq_ok') != [] or
-      set(comm_issue.get('not_alive', ())) != expected_unavailable):
+  invalid = set()
+  stale = set()
+  for comm_issue in comm_issues:
+    if (comm_issue.get('error') is not True or not set(comm_issue.get('invalid', ())).issubset(expected_invalid_services) or
+        comm_issue.get('not_freq_ok') != [] or not set(comm_issue.get('not_alive', ())).issubset(allowed_unavailable)):
+      return None
+    invalid.update(comm_issue.get('invalid', ()))
+    stale.update(set(comm_issue.get('not_alive', ())) - expected_unavailable)
+  if invalid != expected_invalid_services or stale != set(expected_stale_services):
     return None
   return records
 
@@ -477,7 +487,8 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     raise ValueError(f'inactive startup produced {len(car_controls) - len(inactive)} active or steering-output carControl messages')
   child_error = captured.get('controlsd', {}).get('err', '').strip()
   expected_invalid = {row['service'] for row in generated_harness if row['status'] == 'invalid'}
-  stderr_diagnostics = transition_stderr_diagnostics(child_error, expected_invalid)
+  expected_stale = {row['service'] for row in generated_harness if row['status'] == 'stale'}
+  stderr_diagnostics = transition_stderr_diagnostics(child_error, expected_invalid, expected_stale)
   if child_error and (require_inactive or stderr_diagnostics is None):
     raise ValueError(f'controlsd wrote stderr: {child_error}')
 

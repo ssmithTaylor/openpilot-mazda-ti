@@ -42,6 +42,17 @@ def test_transition_stderr_accepts_only_the_explicitly_injected_invalid_input():
   assert transition_stderr_diagnostics(payload, {'unknownService'}) is None
 
 
+def test_transition_stderr_accepts_only_declared_stale_and_invalid_schema_faults():
+  initialized = {'event': 'controlsd.initialized', 'error': True, 'invalid': [], 'not_freq_ok': [], 'not_alive': []}
+  stale = {'event': 'commIssue', 'error': True, 'invalid': [], 'not_freq_ok': [], 'not_alive': ['frogpilotCarState']}
+  invalid = {'event': 'commIssue', 'error': True, 'invalid': ['frogpilotCarState'], 'not_freq_ok': [], 'not_alive': []}
+  payload = '\n'.join(json.dumps(row) for row in (initialized, stale, invalid))
+  assert transition_stderr_diagnostics(payload, {'frogpilotCarState'}, {'frogpilotCarState'}) == [initialized, stale, invalid]
+  unexpected = {**stale, 'not_alive': ['managerState']}
+  assert transition_stderr_diagnostics('\n'.join(json.dumps(row) for row in (initialized, unexpected, invalid)),
+                                       {'frogpilotCarState'}, {'frogpilotCarState'}) is None
+
+
 class FakeMessaging:
   @staticmethod
   def sub_sock(service, **kwargs):
