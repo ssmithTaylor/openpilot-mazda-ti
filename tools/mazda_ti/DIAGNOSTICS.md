@@ -59,6 +59,32 @@ logs have extension version0. Local replay qualification covers22,700 updates/ap
 including2,022 inactive updates: only the four extension fields differ. This is not a
 device-build or physical-handling qualification; verify new recorded fields after deployment.
 
+Check the state extension in a new recording with:
+
+```text
+python -m tools.mazda_ti.audit_friction_release --data-root PATH/TO/rlogs --rlogs ROUTE--SEG/rlog --start-ns START --end-ns END --output NEW-friction-state.json
+```
+
+The auditor reconstructs pre-withdrawal compensation from the logged inverse, friction gate,
+authority and settings. It checks decomposition, bounds and reset state, then replays the
+actual helper from each preceding observed state using the exact consumed carState steering
+rate and logged lane permissions/dwell. The first complete state is an anchor; the check
+does not reconstruct history before it. Publications more than30ms apart fail explicitly.
+There is no controller sequence counter, so even a passing check cannot prove no smaller
+missing interval occurred. Use the separate input/apply and lane-context audits as well.
+
+Exit zero requires version1, consistent state/contribution checks, active coverage and at
+least one checked transition. Absent/unsupported extension, missing or mismatched inputs,
+nonfinite values, altered compensation or latch, reset errors and publication gaps fail.
+The1e-9 tolerance applies only to these Float64 count/state comparisons; it cannot excuse
+an integer-command mismatch. Source/runtime/raw hashes and all failed rows are retained.
+
+Qualification includes twelve serialized production-controller/failure tests and22,697
+adjacent transitions across22,700 generated replay-fixture updates, with their recorded
+carState identities preserved. These generated fixtures are not new vehicle recordings.
+The CLI correctly rejects the original28f version0 records. Qualify actual state coverage
+again when a new drive is available; a state-consistency pass is not a lane-performance score.
+
 `integralBefore`, `integralAfter`, the PID input error/feedforward, gains and output permit inspection of accumulated error and anti-windup. `freezeReasons` bits are: 0 limiter feedback, 1 steeringPressed, 2 speed below 5 m/s. The steeringPressed input can be TI-contaminated and is not evidence of hand contact. `plantLimit` is the controller model's current limit, not a measured tire-grip ceiling.
 
 `settings` bits are: 0 commitment, 1 damping, 2 proactive friction compensation, 3 output smoothing, 4 friction relay disabled. These report the toggles actually seen on that update. Float64 values preserve controller precision where Float32 rounding can change an eventual integer command.
