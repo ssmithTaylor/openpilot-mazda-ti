@@ -26,6 +26,7 @@ from .transition_eval import assess, run as run_transition, source_identity
 
 
 FORMAT_VERSION = 1
+QUALIFIED_DECISION = "qualified_for_separate_authorization"
 COMPONENT_PATHS = (
   "collected-inventory.json", "batch/canonical-001.json", "corpus/result.json", "corpus/report.md",
   "scenario/result.json", "scenario/report.md", "process-contract/result.json", "process/result.json", "comparison/result.json",
@@ -150,6 +151,12 @@ def _expect_rejection(check):
   return False
 
 
+def _evidence_mutation_rejected(release, kind):
+  expected = f"{kind}: Evidence identity changed: {kind}"
+  return (release["status"] == "failed_check" and release["qualification"] == "unqualified"
+          and expected in release["findings"])
+
+
 def _require_hash(path, expected):
   if sha256(path) != expected:
     raise ValueError("Artifact identity changed")
@@ -196,7 +203,7 @@ def _invalidation_checks(output, second, candidate, cache_root):
   request_path = output / "invalidation/evidence-request.json"
   write_json(request_path, request)
   evidence = qualify(request_path, output, output / "invalidation/evidence-release")
-  evidence_rejected = evidence["status"] == "failed_check" and evidence["qualification"] == "unqualified"
+  evidence_rejected = _evidence_mutation_rejected(evidence, "scenario")
 
   cache_case = sorted(path for path in cache_root.iterdir() if path.is_dir())[0]
   corrupt_attempt = cache_case / "attempt-001"
@@ -281,7 +288,7 @@ def _acceptance_checks(first, second, fixtures_equal, portable, invalidation, in
     first["statuses"]["process_declared_runtime"] == second["statuses"]["process_declared_runtime"]
     and ((process_status == "completed_checks"
           and first["statuses"]["release"] == second["statuses"]["release"] == "completed_checks"
-          and first["statuses"]["release_decision"] == second["statuses"]["release_decision"] == "qualified")
+          and first["statuses"]["release_decision"] == second["statuses"]["release_decision"] == QUALIFIED_DECISION)
          or (process_status in ("unsupported", "failed_check")
              and first["statuses"]["release"] == second["statuses"]["release"] == "failed_check"
              and first["statuses"]["release_decision"] == second["statuses"]["release_decision"] == "unqualified"))

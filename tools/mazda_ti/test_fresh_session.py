@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from .fresh_fixture import create_fresh_fixture, fixture_tree_sha256
-from .fresh_session import _acceptance_checks, _portable, run
+from .fresh_session import _acceptance_checks, _evidence_mutation_rejected, _portable, run
 from .provenance import read_json, write_json
 
 
@@ -88,7 +88,7 @@ def test_failed_required_component_cannot_hide_behind_expected_unqualified_relea
   second = copy.deepcopy(first)
   first["statuses"]["process_declared_runtime"] = second["statuses"]["process_declared_runtime"] = "completed_checks"
   first["statuses"]["release"] = second["statuses"]["release"] = "completed_checks"
-  first["statuses"]["release_decision"] = second["statuses"]["release_decision"] = "qualified"
+  first["statuses"]["release_decision"] = second["statuses"]["release_decision"] = "qualified_for_separate_authorization"
   second["execution"]["session_identity"] = "second"
   second["execution"]["batch"] = {"timing_kind": "repeated", "cases": [{"reused": True}]}
   first["statuses"]["scenario"] = second["statuses"]["scenario"] = "failed_check"
@@ -99,3 +99,14 @@ def test_failed_required_component_cannot_hide_behind_expected_unqualified_relea
 
   assert checks["required_component_stages_completed"] is False
   assert all(value for name, value in checks.items() if name != "required_component_stages_completed")
+
+
+def test_evidence_mutation_requires_the_specific_identity_failure():
+  masked = {
+    "status": "failed_check", "qualification": "unqualified",
+    "findings": ["process: Record does not match the process evidence schema"],
+  }
+
+  assert _evidence_mutation_rejected(masked, "scenario") is False
+  masked["findings"].append("scenario: Evidence identity changed: scenario")
+  assert _evidence_mutation_rejected(masked, "scenario") is True
