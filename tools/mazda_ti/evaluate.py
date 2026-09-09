@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from .provenance import check_artifacts, check_sources, environment, read_json, sha256, under, write_json
 from . import run
 from .verify_replay import compare_sends
-from .evaluation_contract import SCOPE, Unsupported, canonical_request, completed_result
+from .evaluation_contract import Unsupported, canonical_request, completed_result, evidence_scope
 
 
 def compare_commands(baseline_path, candidate_path, window, same_source):
@@ -121,9 +121,12 @@ def evaluate(request_path, data_root, output):
   output.mkdir(parents=True, exist_ok=False)
   started = time.perf_counter()
   result = {'format_version': 1, 'status': 'failed_execution', 'case_id': None,
-            'qualification': 'unqualified', 'comparison': None, 'findings': [], 'scope': SCOPE}
+            'qualification': 'unqualified', 'comparison': None, 'findings': [], 'scope': evidence_scope(None)}
   try:
-    request = canonical_request(read_json(request_path))
+    value = read_json(request_path)
+    if isinstance(value, dict) and isinstance(value.get('case'), dict):
+      result['scope'] = evidence_scope(value['case'].get('origin', 'recorded'))
+    request = canonical_request(value)
     case = request['case']
     result['case_id'] = case['id']
     for name in case['experiment']['rlogs']:

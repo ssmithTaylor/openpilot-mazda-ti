@@ -19,6 +19,33 @@ def sample_request():
   return read_json(Path(__file__).with_name('examples') / 'vw-evaluation.json')
 
 
+@pytest.mark.parametrize('failure,status', [('missing_recording', 'failed_execution'), ('changed_recording', 'failed_check'),
+                                          ('settings', 'failed_check'), ('method', 'unsupported'), ('version', 'unsupported')])
+def test_synthetic_early_failures_never_claim_recorded_physical_evidence(tmp_path, failure, status):
+  request = sample_request()
+  case = request['case']
+  case['origin'] = 'synthetic'
+  case['experiment']['rlogs'] = ['rlog']
+  case['input_sha256'] = {'rlog': '0' * 64}
+  if failure == 'changed_recording':
+    (tmp_path / 'rlog').write_bytes(b'changed')
+  elif failure == 'settings':
+    case['experiment']['settings']['SteerKP'] = 'invalid'
+  elif failure == 'method':
+    case['method'] = 'instrumented'
+  elif failure == 'version':
+    request['format_version'] = 99
+  path, output = tmp_path / 'request.json', tmp_path / 'bundle'
+  write_json(path, request)
+  result = evaluate(path, tmp_path, output)
+  assert result['status'] == status
+  assert result['comparison'] is None
+  assert 'no recorded physical handling evidence' in result['scope']
+  report = (output / 'report.md').read_text()
+  assert result['scope'] in report
+  assert 'under recorded physical motion' not in report
+
+
 @pytest.mark.parametrize('location', ['request', 'case', 'experiment', 'window', 'settings', 'setting_value'])
 def test_unrestricted_request_data_is_rejected_before_any_bundle_copy(tmp_path, location):
   request = read_json(Path(__file__).with_name('examples') / 'vw-evaluation.json')

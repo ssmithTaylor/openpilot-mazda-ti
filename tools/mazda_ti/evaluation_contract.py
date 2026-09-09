@@ -18,6 +18,15 @@ class Unsupported(ValueError):
   """The request asks for coverage this adapter does not provide."""
 
 
+def evidence_scope(origin):
+  if origin == 'recorded':
+    return SCOPE
+  if origin == 'synthetic':
+    return ('Synthetic fixed-input command fixture; no recorded physical handling evidence. '
+            'Software TI feedback follows each candidate; no prediction of a vehicle path or successful cornering.')
+  return 'Evidence origin unavailable; no recorded physical handling evidence or successful cornering established.'
+
+
 def canonical_request(value, resolved=False):
   """Reject unknown fields and arbitrary values before persisting any request content."""
   def fields(obj, required, optional=()):
@@ -74,11 +83,9 @@ def completed_result(request, baseline, candidate, comparison):
   """Every trusted top-level field derives from validated request/replay records."""
   case, sources = request['case'], baseline['controller_sources'] | candidate['controller_sources']
   spec = case['experiment']
-  scope = SCOPE if case['origin'] == 'recorded' else (
-    'Synthetic fixed-input command fixture; no recorded physical handling evidence. '
-    'Software TI feedback follows each candidate; no prediction of a vehicle path or successful cornering.')
   return {'format_version': 1, 'status': 'completed_checks', 'case_id': case['id'], 'history': case['history'],
-          'window': spec['window'], 'qualification': baseline['qualification'], 'comparison': comparison, 'findings': [], 'scope': scope,
+          'window': spec['window'], 'qualification': baseline['qualification'], 'comparison': comparison, 'findings': [],
+          'scope': evidence_scope(case['origin']),
           'source_identities': {**{k: spec[k] for k in ('baseline_controller', 'candidate_controller', 'warmup_controller', 'limiter')},
                                 'repository_sources': candidate['repository_sources'], 'controller_sources': sources},
           'input_sha256': candidate['input_sha256'], 'runtime': candidate['environment'], 'limitations': candidate['limitations'] + LIMITATIONS}
