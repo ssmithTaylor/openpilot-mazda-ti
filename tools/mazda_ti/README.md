@@ -1,5 +1,11 @@
 # Mazda TI replay evidence tools
 
+## Isolated startup process boundary
+
+[`STARTUP_EVAL.md`](STARTUP_EVAL.md) documents the isolated real `controlsd`
+process-replay startup profile, its generated diagnostic timestamp checks, and
+the narrower `carState` schema/subscriber check.
+
 For one command that prepares a pinned historical or instrumented case, qualifies its baseline,
 evaluates a candidate, and writes a structured bundle plus readable report, see
 [EVALUATION.md](EVALUATION.md). The supplied VW reference includes explicit input hashes,
