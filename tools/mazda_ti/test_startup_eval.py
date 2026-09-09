@@ -8,7 +8,8 @@ from types import SimpleNamespace as NS
 import pytest
 
 from .provenance import ROOT
-from .startup_eval import construct_controlsd_subscriptions, qualify_nested_timestamps, run, transition_stderr_diagnostics
+from .startup_eval import (construct_controlsd_subscriptions, inject_transition_harness, qualify_nested_timestamps, run,
+                           transition_stderr_diagnostics)
 
 
 def test_nested_diagnostic_references_must_survive_one_outer_timestamp_transform():
@@ -62,6 +63,21 @@ def test_actual_constructor_path_rejects_known_carstate_in_submaster_failure():
   broken = source.replace("self.sm = messaging.SubMaster(['deviceState'", "self.sm = messaging.SubMaster(['carState', 'deviceState'", 1)
   with pytest.raises(ValueError, match='dedicated subscriber'):
     construct_controlsd_subscriptions(broken, FakeMessaging)
+
+
+def test_transition_harness_publishes_only_declared_actual_controlsd_schema_inputs():
+  from cereal import log
+  car_state = log.Event.new_message(logMonoTime=100)
+  car_state.init('carState')
+  car_state.carState.canValid = True
+  events = [car_state.as_reader()]
+  manifest = inject_transition_harness(events, log)
+  generated_services = {row['service'] for row in manifest}
+  assert generated_services == {'managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay'}
+  by_service = {event.which(): event for event in events}
+  assert by_service['pandaStates'].pandaStates[0].controlsAllowed is True
+  assert by_service['frogpilotPlan'].frogpilotPlan.lateralCheck is True
+  assert 'testJoystick' not in generated_services
 
 
 def test_required_full_process_profile_is_explicitly_unsupported_when_runtime_is_missing(tmp_path):

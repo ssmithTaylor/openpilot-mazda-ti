@@ -220,9 +220,11 @@ def inject_transition_harness(events, log):
   # cutout.  `testJoystick` remains deliberately absent: it is the one fake
   # service declared by the process-replay configuration and is retained as a
   # harness exclusion in the evidence.
-  services = ('managerState', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
+  services = ('managerState', 'pandaStates', 'frogpilotCarState', 'frogpilotPlan', 'liveDelay')
   car_states = [event for event in events if event.which() == 'carState']
   generated = []
+  retained = [event for event in events if event.which() != 'pandaStates']
+  events[:] = retained
   for index, car_state in enumerate(car_states):
     status = 'valid'
     # The retained cutout spans activation in 15, TI bypass/disengage in 16,
@@ -234,20 +236,39 @@ def inject_transition_harness(events, log):
     elif index == 16_360:
       status = 'invalid'
     ti_active = not (9_966 <= index < 10_151)
+    # Replay cold-starts controlsd, so recorded panda state cannot claim the
+    # pre-existing engagement.  Supply the actual subscriber schema with a
+    # declared controlsAllowed fixture.  This is an input to the process, not
+    # a CAN sender or a vehicle state change.
     for offset, service in enumerate(services, start=1):
       if status == 'missing' and service == 'frogpilotCarState':
-        generated.append({'service': service, 'status': status, 'source_mono_time': None, 'frame': index})
+        generated.append({'service': service, 'status': status, 'source_mono_time': None, 'frame': index,
+                          'source_car_state_mono_time': int(car_state.logMonoTime), 'derived_from': 'recorded_carState'})
         continue
       mono = int(car_state.logMonoTime) - offset
       if status == 'stale' and service == 'frogpilotCarState':
         mono -= 2_000_000_000
       event = log.Event.new_message(logMonoTime=mono, valid=not (status == 'invalid' and service == 'frogpilotCarState'))
-      event.init(service)
+      event.init(service, 1) if service == 'pandaStates' else event.init(service)
+      if service == 'pandaStates':
+        event.pandaStates[0].controlsAllowed = True
       if service == 'frogpilotCarState':
         event.frogpilotCarState.tiActive = ti_active
+      if service == 'frogpilotPlan':
+        event.frogpilotPlan.lateralCheck = True
       events.append(event.as_reader())
       generated.append({'service': service, 'status': status if service == 'frogpilotCarState' else 'valid',
-                        'source_mono_time': mono, 'frame': index})
+                        'source_mono_time': mono, 'frame': index, 'source_car_state_mono_time': int(car_state.logMonoTime),
+                        'derived_from': 'recorded_carState'})
+    action = {15_000: 'buttonCancel', 15_100: 'buttonEnable'}.get(index)
+    if action is not None:
+      replaced = car_state.as_builder()
+      replaced.carState.init('events', 1)
+      replaced.carState.events[0].name = action
+      events.remove(car_state)
+      events.append(replaced.as_reader())
+      generated.append({'service': 'carState', 'status': 'valid', 'source_mono_time': int(car_state.logMonoTime),
+                        'frame': index, 'event': action, 'derived_from': 'recorded_carState'})
   events.sort(key=lambda event: int(event.logMonoTime))
   return generated
 
