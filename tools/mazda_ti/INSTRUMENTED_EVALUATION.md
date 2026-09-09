@@ -61,6 +61,26 @@ recorded. Candidate commands cannot predict whether a TI loss would be avoided, 
 counterfactual recovery, a new vehicle path or successful cornering. These limitations
 are present in the report even when both command histories reproduce exactly.
 
+### Inspect compensation and integral carryover
+
+New instrumented traces retain `recorded_components` and `replay_components` for active
+version-1 controller diagnostics. `trace.json.component_trace` versions the selection and
+declares native units. Inactive or unavailable components are null, rather than measured
+zeros. These snapshots include the request, effective references, measurement, PID terms,
+inverse command, compensation and final command. `limiter_feedback_limited` and
+`consumed_feedback_steer` retain the replay's actual pre-update limiter state and the exact
+consumed software feedback. TI/stock apply traces remain separate, keyed by apply time;
+they must not be substituted for controller components by nearest-timestamp matching.
+
+The shared trace comparison recognizes acceleration-domain request/reference/integral
+metrics in `m/s^2` and inverse/final/compensation commands in TI counts. It aligns consumed
+input identities and model/camera clocks as well as controller publication time. Integral
+differences are not converted into counts through an assumed linear plant. Compare both
+original and otherwise-equivalent current-control arms before attributing a difference to
+a policy. A changed compensation mapping can change limiter feedback, freeze eligibility,
+and subsequent integral history even after compensation itself returns to its old value.
+Use declared physical phase evidence; chronological quarters alone cannot label corners.
+
 The default suite includes a serialized synthetic zero-command transition, adjacent
 segment joins and corrupted controller/apply/stock evidence. Independent nonzero
 `test_stock_feedback.py` expectations exercise candidate stock evolution under TI,

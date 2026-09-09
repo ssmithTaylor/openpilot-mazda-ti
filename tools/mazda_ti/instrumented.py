@@ -15,6 +15,20 @@ from .provenance import (check_artifacts, check_sources, environment, finish_sou
 from .evaluation_contract import canonical_request, completed_result
 
 REPLAY_FILES = (*run.REPLAY_FILES, 'trace-stock-sends.json')
+COMPONENT_UNITS = {
+  **{name: 'm/s^2' for name in ('rawRequest', 'effectiveFeedforward', 'effectiveSetpoint', 'measurement',
+                              'error', 'integralBefore', 'integralAfter', 'feedforward', 'pidOutput', 'frictionGate')},
+  'measurementRate': 'm/s^3',
+  **{name: 'right-positive TI counts' for name in ('inverseCommand', 'frictionCompensation', 'frictionRelay',
+                                                'breakerBoost', 'commandBeforeSmoothing', 'command')},
+  'freezeReasons': 'bitmask: limiter=1, steeringPressed=2, low-speed=4',
+}
+COMPONENT_METRICS = {
+  'request_mps2': 'rawRequest', 'effective_setpoint_mps2': 'effectiveSetpoint',
+  'effective_feedforward_mps2': 'effectiveFeedforward', 'integral_before_mps2': 'integralBefore',
+  'integral_after_mps2': 'integralAfter', 'inverse_command_counts': 'inverseCommand',
+  'controller_command_counts': 'command', 'compensation_counts': 'frictionCompensation',
+}
 LIMITATIONS = [
   'Exact nested diagnostic inputs and recorded model/camera clocks; no nearest-publication reconstruction.',
   'TI availability and physical motion stay recorded; candidates cannot predict avoidance of the dropout or its counterfactual recovery.',
@@ -22,6 +36,14 @@ LIMITATIONS = [
   'One post-update integral/friction-gate anchor follows supplied warmup; limiter previous-command seeds are recorded at activation.',
   'Runtime controller gains/settings are recorded inputs; active-loop defaults during inactivity are not measurements.',
 ]
+
+
+def component_snapshot(diagnostics, active):
+  """Retain native controller components; inactive/default fields are unavailable."""
+  if not active or diagnostics.version != 1:
+    return None
+  values = diagnostics.to_dict()
+  return {name: values[name] for name in COMPONENT_UNITS}
 
 
 def validate_baseline(path, prep_hash, history, runtime):
@@ -128,6 +150,11 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
                    'limited_match': limited == bool(d.freezeReasons & 1) if observed.active else True,
                    'consumed': {name: int(s.logMonoTime) for name, s in snapshots.items()},
                    'model_context_now': int(d.modelContextNow), 'camera_context_now': int(d.cameraContextNow)})
+      components = component_snapshot(actual.mazdaDiagnostics, bool(observed.active))
+      rows[-1].update(recorded_components=component_snapshot(d, bool(observed.active)), replay_components=components)
+      if components is not None:
+        rows[-1].update({name: components[field] for name, field in COMPONENT_METRICS.items()})
+        rows[-1].update(limiter_feedback_limited=limited, consumed_feedback_steer=feedback_steer)
     if anchor is None and observed.active and mono >= anchor_ns:
       ctrl.pid.i, ctrl.fric_gate_filter.x = float(d.integralAfter), float(d.frictionGate)
       anchor = {'mono': mono, 'integral_after': float(d.integralAfter), 'friction_gate_after': float(d.frictionGate)}
@@ -153,6 +180,11 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
   output.mkdir()
   write_json(output / 'trace.json', {'anchor': anchor, 'skipped_before_anchor': skipped, 'candidate_activation': switched,
                                    'limiter_initialization': {'ti': feedback.applies[0].previous, 'stock': feedback.applies[0].stock_previous},
+                                   'component_trace': {'format_version': 1, 'units': COMPONENT_UNITS,
+                                                       'feedback_units': 'published steer normalized by 600; opposite controller-count sign',
+                                                       'scope': 'Recorded and replayed active controller components; integral is not a TI-count contribution.'},
+                                   'capabilities': {'sample_identity_fields': ['consumed', 'model_context_now', 'camera_context_now'],
+                                                    'metrics': {name: COMPONENT_UNITS[field] for name, field in COMPONENT_METRICS.items()}},
                                    'availability': availability, 'scope': LIMITATIONS})
   write_json(output / 'trace-sends.json', {'sends': ti})
   write_json(output / 'trace-stock-sends.json', {'sends': stock_sends})

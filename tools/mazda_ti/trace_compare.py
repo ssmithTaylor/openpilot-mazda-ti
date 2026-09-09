@@ -10,8 +10,15 @@ from .provenance import read_json, sha256, write_json
 
 
 FORMAT_VERSION = 1
-METRICS = ('request_counts', 'retained_reference_counts', 'integral_counts', 'compensation_counts',
-           'clipped', 'constant_command', 'ti_command_counts', 'stock_command_counts', 'carryover_counts')
+METRIC_UNITS = {
+  **dict.fromkeys(('request_counts', 'retained_reference_counts', 'integral_counts', 'compensation_counts',
+                   'ti_command_counts', 'stock_command_counts', 'carryover_counts',
+                   'inverse_command_counts', 'controller_command_counts'), 'TI counts'),
+  **dict.fromkeys(('clipped', 'constant_command'), 'boolean'),
+  **dict.fromkeys(('request_mps2', 'effective_setpoint_mps2', 'effective_feedforward_mps2',
+                   'integral_before_mps2', 'integral_after_mps2'), 'm/s^2'),
+}
+METRICS = tuple(METRIC_UNITS)
 
 
 def _bundle(path, evidence_root, data_root):
@@ -100,7 +107,7 @@ def _effect(left, right, metric, phase=None):
       [tuple(row[field] for field in fields) for row in left_rows] != [tuple(row[field] for field in fields) for row in right_rows]):
     return {'availability': 'unavailable', 'reason': 'Retained sample identities do not align'}
   deltas = [float(a) - float(b) for a, b in zip(left_values, right_values, strict=True)]
-  return {'availability': 'supported', 'units': 'boolean' if isinstance(left_values[0], bool) else 'TI counts',
+  return {'availability': 'supported', 'units': METRIC_UNITS[metric],
           'minimum_delta': min(deltas), 'maximum_delta': max(deltas), 'worst_absolute_delta': max(map(abs, deltas)),
           'constant_exposure_frames': sum(bool(value) for value in left_values) if metric == 'constant_command' else None}
 

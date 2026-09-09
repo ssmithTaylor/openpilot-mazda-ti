@@ -11,6 +11,7 @@ from .audit_diagnostics import INPUTS
 from .example_fixture import create_example
 from .evaluate import evaluate, verify_bundle
 from .provenance import read_json, sha256
+from .instrumented import component_snapshot
 from cereal import log
 
 REVISION = 'ad14961a29f59635d5f657a43000ca2a1ade62fb'
@@ -77,10 +78,37 @@ def test_complete_instrumented_fixture_qualifies_both_paths_and_reports_transiti
   assert result['comparison']['stock']['changed_sends'] == 0
   assert result['comparison']['availability'] == {'ti_loss': 1, 'ti_reentry': 1, 'stock_fallback_applies': 3, 'inactive_applies': 2}
   assert verify_bundle(tmp_path / 'bundle', request.parent) == result
+  rows = [json.loads(line) for line in (tmp_path / 'bundle/candidate/trace.jsonl').read_text().splitlines()]
+  active, inactive = [row for row in rows if row['active']], [row for row in rows if not row['active']]
+  assert active and inactive
+  assert all(row['replay_components']['command'] == 0 and row['compensation_counts'] == 0 for row in active)
+  assert all(row['replay_components'] is None and row['recorded_components'] is None and
+             'compensation_counts' not in row and 'consumed_feedback_steer' not in row for row in inactive)
   # Stock is required evidence even while the recorded TI path supplies feedback.
   (tmp_path / 'bundle/candidate/trace-stock-sends.json').write_text('{}')
   with pytest.raises(ValueError):
     verify_bundle(tmp_path / 'bundle', request.parent)
+
+
+def test_component_snapshot_preserves_native_signed_values_and_missing_state():
+  event = log.Event.new_message()
+  diagnostics = event.init('controlsState').lateralControlState.init('torqueState').mazdaDiagnostics
+  diagnostics.version = 1
+  diagnostics.inverseCommand, diagnostics.frictionCompensation = -501.25, -68.75
+  diagnostics.integralBefore, diagnostics.integralAfter = .0919, .0920
+  diagnostics.freezeReasons = 3
+  # Exercise the actual serialized schema, including explicit zeros/defaults.
+  with log.Event.from_bytes(event.to_bytes()) as reader:
+    d = reader.controlsState.lateralControlState.torqueState.mazdaDiagnostics
+    values = component_snapshot(d, True)
+    assert values['inverseCommand'] == -501.25 and values['frictionCompensation'] == -68.75
+    assert values['integralBefore'] == .0919 and values['integralAfter'] == .0920
+    assert values['freezeReasons'] == 3
+    assert component_snapshot(d, False) is None
+  diagnostics.version = 0
+  assert component_snapshot(diagnostics, True) is None
+  diagnostics.version = 2
+  assert component_snapshot(diagnostics, True) is None
 
 
 @pytest.mark.parametrize('corruption', ['missing_input', 'version', 'validity', 'sequence', 'stock_previous', 'ti_previous',

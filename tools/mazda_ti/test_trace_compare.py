@@ -10,6 +10,22 @@ from .example_fixture import create_example
 from .evaluate import evaluate
 
 
+def test_native_integral_effect_is_not_reported_as_torque_counts(tmp_path):
+  def native(integral, compensation):
+    return [{'mono': index, 'active': True, 'integral_after_mps2': integral,
+             'compensation_counts': compensation} for index in range(4)]
+  reference = bundle(tmp_path, 'reference', native(.090, 68))
+  control = bundle(tmp_path, 'control', native(.090, 68))
+  candidate = bundle(tmp_path, 'candidate', native(.092, 30))
+  result = compare_trace_bundles(reference, candidate, control, tmp_path / 'report')
+  integral = result['metrics']['integral_after_mps2']
+  assert integral['units'] == 'm/s^2'
+  assert integral['worst_absolute_delta'] == pytest.approx(.002)
+  assert result['metrics']['compensation_counts']['minimum_delta'] == -38
+  assert result['metrics']['integral_counts']['availability'] == 'unavailable'
+  assert result['metrics']['ti_command_counts']['availability'] == 'unavailable'
+
+
 def bundle(root, name, rows, *, status='completed_checks', phases=None, provenance=None):
   path = root / name
   path.mkdir()
