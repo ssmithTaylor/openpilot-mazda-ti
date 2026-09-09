@@ -15,6 +15,13 @@ def test_real_compensation_reports_flat_response_and_is_repeatable(tmp_path):
   assert first['status'] == 'failed_check'
   assert first['qualification'] == 'isolated_compensation_expression'
   assert any(gate['flat_intervals'] > 0 for gate in first['gates'])
+  assert any(gate['flat_below_limit_intervals'] > 0 for gate in first['gates'])
+  compensation, _ = extract(controller_source(ORIGINAL))
+  assert 500 + compensation(500, 3) == pytest.approx(570)
+  assert 530 + compensation(530, 3) == pytest.approx(570)
+  report = (tmp_path / 'first/report.md').read_text()
+  assert 'Physical-limit flat intervals' in report
+  assert 'desirable duration or vehicle handling' in report
   assert first['expressions']['expression_source']
   assert run(ORIGINAL, tmp_path / 'second') == first
   assert (tmp_path / 'first/result.json').read_bytes() == (tmp_path / 'second/result.json').read_bytes()
@@ -54,3 +61,14 @@ def test_probe_rejects_nonfinite_and_overlimit_mapping():
     _, failures = measure(compensation)
     assert len(failures) == 5
     assert all('out-of-envelope' in failure for failure in failures)
+
+
+def test_physical_600_clip_is_distinct_from_artificial_below_limit_plateau():
+  source = controller_source(ORIGINAL)
+  old = 'FRIC_COMP_KEEPOUT = 0.95'
+  assert source.count(old) == 1
+  compensation, _ = extract(source.replace(old, 'FRIC_COMP_KEEPOUT = 1.0'))
+  summaries, failures = measure(compensation)
+  assert failures == []
+  assert any(row['physical_limit_flat_intervals'] > 0 for row in summaries)
+  assert all(row['flat_below_limit_intervals'] == 0 and row['reversed_intervals'] == 0 for row in summaries)

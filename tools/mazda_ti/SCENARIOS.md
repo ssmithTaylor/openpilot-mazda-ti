@@ -68,8 +68,10 @@ before the recognized withdrawal call, from the pinned controller source. It
 rejects changed expression boundaries or additional dependencies. It evaluates
 commands from -600 to +600 in 0.1-count steps at five positive, zero and negative
 gate values, including opposing gate/command signs. Its responsiveness check
-fails flat or reversed full-precision response intervals and nonfinite or
-out-of-envelope results. Integer quantization may still repeat adjacent values;
+fails flat full-precision response intervals below the physical 600-count limit,
+reversed intervals, and nonfinite or out-of-envelope results. Flat intervals at
+the physical limit are reported separately; their duration and handling effect
+still require evaluation. Integer quantization may still repeat adjacent values;
 strict response is not required at every 0.1-count wire step.
 
 `result.json` preserves source revision, source/AST/helper hashes, runtime,

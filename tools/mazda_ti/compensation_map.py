@@ -82,11 +82,13 @@ def measure(compensation):
       continue
     differences = [b - a for a, b in zip(values, values[1:])]
     flat = [i for i, delta in enumerate(differences) if abs(delta) <= 1e-9]
+    below_limit = [i for i in flat if max(abs(values[i]), abs(values[i + 1])) < 600.0 - 1e-9]
     reversals = sum(delta < -1e-9 for delta in differences)
-    if flat or reversals:
-      failures.append(f'gate={gate}: {len(flat)} flat and {reversals} reversed full-precision response intervals')
+    if below_limit or reversals:
+      failures.append(f'gate={gate}: {len(below_limit)} flat below-limit and {reversals} reversed full-precision response intervals')
     summaries.append({'gate_mps2': gate, 'samples': len(values), 'minimum_increment_counts': min(differences),
                       'maximum_increment_counts': max(differences), 'flat_intervals': len(flat),
+                      'flat_below_limit_intervals': len(below_limit), 'physical_limit_flat_intervals': len(flat) - len(below_limit),
                       'reversed_intervals': reversals,
                       'first_flat_inverse_counts': None if not flat else (flat[0] - 6000) / 10.0,
                       'rounded_output_values': len({round(value) for value in values})})
@@ -107,14 +109,18 @@ def run(revision, output):
             'runtime': environment(), 'expressions': expressions,
             'grid': {'inverse_counts': [-600.0, 600.0], 'step_counts': 0.1, 'gates_mps2': list(GATES)},
             'gates': summaries, 'findings': failures,
-            'limitations': ['Strict response concerns full-precision mapping, not every quantized 0.1-count step.',
+            'limitations': ['Strict response concerns full-precision mapping below the physical 600-count clip, not every quantized 0.1-count step.',
+                            'Physical-limit saturation is reported separately; allowing it does not establish desirable duration or vehicle handling.',
                             'The enabled, available-authority branch is isolated; gating, withdrawal and state evolution are excluded.',
                             'A varying request does not establish TI receipt or avoidance of its stuck-request fault.']}
   output = Path(output)
   output.mkdir(parents=True, exist_ok=False)
   write_json(output / 'result.json', result)
+  physical_flats = sum(row['physical_limit_flat_intervals'] for row in summaries)
   (output / 'report.md').write_text('# Production compensation map\n\n' + SCOPE + '\n\nStatus: **' + result['status'] +
-                                   '**\n\n' + '\n'.join('- ' + item for item in failures or ['No mapping failures on the declared grid.']) + '\n',
+                                   '**\n\n' + '\n'.join('- ' + item for item in failures or ['No below-limit flats, reversals or envelope failures on the declared grid.']) +
+                                   f'\n\nPhysical-limit flat intervals across all gates: {physical_flats}.\n\n' +
+                                   '\n'.join('- ' + item for item in result['limitations']) + '\n',
                                    encoding='utf-8', newline='\n')
   return result
 
