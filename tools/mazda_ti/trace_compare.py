@@ -1,0 +1,154 @@
+"""Versioned optional trace capabilities and a portable phase comparison report."""
+
+import argparse
+import json
+from pathlib import Path
+import re
+
+from .provenance import read_json, write_json
+
+
+FORMAT_VERSION = 1
+METRICS = ('request_counts', 'retained_reference_counts', 'integral_counts', 'compensation_counts',
+           'clipped', 'constant_command', 'ti_command_counts', 'stock_command_counts', 'carryover_counts')
+
+
+def _bundle(path):
+  path = Path(path)
+  result, metadata = read_json(path / 'result.json'), read_json(path / 'trace.json')
+  if result.get('format_version') != 1 or metadata.get('format_version') != FORMAT_VERSION:
+    raise ValueError('Unsupported retained trace bundle version')
+  rows = [json.loads(line) for line in (path / 'trace.jsonl').read_text(encoding='utf-8').splitlines() if line]
+  if not rows or any(type(row.get('mono')) not in (int, float) for row in rows):
+    raise ValueError('Trace requires finite monotonic rows')
+  if any(later['mono'] <= earlier['mono'] for earlier, later in zip(rows, rows[1:], strict=False)):
+    raise ValueError('Trace timestamps must increase')
+  provenance = metadata.get('provenance')
+  valid_provenance = isinstance(provenance, dict) and all(isinstance(provenance.get(name), str) and re.fullmatch('[a-f0-9]{64}', provenance[name])
+                                                          for name in ('source_sha256', 'input_sha256'))
+  return {'path': path.name, 'result': result, 'metadata': metadata, 'rows': rows,
+          'provenance': provenance if valid_provenance else None}
+
+
+def _phases(metadata, rows):
+  declared = metadata.get('phase_windows', [])
+  names = ('entry', 'sustained', 'unwind', 'recovery')
+  if declared:
+    if (not isinstance(declared, list) or [row.get('name') for row in declared] != list(names) or
+        any(set(row) != {'name', 'start', 'end', 'source', 'uncertainty'} or type(row['start']) not in (int, float) or
+            type(row['end']) not in (int, float) or row['start'] >= row['end'] or not isinstance(row['source'], str) or
+            not isinstance(row['uncertainty'], str) for row in declared) or
+        any(later['start'] < earlier['end'] for earlier, later in zip(declared, declared[1:], strict=False))):
+      raise ValueError('Phase windows must declare entry, sustained, unwind, and recovery')
+    return [dict(row) for row in declared]
+  start, end = rows[0]['mono'], rows[-1]['mono']
+  interval = (end - start) / 4
+  return [{'name': name, 'start': start + index * interval, 'end': end if index == 3 else start + (index + 1) * interval,
+           'source': 'documented_chronological_rule', 'uncertainty': 'inferred from trace duration; not a rider annotation'}
+          for index, name in enumerate(names)]
+
+
+def _values(bundle, metric, phase=None):
+  active = [row for row in bundle['rows'] if row.get('active') is True and
+            (phase is None or phase['start'] <= row['mono'] <= phase['end'])]
+  if not active:
+    return 'inactive', []
+  values = [row[metric] for row in active if metric in row]
+  if not values:
+    return 'unavailable', []
+  if len(values) != len(active):
+    return 'unavailable', []
+  if any(type(value) not in (int, float, bool) for value in values):
+    return 'unavailable', []
+  return 'supported', values
+
+
+def _effect(left, right, metric, phase=None):
+  left_state, left_values = _values(left, metric, phase)
+  right_state, right_values = _values(right, metric, phase)
+  if 'inactive' in (left_state, right_state):
+    return {'availability': 'inactive', 'reason': 'At least one arm has no active trace fields'}
+  if left_state != 'supported' or right_state != 'supported' or len(left_values) != len(right_values):
+    return {'availability': 'unavailable', 'reason': 'Metric is absent, partial, or not comparable across retained arms'}
+  left_rows = [row for row in left['rows'] if row.get('active') is True and (phase is None or phase['start'] <= row['mono'] <= phase['end'])]
+  right_rows = [row for row in right['rows'] if row.get('active') is True and (phase is None or phase['start'] <= row['mono'] <= phase['end'])]
+  fields = ['mono'] + left['metadata'].get('capabilities', {}).get('sample_identity_fields', [])
+  if (left['metadata'].get('capabilities', {}).get('sample_identity_fields', []) != right['metadata'].get('capabilities', {}).get('sample_identity_fields', []) or
+      any(any(field not in row for field in fields) for row in left_rows + right_rows) or
+      [tuple(row[field] for field in fields) for row in left_rows] != [tuple(row[field] for field in fields) for row in right_rows]):
+    return {'availability': 'unavailable', 'reason': 'Retained sample identities do not align'}
+  deltas = [float(a) - float(b) for a, b in zip(left_values, right_values, strict=True)]
+  return {'availability': 'supported', 'units': 'boolean' if isinstance(left_values[0], bool) else 'TI counts',
+          'minimum_delta': min(deltas), 'maximum_delta': max(deltas), 'worst_absolute_delta': max(map(abs, deltas)),
+          'constant_exposure_frames': sum(bool(value) for value in left_values) if metric == 'constant_command' else None}
+
+
+def compare_trace_bundles(reference_path, candidate_path, current_control_path, output):
+  """Compare retained, versioned traces; no metric is synthesized from absent fields."""
+  reference, candidate, control = _bundle(reference_path), _bundle(candidate_path), _bundle(current_control_path)
+  output = Path(output)
+  output.mkdir(parents=True, exist_ok=False)
+  try:
+    phases = _phases(candidate['metadata'], candidate['rows'])
+  except ValueError as error:
+    result = {'format_version': FORMAT_VERSION, 'status': 'failed_check', 'provenance': {}, 'phases': [],
+              'findings': {'invariants': [{'arm': 'candidate', 'finding': 'Invalid phase declaration: ' + str(error)}],
+                           'command_effects': [], 'physical_observations': []}}
+    write_json(output / 'result.json', result)
+    (output / 'report.md').write_text('# Mazda trace comparison\n\nStatus: **failed_check**. Invalid phase declaration.\n', encoding='utf-8')
+    return result
+  metrics = {name: _effect(candidate, reference, name) for name in METRICS}
+  current = {name: _effect(candidate, control, name) for name in METRICS}
+  phase_effects = {phase['name']: {
+    'candidate_minus_reference': {name: _effect(candidate, reference, name, phase) for name in METRICS},
+    'candidate_minus_current_control': {name: _effect(candidate, control, name, phase) for name in METRICS},
+  } for phase in phases}
+  invariants = [{'arm': name, 'status': bundle['result'].get('status'), 'finding': 'Retained arm did not complete declared checks'}
+                for name, bundle in (('reference', reference), ('candidate', candidate), ('current_control', control))
+                if bundle['result'].get('status') != 'completed_checks']
+  arms = {'reference': reference, 'candidate': candidate, 'current_control': control}
+  for name, bundle in arms.items():
+    if bundle['provenance'] is None:
+      invariants.append({'arm': name, 'finding': 'Retained arm lacks valid source/input provenance'})
+  if all(bundle['provenance'] is not None for bundle in arms.values()):
+    input_hashes = {bundle['provenance']['input_sha256'] for bundle in arms.values()}
+    if len(input_hashes) != 1:
+      invariants.append({'arm': 'current_control', 'finding': 'Retained arms have mismatched input provenance'})
+  status = 'failed_check' if invariants else 'completed_checks'
+  result = {'format_version': FORMAT_VERSION, 'status': status,
+            'provenance': {name: {'bundle': bundle['path'], **(bundle['provenance'] or {})} for name, bundle in arms.items()},
+            'phases': phases, 'metrics': metrics,
+            'phase_effects': phase_effects,
+            'command_effects': {'candidate_minus_reference': {name: metrics[name] for name in ('ti_command_counts', 'stock_command_counts')},
+                                'candidate_minus_current_control': {name: current[name] for name in ('ti_command_counts', 'stock_command_counts')}},
+            'findings': {'invariants': invariants,
+                         'command_effects': ['Deltas describe recorded-motion command effects, not handling improvement.'],
+                         'physical_observations': candidate['metadata'].get('physical_observations', [])},
+            'scope': 'Software invariants, recorded-motion command effects, and physical observations are separate. Earlier release alone is not improvement.'}
+  write_json(output / 'result.json', result)
+  lines = ['# Mazda trace comparison', '', f"Status: **{status}**.", '', result['scope'], '', '## Phases', '']
+  lines += [f"- {item['name']}: {item['start']} to {item['end']} ({item['source']}; {item['uncertainty']})" for item in phases]
+  lines += ['', '## Command effects', '']
+  for name, effect in result['command_effects']['candidate_minus_reference'].items():
+    lines.append(f"- {name}: {effect['availability']}; worst candidate-minus-reference delta {effect.get('worst_absolute_delta', 'unavailable')}.")
+  lines += ['', '## Unfavorable, missing, and inactive evidence', '']
+  lines += [f"- {name}: {effect['availability']} ({effect.get('reason', 'retained comparison')})" for name, effect in metrics.items() if effect['availability'] != 'supported']
+  lines += ['', '## Physical observations', ''] + [f"- {item.get('text', 'unavailable')} ({item.get('provenance', 'unavailable')})" for item in result['findings']['physical_observations']]
+  (output / 'report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')
+  return result
+
+
+def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument('--reference', type=Path, required=True)
+  parser.add_argument('--candidate', type=Path, required=True)
+  parser.add_argument('--current-control', type=Path, required=True)
+  parser.add_argument('--output', type=Path, required=True)
+  args = parser.parse_args()
+  result = compare_trace_bundles(args.reference, args.candidate, args.current_control, args.output)
+  print(f"{result['status']}: {args.output / 'report.md'}")
+  return 0 if result['status'] == 'completed_checks' else 1
+
+
+if __name__ == '__main__':
+  raise SystemExit(main())

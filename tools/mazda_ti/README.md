@@ -8,6 +8,9 @@ settings, revisions, history, and scoring window.
 For versioned mixed recorded cases, rider annotations, exposure and required coverage
 profiles, see [CORPUS.md](CORPUS.md).
 
+[TRACE_COMPARISON.md](TRACE_COMPARISON.md) documents the optional, versioned portable
+trace comparison report and its equivalent current-control arm.
+
 ## Raw-evidence ingestion
 
 [`INGESTION.md`](INGESTION.md) defines the separate versioned inventory and explicit bounded collection command for raw drive evidence. It is offline-testable and does not evaluate a candidate, contact a device, or expose unrestricted Params.
