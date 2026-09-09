@@ -381,6 +381,10 @@ def actual_full_process(rlog, max_carstate_messages=100, require_inactive=True, 
     generated_harness = inject_transition_harness(events, log, max_carstate_messages)
   startup_events = events if all_segments else _read_rlog_events(log, rlogs[-1].read_bytes())[0]
   bounded, cutoff = _bounded_startup_events(startup_events, max_carstate_messages)
+  if transition_harness:
+    # The report describes the bounded process input, not every generated row
+    # from the adjacent source segments that never crossed this replay run.
+    generated_harness = [row for row in generated_harness if row.get('frame', -1) < max_carstate_messages]
   # Later route segments do not repeat carParams. Carry the exact earlier event
   # into the isolated startup input rather than synthesizing one.
   if not any(event.which() == 'carParams' for event in bounded):

@@ -44,6 +44,26 @@ selection. At an active TI-bypass boundary it checks the exact
 serialized prior `integralAfter` against the bypass frame's `integralBefore`;
 the integral may evolve, but a reset cannot be hidden as retained state.
 
+`--schema-input-harness` is the bounded live-transition profile. It runs
+`controlsd` with process replay simulation disabled and paces the actual
+subscriber schemas at their declared service frequencies. Retained valid
+payloads are republished for the real `controlsd` subscriptions; generated
+inputs are limited to `managerState`, `pandaStates`, `frogpilotCarState`,
+`frogpilotPlan`, and `liveDelay`, each carries its retained source-frame
+identity. The fixture deliberately withholds `frogpilotCarState` during its
+cold start (missing), makes a later publication gap while other subscriptions
+stay healthy (stale), and sends one explicitly invalid schema event. These are
+reported as expected harness exclusions only when the parsed `controlsd`
+diagnostic names exactly those declared services; any extra service, stack
+trace, malformed stderr, or non-frequency health failure fails the run.
+
+This profile demonstrates process response to serialized schema inputs. It
+does not claim recorded TI availability beyond the fixed retained cutout, live
+vehicle behavior, hardware output, or device timing. Its 100 Hz wall-clock
+pacing and host workload are execution metadata. The retained unmodified
+cold/inactive replay remains negative evidence rather than a substitute for
+the active transition profile.
+
 When the host cannot import the supported runtime, the command records
 `unsupported`; when a retained rlog does not contain all required active or
 fault sequences, it records `failed_check` with the fixed availability counts.
