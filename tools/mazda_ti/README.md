@@ -71,6 +71,18 @@ It records source hashes and any visibility transformation description. Keep
 video and extracted rows in C: scratch under the storage policy; retain only
 the compact mapping JSON in durable study storage.
 
+### Rider review bundle
+
+Use `rider_review.py build` with a source-locked request, byte-hashed manifest,
+existing local video, and a camera mapping carrying matching route, segment, and
+video identities to create a small static review page. Labels are
+explicit observations (`smooth`, `scallop`, `held_inward`, `over_release`,
+`intervention`, or `uncertain`); they never infer inside/outside, driver contact,
+or TI causality. `rider_review.py validate` requires matching request/manifest
+hashes, exact interval IDs and mapping brackets, confidence, and rider
+provenance for physical labels. The tool refuses ambiguous or changed inputs
+and never copies video into the repository.
+
 ### Lateral event evidence
 
 `lateral_event_detector.py` scores a pre-joined normalized row stream for
