@@ -136,3 +136,30 @@ def test_repeated_payload_and_duplicate_publication_are_rejected():
   repeat.carOutput.mazdaDiagnostics.driverTorque = 1
   with pytest.raises(ValueError, match='Repeated apply changed'):
     make(events + [repeat])
+
+
+def test_previous_applied_feedback_is_owned_prior_and_never_future():
+  replay = make()
+  replay.publish(1160, .5)
+  warmup = replay.previous_applied_for_update(1160, 1150)
+  assert warmup.observed_steer == serialized_steer(10 / 600)
+  assert not warmup.candidate_available
+
+  previous = replay.previous_applied_for_update(1200, 1190, limiter_frozen=True)
+  assert previous.candidate_available
+  assert previous.candidate.source_controller_mono == 1160
+  assert previous.candidate.source_request_mono == 1170
+  assert previous.candidate.applied_mono == 1180
+  assert previous.candidate.publication_mono == 1190
+  assert previous.candidate.selected_counts == 20
+  assert previous.candidate.limiter_frozen
+  with pytest.raises(ValueError, match='future'):
+    replay.previous_applied_for_update(1190, 1190)
+
+
+def test_equivalent_candidate_feedback_matches_recorded_baseline_exactly():
+  replay = make()
+  replay.publish(1160, .5)
+  previous = replay.previous_applied_for_update(1200, 1190)
+  assert previous.candidate.ti_counts == 20
+  assert previous.candidate.normalized_steer == serialized_steer(20 / 600)

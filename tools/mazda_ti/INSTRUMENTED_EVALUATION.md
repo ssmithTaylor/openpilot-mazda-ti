@@ -39,6 +39,11 @@ existing controller state; inactivity resets the controller and both limiter his
 TI requests reset during bypass and restart on re-entry; the candidate stock history
 continues even while TI supplies feedback. Consumed feedback selects the exact previous
 apply, and limited-state history compares before appending the current request.
+Before every controller call, the adapter obtains a typed previous-applied snapshot. It is
+candidate-owned only after the represented apply was sourced by a post-activation update,
+and its identities must satisfy controller <= request <= apply <= publication < current
+update. First-cycle warmup remains unavailable. The snapshot is captured before the caller
+updates `limited` or appends the current request, so a same-cycle send cannot leak into it.
 
 Baseline qualification requires nonempty active coverage, exact Float32-serialized
 controller output equality on every scored update (including inactivity), controller command residual
@@ -71,6 +76,8 @@ inverse command, compensation and final command. `limiter_feedback_limited` and
 `consumed_feedback_steer` retain the replay's actual pre-update limiter state and the exact
 consumed software feedback. TI/stock apply traces remain separate, keyed by apply time;
 they must not be substituted for controller components by nearest-timestamp matching.
+`previous_applied_feedback` carries the typed candidate-owned TI/stock selection and exact
+source chain when available; null means the producer identity is not qualified.
 
 The shared trace comparison recognizes acceleration-domain request/reference/integral
 metrics in `m/s^2` and inverse/final/compensation commands in TI counts. It aligns consumed

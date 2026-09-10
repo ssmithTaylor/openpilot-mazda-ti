@@ -4,6 +4,7 @@ Only software requests/feedback evolve. Sensors, planner, availability and apply
 """
 
 from collections import deque
+from dataclasses import asdict
 import hashlib
 import json
 from types import SimpleNamespace as NS
@@ -138,7 +139,10 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
     ctrl.update_model_context(model.modelV2, int(model.logMonoTime), snapshots['modelV2'].checksPassed, d.modelContextNow, d.cameraContextNow)
     curvature = d.rawRequest / (cs.vEgo ** 2) if cs.vEgo else event.controlsState.desiredCurvature
     fp = used['frogpilotCarState'].frogpilotCarState if snapshots['frogpilotCarState'].checksPassed else None
-    feedback_steer = feedback.output_for(int(used['carOutput'].logMonoTime))
+    applied_feedback = feedback.previous_applied_for_update(
+      mono, int(used['carOutput'].logMonoTime), limiter_frozen=limited,
+    )
+    feedback_steer = applied_feedback.observed_steer
     steer, _, actual = ctrl.update(bool(observed.active), cs, vm, lp, limited, curvature, bool(d.curvatureLimited),
                                   used['liveDelay'].liveDelay.lateralDelay + .1, None, model.modelV2, toggles, fp)
     feedback.publish(mono, steer)
@@ -149,7 +153,10 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
                    'plant_match': actual.plantState == observed.plantState,
                    'limited_match': limited == bool(d.freezeReasons & 1) if observed.active else True,
                    'consumed': {name: int(s.logMonoTime) for name, s in snapshots.items()},
-                   'model_context_now': int(d.modelContextNow), 'camera_context_now': int(d.cameraContextNow)})
+                   'model_context_now': int(d.modelContextNow), 'camera_context_now': int(d.cameraContextNow),
+                   'previous_applied_feedback': (
+                     asdict(applied_feedback.candidate) if applied_feedback.candidate_available else None
+                   )})
       components = component_snapshot(actual.mazdaDiagnostics, bool(observed.active))
       rows[-1].update(recorded_components=component_snapshot(d, bool(observed.active)), replay_components=components)
       if components is not None:

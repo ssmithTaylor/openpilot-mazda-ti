@@ -161,8 +161,15 @@ CLI still uses its declared sampling histories. After auditing the input chain, 
 carOutput events paired with event timestamps, a carControl event map keyed by timestamp,
 and the pinned production limiter. Times are integer nanoseconds.
 
-Before each controller update, use `output_for(consumed_carOutput_mono)` for the exact
-output identity in its diagnostic inputs. Publish the resulting normalized steering with
+Before each controller update, use
+`previous_applied_for_update(controlsState_mono, consumed_carOutput_mono, limiter_frozen)`.
+Use its `observed_steer` for the existing limiter-history comparison and expose its typed
+`candidate` only when `candidate_available` is true. The candidate record is causally
+ordered and identifies the controller update, paired request, apply and output publication;
+it includes candidate-owned TI/stock counts, permission/selection, fallback and the caller's
+pre-update freeze state. A recorded warmup output or a historical request without a qualified
+producer identity deliberately returns no candidate record. `output_for` remains the lower
+level exact-output helper. Publish the resulting normalized steering with
 `publish(controlsState_mono, steer)`. Use `history_request(mono, replayed, recorded)` for
 the controller's request-history comparison, preserving recorded requests and feedback
 together before activation. Call `finish()` after all required controller outputs are

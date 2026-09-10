@@ -81,6 +81,14 @@ def test_complete_instrumented_fixture_qualifies_both_paths_and_reports_transiti
   rows = [json.loads(line) for line in (tmp_path / 'bundle/candidate/trace.jsonl').read_text().splitlines()]
   active, inactive = [row for row in rows if row['active']], [row for row in rows if not row['active']]
   assert active and inactive
+  prior = [row['previous_applied_feedback'] for row in rows if row['previous_applied_feedback'] is not None]
+  assert prior and rows[0]['previous_applied_feedback'] is None
+  assert all(p['source_controller_mono'] <= p['source_request_mono'] <= p['applied_mono'] <=
+             p['publication_mono'] < row['mono'] for row in rows
+             if (p := row['previous_applied_feedback']) is not None)
+  assert any(p['stock_fallback'] and p['selected_counts'] == p['stock_counts'] for p in prior)
+  assert any(p['ti_selected'] and p['selected_counts'] == p['ti_counts'] for p in prior)
+  assert any(not p['active'] and p['selected_counts'] == 0 for p in prior)
   assert all(row['replay_components']['command'] == 0 and row['compensation_counts'] == 0 for row in active)
   assert all(row['replay_components'] is None and row['recorded_components'] is None and
              'compensation_counts' not in row and 'consumed_feedback_steer' not in row for row in inactive)

@@ -93,3 +93,25 @@ def test_eps_delivery_scale_cannot_replace_stock_command_normalization():
   rows[7].carOutput.actuatorsOutput.steer = -20 / 308
   with pytest.raises(ValueError, match='does not represent'):
     make(rows)
+
+
+def test_typed_feedback_tracks_dropout_fallback_inactive_and_reengage():
+  replay = make(events())
+  for i in range(1, 8):
+    replay.publish(990 + i * 100, .5)
+
+  dropout = replay.previous_applied_for_update(1450, 1420)
+  assert (dropout.candidate.ti_counts, dropout.candidate.stock_counts,
+          dropout.candidate.selected_counts) == (0, 40, 40)
+  assert dropout.candidate.stock_fallback and not dropout.candidate.ti_available
+
+  reentry = replay.previous_applied_for_update(1550, 1520)
+  assert (reentry.candidate.ti_counts, reentry.candidate.stock_counts,
+          reentry.candidate.selected_counts) == (10, 50, 10)
+  assert reentry.candidate.ti_selected and not reentry.candidate.stock_fallback
+
+  inactive = replay.previous_applied_for_update(1650, 1620)
+  assert not inactive.candidate.active and inactive.candidate.selected_counts == 0
+  reengaged = replay.previous_applied_for_update(1750, 1720)
+  assert reengaged.candidate.active and reengaged.candidate.stock_fallback
+  assert reengaged.candidate.selected_counts == 10

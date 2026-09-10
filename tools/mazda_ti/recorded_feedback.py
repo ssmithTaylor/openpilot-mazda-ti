@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from .applied_feedback import AppliedLateralFeedback, PreviousAppliedFeedback
+
 
 def serialized_steer(value):
   value = float(value)
@@ -36,6 +38,7 @@ class Apply:
   sequence: int
   applied_at: int
   controller: int
+  request_mono: int
   request: float
   allowed: bool
   previous: int
@@ -104,7 +107,7 @@ class RecordedTiFeedback:
         raise ValueError('Recorded TI request does not match applied carControl')
       if not math.isfinite(d['driverTorque']):
         raise ValueError('Non-finite driver torque')
-      apply = Apply(sequence, int(co.appliedAtMonoTime), int(cc.controlsStateMonoTime), request, allowed,
+      apply = Apply(sequence, int(co.appliedAtMonoTime), int(cc.controlsStateMonoTime), int(co.appliedCarControlMonoTime), request, allowed,
                     int(d['tiPrevious']), int(d['tiLimited']), d['driverTorque'], limits_from_diagnostics(d),
                     bool(cc.latActive), bool(d['tiAllowed']), int(d['stockPrevious']), int(d['stockLimited']))
       if not -600 <= apply.previous <= 600 or not -600 <= apply.recorded <= 600:
@@ -186,6 +189,27 @@ class RecordedTiFeedback:
       if not apply.ti_selected:
         return serialized_steer(self.stock_counts[sequence] / 600)
     return serialized_steer(self.counts[sequence] / 600)
+
+  def previous_applied_for_update(self, update_mono, output_mono, limiter_frozen=False):
+    """Return only causally prior, candidate-owned apply state for ``update_mono``."""
+    observed = self.output_for(output_mono)
+    sequence, applied_at, _ = self.outputs[output_mono]
+    if applied_at < self.activation_ns:
+      return PreviousAppliedFeedback(int(update_mono), observed, None)
+    apply = next((a for a in self.applies if a.sequence == sequence), None)
+    if apply is None:
+      raise ValueError('Missing apply identity for consumed output')
+    if apply.controller < self.activation_ns:
+      return PreviousAppliedFeedback(int(update_mono), observed, None)
+    stock = self.stock_counts.get(sequence) if self.stock_limiter is not None else None
+    fallback = bool(apply.active and not apply.ti_selected)
+    selected = stock if fallback else self.counts[sequence]
+    snapshot = AppliedLateralFeedback(
+      int(output_mono), apply.applied_at, apply.request_mono, apply.controller, sequence,
+      self.counts[sequence], stock, selected, observed, apply.active, apply.allowed,
+      apply.ti_selected, bool(apply.active and apply.ti_selected), fallback, bool(limiter_frozen),
+    )
+    return PreviousAppliedFeedback(int(update_mono), observed, snapshot)
 
   def finish(self):
     self._advance(self.applies[-1].sequence)

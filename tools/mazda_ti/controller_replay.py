@@ -8,6 +8,7 @@ this script executes. Input sampling/validity and initial state remain auditable
 
 from bisect import bisect_right
 from collections import deque
+from dataclasses import asdict
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +68,11 @@ def instrument(source):
       future_lateral_accel=future_lateral_accel, fric_comp=fric_comp,
       pre_break_command=self._replay_pre_break_command, break_target=target,
       break_boost=self.break_boost, break_frames=self.break_frames,
+      prompt_unload=getattr(self,"prompt_unload",0.0),
+      prompt_unload_target=getattr(self,"prompt_unload_target",0.0),
+      prompt_unload_active=getattr(self,"prompt_unload_active",False),
+      prompt_unload_completed=getattr(self,"prompt_unload_completed",False),
+      prompt_decline_samples=getattr(self,"prompt_decline_samples",0),
       freeze_integrator=freeze_integrator, commit_blend=self.commit_blend,
       commit_ff_state=self.commit_ff_filter.x, commit_sp_state=self.commit_sp_filter.x,
       commit_release_coefficient=self.commit_ff_filter.a_release,
@@ -132,7 +138,7 @@ def publish_paired_request(feedback, streams, mono, curvature, recorded_output, 
   # A post-activation publication can use pre-activation consumed input, or even
   # a pre-activation controller update. Publication and computation are separate.
   steer = candidate_output if mono >= feedback.fixture.start_ns else recorded_output
-  feedback.publish_request(cc_mono, steer, active)
+  feedback.publish_request(cc_mono, steer, active, source_controller_mono=mono)
 
 
 def run(args):
@@ -228,9 +234,10 @@ def run(args):
     fp = latest['frogpilotCarState'][0]
     co = latest['carOutput'][0]
     software_active = feedback is not None and cutoff >= feedback.fixture.start_ns
+    applied_feedback = None
     if software_active:
-      simulated_output = feedback.output_at(cutoff)
-      co = SimpleNamespace(actuatorsOutput=SimpleNamespace(steer=simulated_output.steer))
+      applied_feedback = feedback.previous_applied_for_update(mono, cutoff, limiter_frozen=limited)
+      co = SimpleNamespace(actuatorsOutput=SimpleNamespace(steer=applied_feedback.observed_steer))
     active = bool(observed.active)
     variant_active = args.variant_start is None or mono / 1e9 >= args.variant_start
     if variant_active and ctrl.__class__ is not module.LatControlTorque:
@@ -272,6 +279,9 @@ def run(args):
       'variant_active': variant_active,
       'software_feedback_active': software_active,
       'feedback_steer': float(co.actuatorsOutput.steer),
+      'previous_applied_feedback': (
+        asdict(applied_feedback.candidate) if applied_feedback is not None and applied_feedback.candidate_available else None
+      ),
       'v_ego': cs.vEgo,
       'angle': cs.steeringAngleDeg,
       'rate': cs.steeringRateDeg,
