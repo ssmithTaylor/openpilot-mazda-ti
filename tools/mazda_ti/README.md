@@ -73,6 +73,8 @@ Version2 runner records cover relevant repository dependencies (including PID, p
 ## Prepare and replay
 
 For older NNFF recordings, use the separate [historical NNFF/PID probe](LEGACY_NNFF.md).
+Then use the [historical actuation audit](LEGACY_NNFF_ACTUATION.md) for original
+TI/stock scaling, limiter history and previous-apply feedback checks.
 It covers normalized controller-output reconstruction on pinned source, with
 explicit legacy receipt assumptions. The full actuator/candidate adapters below
 remain distinct and do not inherit that qualification.

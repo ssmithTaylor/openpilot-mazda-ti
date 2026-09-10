@@ -84,3 +84,5 @@ Retain compact summaries, hashes, requests, frozen method/selection protocols
 and failed attempts. After deleting full traces, mark summaries as requiring
 full reconstruction before verification or qualification. A full adapter for
 candidate-owned actuator feedback and applied CAN remains separate work.
+The narrower [historical actuation audit](LEGACY_NNFF_ACTUATION.md) now checks
+original TI/stock counts and feedback, preserving remaining rounding failures.
