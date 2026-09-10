@@ -45,11 +45,12 @@ Use it before attributing a plateau-related feedback or integral change to the p
 
 ## Raw-evidence ingestion
 
-On Windows, `.ti-local/raw` may be a junction or other reparse point. Resolve
-its target (or use the request's explicit data root) before inventorying routes;
-some recursive search tools do not traverse that link. A route is unavailable
-only after its exact requested segment paths have been checked in the resolved
-root. Preserve the configured root and exact paths in the compact evidence.
+On Windows, `.ti-local/raw` may be a junction or other reparse point. The coarse
+geographic inventory accepts an explicitly supplied final root junction or
+symlink, records both the caller spelling and resolved target, and rejects
+reparse ancestors and nested reparse entries. A route is unavailable only after
+its exact requested segment paths have been checked in the resolved root.
+Preserve the configured root and exact paths in the compact evidence.
 
 Before attributing a candidate-only effect, run `candidate_attribution.py`'s
 validator (or the equivalent library call). A historical recorded baseline may
@@ -101,6 +102,10 @@ asserts rider contact, surveyed lane truth, causality, or physical success.
 Use [geographic matching](GEOGRAPHIC_MATCH.md) to locate a previously identified
 road window in another recorded drive. It retains direction, coverage and
 localization checks; matching a location does not transfer rider annotations.
+For a compact first pass over extracted NPZ files, use the coarse inventory
+documented there. It derives geometry from a hash-verified reference extract;
+its qualification is always `coarse_candidate_only`, and raw float64 geographic
+matching is required before naming or using a hit.
 
 [`INGESTION.md`](INGESTION.md) defines the separate versioned inventory and explicit bounded collection command for raw drive evidence. It is offline-testable and does not evaluate a candidate, contact a device, or expose unrestricted Params.
 

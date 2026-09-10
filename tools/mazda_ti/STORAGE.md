@@ -11,6 +11,22 @@ Read current free space before a run; a cache often duplicates the full output.
 Use an explicit scratch output and a separate scratch cache even when the batch
 CLI's default would place the cache inside its output.
 
+The coarse NPZ geographic inventory is a compact durable record: keep its
+request and `inventory.json` in the study, while keeping the searched extracts
+in scratch or the separately managed raw-data store. Its manifest digest binds
+the complete searched path set without expanding misses into the durable
+record. The inventory derives its reference geometry from a hash-verified NPZ;
+the retained raw rlog hashes are downstream pointers and remain unverified by
+the coarse tool. Retain or reacquire those raw rlogs for the mandatory float64
+geographic verification before road naming or downstream use. Keep the compact
+`unscannable_files` exclusions with the inventory when coordinate rows are
+missing; they are evidence of incomplete discovery, not misses. The explicitly
+supplied final extract root may be a junction or symlink; the inventory records
+the caller spelling, link/reparse status, and resolved target. It rejects
+reparse ancestors before that final component and nested reparse entries under
+the resolved target. Manifest paths and before/after completeness checks are
+relative to that resolved target.
+
 ## Before execution
 
 The read-only preflight checks explicit absolute output/cache paths, a caller's
