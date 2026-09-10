@@ -86,3 +86,6 @@ full reconstruction before verification or qualification. A full adapter for
 candidate-owned actuator feedback and applied CAN remains separate work.
 The narrower [historical actuation audit](LEGACY_NNFF_ACTUATION.md) now checks
 original TI/stock counts and feedback, preserving remaining rounding failures.
+The [feedback-rate isolation guide](LEGACY_NNFF_FEEDBACK.md) tests whether
+scaled desired/measured jerk contributes to a correction without evolving a
+candidate controller or physical path.
