@@ -11,6 +11,12 @@ For a clean-session, relocation, or complete-infrastructure acceptance, follow [
 
 Establish the current source and evidence before continuing: inspect Git status/HEAD, the run's source lock, explicit route/segment identifiers, monotonic window, controller settings, consumed-input assumptions, and rider annotations. Use local `CLAUDE.md` and `.ti-local/` notes to locate existing work when present; their remembered deployment claims need current verification. Treat a source lock as provenance captured by a run, not as proof that its baseline was correct.
 
+When locating archived raw inputs on Windows, resolve `.ti-local/raw` and other
+reparse-point/junction data roots to their actual targets, or use the explicitly
+configured data root from the request. Do not treat a recursive search that did
+not traverse a junction as evidence that a route is absent. Before declaring a
+route unavailable, verify each requested segment by its exact configured path.
+
 For drives containing structured Mazda diagnostics, read [the field and identity guide](../../../tools/mazda_ti/DIAGNOSTICS.md). Join carOutput to its applied carControl, that command to controlsState, and the controller to its explicitly recorded input identities. Preserve previous-apply alignment and segment-boundary coverage. A zero diagnostic version means absent; inactive fields are not measured zeros. CAN commands are not motor-delivery measurements. Qualify nested timestamp handling before applying these joins to generated process-replay logs, whose outer timestamps can be rewritten. Verify the running build and recorded fields before assuming new instrumentation is deployed.
 
 Run `python -m tools.mazda_ti.audit_diagnostics` with explicit relative rlog paths, integer nanosecond window and a new output file before interpreting a new instrumented drive. Follow the guide's identity and health checks. A passing audit establishes links for scored applied-output publications with active controller coverage; command reconstruction and physical lane-motion validation remain separate requirements. Preserve failed reports and load missing adjacent segments instead of replacing explicit identities with nearby timestamps.
@@ -35,7 +41,28 @@ For historical activation failures or mismatches clustered just after activation
 
 Before using candidate replay to select steering changes, independently reproduce the recorded baseline. Keep controller-input sampling, card request sampling, filter warmup and retained integrator/friction state explicit. Creation before a publication bound does not prove message receipt. Compatible earliest/latest histories are sensitivity cases, not bounds over every possible history. Use each candidate's own requests and simulated TI feedback after activation; keep recorded physical observations labeled as fixed. A numerical exception needs an isolated explanation and separate qualification, not a silently widened tolerance.
 
+When the candidate controller source differs from the historical recorded source,
+require an explicitly simulated equivalent-control arm under the same controller
+parent, dependency set, preparation, warmup, settings, history, and window before
+calling any delta candidate-only. Reject missing or mismatched arms with the
+shared `candidate_attribution` validator; a direct historical-to-candidate delta
+conflates controller changes with the candidate effect.
+
 For instrumented-drive feedback coupling, follow the `RecordedTiFeedback` API in [the field guide](../../../tools/mazda_ti/DIAGNOSTICS.md). Preserve recorded requests and feedback together before activation, use the consumed output identity, and retain the caller's limiter-history update order. Its component qualification does not replace a qualified full-controller baseline. Include inactive-to-active transitions when testing damping or reference changes: inactive diagnostic defaults do not expose retained observer state, and a continuous-active replay cannot qualify re-engagement.
+
+When a candidate mechanism consumes actuator feedback, use the shared typed
+`PreviousAppliedFeedback` seam before the controller update. Require its candidate record
+and exact controller/request/apply/publication ordering; null is unavailable, not zero.
+Never derive a current-cycle feedback value from a send or output published after the
+update. Preserve the pre-update limiter-freeze value and trace TI/stock selection through
+dropout, fallback, inactivity and re-engagement. Source snapshots already lock every
+`tools/mazda_ti/*.py` dependency, including this seam.
+
+For camera timing, `roadEncodeIdx.frame_id` is the decoded source-frame ordinal
+used for generated clip PTS; `segment_id` remains the row identity. Require
+explicit identity/lane-health fields in lateral-event inputs. A
+motion-supported event additionally requires steering-angle/rate unwind signs
+and timing; missing or disagreeing steering can only yield command-only evidence.
 
 For compensation changes or integral carryover in instrumented replay, follow the [component-trace workflow](../../../tools/mazda_ti/INSTRUMENTED_EVALUATION.md#inspect-compensation-and-integral-carryover). Require fresh qualified baseline and equivalent current-control arms with identical imported dependency hashes. Read recorded/replayed native components, exact consumed feedback and limiter-freeze state; preserve inactive or absent fields as unavailable. Trace comparison keeps integral/reference differences in m/s² and controller commands in right-positive TI counts. Attribute later changes only after tracing feedback and integral history; chronological trace quarters do not establish physical corner phases. Before attributing nonzero command at near-zero raw request to reference lag, decompose P/D/I/feedforward and resolve consumed liveParameters roll and learned acceleration offset. effectiveFeedforward precedes roll/offset correction; feedforward includes it. Check commitBlend, filtered/delayed requests and lane/rider evidence. A near-zero request alone does not label a physical release failure.
 

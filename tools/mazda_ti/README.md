@@ -45,6 +45,47 @@ Use it before attributing a plateau-related feedback or integral change to the p
 
 ## Raw-evidence ingestion
 
+On Windows, `.ti-local/raw` may be a junction or other reparse point. Resolve
+its target (or use the request's explicit data root) before inventorying routes;
+some recursive search tools do not traverse that link. A route is unavailable
+only after its exact requested segment paths have been checked in the resolved
+root. Preserve the configured root and exact paths in the compact evidence.
+
+Before attributing a candidate-only effect, run `candidate_attribution.py`'s
+validator (or the equivalent library call). A historical recorded baseline may
+use a different controller than the current candidate. In that case an
+explicitly simulated equivalent-control arm is mandatory and must match the
+candidate's controller parent, dependency hashes, preparation, warmup, settings,
+history, and window. Mismatched arms are rejected; direct historical-to-candidate
+deltas are not candidate-only evidence.
+
+### Camera timing provenance
+
+Use `camera_timing.py` to map a generated clip to exact `roadEncodeIdx` rows.
+The input JSON contains only extracted `fullHEVC` rows with `segment_id`,
+`frame_id`, `encode_id`, and SOF/EOF nanoseconds. The tool validates contiguous
+frames, preserves before/after EOF brackets, and generates PTS from the declared
+frame rate. Camera SOF/EOF clocks remain separate from generated clip PTS; the
+tool does not infer lane position, rider contact, causality, or physical effect.
+It records source hashes and any visibility transformation description. Keep
+video and extracted rows in C: scratch under the storage policy; retain only
+the compact mapping JSON in durable study storage.
+
+### Lateral event evidence
+
+`lateral_event_detector.py` scores a pre-joined normalized row stream for
+command decline while motion remains in the prior direction. It requires an
+explicit monotonic window and rlog paths plus explicit identity, lane-health
+and health fields; missing gates are insufficient evidence. It rejects invalid
+rows and gaps over 100 ms, keeps camera EOF separate from MONOTONIC, and grades results as
+`command-only`, `motion-supported candidate`, or `insufficient evidence`.
+Motion-supported requires steering-angle/rate unwind signs and timing to agree
+with the command, in addition to lane/health and yaw-rate × speed checks;
+missing or disagreeing steering remains command-only when other gates are usable.
+Model lane geometry is a validity gate and remains model-derived; yaw-rate ×
+speed and lateral acceleration are a separate motion check. The output never
+asserts rider contact, surveyed lane truth, causality, or physical success.
+
 Use [geographic matching](GEOGRAPHIC_MATCH.md) to locate a previously identified
 road window in another recorded drive. It retains direction, coverage and
 localization checks; matching a location does not transfer rider annotations.
@@ -63,6 +104,11 @@ the shared library for coupling candidate requests to software TI feedback throu
 consumed-output and applied-command identities. It is separate from the historical runner
 below. The [full-controller adapter](INSTRUMENTED_EVALUATION.md) resolves every consumed
 input and recorded clock and qualifies both command paths through TI loss and recovery.
+Both adapters expose the typed `PreviousAppliedFeedback` boundary before a controller
+update. `candidate` is absent until the consumed output represents an apply sourced by a
+post-activation candidate update. When present, it carries TI and stock counts, selection,
+availability, limiter-freeze state and the known request/controller/apply/publication
+identities. Callers must not reconstruct this state by joining a later send or output.
 
 `verify_replay.py` checks that an integrated controller reproduces an already-qualified reference replay, and that the source files still match the integration run's recorded hashes. It runs with Python3.11+ and the standard library on Windows or Linux. It reads local files and performs no network, vehicle or deployment operations.
 
@@ -122,6 +168,11 @@ python -m tools.mazda_ti.run replay --prepared evidence/prepared --data-root PAT
 ```
 
 Repeat baseline and candidate with `latest` and distinct output directories. These are two compatible sampling histories, not bounds on all possible histories. Candidate execution uses its own commands and software TI feedback after activation; recorded vehicle motion remains fixed. The schema's newly logged input identities are not yet consumed by this historical-log runner.
+
+The historical runner records exact candidate controller and paired-request identities in
+`previous_applied_feedback` once a candidate-generated send has produced the consumed
+output. Older recorded requests have no qualified producing-controller identity, so the
+typed candidate value remains null during warmup instead of assigning a nearest update.
 
 At activation, separate controller computation, consumed-input time and command publication.
 `publish_paired_request` publishes each paired carControl inside the feedback window even
