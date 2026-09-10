@@ -77,6 +77,11 @@ It covers normalized controller-output reconstruction on pinned source, with
 explicit legacy receipt assumptions. The full actuator/candidate adapters below
 remain distinct and do not inherit that qualification.
 
+For hidden retained targets in the older plant controller, use the
+[legacy feedback-reference audit](LEGACY_REFERENCE.md). It separates current,
+delayed and retained targets using source-verified log equations, without
+turning that algebraic evidence into a physical handling claim.
+
 Run these commands from the repository root. The runner needs numpy and pycapnp compatible with the chosen Python runtime; the verifier itself remains standard-library-only. It loads real controller/PID/filter/plant/limiter code with constant-only facades for hardware imports. It does not open sockets, invoke vehicle hardware or modify the checkout.
 
 Create an experiment JSON with these fields:
