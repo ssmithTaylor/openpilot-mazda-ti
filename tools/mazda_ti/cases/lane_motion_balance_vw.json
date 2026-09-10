@@ -1,0 +1,60 @@
+{
+  "cases": {
+    "24d": {
+      "data_root": "old",
+      "bounds_ns": [
+        1100765371121,
+        1105765371121
+      ],
+      "raw_sha256": {
+        "0000024d--8deb0716b5--14/rlog": "ac32eac7fa9fb9b20ac2511fc3b9b2fe978c1894a0ebd0211ed08077365d3e9c",
+        "0000024d--8deb0716b5--15/rlog": "f724be836ca4eb655cb12e443d425c322709975db04b30c542db39787b72dbb3",
+        "0000024d--8deb0716b5--16/rlog": "ba6ae1a62e003d7e32d0bc08aad493a12e44a982c436fd60da0f1d2d71779dd0"
+      }
+    },
+    "261": {
+      "data_root": "old",
+      "bounds_ns": [
+        291721355775,
+        297221355775
+      ],
+      "raw_sha256": {
+        "00000261--7120d4c827--1/rlog": "4b9463d065108d610f1be5fd82db9f523670f7813952e237b4528cc6d558490e",
+        "00000261--7120d4c827--2/rlog": "223a62d270a6de9419b65ed7e18bf8462eddff798a1256020559745112c75ec8",
+        "00000261--7120d4c827--3/rlog": "40958e4e3c9fa44895c7748b77e95d52df6535d08fb5970a23da075441bd62c6"
+      }
+    },
+    "28c": {
+      "data_root": "reference",
+      "bounds_ns": [
+        269000000000,
+        274000000000
+      ],
+      "raw_sha256": {
+        "0000028c--0ea8954ea3--3/rlog": "f2d0411e41caaa9bd1e3a9980b0680e680226a11d67ae4a73c66702e689a266f",
+        "0000028c--0ea8954ea3--4/rlog": "b4be056404cc2b850a934afc324106fd4847caaf7fa966e8d846e501a0fb167b"
+      }
+    }
+  },
+  "selection_provenance": {
+    "coarse_result_sha256": "5eda97d2495e6593ced5665fc74075f8982c9505c7d1e408340ed3a5aebdf1aa",
+    "original_selection": {
+      "input_sha256": {
+        "anchors": "19ae19df2897c0ffd1f278c12067aaf30a6a6e62d2d82b214e47e6c9e331380e",
+        "geometry": "6dcb4ac18f6d239f40db288bf97e3f2bb0586db1bab3daae718b5ad11cf0344e"
+      },
+      "inputs": {
+        "anchors": ".ti-local/older-vw-video-candidates-20260909/anchor-separations-v1.json",
+        "geometry": ".ti-local/older-vw-video-candidates-20260909/lane-geometry-v1.json.gz"
+      },
+      "maximum_endpoint_error_ns": 250000000,
+      "maximum_grid_gap_s": 0.51,
+      "reference_window_ns": [
+        269000000000,
+        274000000000
+      ],
+      "selection": "Previously observed first-unwind window, geographic anchors fixed; nearest existing half-second grid endpoints, no fit to closure."
+    },
+    "description": "Freeze original geographically mapped nearest-grid bounds; do not select or tune using balance residuals."
+  }
+}

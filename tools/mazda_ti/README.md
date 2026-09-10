@@ -82,6 +82,11 @@ For hidden retained targets in the older plant controller, use the
 delayed and retained targets using source-verified log equations, without
 turning that algebraic evidence into a physical handling claim.
 
+Before using fitted road curvature as an independent steering target, run the
+[lane-motion consistency check](LANE_MOTION_BALANCE.md). It compares recorded
+lane motion with yaw/speed at original model rate and preserves sensitivity to
+the10m/20m fits, missing geometry and observation timing.
+
 Run these commands from the repository root. The runner needs numpy and pycapnp compatible with the chosen Python runtime; the verifier itself remains standard-library-only. It loads real controller/PID/filter/plant/limiter code with constant-only facades for hardware imports. It does not open sockets, invoke vehicle hardware or modify the checkout.
 
 Create an experiment JSON with these fields:
