@@ -73,6 +73,7 @@ def instrument(source):
       prompt_unload_active=getattr(self,"prompt_unload_active",False),
       prompt_unload_completed=getattr(self,"prompt_unload_completed",False),
       prompt_decline_samples=getattr(self,"prompt_decline_samples",0),
+      **getattr(self,"_term_ablation_trace",{}),
       freeze_integrator=freeze_integrator, commit_blend=self.commit_blend,
       commit_ff_state=self.commit_ff_filter.x, commit_sp_state=self.commit_sp_filter.x,
       commit_release_coefficient=self.commit_ff_filter.a_release,
