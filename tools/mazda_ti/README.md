@@ -106,6 +106,51 @@ return to source-locked replay and physical evidence before selecting a
 controller change. The compact 28f initData extract records the exact source
 rlog hash and only fields explicitly read from its first initData event.
 
+### Plan-to-motion phase audit
+
+Use plan_feedback_audit.py to examine the narrow observational question
+whether as-of model demand has a stable phase relationship with measured yaw
+motion across rider-labelled symptom and smooth-control windows:
+
+~~~powershell
+python tools/mazda_ti/plan_feedback_audit.py --request .ti-local/compensation-study-20260909/plan-feedback-audit-request-v1.json --data-root . --output NEW_COMPACT_JSON --markdown NEW_COMPACT_MD
+~~~
+
+The request freezes raw paths, monotonic windows and rider labels. The tool
+hashes the rlogs and source, rejects stale joins, reports its full +/-1 s
+time-domain scan, and only exposes 0.4-3 Hz Welch phases when at least three
+windows exist. A maximum at the lag-search edge is explicitly edge_limited.
+The model request is an as-of modelV2 publication, not an exact legacy
+consumed-input identity; phase, correlation and coherence never establish
+plan-to-motion causality. Keep only the compact outputs; rebuild from the
+request and raw rlogs when reviewing later.
+
+### Closed-loop command-response audit
+
+Use `closed_loop_id_audit.py` only with a compact, source-locked set of
+independently named rider-labelled windows. It tests whether a published-TI
+command proxy adds reproducible *one-step* prediction of measured wheel-angle
+or fused-yaw increments beyond causal response state and speed, using
+leave-case-out scoring and train-only lag selection:
+
+```powershell
+python tools/mazda_ti/closed_loop_id_audit.py `
+  --input F:/owned-study/closed-loop-id-input.json `
+  --output F:/owned-study/closed-loop-id-audit.json `
+  --markdown F:/owned-study/CLOSED-LOOP-ID-AUDIT.md
+```
+
+Rows may contain only `time_s`, `ti_command_counts`, `wheel_angle_deg`,
+`yaw_lateral_accel_mps2`, and `speed_mps`. The audit rejects malformed or
+nonmonotonic rows. It excludes controller reference/actual fields, lane/model
+values, and future response values from predictors, so it cannot use a
+post-treatment controller signal to create a command-to-motion claim. Its
+reported gains, lag choices, and outcome-separation gate are predictive
+associations, not rack parameters, delivered torque, or proof of a physical
+path. A failed gate is an explicit falsifier of this corpus as a basis for a
+delay/gain/phase controller change; a passing gate still needs current,
+instrumented exact-applied-command evidence and rider-confirmed road behavior.
+
 ### Lateral event evidence
 
 `lateral_event_detector.py` scores a pre-joined normalized row stream for

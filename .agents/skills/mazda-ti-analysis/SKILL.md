@@ -22,6 +22,18 @@ confounded until equivalent source-locked evidence isolates them. Preserve the
 compact initData extract and its raw-rlog hash when a case's full initData is
 otherwise too large to retain.
 
+For a minimal cross-validated test of whether command-response dynamics differ
+between rider-labelled smooth, settling, and scallop windows, use
+`tools/mazda_ti/closed_loop_id_audit.py`. Its input permits only prior/current
+measured wheel or yaw state, speed, and published TI command; controller
+reference/actual fields, lane/model values, and future response must not enter
+predictors. Use named leave-case-out folds with lag selection confined to the
+other cases. Treat published TI as command evidence, never delivered torque;
+model coefficients and a passing separation gate remain predictive
+associations. Preserve failed separation/stability gates as explicit
+falsifiers and require current instrumented exact-apply evidence before any
+controller selection.
+
 When locating archived raw inputs on Windows, resolve `.ti-local/raw` and other
 reparse-point/junction data roots to their actual targets, or use the explicitly
 configured data root from the request. Do not treat a recursive search that did
@@ -47,6 +59,16 @@ Inspect which dependencies the source lock covers. Legacy integration records co
 For a new replay, read required settings from raw initData entries and keep the explicit whitelist; extracted summaries can omit keys. The actual interceptor setting is TorqueInterceptorEnabled. Choose enough warmup history and record the integral anchor and FPCS sampling assumption in the spec. Preserve baseline failures and choose new output directories. The shared runner does not implement the separate historical one-count rounding exception; do not widen its exact-send requirement to force that case through. New diagnostic identities are not yet consumed by the historical-log runner.
 
 When a historical plateau or candidate feedback change affects selection, run the [four-bundle sampling-sensitivity check](../../../tools/mazda_ti/SAMPLING_SENSITIVITY.md). Qualify original baselines and equivalent current-control/candidate arms under both earliest and latest histories with the same case, window, state anchor, dependencies and runtime. Compare incremental effects between histories; inspect request age and the first feedback/integral divergence. A large history-sensitive delta is uncertainty in the replay prediction, not a measured regression, and these two histories are not bounds on every possible receipt sequence.
+
+For a specific claim that the model plan mirrors measured vehicle motion, run
+tools/mazda_ti/plan_feedback_audit.py from a hash-bound request containing
+rider-labelled symptom and smooth-control windows. Its model request is an
+as-of legacy publication, not a proven consumed controller input. Preserve the
+full time-domain lag scan, reject edge-limited maxima as non-identifying, and
+only inspect 0.4-3 Hz phase when the audit has three Welch windows. Correlation,
+coherence and phase remain descriptive: require exact current consumed-input
+identities and a candidate-responsive closed-loop test before attributing a
+plan-feedback mechanism.
 
 For historical activation failures or mismatches clustered just after activation, follow the tool guide's publication-boundary and anchor-settling checks. Keep the failed run and declare the changed initialization before rerunning; a repaired case does not qualify another baseline failure.
 
