@@ -88,6 +88,8 @@ class ReplayAppliedFeedback:
     candidate = self.candidate
     if candidate is None:
       raise ValueError('Candidate-owned applied feedback is unavailable')
+    if not candidate.active:
+      raise ValueError('Inactive applied feedback is not stock-request history')
     if candidate.stock_counts is None:
       raise ValueError('Exact candidate stock-command history is unavailable')
     return int(candidate.stock_counts)

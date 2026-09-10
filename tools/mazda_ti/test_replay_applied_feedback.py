@@ -73,6 +73,17 @@ def test_inactive_feedback_cannot_restore_nonzero_history():
     ReplayAppliedFeedback(previous.update_mono, previous)
 
 
+def test_inactive_zero_feedback_is_visible_but_not_stock_request_history():
+  previous = applied(active=False, ti_counts=0, stock_counts=0)
+  ctrl = controller()
+  context = expose_applied_feedback(ctrl, previous.update_mono, previous)
+
+  assert context.candidate is previous.candidate
+  assert ctrl.plant.u_prev == 411.0
+  with pytest.raises(ValueError, match='Inactive'):
+    context.stock_request_counts()
+
+
 def test_context_rejects_wrong_or_nonmonotonic_update_identity():
   previous = applied()
   with pytest.raises(ValueError, match='different controller update'):
