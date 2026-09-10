@@ -68,17 +68,23 @@ def map_target(rows: list[dict[str, Any]], target_s: float, fps: float, start_fr
 
 
 def build_mapping(rows: Iterable[dict[str, Any]], targets: dict[str, float], fps: float = 20.0,
-                  start_frame: int | None = None, decoded_frame_count: int | None = None) -> dict[str, Any]:
+                  start_frame: int | None = None, decoded_frame_count: int | None = None,
+                  route: str | None = None, segment: str | None = None) -> dict[str, Any]:
   checked = validate_rows(rows)
   if decoded_frame_count is not None and decoded_frame_count != len(checked):
     raise ValueError("decoded frame count does not match roadEncodeIdx row count")
   first = int(checked[0]["frame_id"]) if start_frame is None else start_frame
   if first < int(checked[0]["frame_id"]) or first > int(checked[-1]["frame_id"]):
     raise ValueError("start_frame is outside roadEncodeIdx coverage")
-  return {"format_version": 1, "fps": fps, "row_count": len(checked),
-          "source_frame_start": first, "source_frame_end_inclusive": int(checked[-1]["frame_id"]),
-          "events": {name: map_target(checked, value, fps, first) for name, value in targets.items()},
-          "scope": "camera SOF/EOF to generated clip PTS mapping; no physical or lane interpretation"}
+  if (route is None) != (segment is None):
+    raise ValueError("route and segment identity must be supplied together")
+  result = {"format_version": 1, "fps": fps, "row_count": len(checked),
+            "source_frame_start": first, "source_frame_end_inclusive": int(checked[-1]["frame_id"]),
+            "events": {name: map_target(checked, value, fps, first) for name, value in targets.items()},
+            "scope": "camera SOF/EOF to generated clip PTS mapping; no physical or lane interpretation"}
+  if route is not None:
+    result["identity"] = {"route": route, "segment": segment}
+  return result
 
 
 def main() -> None:
@@ -88,6 +94,8 @@ def main() -> None:
   parser.add_argument("--output", type=Path, required=True)
   parser.add_argument("--fps", type=float, default=20.0)
   parser.add_argument("--decoded-frame-count", type=int)
+  parser.add_argument("--route")
+  parser.add_argument("--segment")
   parser.add_argument("--target", action="append", required=True, metavar="NAME=MONO_SECONDS")
   parser.add_argument("--enhancement", default=None, help="record-only transformation description")
   args = parser.parse_args()
@@ -100,7 +108,8 @@ def main() -> None:
     if not sep or not name or name in targets:
       raise ValueError(f"invalid target {item!r}")
     targets[name] = float(value)
-  result = build_mapping(rows, targets, args.fps, decoded_frame_count=args.decoded_frame_count)
+  result = build_mapping(rows, targets, args.fps, decoded_frame_count=args.decoded_frame_count,
+                         route=args.route, segment=args.segment)
   result["inputs"] = {"road_encode_json": {"path": str(args.road_encode_json.resolve()), "sha256": sha256(args.road_encode_json)},
                        "video": {"path": str(args.video.resolve()), "sha256": sha256(args.video), "size_bytes": args.video.stat().st_size}}
   result["transformation"] = {"applied": args.enhancement is not None, "description": args.enhancement}

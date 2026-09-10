@@ -34,3 +34,10 @@ def test_uses_decoded_frame_id_when_segment_id_differs():
 def test_rejects_invalid_target_coverage():
   with pytest.raises(ValueError, match="outside"):
     build_mapping(rows(), {"late": 1.0})
+
+
+def test_route_segment_identity_must_be_paired():
+  result = build_mapping(rows(), {"mid": .075}, route="route", segment="3")
+  assert result["identity"] == {"route": "route", "segment": "3"}
+  with pytest.raises(ValueError, match="supplied together"):
+    build_mapping(rows(), {"mid": .075}, route="route")
