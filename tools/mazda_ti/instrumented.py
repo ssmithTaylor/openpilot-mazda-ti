@@ -159,6 +159,9 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
                    )})
       components = component_snapshot(actual.mazdaDiagnostics, bool(observed.active))
       rows[-1].update(recorded_components=component_snapshot(d, bool(observed.active)), replay_components=components)
+      term_ablation = getattr(ctrl, '_term_ablation_trace', None)
+      if term_ablation is not None:
+        rows[-1]['term_ablation_trace'] = term_ablation
       if components is not None:
         rows[-1].update({name: components[field] for name, field in COMPONENT_METRICS.items()})
         rows[-1].update(limiter_feedback_limited=limited, consumed_feedback_steer=feedback_steer)
