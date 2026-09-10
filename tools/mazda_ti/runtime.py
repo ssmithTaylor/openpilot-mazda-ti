@@ -7,10 +7,13 @@ No CAN packer, device Params, sockets, or vehicle-motion simulator is provided.
 """
 
 import ast
+from dataclasses import dataclass
 import importlib
 from pathlib import Path
 import sys
 import types
+
+from .applied_feedback import AppliedLateralFeedback, PreviousAppliedFeedback
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,6 +52,64 @@ def load_controller_source(source, name):
 
 
 DT = 0.01
+
+
+@dataclass(frozen=True)
+class ReplayAppliedFeedback:
+  """Candidate-owned actuator feedback visible to one replay update.
+
+  The context is diagnostic input.  In particular, installing it does not
+  replace ``TiLateralPlant.u_prev``: that field preserves the production
+  controller's raw stock-request history.  A candidate that deliberately
+  models the limited stock command must request it through
+  :meth:`stock_request_counts` and thereby prove that exact stock history is
+  available.
+  """
+
+  update_mono: int
+  previous: PreviousAppliedFeedback | None
+
+  def __post_init__(self):
+    if self.update_mono <= 0:
+      raise ValueError('Replay update identity must be positive')
+    if self.previous is not None and self.previous.update_mono != self.update_mono:
+      raise ValueError('Applied feedback belongs to a different controller update')
+    candidate = self.candidate
+    if candidate is not None and not candidate.active:
+      if candidate.ti_counts != 0 or candidate.stock_counts not in (None, 0):
+        raise ValueError('Inactive applied feedback cannot restore actuator history')
+
+  @property
+  def candidate(self) -> AppliedLateralFeedback | None:
+    return self.previous.candidate if self.previous is not None else None
+
+  def stock_request_counts(self) -> int:
+    """Return the prior limited stock request without changing plant state."""
+    candidate = self.candidate
+    if candidate is None:
+      raise ValueError('Candidate-owned applied feedback is unavailable')
+    if candidate.stock_counts is None:
+      raise ValueError('Exact candidate stock-command history is unavailable')
+    return int(candidate.stock_counts)
+
+
+def expose_applied_feedback(controller, update_mono, previous):
+  """Install one immutable pre-update context on a replay controller and plant.
+
+  This is the production-neutral seam: replay-only candidate code can inspect
+  ``_replay_applied_feedback`` on either object, while an unmodified controller
+  and ``TiLateralPlant`` execute exactly their existing path.
+  """
+  context = ReplayAppliedFeedback(int(update_mono), previous)
+  last = getattr(controller, '_replay_applied_feedback', None)
+  if last is not None and context.update_mono <= last.update_mono:
+    raise ValueError('Replay feedback updates must be strictly increasing')
+  plant = getattr(controller, 'plant', None)
+  if plant is None:
+    raise ValueError('Applied feedback requires a replay controller with a lateral plant')
+  controller._replay_applied_feedback = context
+  plant._replay_applied_feedback = context
+  return context
 
 
 class TestInterface:

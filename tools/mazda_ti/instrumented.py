@@ -74,7 +74,7 @@ def controller_inputs(event, streams):
 
 
 def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=None):
-  from .runtime import bootstrap, TestInterface, controller_source, load_controller_source
+  from .runtime import bootstrap, TestInterface, controller_source, expose_applied_feedback, load_controller_source
 
   before, runtime_before = source_snapshot(), environment()
   check_sources(preparation['repository_sources'])
@@ -142,6 +142,7 @@ def replay(spec, events, output, variant, preparation, prep_hash, baseline_path=
     applied_feedback = feedback.previous_applied_for_update(
       mono, int(used['carOutput'].logMonoTime), limiter_frozen=limited,
     )
+    expose_applied_feedback(ctrl, mono, applied_feedback)
     feedback_steer = applied_feedback.observed_steer
     steer, _, actual = ctrl.update(bool(observed.active), cs, vm, lp, limited, curvature, bool(d.curvatureLimited),
                                   used['liveDelay'].liveDelay.lateralDelay + .1, None, model.modelV2, toggles, fp)

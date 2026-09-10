@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from .runtime import DT, TestInterface, controller_source, load_controller_source, bootstrap
+from .runtime import DT, TestInterface, controller_source, expose_applied_feedback, load_controller_source, bootstrap
 
 bootstrap()
 from cereal import log
@@ -253,6 +253,7 @@ def run(args):
       ctrl.update_live_torque_params(torque.latAccelFactorFiltered, torque.latAccelOffsetFiltered, torque.frictionCoefficientFiltered)
     if not active:
       ctrl.reset()
+    expose_applied_feedback(ctrl, mono, applied_feedback)
     if previous_output is None and args.seed_i:
       # One initial observed state, not per-frame forcing. Helps isolate
       # finite-segment initialization and is reported explicitly.
