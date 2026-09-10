@@ -84,6 +84,28 @@ hashes, exact interval IDs and mapping brackets, confidence, and rider
 provenance for physical labels. The tool refuses ambiguous or changed inputs
 and never copies video into the repository.
 
+### Rider outcome/controller-feature intersection
+
+For a compact cross-case audit of retained Mazda rider labels and controller
+settings, run:
+
+```powershell
+python tools/mazda_ti/feature_intersection_audit.py `
+  --root F:/repos/openpilot-mazda-ti `
+  --json F:/repos/openpilot-mazda-ti/.ti-local/compensation-study-20260909/feature-intersection-audit-v1.json `
+  --md F:/repos/openpilot-mazda-ti/.ti-local/compensation-study-20260909/FEATURE-INTERSECTION-AUDIT-v1.md
+```
+
+The output is an evidence index, not an event detector or controller
+qualification. It retains source and input hashes, leaves unrecorded settings
+as `null`, and keeps rider labels, command/telemetry, and road behavior as
+separate evidence levels. Route-level labels must not be read as exact event
+labels. Use the feature findings to identify exclusions and confounding (for
+example, a setting common to both smooth and problematic modern cases), then
+return to source-locked replay and physical evidence before selecting a
+controller change. The compact 28f initData extract records the exact source
+rlog hash and only fields explicitly read from its first initData event.
+
 ### Lateral event evidence
 
 `lateral_event_detector.py` scores a pre-joined normalized row stream for

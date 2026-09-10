@@ -11,6 +11,17 @@ For a clean-session, relocation, or complete-infrastructure acceptance, follow [
 
 Establish the current source and evidence before continuing: inspect Git status/HEAD, the run's source lock, explicit route/segment identifiers, monotonic window, controller settings, consumed-input assumptions, and rider annotations. Use local `CLAUDE.md` and `.ti-local/` notes to locate existing work when present; their remembered deployment claims need current verification. Treat a source lock as provenance captured by a run, not as proof that its baseline was correct.
 
+For a corpus-level rider outcome versus controller-feature audit, use
+`tools/mazda_ti/feature_intersection_audit.py` with explicit JSON and Markdown
+outputs under owned `.ti-local` study storage. Read its hash-bound table and
+findings as an intersection audit only: missing settings remain `null`, rider
+brackets do not become event labels, and a feature common to smooth and
+problematic cases is not a mechanism discriminator. Treat differences between
+controller eras, source commits, speed/load, road feature, or lane as
+confounded until equivalent source-locked evidence isolates them. Preserve the
+compact initData extract and its raw-rlog hash when a case's full initData is
+otherwise too large to retain.
+
 When locating archived raw inputs on Windows, resolve `.ti-local/raw` and other
 reparse-point/junction data roots to their actual targets, or use the explicitly
 configured data root from the request. Do not treat a recursive search that did
