@@ -432,3 +432,22 @@ def test_resampling_preserves_cycles_and_rms():
     results.append((mm.cycles(rows, (0, 14 * NS), CAL)['value'], mm.path_quality(rows, (0, 14 * NS), a, CAL)['value']))
   assert len({c for c, _ in results}) == 1
   assert max(r for _, r in results) - min(r for _, r in results) < 0.02
+
+
+def test_settling_candidate_does_not_survive_a_real_gap_in_the_later_region():
+  # A first gap (10.0-10.6 s) precedes any dwell, same as the unresolved test above. A second
+  # gap (12.5-14.0 s) sits inside the later region; a brief ~0.15 s compliant window opens just
+  # before it (well under t_dwell_s=1.0 s), too short to confirm on its own. A candidate must
+  # not be carried across the real gap and confirmed only by the gap's own elapsed time; the
+  # genuine dwell is the one that starts once real data resumes at 14.0 s.
+  offset = lambda t: 0.5 if t < 11.6 else 0.0
+  times = [t for t in grid(0, 20) if not (10.0 < t < 10.6) and not (12.5 < t < 14.0)]
+  rows, anchors = _recovery_case(offset, times=times)
+  s = mm.settling(rows, (0, 20 * NS), anchors, CAL)
+  assert s['status'] == 'unresolved'
+  assert s['diagnostics']['later_dwell_observation']['start_s'] >= 14.0
+  # The real-gap reset must not regress the filter-edge-loss case (no actual observation gap,
+  # just running out of trailing data): candidate_dwell_start_s must still survive there.
+  edge_rows, edge_anchors = _recovery_case(lambda t: 0.5 if t < 18.6 else 0.0, times=grid(0, 20))
+  edge = mm.settling(edge_rows, (0, 20 * NS), edge_anchors, CAL)
+  assert edge['status'] == 'right_censored' and edge['diagnostics']['candidate_dwell_start_s'] is not None

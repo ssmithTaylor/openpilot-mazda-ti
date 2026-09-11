@@ -488,8 +488,13 @@ def settling(rows, window, anchors, params, interventions=()):
     """Return (dwell_start_i or None, last_violation_ns, candidate_start_i or None) over [lo, hi)."""
     last_v, cand = None, None
     for i in range(lo, hi):
+      if i > lo and times[i] - times[i - 1] > params.max_gap_ns:
+        # A real observation gap breaks continuity of observation: it is not itself a
+        # violation (last_v is untouched), but it invalidates any candidate dwell in
+        # progress, which cannot be confirmed across missing data.
+        cand = None
       if e[i] is None or v[i] is None:
-        # Missing filter support (edge of data, not a confirmed violation) neither starts nor
+        # Missing filter support with no timestamp gap (edge of data) neither starts nor
         # invalidates a candidate dwell already in progress; it just can't be confirmed here.
         continue
       ok = abs(e[i]) <= params.e_settle_m and abs(v[i]) <= params.v_settle_mps
