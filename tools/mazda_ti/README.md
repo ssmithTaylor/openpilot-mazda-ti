@@ -166,6 +166,16 @@ Model lane geometry is a validity gate and remains model-derived; yaw-rate ×
 speed and lateral acceleration are a separate motion check. The output never
 asserts rider contact, surveyed lane truth, causality, or physical success.
 
+### Observed-drive measurement qualification
+
+`observed_drive_rows.py`, `maneuver_metrics.py` and `measurement_qualification.py`
+measure settling, lane-motion cycles, inward-hold/late-wide, path quality and a
+jerk proxy on already supplied drives with per-group health and curvature phase
+anchors, then report false alarms, missed symptoms and unscorable cases against
+retained rider labels. Holdout traversals are sealed outcome-blind. See
+[OBSERVED_DRIVE_METRICS.md](OBSERVED_DRIVE_METRICS.md). This qualifies the
+measurement, not a controller or a physical acceptance threshold.
+
 Use [geographic matching](GEOGRAPHIC_MATCH.md) to locate a previously identified
 road window in another recorded drive. It retains direction, coverage and
 localization checks; matching a location does not transfer rider annotations.
