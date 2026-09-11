@@ -423,3 +423,268 @@ def phase_anchors(rows, window, params):
   result['coverage'] = {'entry_to_unwind_s': (unwind - times[entry_i]) / NS,
                         'recovery_observed_s': (min(times[-1], result['recovery']['end_ns']) - unwind) / NS}
   return result
+
+
+def record(metric, *, unit, status='unscorable', reason='not_computed', value=None, lower_bound_s=None,
+           valid_duration_s=None, required_duration_s=None, maximum_gap_s=None, critical_gap=None,
+           phase_coverage=None, supporting_event_ids=None, diagnostics=None):
+  if status not in STATUSES:
+    raise ValueError(f'Unknown status {status}')
+  return {'metric': metric, 'version': 1, 'value': value, 'unit': unit, 'status': status, 'reason': reason,
+          'lower_bound_s': lower_bound_s, 'valid_duration_s': valid_duration_s,
+          'required_duration_s': required_duration_s, 'maximum_gap_s': maximum_gap_s,
+          'critical_gap': critical_gap, 'phase_coverage': phase_coverage or {},
+          'uncertainty_method': 'not_established_v1',
+          'supporting_event_ids': supporting_event_ids or [], 'diagnostics': diagnostics or {}}
+
+
+def _coverage(rows, start_ns, end_ns, max_gap_ns):
+  """Record fields from coverage(); rows must include margin rows so trailing support is real."""
+  c = coverage(rows, start_ns, end_ns, max_gap_ns)
+  return {'valid_duration_s': c['valid_duration_s'], 'required_duration_s': c['required_duration_s'],
+          'maximum_gap_s': c['maximum_gap_s']}
+
+
+def _full_coverage(rows, start_ns, end_ns, params):
+  return coverage(rows, start_ns, end_ns, params.max_gap_ns)
+
+
+def _calibrated(params, *names):
+  missing = [n for n in names if getattr(params, n) is None]
+  return missing
+
+
+def settling(rows, window, anchors, params, interventions=()):
+  """Elapsed time from the unwind anchor to the start of the first confirmed dwell."""
+  missing = _calibrated(params, 'e_settle_m', 'v_settle_mps')
+  if missing:
+    return record('settling_time', unit='s', reason=f'uncalibrated:{",".join(missing)}')
+  if anchors.get('unwind_ns') is None:
+    return record('settling_time', unit='s', reason='no_unwind_anchor')
+  if anchors.get('critical_gap'):
+    return record('settling_time', unit='s', reason='critical_gap', critical_gap=True)
+  unwind, rec_end = anchors['unwind_ns'], anchors['recovery']['end_ns']
+  for iv in interventions:
+    # Overlap test: an intervention that starts before unwind and has not ended (unknown end
+    # is treated as continuing) still assists the recovery.
+    if iv['kind'] == 'intervention' and iv['start_ns'] < rec_end and (iv.get('end_ns') is None or iv['end_ns'] > unwind):
+      return record('settling_time', unit='s', reason='assisted_recovery',
+                    diagnostics={'intervention_start_s': (iv['start_ns'] - unwind) / NS,
+                                 'intervention_end_known': iv.get('end_ns') is not None})
+  # Filters use every lane-healthy row, including margin rows beyond recovery, so support is
+  # not discarded at the recovery end; only dwell scoring is restricted to [unwind, rec_end).
+  lane = healthy_rows(rows, ('lane',))
+  times = [_t(r) for r in lane]
+  e = smoothed(lane, 'lane_offset_m', params)
+  v = derivative(lane, 'lane_offset_m', params)
+  cov = _coverage(lane, unwind, rec_end, params.max_gap_ns)
+  dwell_ns = int(round(params.t_dwell_s * NS))
+  start_i, end_i = bisect_left(times, unwind), bisect_left(times, rec_end)
+  last_violation = unwind
+  first_gap_i = next((k for k in range(start_i, end_i - 1) if times[k + 1] - times[k] > params.max_gap_ns), None)
+  gap_end_i = first_gap_i + 1 if first_gap_i is not None else end_i
+
+  def scan(lo, hi):
+    """Return (dwell_start_i or None, last_violation_ns, candidate_start_i or None) over [lo, hi)."""
+    last_v, cand = None, None
+    for i in range(lo, hi):
+      if e[i] is None or v[i] is None:
+        # Missing filter support (edge of data, not a confirmed violation) neither starts nor
+        # invalidates a candidate dwell already in progress; it just can't be confirmed here.
+        continue
+      ok = abs(e[i]) <= params.e_settle_m and abs(v[i]) <= params.v_settle_mps
+      if not ok:
+        last_v, cand = times[i], None
+        continue
+      if cand is None:
+        cand = i
+      if times[i] - times[cand] >= dwell_ns:
+        return cand, last_v, cand
+    return None, last_v, cand
+
+  dwell_i, last_v, cand = scan(start_i, gap_end_i)
+  last_violation = last_v if last_v is not None else unwind
+  diag = {'residual_offset_m': None, 'last_overshoot_m': None, 'candidate_dwell_start_s': None, 'later_dwell_observation': None}
+  base = dict(valid_duration_s=cov['valid_duration_s'], required_duration_s=cov['required_duration_s'],
+              maximum_gap_s=cov['maximum_gap_s'], critical_gap=False,
+              phase_coverage={'recovery_observed_s': anchors['coverage'].get('recovery_observed_s')})
+  if dwell_i is not None:
+    tail = [abs(e[i]) for i in range(dwell_i, end_i) if e[i] is not None]
+    peak = max((abs(e[i]) for i in range(start_i, dwell_i) if e[i] is not None), default=None)
+    diag.update(residual_offset_m=tail[-1] if tail else None, last_overshoot_m=peak)
+    return record('settling_time', unit='s', status='measured_estimate', reason='first_confirmed_dwell',
+                  value=(times[dwell_i] - unwind) / NS, diagnostics=diag, **base)
+  bound = (last_violation - unwind) / NS
+  if cand is not None:
+    diag['candidate_dwell_start_s'] = (times[cand] - unwind) / NS
+  if first_gap_i is not None:
+    later_i, _, _ = scan(gap_end_i, end_i)
+    if later_i is not None:
+      # Absolute row time, not elapsed-since-unwind: this observation sits after a gap the
+      # first scan could not cross, so it is reported on the clip's own timeline.
+      diag['later_dwell_observation'] = {'start_s': times[later_i] / NS,
+                                         'residual_offset_m': abs(e[later_i])}
+    return record('settling_time', unit='s', status='unresolved', reason='gap_before_first_dwell',
+                  lower_bound_s=bound, diagnostics=diag, **base)
+  return record('settling_time', unit='s', status='right_censored', reason='recovery_ended_before_dwell',
+                lower_bound_s=bound, diagnostics=diag, **base)
+
+
+def cycles(rows, window, params):
+  """Alternating lane-motion cycles over the window; command reversals are a separate diagnostic."""
+  if params.a_min_m is None:
+    return record('lane_motion_cycles', unit='cycles', reason='uncalibrated:a_min_m')
+  lane_all = healthy_rows(rows, ('lane',))
+  lane = _in_window(lane_all, window)
+  if not lane:
+    return record('lane_motion_cycles', unit='cycles', reason='no_lane_rows')
+  ex = [e for e in extrema(lane_all, 'lane_offset_m', params) if window[0] <= e['mono_ns'] < window[1]]
+  ep = cycle_episodes(ex, params)
+  full = _full_coverage(lane_all, window[0], window[1], params)
+  cov = {k: full[k] for k in ('valid_duration_s', 'required_duration_s', 'maximum_gap_s')}
+  cmd = _in_window(healthy_rows(rows, ('command',)), window)
+  signs = [1 if r['ti_command_counts'] > 0 else -1 if r['ti_command_counts'] < 0 else 0 for r in cmd]
+  reversals = sum(1 for a, b in zip(signs, signs[1:]) if a and b and a != b) if cmd else None
+  covered = absence_supported(full, params)
+  diagnostics = {**ep, 'observed_cycle_count': ep['cycle_count'], 'command_sign_reversals': reversals,
+                 'peak_to_peak_max_m': max((e['peak_to_peak_m'] for e in ep['episodes']), default=None),
+                 'leading_unobserved_s': full['leading_unobserved_s'], 'trailing_unobserved_s': full['trailing_unobserved_s'],
+                 'absence_supported': covered}
+  if ep['cycle_count'] > 0 or covered:
+    # Observed cycles are evidence regardless of coverage; absence needs the whole interval observed.
+    return record('lane_motion_cycles', unit='cycles', status='measured_estimate', reason='counted' if covered else 'counted_with_partial_coverage',
+                  value=ep['cycle_count'], critical_gap=not covered, **cov, diagnostics=diagnostics)
+  return record('lane_motion_cycles', unit='cycles', status='unresolved', reason='interval_not_fully_observed',
+                critical_gap=True, **cov, diagnostics=diagnostics)
+
+
+def hold_late_wide(rows, window, anchors, params, direction):
+  """Inward peak/dwell, outward peak, time to recovery and footprint-free boundary proxies."""
+  if params.corridor_half_width_m is None:
+    return record('late_wide_excursion', unit='m', reason='uncalibrated:corridor_half_width_m')
+  if anchors.get('entry_ns') is None:
+    return record('late_wide_excursion', unit='m', reason='no_entry_anchor')
+  end = anchors['recovery']['end_ns'] if anchors.get('recovery') else window[1]
+  lane = healthy_rows(rows, ('lane',))
+  if not [r for r in lane if anchors['entry_ns'] <= _t(r) < end]:
+    return record('late_wide_excursion', unit='m', reason='no_lane_rows')
+  times = [_t(r) for r in lane]
+  w = elapsed_weights(lane, anchors['entry_ns'], end, params.max_gap_ns)
+  e = [x if wi > 0 or (anchors['entry_ns'] <= t < end) else None
+       for x, wi, t in zip(smoothed(lane, 'lane_offset_m', params), w, times, strict=True)]
+  valid = [(i, x) for i, x in enumerate(e) if x is not None]
+  if not valid:
+    return record('late_wide_excursion', unit='m', reason='no_supported_smoothed_values')
+  inward_i, inward = max(valid, key=lambda p: p[1])
+  after = [(i, x) for i, x in valid if i > inward_i]
+  outward_i, outward = min(after, key=lambda p: p[1]) if after else (None, None)
+  dwell = sum(w[i] for i, x in valid if x > params.corridor_half_width_m)
+  ttr, unwind = None, anchors.get('unwind_ns')
+  if unwind is not None:
+    dwell_ns = int(round(params.t_dwell_s * NS))
+    run, prev_i = None, None
+    for i, x in enumerate(e):
+      if times[i] < unwind:
+        continue
+      unsupported = x is None or (prev_i is not None and times[i] - times[prev_i] > params.max_gap_ns)
+      prev_i = i
+      if unsupported or abs(x) > params.corridor_half_width_m:
+        run = None
+        continue
+      run = i if run is None else run
+      if times[i] - times[run] >= dwell_ns:
+        ttr = (times[run] - unwind) / NS
+        break
+  e_right = [direction * x if x is not None else None for x in e]
+  left = [r['lane_width_m'] / 2 + x for r, x in zip(lane, e_right, strict=True) if x is not None]
+  right = [r['lane_width_m'] / 2 - x for r, x in zip(lane, e_right, strict=True) if x is not None]
+  inside = 'right' if direction > 0 else 'left'
+  proxies = ({'min_left_m': min(left), 'min_right_m': min(right), 'inside_side': inside,
+              'min_inside_m': min(right) if inside == 'right' else min(left),
+              'min_outside_m': min(left) if inside == 'right' else min(right),
+              'basis': 'reference point to model lane line; no vehicle footprint'} if left else
+             {'min_left_m': None, 'min_right_m': None, 'inside_side': inside, 'min_inside_m': None, 'min_outside_m': None,
+              'basis': 'no supported smoothed values'})
+  full = _full_coverage(lane, anchors['entry_ns'], end, params)
+  cov = {k: full[k] for k in ('valid_duration_s', 'required_duration_s', 'maximum_gap_s')}
+  covered = absence_supported(full, params)
+  diagnostics = {'inward_peak_m': inward, 'inward_peak_ns': times[inward_i], 'inward_dwell_s': dwell,
+                 'outward_peak_m': outward, 'outward_peak_ns': times[outward_i] if outward_i is not None else None,
+                 'time_to_recovery_s': ttr, 'boundary_distance_proxy_m': proxies, 'coverage_adequate': covered,
+                 'leading_unobserved_s': full['leading_unobserved_s'], 'trailing_unobserved_s': full['trailing_unobserved_s']}
+  value = abs(min(outward, 0.0)) if outward is not None else None
+  if not covered:
+    # Observed excursion/dwell remain diagnostics; absence of the symptom cannot be asserted.
+    return record('late_wide_excursion', unit='m', status='unresolved', reason='interval_not_fully_observed',
+                  value=value, critical_gap=True, **cov, diagnostics=diagnostics)
+  status = 'measured_estimate' if ttr is not None or unwind is None else 'right_censored'
+  return record('late_wide_excursion', unit='m', status=status, reason='outward_peak_after_inward_peak' if outward is not None else 'no_outward_motion',
+                value=value, critical_gap=anchors.get('critical_gap'), **cov, diagnostics=diagnostics)
+
+
+def path_quality(rows, window, anchors, params):
+  """Elapsed-time RMS and p95 of |e| and time outside the corridor; no re-centering."""
+  lane = healthy_rows(rows, ('lane',))
+  if not _in_window(lane, window):
+    return record('path_rms', unit='m', reason='no_lane_rows')
+  w = elapsed_weights(lane, window[0], window[1], params.max_gap_ns)
+  e = [abs(r['lane_offset_m']) for r in lane]
+  cov = _coverage(lane, window[0], window[1], params.max_gap_ns)
+  half = params.corridor_half_width_m
+  outside = sum(wi for wi, x in zip(w, e, strict=True) if half is not None and x > half)
+  rec = None
+  if anchors.get('recovery'):
+    r0, r1 = anchors['recovery']['start_ns'], anchors['recovery']['end_ns']
+    ws = elapsed_weights(lane, r0, r1, params.max_gap_ns)
+    if sum(ws) > 0:
+      rec = {'rms_m': weighted_rms(e, ws), 'p95_m': weighted_percentile(e, ws, 0.95)}
+  return record('path_rms', unit='m', status='measured_estimate', reason='elapsed_time_weighted',
+                value=weighted_rms(e, w), critical_gap=False, **cov,
+                diagnostics={'p95_m': weighted_percentile(e, w, 0.95), 'time_outside_corridor_s': outside if half is not None else None,
+                             'recovery': rec, 'target': 'lane centre, no re-centering'})
+
+
+def comfort_proxy(rows, window, params):
+  """Lateral jerk proxy from d/dt(speed * yaw rate); a kinematic proxy, not occupant acceleration."""
+  yaw = healthy_rows(rows, ('yaw', 'speed'))
+  if len(_in_window(yaw, window)) < 3:
+    return record('lateral_jerk_p95', unit='m/s^3', reason='no_yaw_rows')
+  j = derivative(yaw, 'yaw_lateral_accel_mps2', params, span_s=params.jerk_smooth_span_s)
+  w = elapsed_weights(yaw, window[0], window[1], params.max_gap_ns)
+  # margin rows supply filter support only; peak and p95 use supported in-window values (positive weight)
+  pairs = [(abs(x), wi) for x, wi in zip(j, w, strict=True) if x is not None and wi > 0]
+  if not pairs:
+    return record('lateral_jerk_p95', unit='m/s^3', reason='no_supported_derivative')
+  vals, ws = [p[0] for p in pairs], [p[1] for p in pairs]
+  above = sum(wi for x, wi in pairs if params.j_limit_mps3 is not None and x > params.j_limit_mps3)
+  cov = _coverage(yaw, window[0], window[1], params.max_gap_ns)
+  return record('lateral_jerk_p95', unit='m/s^3', status='measured_estimate', reason='kinematic_proxy',
+                value=weighted_percentile(vals, ws, 0.95), critical_gap=False, **cov,
+                diagnostics={'peak_mps3': max(vals), 'duration_above_limit_s': above if params.j_limit_mps3 is not None else None,
+                             'basis': 'kinematic_proxy', 'signal': 'liveLocationKalman calibrated yaw rate times carState speed',
+                             'smoothing_s': params.jerk_smooth_span_s, 'derivative_span_s': params.velocity_span_s,
+                             'sample_basis': 'model-rate latest-publication join'})
+
+
+def annotations(case_annotations, window, labels=None):
+  """Carry rider-supplied crossings and interventions; never inferred from telemetry.
+
+  A count of zero is a measurement only when the case's labels explicitly declare the
+  event absent over a stated scope; an empty annotation list alone is unresolved.
+  """
+  labels = labels or {}
+  out = {}
+  for metric, kind, label in (('boundary_crossings', 'crossing', 'crossing'), ('driver_catches', 'intervention', 'intervention')):
+    items = [a for a in case_annotations if a['kind'] == kind and window[0] <= a['start_ns'] < window[1]]
+    ids = [f"{kind}:{a['start_ns']}" for a in items]
+    if items:
+      out[metric] = record(metric, unit='events', status='measured_estimate', reason='rider_annotation', value=len(items),
+                           supporting_event_ids=ids, diagnostics={'provenance': 'rider_annotation', 'items': items})
+    elif labels.get(label) == 'absent' and labels.get('scope'):
+      out[metric] = record(metric, unit='events', status='measured_estimate', reason='rider_declared_absent',
+                           value=0, supporting_event_ids=[f'{kind}:absent:{labels["scope"]}'],
+                           diagnostics={'provenance': 'rider_annotation', 'scope': labels['scope'], 'items': []})
+    else:
+      out[metric] = record(metric, unit='events', status='unresolved', reason='no_annotation_or_negative_label',
+                           diagnostics={'provenance': 'rider_annotation', 'items': []})
+  return out
