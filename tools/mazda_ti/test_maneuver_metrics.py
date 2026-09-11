@@ -146,3 +146,76 @@ def test_elapsed_weights_cover_window_and_exclude_gaps_and_never_extend_past_las
   assert cov['leading_unobserved_s'] == 0.0
   assert abs(mm.weighted_rms([1.0, 3.0], [1.0, 1.0]) - math.sqrt(5.0)) < 1e-12
   assert mm.weighted_percentile([1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0], 0.95) == 4.0
+
+
+def _sine_rows(cycles=2, period=3.0, amp=0.4, start=0.0):
+  return make_rows(grid(start, start + cycles * period), lambda t: amp * math.sin(2 * math.pi * (t - start) / period))
+
+
+def test_extrema_alternate_with_prominence():
+  ex = mm.extrema(_sine_rows(), 'lane_offset_m', mm.DEFAULT_PARAMETERS)
+  kinds = [e['kind'] for e in ex]
+  assert kinds[:4] == ['max', 'min', 'max', 'min']
+  assert all(a != b for a, b in zip(kinds, kinds[1:]))
+  assert all(e['prominence_m'] > 0.7 for e in ex[1:])
+
+
+def test_plateau_between_opposite_signs_is_one_extremum_and_same_sign_is_none():
+  def hill(t):  # rise, flat top from 2 to 3 s, fall
+    return min(t, 2.0) if t < 3 else max(0.0, 5.0 - t)
+  rows = make_rows(grid(0, 5), hill)
+  ex = [e for e in mm.extrema(rows, 'lane_offset_m', mm.DEFAULT_PARAMETERS) if e['kind'] == 'max']
+  assert len(ex) == 1 and ex[0]['plateau'] is True
+  assert abs(ex[0]['mono_ns'] / NS - 2.5) < 0.2
+
+  def shoulder(t):  # rise, flat from 2 to 3 s, rise again: no extremum
+    return t if t < 2 else 2.0 if t < 3 else t - 1
+  ex = mm.extrema(make_rows(grid(0, 5), shoulder), 'lane_offset_m', mm.DEFAULT_PARAMETERS)
+  assert [e for e in ex if e['plateau']] == []
+
+
+def test_peak_trough_peak_is_one_cycle_and_two_extrema_are_truncated():
+  params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
+  ex = mm.extrema(make_rows(grid(0, 3.0), lambda t: 0.4 * math.sin(2 * math.pi * t / 3.0)), 'lane_offset_m', params)
+  # 3 s of a 3 s period: max at 0.75, min at 2.25 -> two extrema only
+  out = mm.cycle_episodes(ex, params)
+  assert out['cycle_count'] == 0 and out['truncated_cycles'] == 1
+  full = mm.cycle_episodes(mm.extrema(_sine_rows(cycles=2), 'lane_offset_m', params), params)
+  assert full['cycle_count'] >= 1 and full['episode_count'] == 1
+
+
+def test_two_separate_episodes_sum_and_longest_is_reported():
+  params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
+  def two(t):
+    if 0 <= t <= 4.5:
+      return 0.4 * math.sin(2 * math.pi * t / 3.0)
+    if 10 <= t <= 14.5:
+      return 0.4 * math.sin(2 * math.pi * (t - 10) / 3.0)
+    return 0.0
+  ex = mm.extrema(make_rows(grid(0, 16), two), 'lane_offset_m', params)
+  out = mm.cycle_episodes(ex, params)
+  # the 4.5-10 s flat stretch is a plateau longer than episode_quiet_s: a terminator, not a connecting trough
+  assert out['episode_count'] == 2 and out['cycle_count'] == 2 and out['longest_episode_cycles'] == 1
+
+
+def test_slow_continuous_oscillation_still_counts():
+  params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
+  ex = mm.extrema(make_rows(grid(0, 20), lambda t: 0.4 * math.sin(2 * math.pi * t / 5.0)), 'lane_offset_m', params)
+  out = mm.cycle_episodes(ex, params)
+  assert out['episode_count'] == 1 and out['cycle_count'] >= 3
+
+
+def test_cycles_never_chain_across_an_observation_gap():
+  params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
+  # a peak, then a 3 s gap, then a trough and a peak: two fragments that combined would look like one cycle
+  f = lambda t: 0.4 * math.sin(2 * math.pi * t / 3.0)
+  times = [t for t in grid(0, 6) if not 1.0 < t < 4.0]
+  ex = mm.extrema(make_rows(times, f), 'lane_offset_m', params)
+  assert {e['segment'] for e in ex} == {0, 1}
+  assert mm.cycle_episodes(ex, params)['cycle_count'] == 0
+
+
+def test_small_wiggles_below_prominence_do_not_count():
+  params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
+  ex = mm.extrema(make_rows(grid(0, 6), lambda t: 0.02 * math.sin(2 * math.pi * t)), 'lane_offset_m', params)
+  assert mm.cycle_episodes(ex, params)['cycle_count'] == 0

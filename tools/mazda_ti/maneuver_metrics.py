@@ -224,3 +224,103 @@ def weighted_percentile(values, weights, q):
     if running / total >= q:
       return v
   return pairs[-1][0]
+
+
+def _sign(v, deadband):
+  if v is None:
+    return None
+  return 1 if v > deadband else -1 if v < -deadband else 0
+
+
+def extrema(rows, key, params):
+  """Alternating extrema of the smoothed series per observation segment.
+
+  Sign changes of the derivative mark extrema. A flat run (|d| <= plateau deadband)
+  counts once, at its midpoint, only when the derivative signs before and after it
+  are opposite; a run between same-sign derivatives is a shoulder. Prominence is the
+  absolute change from the previous opposite extremum (first: from the first valid
+  smoothed value).
+  """
+  out = []
+  for segment_index, part in enumerate(segments(rows, params.max_gap_ns)):
+    s = smoothed(part, key, params)
+    d = derivative(part, key, params)
+    times = [_t(r) for r in part]
+    signs = [_sign(v, params.plateau_deadband_mps) for v in d]
+    first_valid = next((v for v in s if v is not None), None)
+    previous = None
+    last_nonzero, last_nonzero_i = None, None
+    flat_start = None
+    for i, sg in enumerate(signs):
+      if sg is None or s[i] is None:
+        flat_start = None
+        continue
+      if sg == 0:
+        if flat_start is None:
+          flat_start = i
+        continue
+      if last_nonzero is not None and sg != last_nonzero:
+        if flat_start is not None:
+          j = (flat_start + i - 1) // 2
+          plateau, plateau_s = True, (times[i - 1] - times[flat_start]) / NS
+        else:
+          j = i - 1 if s[i - 1] is not None else i
+          plateau, plateau_s = False, 0.0
+        kind = 'max' if last_nonzero > 0 else 'min'
+        ref = previous['value'] if previous else first_valid
+        item = {'mono_ns': times[j], 'value': s[j], 'kind': kind, 'segment': segment_index,
+                'prominence_m': abs(s[j] - ref) if ref is not None else None, 'plateau': plateau,
+                'plateau_duration_s': plateau_s}
+        out.append(item)
+        previous = item
+      flat_start = None
+      last_nonzero, last_nonzero_i = sg, i
+  return out
+
+
+def cycle_episodes(extrema_list, params):
+  """Group qualifying alternating extrema into episodes and count cycles.
+
+  Qualifying: prominence >= a_min_m and spacing from the previous qualifying extremum
+  >= t_min_s. A chain terminates at an observation-segment change or at a quiet
+  interval, detected as a plateau (|de/dt| within the deadband) lasting longer than
+  episode_quiet_s; that plateau extremum is a terminator and joins no chain. Slow but
+  continuous oscillations therefore still count. A maximal alternating chain with >= 3
+  members is an episode with floor((n - 1) / 2) cycles; a chain of exactly 2 is a
+  truncated cycle. cycle_count sums episodes. Requires a calibrated a_min_m.
+  """
+  if params.a_min_m is None:
+    raise ValueError('a_min_m is not calibrated')
+  chains, chain = [], []
+  for e in extrema_list:
+    quiet = e['plateau'] and e['plateau_duration_s'] > params.episode_quiet_s
+    if quiet:
+      if chain:
+        chains.append(chain)
+      chain = []
+      continue
+    ok = (e['prominence_m'] is not None and e['prominence_m'] >= params.a_min_m
+          and (not chain or e['segment'] == chain[-1]['segment'])
+          and (not chain or (e['mono_ns'] - chain[-1]['mono_ns']) / NS >= params.t_min_s)
+          and (not chain or e['kind'] != chain[-1]['kind']))
+    if ok:
+      chain.append(e)
+    else:
+      if chain:
+        chains.append(chain)
+      chain = [e] if (e['prominence_m'] is not None and e['prominence_m'] >= params.a_min_m) else []
+  if chain:
+    chains.append(chain)
+  episodes, truncated = [], 0
+  for c in chains:
+    if len(c) == 2:
+      truncated += 1
+    if len(c) < 3:
+      continue
+    swings = [abs(b['value'] - a['value']) for a, b in zip(c, c[1:])]
+    ratios = [b / a for a, b in zip(swings, swings[1:]) if a > 0]
+    episodes.append({'start_ns': c[0]['mono_ns'], 'end_ns': c[-1]['mono_ns'], 'cycles': (len(c) - 1) // 2,
+                     'peak_to_peak_m': max(swings), 'amplitude_ratio': ratios, 'extrema': c})
+  return {'cycle_count': sum(e['cycles'] for e in episodes), 'episode_count': len(episodes),
+          'longest_episode_cycles': max((e['cycles'] for e in episodes), default=0),
+          'truncated_cycles': truncated, 'episodes': episodes}
