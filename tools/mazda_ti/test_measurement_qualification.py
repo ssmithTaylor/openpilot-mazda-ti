@@ -63,6 +63,9 @@ def test_request_validation_rejects_outcome_fields_on_holdout_and_bad_windows():
   mq.validate_request(request([ok]))
   with pytest.raises(ValueError, match='duplicate'):
     mq.validate_request(request([case('a', labels=SMOOTH), case('a', labels=SMOOTH)]))
+  bad = request([case('a', labels=SMOOTH)]); bad['data_roots'] = {'raw': 'relative/path'}
+  with pytest.raises(ValueError, match='data_roots'):
+    mq.validate_request(bad)
 
 
 def _smooth_profile(residual=0.05, decay=0.6):
@@ -86,8 +89,30 @@ def test_calibrate_derives_parameters_and_excludes_short_recovery_support():
 def test_calibrate_fails_parameter_when_too_few_eligible_cases():
   profiles = {'ra': _smooth_profile(), 'rc': (lambda t: 0.5 if t < 9.5 else 0.0, [t for t in grid(0, 20) if t < 11.0])}
   req = request([case('a', labels=SMOOTH), case('c', labels=SMOOTH)])
-  with pytest.raises(ValueError, match='e_settle_m'):
+  with pytest.raises(ValueError, match='e_settle_m') as excinfo:
     mq.calibrate(req, mm.DEFAULT_PARAMETERS, fake_extractor(profiles))
+  assert set(excinfo.value.derivation) == {'e_settle_m', 'v_settle_mps', 'a_min_m', 't_settle_max_s'}
+
+
+def test_calibrate_skips_extraction_for_input_unavailable_cases():
+  calls = []
+  base_extractor = fake_extractor({'ra': _smooth_profile(), 'rb': _smooth_profile()})
+
+  def recording_extractor(data_root, rlogs, expected, start_ns, end_ns, margin_ns):
+    calls.append(list(rlogs))
+    return base_extractor(data_root, rlogs, expected, start_ns, end_ns, margin_ns)
+
+  bad = case('z', labels=SMOOTH)
+  bad['input_status'] = {'ok': False, 'problems': [{'rlog': 'rz--1/rlog', 'reason': 'missing'}]}
+  req = request([case('a', labels=SMOOTH), case('b', labels=SMOOTH), bad])
+  out = mq.calibrate(req, mm.DEFAULT_PARAMETERS, recording_extractor)
+  assert not any(r[0].startswith('rz') for r in calls)
+  assert set(out['cases']) == {'a', 'b', 'z'}
+  z = out['cases']['z']
+  assert z['anchors']['status'] == 'unscorable' and z['anchors']['reason'] == 'input_unavailable'
+  for name in ('e_settle_m', 'v_settle_mps', 'a_min_m', 't_settle_max_s'):
+    assert out['derivation'][name]['cases']['z']['eligible'] is False
+    assert out['derivation'][name]['cases']['z']['reason'] == 'input_unavailable'
 
 
 def test_calibrate_uses_only_smooth_labelled_development_cases():

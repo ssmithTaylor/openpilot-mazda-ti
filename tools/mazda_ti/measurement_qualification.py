@@ -32,6 +32,9 @@ HEX = re.compile('[a-f0-9]{64}')
 def validate_request(request):
   if request.get('format_version') != 1 or not isinstance(request.get('data_roots'), dict) or not request['data_roots']:
     raise ValueError('Request needs format_version 1 and named data_roots')
+  for name, root in request['data_roots'].items():
+    if not isinstance(root, str) or not Path(root).is_absolute():
+      raise ValueError(f'data_roots[{name!r}] must be an absolute path string')
   cases = request.get('cases')
   if not isinstance(cases, list) or not cases:
     raise ValueError('Request needs a nonempty cases list')
@@ -124,7 +127,9 @@ def calibrate(request, params, extractor):
     rec = _continuous_recovery_rows(rows, anchors, params)
     support = (int(rec[-1]['mono_ns']) - int(rec[0]['mono_ns'])) / NS if len(rec) > 1 else 0.0
     lane_all = mm.healthy_rows(rows, ('lane',))
-    longest = max(((int(p[-1]['mono_ns']) - int(p[0]['mono_ns'])) / NS for p in mm.segments(lane_all, params.max_gap_ns)), default=0.0)
+    segs = mm.segments(lane_all, params.max_gap_ns)
+    durations = [(p, (int(p[-1]['mono_ns']) - int(p[0]['mono_ns'])) / NS) for p in segs]
+    longest_part, longest = max(durations, key=lambda pd: pd[1]) if durations else (None, 0.0)
     stats = {}
     if rec:
       e = [abs(r['lane_offset_m']) for r in rec]
@@ -135,7 +140,7 @@ def calibrate(request, params, extractor):
                'p95_abs_velocity_mps': mm.weighted_percentile([p[0] for p in pairs], [p[1] for p in pairs], 0.95) if pairs else None}
     residual = None
     if longest >= params.min_recovery_support_s:
-      part = max(mm.segments(lane_all, params.max_gap_ns), key=len)
+      part = longest_part
       s = mm.smoothed(part, 'lane_offset_m', params)
       slow = mm.smoothed(part, 'lane_offset_m', params, span_s=2.0)
       res = [abs(a - b) for a, b in zip(s, slow, strict=True) if a is not None and b is not None]
@@ -159,21 +164,33 @@ def calibrate(request, params, extractor):
       return False, f'recovery_support {info["recovery_support_s"]:.2f}s < {params.min_recovery_support_s}s'
     return True, 'eligible'
 
+  shortfalls = []
+
   def derive(name, rule, eligibility, values, step):
     table = {cid: {'eligible': ok, 'reason': why, 'value': values.get(cid)} for cid, (ok, why) in eligibility.items()}
     usable = [values[cid] for cid, row in table.items() if row['eligible'] and values.get(cid) is not None]
     if len(usable) < params.min_eligible_cases:
-      derivation[name] = {'rule': rule, 'cases': table, 'value': None, 'eligible_count': len(usable)}
-      raise ValueError(f'{name}: only {len(usable)} eligible cases, need {params.min_eligible_cases}')
+      derivation[name] = {'rule': rule, 'cases': table, 'value': None, 'eligible_count': len(usable),
+                          'reason': f'shortfall: {len(usable)} eligible cases, need {params.min_eligible_cases}'}
+      shortfalls.append(f'{name} ({len(usable)} eligible, need {params.min_eligible_cases})')
+      return None
     derivation[name] = {'rule': rule, 'cases': table, 'value': _round_up(max(usable), step), 'eligible_count': len(usable)}
     return derivation[name]['value']
+
+  def eligible_lane_support(cid):
+    info = cases[cid]
+    if info.get('input_problems'):
+      return False, 'input_unavailable'
+    if info['longest_lane_support_s'] >= params.min_recovery_support_s:
+      return True, 'eligible'
+    return False, 'lane_support too short'
 
   rec_elig = {cid: eligible_recovery(cid) for cid in cases}
   e_settle = derive('e_settle_m', 'max over eligible cases of elapsed-time p95 |e| in continuous recovery observation, rounded up to 0.01',
                     rec_elig, {cid: cases[cid]['recovery_stats'].get('p95_abs_offset_m') for cid in cases}, 0.01)
   v_settle = derive('v_settle_mps', 'max over eligible cases of elapsed-time p95 |de/dt| in continuous recovery observation, rounded up to 0.01',
                     rec_elig, {cid: cases[cid]['recovery_stats'].get('p95_abs_velocity_mps') for cid in cases}, 0.01)
-  a_elig = {cid: ((cases[cid]['longest_lane_support_s'] >= params.min_recovery_support_s), 'eligible' if cases[cid]['longest_lane_support_s'] >= params.min_recovery_support_s else 'lane_support too short') for cid in cases}
+  a_elig = {cid: eligible_lane_support(cid) for cid in cases}
   a_min = derive('a_min_m', 'three times the max over eligible cases of the median |smoothed offset - 2 s moving mean|, rounded up to 0.01',
                  a_elig, {cid: (3 * cases[cid]['offset_residual_mad_m']) if cases[cid]['offset_residual_mad_m'] is not None else None for cid in cases}, 0.01)
   probe = mm.Parameters(**{**params.as_dict(), 'e_settle_m': e_settle, 'v_settle_mps': v_settle})
@@ -193,6 +210,10 @@ def calibrate(request, params, extractor):
         ok, why = False, f'no confirmed dwell ({s["status"]}: {s["reason"]})'
     settle_elig[cid] = (ok, why)
   t_max = derive('t_settle_max_s', 'max over eligible cases of confirmed settling_time_s times 1.5, rounded up to 0.1', settle_elig, settle_values, 0.1)
+  if shortfalls:
+    err = ValueError('Insufficient eligible cases for: ' + '; '.join(shortfalls))
+    err.derivation = derivation
+    raise err
   digest = hashlib.sha256(json.dumps({'base': params.params_id, 'e': e_settle, 'v': v_settle, 'a': a_min, 't': t_max}, sort_keys=True).encode()).hexdigest()[:12]
   new = mm.Parameters(**{**params.as_dict(), 'params_id': f'{params.params_id}-cal-{digest}', 'e_settle_m': e_settle,
                          'v_settle_mps': v_settle, 'a_min_m': a_min, 't_settle_max_s': t_max, 'corridor_half_width_m': e_settle})
