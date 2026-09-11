@@ -200,7 +200,8 @@ def coverage(rows, start_ns, end_ns, max_gap_ns):
   last = supported[-1][1] if supported else start_ns
   internal = [(times[i + 1] - times[i]) / NS for i in range(len(times) - 1)
               if times[i + 1] > start_ns and times[i] < end_ns and times[i + 1] - times[i] > max_gap_ns]
-  return {'valid_duration_s': sum(weights), 'required_duration_s': (end_ns - start_ns) / NS,
+  required = (end_ns - start_ns) / NS
+  return {'valid_duration_s': min(sum(weights), required), 'required_duration_s': required,
           'maximum_gap_s': max(internal, default=0.0), 'leading_unobserved_s': (first - start_ns) / NS,
           'trailing_unobserved_s': (end_ns - last) / NS if supported else (end_ns - start_ns) / NS}
 
@@ -693,3 +694,45 @@ def annotations(case_annotations, window, labels=None):
       out[metric] = record(metric, unit='events', status='unresolved', reason='no_annotation_or_negative_label',
                            diagnostics={'provenance': 'rider_annotation', 'items': []})
   return out
+
+
+PHYSICAL_MAP = {'settling_time': 'settling_time', 'lane_motion_cycles': 'scallop_peak_to_peak',
+                'late_wide_excursion': 'late_wide_excursion', 'lateral_jerk_p95': 'lateral_jerk_p95',
+                'driver_catches': 'driver_catches', 'path_rms': 'corridor_violation_duration'}
+
+
+def to_physical_records(records_by_metric, identity, contact_status):
+  """Shape measurement records for physical_evidence.classify_metrics; clearance is never supplied."""
+  out = []
+  for name, target in PHYSICAL_MAP.items():
+    rec = records_by_metric.get(name)
+    if rec is None or rec['status'] not in ('measured_estimate',):
+      continue
+    value = rec['value']
+    if name == 'lane_motion_cycles':
+      value = rec['diagnostics'].get('peak_to_peak_max_m')
+      if value is None:
+        continue
+    if name == 'path_rms':
+      value = rec['diagnostics'].get('time_outside_corridor_s')
+      if value is None:
+        continue
+    item = {'metric': target, 'value': int(value) if target == 'driver_catches' else float(value),
+            'unit': {'settling_time': 's', 'scallop_peak_to_peak': 'm', 'late_wide_excursion': 'm',
+                     'lateral_jerk_p95': 'm/s^3', 'driver_catches': 'events', 'corridor_violation_duration': 's'}[target],
+            'valid_duration_s': rec['valid_duration_s'], 'required_duration_s': rec['required_duration_s'],
+            'maximum_gap_s': rec['maximum_gap_s'], 'critical_gap': bool(rec['critical_gap']), 'ambiguous': False,
+            'uncertainty_method': rec['uncertainty_method'], 'source_identity': identity,
+            'supporting_event_ids': rec['supporting_event_ids'] or [f'{name}:{identity["window_ns"][0]}'],
+            'contact_status': contact_status, 'complete_recovery': rec['status'] == 'measured_estimate'}
+    if target == 'driver_catches':
+      item.update(valid_duration_s=(identity['window_ns'][1] - identity['window_ns'][0]) / NS,
+                  required_duration_s=(identity['window_ns'][1] - identity['window_ns'][0]) / NS, maximum_gap_s=0.0)
+    out.append(item)
+  return out
+
+
+def physical_verdicts(records_by_metric, identity, contact_status):
+  from tools.mazda_ti.physical_evidence import classify_metrics
+  return classify_metrics(to_physical_records(records_by_metric, identity, contact_status),
+                          evidence_type='recorded_baseline', source_arm='reference', verified_identity=identity)

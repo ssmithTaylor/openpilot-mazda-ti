@@ -148,6 +148,12 @@ def test_elapsed_weights_cover_window_and_exclude_gaps_and_never_extend_past_las
   assert mm.weighted_percentile([1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0], 0.95) == 4.0
 
 
+def test_coverage_valid_duration_never_exceeds_required():
+  rows = make_rows(grid(0, 20), 0.0)
+  cov = mm.coverage(rows, int(9.15 * NS), 20 * NS, mm.DEFAULT_PARAMETERS.max_gap_ns)
+  assert cov['valid_duration_s'] <= cov['required_duration_s']
+
+
 def _sine_rows(cycles=2, period=3.0, amp=0.4, start=0.0):
   return make_rows(grid(start, start + cycles * period), lambda t: amp * math.sin(2 * math.pi * (t - start) / period))
 
@@ -451,3 +457,36 @@ def test_settling_candidate_does_not_survive_a_real_gap_in_the_later_region():
   edge_rows, edge_anchors = _recovery_case(lambda t: 0.5 if t < 18.6 else 0.0, times=grid(0, 20))
   edge = mm.settling(edge_rows, (0, 20 * NS), edge_anchors, CAL)
   assert edge['status'] == 'right_censored' and edge['diagnostics']['candidate_dwell_start_s'] is not None
+
+
+def test_physical_bridge_keeps_unknown_contact_not_measured():
+  from tools.mazda_ti.physical_evidence import classify_metrics
+  rows, anchors = _recovery_case(lambda t: 0.5 if t < 9.5 else 0.5 * math.exp(-(t - 9.5) / 0.6))
+  recs = {'settling_time': mm.settling(rows, (0, 20 * NS), anchors, CAL),
+          'lane_motion_cycles': mm.cycles(rows, (0, 20 * NS), CAL),
+          'late_wide_excursion': mm.hold_late_wide(rows, (0, 20 * NS), anchors, CAL, 1),
+          'lateral_jerk_p95': mm.comfort_proxy(rows, (0, 20 * NS), CAL),
+          **mm.annotations([], (0, 20 * NS), labels={'intervention': 'absent', 'scope': 'window'})}
+  identity = {'route': 'r', 'source_sha256': 'a' * 64, 'raw_sha256': {'r--1/rlog': 'b' * 64}, 'window_ns': [0, 20 * NS]}
+  physical = mm.to_physical_records(recs, identity, 'unknown')
+  names = {p['metric'] for p in physical}
+  assert {'settling_time', 'late_wide_excursion', 'lateral_jerk_p95', 'driver_catches'} <= names
+  assert 'scallop_peak_to_peak' not in names   # a monotonic recovery has no cycle episode to report
+  verdicts = classify_metrics(physical, evidence_type='recorded_baseline', source_arm='reference', verified_identity=identity)
+  by = {v['metric']: v for v in verdicts}
+  assert by['settling_time']['status'] == 'not_measured'
+  assert by['minimum_left_clearance']['status'] == 'not_measured'
+  assert by['lateral_jerk_p95']['status'] == 'observed_unqualified'
+  confirmed = classify_metrics(mm.to_physical_records(recs, identity, 'confirmed_no_intervention'),
+                               evidence_type='recorded_baseline', source_arm='reference', verified_identity=identity)
+  assert {v['metric']: v['status'] for v in confirmed}['settling_time'] == 'observed_unqualified'
+
+
+def test_physical_bridge_maps_cycle_peak_to_peak():
+  identity = {'route': 'r', 'source_sha256': 'a' * 64, 'raw_sha256': {'r--1/rlog': 'b' * 64}, 'window_ns': [0, 20 * NS]}
+  osc = mm.oriented(make_rows(grid(0, 20), lambda t: 0.4 * math.sin(2 * math.pi * t / 5.0)), 1)
+  cyc = mm.cycles(osc, (0, 20 * NS), CAL)
+  assert cyc['status'] == 'measured_estimate' and cyc['diagnostics']['peak_to_peak_max_m'] is not None
+  mapped = mm.to_physical_records({'lane_motion_cycles': cyc}, identity, 'unknown')
+  assert [p['metric'] for p in mapped] == ['scallop_peak_to_peak']
+  assert abs(mapped[0]['value'] - cyc['diagnostics']['peak_to_peak_max_m']) < 1e-9 and mapped[0]['unit'] == 'm'
