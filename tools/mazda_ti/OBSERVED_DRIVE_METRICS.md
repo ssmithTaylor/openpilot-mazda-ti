@@ -35,8 +35,13 @@ handling verdict. CLI (as shipped, `python -m tools.mazda_ti.measurement_qualifi
 
 ```text
 calibrate --request REQUEST.json --params-out PARAMS_OUT.json --output OUTPUT.json [--params BASE_PARAMS.json]
-evaluate  --request REQUEST.json --params PARAMS.json --output OUTPUT_DIR --scratch SCRATCH_DIR
+evaluate  --request REQUEST.json --params PARAMS.json --output OUTPUT_DIR
 ```
+
+`evaluate` keeps extraction in memory and writes only the compact
+`result.json`/`report.md`/`holdout-sealed.json` outputs under `OUTPUT_DIR`;
+it has no `--scratch` flag, and running `storage_preflight` over the
+extraction workspace stays the operator's own step beforehand.
 
 The exact commands run for the one real-data attempt (Task 9, 2026-09-10,
 worktree-absolute paths; see "Real-data calibration attempt" below for why
