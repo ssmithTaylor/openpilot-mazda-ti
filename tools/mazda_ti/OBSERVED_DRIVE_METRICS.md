@@ -297,6 +297,37 @@ All three smooth controls are `eligible: true` for `a_min_m` (values
 (data health)`. No parameter file, no `params_id`, and no evaluation output
 exists for this attempt.
 
+## Window protocol v2 and gap semantics (post-review, 2026-09-11)
+
+- The window amendments made in attempts 2 and 3 for `24d_smooth_vw` and
+  `261_smooth_vw` are exploratory development amendments made after
+  failures, not the original predeclared protocol; they keep their
+  diagnostic value. The frozen rule for the next attempt, window protocol
+  v2: window start is the predeclared `geographic_lookup_window_ns` start;
+  window end is the predeclared geographic end plus a fixed 12.0 s
+  extension. The request's `window_source` label "recovery_horizon_s
+  (12.0 s)" is a mislabel; `recovery_horizon_s` is 8.0 s. All three
+  calibration failure records are preserved; the sealed holdout is
+  untouched and must stay untouched.
+- `max_gap_s` stays 0.2 s for this protocol; any jitter allowance requires a
+  separately justified, versioned rule with a new `params_id`.
+  Timestamp-gap semantics: a gap is the difference between the monotonic
+  `mono_ns` timestamps of two consecutive rows in the group-healthy row
+  list under test (lane rows for lane metrics; yaw+speed rows for the
+  comfort proxy); it exceeds the limit when that difference is greater than
+  `max_gap_s` in nanoseconds. Four frame periods are not the same as four
+  missing frames: a row is also removed by an unhealthy group, and the
+  comparison is on the actual timestamp difference, not a frame count.
+- Precondition for supporting a parameter file with changed gap or filter
+  settings: `orient()` must take its gap limit from the parameters in use
+  rather than `DEFAULT_MAX_GAP_S`, and `case_rows()` must size the
+  extraction margin from the parameters in use rather than
+  `DEFAULT_PARAMETERS`. Until then only the default `max_gap_s`,
+  `smooth_span_s` and `velocity_span_s` are supported.
+- `settling`: `unresolved` with reason `gap_before_first_dwell` now carries
+  `critical_gap` true; a gap after an already-confirmed dwell does not
+  invalidate a measured settling time.
+
 ## Limits
 
 Model-derived geometry (one camera-model lane fit, not surveyed truth);
