@@ -1,0 +1,50 @@
+{
+  "candidate_revision": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+  "case": {
+    "experiment": {
+      "baseline_controller": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+      "force_offset": true,
+      "format_version": 1,
+      "fpcs_sample_at": "diagnostic",
+      "limiter": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+      "name": "instrumented-cutout-290",
+      "rlogs": [
+        "00000290--9c1e61afa1--15/rlog",
+        "00000290--9c1e61afa1--16/rlog",
+        "00000290--9c1e61afa1--17/rlog"
+      ],
+      "settings": {
+        "LatCommitSetpoint": 1.0,
+        "LatDamping": 1.0,
+        "LatFrictionComp": 1.0,
+        "LatNoFrictionRelay": 1.0,
+        "LatOutputFilter": 0.0,
+        "SteerKP": 0.8,
+        "TiSteerDeltaDown": 15.0,
+        "TiSteerDeltaUp": 10.0,
+        "TiSteerDeltaUpHigh": 9.0,
+        "TiSteerDeltaUpKnee": 630.0,
+        "TiSteerDriverAllowance": 15.0,
+        "TiSteerDriverMultiplier": 40.0,
+        "TiSteerMax": 600.0,
+        "TorqueInterceptorEnabled": 1.0
+      },
+      "warmup_controller": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+      "window": {
+        "activation": 1000.0,
+        "anchor_i_at": 990.0,
+        "end": 1070.0,
+        "start": 1000.0
+      }
+    },
+    "history": "exact",
+    "id": "instrumented-cutout-290",
+    "input_sha256": {
+      "00000290--9c1e61afa1--15/rlog": "e2a2deb7da98d662168267de3d7ab92c1e2cc51f4205ab4cabbd951e3dc2384d",
+      "00000290--9c1e61afa1--16/rlog": "5fecc6b4c171e81ad18dbc89ae5ee8aea20e002494017730bed2a59a4ab76e4c",
+      "00000290--9c1e61afa1--17/rlog": "ac4083919f2b87bafa0570d1d933572442259216ee8bb2356e4347e6aeacf5dd"
+    },
+    "method": "instrumented"
+  },
+  "format_version": 1
+}

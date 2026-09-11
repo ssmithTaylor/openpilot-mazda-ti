@@ -20,6 +20,19 @@ env:
 
 
 jobs:
+  mazda_ti_evidence:
+    name: Mazda TI evidence tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - uses: ./.github/workflows/setup-with-retry
+    - name: Run Mazda evidence tests
+      run: |
+        ${{ env.RUN }} "python -m pytest -c tools/mazda_ti/pytest.ini --confcutdir=tools/mazda_ti tools/mazda_ti"
+
   simulator_driving:
     name: simulator driving
     runs-on: ubuntu-latest

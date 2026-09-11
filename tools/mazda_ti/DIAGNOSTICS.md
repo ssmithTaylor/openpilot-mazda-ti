@@ -19,6 +19,59 @@ The original instrumentation in `1f56328` incorrectly looked up carState in SubM
 
 ## Controller record
 
+### Check the angle-model measurement against consumed yaw
+
+Before attributing a release delay to inflated steering-angle acceleration, use:
+
+```text
+python -m tools.mazda_ti.audit_measurement --data-root PATH/TO/rlogs --rlogs ROUTE--SEG/rlog --start-ns START --end-ns END --output NEW-measurement.json
+```
+
+This joins the original active torque diagnostics to exactly consumed carState and
+liveLocationKalman identities. It compares gross right-positive `measurement` to
+`angularVelocityCalibrated.value[2] * carState.vEgo`. Do not subtract roll or learned
+offset on just one side. Analyze stable and unwind windows separately, with windows
+declared before inspecting disagreement. A passing command means all supplied
+active measurements have valid identities, finite values and healthy inputs; it
+does not qualify a controller or establish physical handling.
+
+The compact report retains min/median/max, both publication ages, mixed-time
+separation, distinct localizer-message count, issue counts, bounded samples and
+source/raw/runtime hashes. `--sample-count` defaults to12 and accepts0–100; no full
+trace or cache is written. Metrics weight controller publications, including
+repeated localizer inputs. Inactive defaults and unhealthy measurements are excluded
+from statistics. Missing exact inputs are failures, never replaced with nearest
+messages. Maximum publication gap and actual first/last publication remain visible;
+coverage does not certify missing time or sensor exposure timing.
+Supply one original route: the CLI checks distinct paths, not common route naming.
+Health failures have aggregate counts; bounded unhealthy samples indicate rejection,
+but the individual flag at every rejected timestamp requires re-reading raw inputs.
+
+Yaw times speed approximates rotational acceleration; lateral velocity transients,
+mounting, speed and timing can contribute to disagreement. The reported yaw-only
+standard deviation times speed is not total uncertainty or a physical error bound.
+The fused localizer offers a route beyond steering angle, not independent ground
+truth. Do not fit lag to improve agreement or divide uncertainty by sqrt(sample count).
+Preserve this distinction when interpreting a small difference or selecting a new
+measurement source. Serialized tests cover wrong identities, malformed/invalid data,
+unhealthy inputs, inactive defaults, repeated localizer samples and compact output.
+
+### Recorded fields
+
+When testing a short lane-motion forecast as a possible release signal, freeze
+horizons and scoring windows first. Predict from currently consumed geometry and
+motion only; keep later observations exclusively in scoring. Camera-EOF horizons
+leave only `horizon - cameraAge` lead at issue. Report this mixed-time assumption
+and reject nonpositive lead. Transport3D points with an explicitly compatible
+coordinate frame, rejecting missing or nonmonotonic support rather than extrapolating.
+Compare persistence and simple heading prediction on exactly the same available
+rows. Future lane estimates share the visual system's errors and are not surveyed
+boundaries. Preserve unavailable rows, active-episode boundaries and scoring gaps.
+Require improvement before the relevant permission decision; aggregate forecast
+accuracy alone cannot justify an earlier release or revive retired raw-plan FF.
+If full rows are pruned, retained aggregates/hashes require row reconstruction
+before independent recomputation. A forecast is not a candidate-driven vehicle replay.
+
 `mazdaDiagnostics.version == 1` identifies this format. Version zero means absent, including non-plant controllers and old recordings. If the surrounding torque state is inactive, only request/filter/context/settings fields are populated; zero active-loop fields do not represent measured zero torque or acceleration.
 
 The reference sequence is:
@@ -59,6 +112,32 @@ logs have extension version0. Local replay qualification covers22,700 updates/ap
 including2,022 inactive updates: only the four extension fields differ. This is not a
 device-build or physical-handling qualification; verify new recorded fields after deployment.
 
+Check the state extension in a new recording with:
+
+```text
+python -m tools.mazda_ti.audit_friction_release --data-root PATH/TO/rlogs --rlogs ROUTE--SEG/rlog --start-ns START --end-ns END --output NEW-friction-state.json
+```
+
+The auditor reconstructs pre-withdrawal compensation from the logged inverse, friction gate,
+authority and settings. It checks decomposition, bounds and reset state, then replays the
+actual helper from each preceding observed state using the exact consumed carState steering
+rate and logged lane permissions/dwell. The first complete state is an anchor; the check
+does not reconstruct history before it. Publications more than30ms apart fail explicitly.
+There is no controller sequence counter, so even a passing check cannot prove no smaller
+missing interval occurred. Use the separate input/apply and lane-context audits as well.
+
+Exit zero requires version1, consistent state/contribution checks, active coverage and at
+least one checked transition. Absent/unsupported extension, missing or mismatched inputs,
+nonfinite values, altered compensation or latch, reset errors and publication gaps fail.
+The1e-9 tolerance applies only to these Float64 count/state comparisons; it cannot excuse
+an integer-command mismatch. Source/runtime/raw hashes and all failed rows are retained.
+
+Qualification includes twelve serialized production-controller/failure tests and22,697
+adjacent transitions across22,700 generated replay-fixture updates, with their recorded
+carState identities preserved. These generated fixtures are not new vehicle recordings.
+The CLI correctly rejects the original28f version0 records. Qualify actual state coverage
+again when a new drive is available; a state-consistency pass is not a lane-performance score.
+
 `integralBefore`, `integralAfter`, the PID input error/feedforward, gains and output permit inspection of accumulated error and anti-windup. `freezeReasons` bits are: 0 limiter feedback, 1 steeringPressed, 2 speed below 5 m/s. The steeringPressed input can be TI-contaminated and is not evidence of hand contact. `plantLimit` is the controller model's current limit, not a measured tire-grip ceiling.
 
 `settings` bits are: 0 commitment, 1 damping, 2 proactive friction compensation, 3 output smoothing, 4 friction relay disabled. These report the toggles actually seen on that update. Float64 values preserve controller precision where Float32 rounding can change an eventual integer command.
@@ -82,8 +161,15 @@ CLI still uses its declared sampling histories. After auditing the input chain, 
 carOutput events paired with event timestamps, a carControl event map keyed by timestamp,
 and the pinned production limiter. Times are integer nanoseconds.
 
-Before each controller update, use `output_for(consumed_carOutput_mono)` for the exact
-output identity in its diagnostic inputs. Publish the resulting normalized steering with
+Before each controller update, use
+`previous_applied_for_update(controlsState_mono, consumed_carOutput_mono, limiter_frozen)`.
+Use its `observed_steer` for the existing limiter-history comparison and expose its typed
+`candidate` only when `candidate_available` is true. The candidate record is causally
+ordered and identifies the controller update, paired request, apply and output publication;
+it includes candidate-owned TI/stock counts, permission/selection, fallback and the caller's
+pre-update freeze state. A recorded warmup output or a historical request without a qualified
+producer identity deliberately returns no candidate record. `output_for` remains the lower
+level exact-output helper. Publish the resulting normalized steering with
 `publish(controlsState_mono, steer)`. Use `history_request(mono, replayed, recorded)` for
 the controller's request-history comparison, preserving recorded requests and feedback
 together before activation. Call `finish()` after all required controller outputs are
@@ -94,8 +180,9 @@ Construction verifies original serialized requests, sequential TI limits, previo
 continuity, repeated-apply payloads and feedback values. Simulation retains its own previous
 limited command. A post-activation publication can still represent a pre-activation apply;
 the represented apply determines which feedback is used. Missing identities, changed repeated
-applies, nonfinite signals, unsupported settings and active stock fallback while TI is
-unavailable fail explicitly. Recorded physical observations, driver torque, actuator permission
+applies, nonfinite signals and unsupported settings fail explicitly. Active stock fallback
+requires the explicit stock configuration below; the default TI-only mode still rejects it.
+Recorded physical observations, driver torque, actuator permission
 and the apply schedule remain fixed; software feedback is not a vehicle-motion prediction.
 
 The helper reproduced the local exact-identity prototype's controller traces byte-for-byte
@@ -105,6 +192,31 @@ candidate-owned feedback, delayed consumed identities, and malformed/incomplete 
 This qualifies the feedback component, not an arbitrary new controller or full replay runner.
 Preserve caller, dependency, runtime and raw-log hashes and independently reproduce the
 recorded baseline before interpreting a candidate.
+
+### TI bypass and stock feedback
+
+GEN1 continues calculating the stock command while the TI operates. When TI permission is
+lost, `carOutput.actuatorsOutput.steer` selects the stock limited request divided by **600**.
+The EPS's measured ±308 response is a different quantity. Replacing unavailable TI feedback
+with zero loses the stock limiter history and can change the controller's anti-windup behavior.
+
+Use `pure_stock_limiter(pinned_revision)` from `feedback.py` to load the actual stock limiter,
+GEN1 constants and their source hashes without hardware imports. Pass its first two results
+as `stock_limiter=` and `stock_limits=` to `RecordedTiFeedback`. Record the returned source
+hashes with the caller's provenance. Only the explicit GEN1 stock600 settings are supported.
+
+This mode validates both recorded request/previous/limited sequences on every apply, including
+when the other actuator supplies the published feedback. Candidate requests advance both
+histories; `output_for` selects the appropriate normalized command using recorded TI permission.
+`counts` and `finish()` retain their existing TI-count meaning; `stock_counts` contains the
+separate stock counts keyed by apply sequence. Neither is motor-delivery measurement.
+
+Seven serialized-event tests cover the distinct rate limits, continuously retained stock
+history, TI reset/re-entry, inactive reset, old consumed identities, corrupt stock evidence
+and rejection of EPS308 normalization. A 7,000-update original-drive baseline covering a TI
+cutout, active stock fallback and recovery reproduces all TI and stock commands. Recorded
+availability still forces the same TI dropout in candidate replay; this cannot predict
+whether changed commands would avoid it or how the subsequent vehicle trajectory would differ.
 
 After checking applied-output identities, reproduce the lane observer from the actual consumed
 model events and both recorded clocks:
@@ -165,3 +277,97 @@ exit zero requires every state to be exercised and p99 below10ms. Timing results
 with machine load and are not deterministic artifacts. This controlled workload does
 not measure full process transport, concurrent onroad load or actual lane performance.
 Keep its result with the build record, then verify real onroad logs separately.
+
+The [instrumented evaluation adapter](INSTRUMENTED_EVALUATION.md) now promotes the local full-controller caller
+behind the shared evaluation command. It requires complete exact identities, checks each applied
+carControl against its linked controller publication, and qualifies both limiter histories before
+evaluating a candidate. The standalone identity auditor remains an identity-coverage check.
+
+## Compare legacy recordings across lateral controllers
+
+Use this procedure when an older rider-confirmed comparison lacks the structured
+input identities required by the auditors above. A zero diagnostic version or
+pre-instrumentation controller flag is unavailable evidence, not a measured zero.
+
+The current `controller_replay.py` and `instrumented.py` adapters instantiate
+`LatControlTorque`. They do not reproduce a historical `LatControlNNFF` baseline.
+Loading its original neural model asset is only a feasibility check: qualifying
+that baseline also requires the original controller/PID/interface, plan and roll
+histories, parameter sampling and command/limiter reproduction. A mismatch from
+the torque adapter on an NNFF recording is not a handling verdict.
+
+The separate [legacy NNFF/PID probe](LEGACY_NNFF.md) now reproduces normalized
+output on three declared route261 windows. It includes source-derived receipt
+sequence checks and shared requests; it does not add NNFF to the full actuator
+or release adapters. Use its four timing choices and retain failed holdouts.
+
+For legacy NNFF source `2a098cdb`, distinguish raw `liveDelay.lateralDelay`
+passed to `update_live_delay` from the raw delay plus `LAT_SMOOTH_SECONDS`
+passed to the controller update. Future neural samples use the former; the
+desired-jerk calculation uses the latter. Pitch and demand/roll histories update
+only on active full-neural/model-good frames. The old base `reset()` only clears
+saturation time, and NNFF has no reset override; never assume inactive intervals
+reset its PID or histories. A feedforward-only reconstruction can use an explicit
+capture facade, but must label PID, final commands and vehicle response unqualified.
+
+For an original-source NNFF/PID reconstruction, warm the neural pitch/deques
+before applying one declared post-update recorded integral anchor. Anchoring I
+while neural history is still empty can alter anti-windup decisions and leave a
+persistent integral error after feedforward settles. Preserve the failed early
+anchor result; do not repeatedly reset I to the recording. In `2a098cdb`,
+`publish_logs` computes steering-limited from the current requested steer and
+received carOutput after the controller update, for use on the next cycle.
+Keep that order and retain separate carOutput receipt hypotheses. Saturation
+alert reproduction and applied CAN qualification are separate from PID output.
+
+[`legacy_input_constraints.py`](legacy_input_constraints.py) provides finite
+Float32 rounding intervals and `curvature_compatible` for source-verified legacy
+angle-model equations. Compare recomputed actual curvature and acceleration
+after serialization; check overlap between recorded desired curvature and
+desired acceleration rounding intervals at the candidate speed. Do not require
+the product of the already-rounded curvature to equal the recorded acceleration.
+These necessary conditions reject incompatible candidates without fitting P/I/F
+or output. They do not distinguish equal-valued publications, prove receipt,
+or remove numerical-runtime uncertainty. Preserve all remaining ambiguity and
+score declared timing choices separately. Focused checks:
+
+```text
+python -m pytest tools/mazda_ti/tests/test_legacy_input_constraints.py --confcutdir=tools/mazda_ti/tests -o addopts= -p no:cacheprovider --basetemp ABSOLUTE-OWNED-SCRATCH -q
+```
+
+1. Bind the rider's symptom and lane annotations to original route/segment/time
+   identities. Keep later clarifications as separate records rather than rewriting
+   the original annotation. Geographic matching does not establish lane identity
+   or transfer an outcome. Within-lane entry position remains a separate variable.
+2. Record startup settings, source cleanliness, speed and actuator availability.
+   A startup NNFF toggle supports configuration; verify source selection gates
+   before declaring effective mode. Do not interpret a controller switch as only
+   a change to one feedforward term.
+3. Compare original wheel, speed, yaw, model geometry and CAN publications with
+   their own timestamps, signs and availability. If exact consumed identities are
+   absent, label an as-of publication join explicitly and retain its ages. Never
+   fill missing history with future observations or silently score unavailable rows.
+4. For cross-drive wheel-angle comparisons, retain both raw angle and each drive's
+   learned center. Right-positive adjusted angle is
+   `-carState.steeringAngleDeg + liveParameters.angleOffsetDeg`. This is estimator
+   normalization, not independent steering-zero calibration. Preserve localizer
+   health, mixed ages and reported yaw-only uncertainty; do not divide correlated
+   uncertainty by the square root of the sample count.
+5. Inspect the recorded source's logging assignments before interpreting internal
+   targets or PID terms. For example, plant-controller revision
+   `2c50a68456d6f8eb18c5688a72a2c055a2572182` logs `desiredLateralAccel = setpoint`
+   while feedback uses the committed `tracked_setpoint`. Logged desired below
+   actual can coexist with positive P without proving a sign error. NNFF fields
+   require their own units and computation check.
+6. Validate a proposed symptom metric against rider-confirmed positive and negative
+   examples before using it to select changes. Wheel reversal count alone failed
+   this check in the September 2026 VW comparison: a smooth and a symptomatic
+   pass both had three reversals under the same existing definition. Preserve
+   magnitude, timing and lane context instead of relabeling the rider's outcome.
+
+Completion here means a reproducible descriptive comparison with explicit limits.
+It does not provide a candidate-responsive physical test. Keep compact requests,
+annotations, hashes, findings and reproduction instructions; lossless compression
+can retain full descriptive results while removing verified generated duplicates.
+Do not promote a local exploratory helper as a qualified shared runner without
+portable inputs and the corresponding command-level acceptance evidence.

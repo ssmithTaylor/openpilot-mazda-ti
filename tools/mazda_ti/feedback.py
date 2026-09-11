@@ -18,6 +18,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+from .applied_feedback import AppliedLateralFeedback, PreviousAppliedFeedback
 from .runtime import ROOT
 
 sys.path.insert(0, str(ROOT))
@@ -29,6 +30,7 @@ class Request:
   mono: int
   steer: float
   active: bool
+  source_controller_mono: int | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,29 @@ def pure_limiter(revision):
   scope = {'clip': np.clip}
   exec(compile(ast.Module(body=[node], type_ignores=[]), 'recorded_TÎ™_limiter', 'exec'), scope)
   return scope[node.name], hashlib.sha256(raw).hexdigest()
+
+
+def pure_stock_limiter(revision):
+  """Pinned GEN1 stock request limiter/settings; counts are not EPS delivery."""
+  raw = subprocess.check_output(['git', 'show', revision + ':selfdrive/car/__init__.py'], cwd=ROOT)
+  values = subprocess.check_output(['git', 'show', revision + ':selfdrive/car/mazda/values.py'], cwd=ROOT)
+  node = next(n for n in ast.parse(raw.decode()).body
+              if isinstance(n, ast.FunctionDef) and n.name == 'apply_driver_steer_torque_limits')
+  scope = {'clip': np.clip}
+  exec(compile(ast.Module(body=[node], type_ignores=[]), 'recorded_stock_limiter', 'exec'), scope)
+  cls = next(n for n in ast.parse(values.decode()).body if isinstance(n, ast.ClassDef) and n.name == 'CarControllerParams')
+  init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+  gen1 = next(n for n in init.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'CP.flags & MazdaFlags.GEN1')
+  required = {'STEER_MAX', 'STEER_DELTA_UP', 'STEER_DELTA_DOWN', 'STEER_DRIVER_ALLOWANCE',
+              'STEER_DRIVER_MULTIPLIER', 'STEER_DRIVER_FACTOR'}
+  constants = {n.targets[0].attr: ast.literal_eval(n.value) for n in gen1.body
+               if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute) and n.targets[0].attr in required}
+  if set(constants) != required:
+    raise ValueError('Missing pinned GEN1 stock limiter constants')
+  return scope[node.name], SimpleNamespace(**constants), {
+    'selfdrive/car/__init__.py': hashlib.sha256(raw).hexdigest(),
+    'selfdrive/car/mazda/values.py': hashlib.sha256(values).hexdigest(),
+  }
 
 
 class Fixture:
@@ -139,7 +164,7 @@ class Fixture:
   def new(self):
     if not self.baseline_verified:
       raise RuntimeError('verify_baseline() must pass before candidate use')
-    return TiFeedbackReplay(self)
+    return TiFeedbackReplay(self, require_source_identity=True)
 
   def verify_baseline(self):
     replay = TiFeedbackReplay(self)
@@ -168,8 +193,9 @@ class TiFeedbackReplay:
   interpolation or wall-clock waiting and no per-frame state anchoring.
   """
 
-  def __init__(self, fixture):
+  def __init__(self, fixture, require_source_identity=False):
     self.fixture = fixture
+    self.require_source_identity = bool(require_source_identity)
     self.now = fixture.start_ns
     self.index = 0
     self.last_send = fixture.initial_send[1]
@@ -183,6 +209,8 @@ class TiFeedbackReplay:
     self.output_times = [fixture.initial_output.mono]
     self.request_log = []
     self.requests_by_time = dict(fixture.prior_requests)
+    self.last_send_identity = (fixture.initial_send[0], fixture.initial_sampled_request)
+    self.output_apply_identity = {}
 
   def advance_until(self, mono):
     mono = int(mono)
@@ -203,6 +231,7 @@ class TiFeedbackReplay:
         wanted = round(self.sampled_request.steer * self.fixture.limits.TI_STEER_MAX)
         self.last_send = self.fixture.limiter(wanted, self.last_send, self.sensor, self.fixture.limits)
         self.sends.append((t, self.last_send))
+        self.last_send_identity = (t, self.sampled_request)
       elif kind == 'output':
         # cereal CarControl.Actuators.steer is Float32 on the wire.
         steer = float(np.float32(self.last_send / self.fixture.limits.TI_STEER_MAX))
@@ -210,6 +239,7 @@ class TiFeedbackReplay:
         self.outputs.append(self.latest_output)
         self.output_history.append(self.latest_output)
         self.output_times.append(t)
+        self.output_apply_identity[t] = self.last_send_identity
       self.index += 1
     self.now = mono
     return self.latest_output
@@ -228,12 +258,34 @@ class TiFeedbackReplay:
       raise ValueError('Requested feedback precedes initialized publication history')
     return self.output_history[index]
 
-  def publish_request(self, mono, steer, active=True):
+  def previous_applied_for_update(self, update_mono, output_mono, limiter_frozen=False):
+    """Expose a prior candidate apply only when its producing update is known."""
+    output = self.output_at(output_mono)
+    identity = self.output_apply_identity.get(output.mono)
+    if identity is None:
+      return PreviousAppliedFeedback(int(update_mono), output.steer, None)
+    applied_mono, request = identity
+    if request.source_controller_mono is None or request.source_controller_mono < self.fixture.start_ns:
+      return PreviousAppliedFeedback(int(update_mono), output.steer, None)
+    snapshot = AppliedLateralFeedback(
+      output.mono, applied_mono, request.mono, request.source_controller_mono,
+      None, output.counts, None, output.counts,
+      output.steer, request.active, request.active, True, request.active, False,
+      bool(limiter_frozen),
+    )
+    return PreviousAppliedFeedback(int(update_mono), output.steer, snapshot)
+
+  def publish_request(self, mono, steer, active=True, source_controller_mono=None):
     if not active:
       raise ValueError('Engagement transitions are outside this adapter scope')
     if not np.isfinite(steer) or abs(steer) > 1:
       raise ValueError('Candidate normalized steer must be finite and within existing bounds')
+    if self.require_source_identity and source_controller_mono is None:
+      raise ValueError('Candidate request requires its producing controller identity')
+    if source_controller_mono is not None and not 0 < int(source_controller_mono) <= int(mono):
+      raise ValueError('Invalid candidate request/controller identity')
     self.advance_until(mono)
-    self.latest_request = Request(int(mono), float(np.float32(steer)), True)
+    self.latest_request = Request(int(mono), float(np.float32(steer)), True,
+                                  int(source_controller_mono) if source_controller_mono is not None else None)
     self.requests_by_time[int(mono)] = self.latest_request
     self.request_log.append(self.latest_request)

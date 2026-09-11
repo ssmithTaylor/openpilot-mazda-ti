@@ -1,0 +1,226 @@
+{
+  "cases": [
+    {
+      "annotations": [
+        {"confidence": "uncertain", "kind": "contact", "source": "broad", "value": "Contact onset/end not independently established; TI signals are not hand evidence", "window": null},
+        {"confidence": "approximate", "kind": "speed", "source": "raw-vw-continuous-28c", "value": "Recorded speed min/median/max 23.11/24.79/25.57 m/s", "window": [230.0, 290.0]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-vw-continuous-28c", "value": "First scoring second: speed 23.33 m/s, steering angle 1.70 deg; lane position uncalibrated; no matched-condition comparison", "window": [230.0, 231.0]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "carState",
+          "limiter": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "name": "vw-continuous",
+          "rlogs": ["0000028c--0ea8954ea3--3/rlog", "0000028c--0ea8954ea3--4/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "window": {"activation": 230.0, "anchor_i_at": 225.0, "end": 290.0, "start": 230.0}
+        },
+        "history": "earliest",
+        "id": "vw-continuous-28c",
+        "input_sha256": {"0000028c--0ea8954ea3--3/rlog": "f2d0411e41caaa9bd1e3a9980b0680e680226a11d67ae4a73c66702e689a266f", "0000028c--0ea8954ea3--4/rlog": "b4be056404cc2b850a934afc324106fd4847caaf7fa966e8d846e501a0fb167b"},
+        "method": "historical",
+        "origin": "recorded"
+      },
+      "categories": ["difficult_corner"],
+      "control_revision": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+      "exclusion": null,
+      "expected": {"minimum_sends": 6000, "stock_commands": false},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    },
+    {
+      "annotations": [
+        {"confidence": "uncertain", "kind": "contact", "source": "cutout", "value": "Return-trip contact is unannotated; do not infer from steeringPressed", "window": null},
+        {"confidence": "approximate", "kind": "speed", "source": "raw-instrumented-cutout-290", "value": "Recorded speed min/median/max 20.84/24.36/25.71 m/s", "window": [1000.0, 1070.0]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-instrumented-cutout-290", "value": "First scoring second: speed 25.62 m/s, steering angle 3.10 deg; lane position uncalibrated; no matched-condition comparison", "window": [1000.0, 1001.0]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "diagnostic",
+          "limiter": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+          "name": "instrumented-cutout-290",
+          "rlogs": ["00000290--9c1e61afa1--15/rlog", "00000290--9c1e61afa1--16/rlog", "00000290--9c1e61afa1--17/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+          "window": {"activation": 1000.0, "anchor_i_at": 990.0, "end": 1070.0, "start": 1000.0}
+        },
+        "history": "exact",
+        "id": "instrumented-cutout-290",
+        "input_sha256": {"00000290--9c1e61afa1--15/rlog": "e2a2deb7da98d662168267de3d7ab92c1e2cc51f4205ab4cabbd951e3dc2384d", "00000290--9c1e61afa1--16/rlog": "5fecc6b4c171e81ad18dbc89ae5ee8aea20e002494017730bed2a59a4ab76e4c", "00000290--9c1e61afa1--17/rlog": "ac4083919f2b87bafa0570d1d933572442259216ee8bb2356e4347e6aeacf5dd"},
+        "method": "instrumented",
+        "origin": "recorded"
+      },
+      "categories": ["actuator_transition", "engagement_boundary"],
+      "control_revision": "ad14961a29f59635d5f657a43000ca2a1ade62fb",
+      "exclusion": null,
+      "expected": {"minimum_sends": 6999, "stock_commands": true},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    },
+    {
+      "annotations": [
+        {"confidence": "uncertain", "kind": "outcome", "source": "broad", "value": "Ordinary-road command coverage; successful physical passage has not been rider-confirmed", "window": null},
+        {"confidence": "approximate", "kind": "speed", "source": "raw-ordinary-28c", "value": "Recorded speed min/median/max 20.15/21.53/24.02 m/s", "window": [338, 387]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-ordinary-28c", "value": "First scoring second: speed 23.77 m/s, steering angle 0.15 deg; lane position uncalibrated; no matched-condition comparison", "window": [338, 339]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "carState",
+          "limiter": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "name": "ordinary-28c",
+          "rlogs": ["0000028c--0ea8954ea3--4/rlog", "0000028c--0ea8954ea3--5/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "window": {"activation": 338, "anchor_i_at": 328, "end": 387, "start": 338}
+        },
+        "history": "earliest",
+        "id": "ordinary-28c",
+        "input_sha256": {"0000028c--0ea8954ea3--4/rlog": "b4be056404cc2b850a934afc324106fd4847caaf7fa966e8d846e501a0fb167b", "0000028c--0ea8954ea3--5/rlog": "93c6a538fb29eed50dda6672c1a1a1cf92ea043b15beff1cb877f48d1e5d70b2"},
+        "method": "historical",
+        "origin": "recorded"
+      },
+      "categories": ["straight_gentle"],
+      "control_revision": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+      "exclusion": null,
+      "expected": {"minimum_sends": 4900, "stock_commands": false},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    },
+    {
+      "annotations": [
+        {"confidence": "confirmed", "kind": "outcome", "source": "rider-old", "value": "failed_corner", "window": null},
+        {"confidence": "approximate", "kind": "catch", "source": "rider-old", "value": "Rider estimates intervention near clip 7 seconds / monotonic 2879; contact end unknown", "window": [2879, 2879]},
+        {"confidence": "uncertain", "kind": "contact", "source": "rider-old", "value": "Intervention timing is approximate; subsequent contact end is unknown", "window": [2878.2, 2886]},
+        {"confidence": "uncertain", "kind": "intended_lane", "source": "rider-old", "value": "Specific intended lane and calibrated clearance unavailable", "window": null},
+        {"confidence": "uncertain", "kind": "crossing_direction", "source": "rider-old", "value": "Rider described turn-in overshoot; no independently calibrated boundary crossing direction", "window": null},
+        {"confidence": "approximate", "kind": "speed", "source": "raw-hard-right-28a", "value": "Recorded speed min/median/max 15.66/16.38/18.08 m/s", "window": [2872, 2886]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-hard-right-28a", "value": "First scoring second: speed 17.57 m/s, steering angle 0.40 deg; lane position uncalibrated; no matched-condition comparison", "window": [2872, 2873]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "carState",
+          "limiter": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "name": "hard-right-28a",
+          "rlogs": ["0000028a--601b728d66--46/rlog", "0000028a--601b728d66--47/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "window": {"activation": 2863, "anchor_i_at": 2862, "end": 2886, "start": 2872}
+        },
+        "history": "earliest",
+        "id": "hard-right-28a",
+        "input_sha256": {"0000028a--601b728d66--46/rlog": "b48eed4e4922390ee0811b0b968e9f9a11200985c4c46ca130f23098d7eb546e", "0000028a--601b728d66--47/rlog": "c4e6ad161412adc0a560b3faaa41796cab028fcc096b2c37fab818de1564eed1"},
+        "method": "historical",
+        "origin": "recorded"
+      },
+      "categories": ["difficult_corner", "failed_corner"],
+      "control_revision": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+      "exclusion": null,
+      "expected": {"minimum_sends": 1400, "stock_commands": false},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    },
+    {
+      "annotations": [
+        {"confidence": "approximate", "kind": "speed", "source": "raw-retained-rounding-28c", "value": "Recorded speed min/median/max 17.86/20.26/20.73 m/s", "window": [648, 747]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-retained-rounding-28c", "value": "First scoring second: speed 20.19 m/s, steering angle 1.60 deg; lane position uncalibrated; no matched-condition comparison", "window": [648, 649]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "carState",
+          "limiter": "e409edb8d7ce3766d02379f2f2dafcb5887007ce",
+          "name": "retained-rounding-28c",
+          "rlogs": ["0000028c--0ea8954ea3--10/rlog", "0000028c--0ea8954ea3--11/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+          "window": {"activation": 648, "anchor_i_at": 638, "end": 747, "start": 648}
+        },
+        "history": "latest",
+        "id": "retained-rounding-28c",
+        "input_sha256": {"0000028c--0ea8954ea3--10/rlog": "dd8d618553ea4b7a48ac4ab12c8a98e464535a777b64cc1e85d59d3605c2617f", "0000028c--0ea8954ea3--11/rlog": "162efb7599127bdb9617894af7e5390ac5b03d0e57823929214b9e1e65197f48"},
+        "method": "historical",
+        "origin": "recorded"
+      },
+      "categories": ["difficult_corner"],
+      "control_revision": "2c50a68456d6f8eb18c5688a72a2c055a2572182",
+      "exclusion": {"reason": "Original latest history has one integer mismatch. The separate adjacent-Float32 exception is not supported; exact-send requirement is unchanged.", "source": "baseline-failure"},
+      "expected": {"minimum_sends": 9900, "stock_commands": false},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    },
+    {
+      "annotations": [
+        {"confidence": "confirmed", "kind": "outcome", "source": "rider-outward", "value": "failed_corner", "window": [850.0145, 852.0145]},
+        {"confidence": "confirmed", "kind": "intended_lane", "source": "rider-outward", "value": "Left lane, divided from same-direction right lane by dashed white line", "window": [850.0145, 852.0145]},
+        {"confidence": "confirmed", "kind": "crossing_direction", "source": "rider-outward", "value": "Left lane into right lane; outward during the left bend", "window": [850.0145, 852.0145]},
+        {"confidence": "confirmed", "kind": "contact", "source": "rider-outward", "value": "Rider confirms no intervention during crossing; self-recovery does not erase failure", "window": [850.0145, 852.0145]},
+        {"confidence": "confirmed", "kind": "catch", "source": "rider-outward", "value": "Confirmed catch near 859.0145; approximate timing, contact end unknown", "window": [859.0145, 859.0145]},
+        {"confidence": "confirmed", "kind": "catch", "source": "rider-outward", "value": "Confirmed second catch near 868.0145; approximate timing, contact end unknown", "window": [868.0145, 868.0145]},
+        {"confidence": "uncertain", "kind": "contact", "source": "rider-outward", "value": "Contact end after the first catch is unknown; subsequent motion is not independently hands-off", "window": [859.0145, 875]},
+        {"confidence": "approximate", "kind": "speed", "source": "raw-outward-crossing-28f", "value": "Recorded speed min/median/max 19.89/20.17/20.48 m/s", "window": [835, 875]},
+        {"confidence": "approximate", "kind": "entry", "source": "raw-outward-crossing-28f", "value": "First scoring second: speed 20.46 m/s, steering angle 7.20 deg; lane position uncalibrated; no matched-condition comparison", "window": [835, 836]}
+      ],
+      "case": {
+        "experiment": {
+          "baseline_controller": "9c6c8abf2d85330c701284c7d6122bda3c0edf5f",
+          "force_offset": true,
+          "format_version": 1,
+          "fpcs_sample_at": "diagnostic",
+          "limiter": "9c6c8abf2d85330c701284c7d6122bda3c0edf5f",
+          "name": "outward-crossing-28f",
+          "rlogs": ["0000028f--1fd872c052--13/rlog", "0000028f--1fd872c052--14/rlog"],
+          "settings": {"LatCommitSetpoint": 1.0, "LatDamping": 1.0, "LatFrictionComp": 1.0, "LatNoFrictionRelay": 1.0, "LatOutputFilter": 0.0, "SteerKP": 0.8, "TiSteerDeltaDown": 15.0, "TiSteerDeltaUp": 10.0, "TiSteerDeltaUpHigh": 9.0, "TiSteerDeltaUpKnee": 630.0, "TiSteerDriverAllowance": 15.0, "TiSteerDriverMultiplier": 40.0, "TiSteerMax": 600.0, "TorqueInterceptorEnabled": 1.0},
+          "warmup_controller": "9c6c8abf2d85330c701284c7d6122bda3c0edf5f",
+          "window": {"activation": 835, "anchor_i_at": 834, "end": 875, "start": 835}
+        },
+        "history": "exact",
+        "id": "outward-crossing-28f",
+        "input_sha256": {"0000028f--1fd872c052--13/rlog": "5531f640f646a7f08392ee6949bfe7c0ff2f623536eb672f66324fb0c5e81a8a", "0000028f--1fd872c052--14/rlog": "62ef5ef4b8e9f9de2d423cfa06165efb4904ecad157a16511c23ee2373c40d97"},
+        "method": "instrumented",
+        "origin": "recorded"
+      },
+      "categories": ["difficult_corner", "failed_corner"],
+      "control_revision": "9c6c8abf2d85330c701284c7d6122bda3c0edf5f",
+      "exclusion": null,
+      "expected": {"minimum_sends": 3999, "stock_commands": true},
+      "exposures": ["Previously inspected in the September 2026 tuning campaign; not untouched validation"],
+      "group": "development"
+    }
+  ],
+  "format_version": 1,
+  "id": "mazda-recorded-development",
+  "profiles": {
+    "command-regression": {"require_unexposed_withheld": false, "required_cases": ["vw-continuous-28c", "instrumented-cutout-290", "ordinary-28c", "hard-right-28a"], "required_categories": ["difficult_corner", "failed_corner", "straight_gentle", "actuator_transition", "engagement_boundary"]},
+    "representative-validation": {"require_unexposed_withheld": true, "required_cases": ["vw-continuous-28c", "instrumented-cutout-290", "ordinary-28c", "hard-right-28a", "retained-rounding-28c", "outward-crossing-28f"], "required_categories": ["successful_corner", "failed_corner", "straight_gentle", "actuator_transition", "engagement_boundary"]}
+  },
+  "sources": [
+    {"id": "rider-old", "kind": "rider", "path": "rider-event-annotations.json", "sha256": "83ffad775c99574f61bb0a454cb3fa5f22c10e737e715ac3922a13a57fef5484"},
+    {"id": "rider-outward", "kind": "rider", "path": "post-drive-28f/rider-annotations-v2.json", "sha256": "261b22db8d909166fab1ae255ee2cde393ff9340dd78fb8f88cd38bbca86ba65"},
+    {"id": "broad", "kind": "analysis", "path": "post-drive-28f/HISTORICAL-BOUNDARY-REPAIR.md", "sha256": "bdff7785cb207342c10bf4d61810efd32eb04dca6739cd7b65678892b2440699"},
+    {"id": "cutout", "kind": "analysis", "path": "post-drive-290/KEEP0UT-REPLAY-RESULTS.md", "sha256": "768fe30ca2a59e640ead0007cae1c07c4c0bf2de74242ed96bac6e9c34f91b48"},
+    {"id": "baseline-failure", "kind": "baseline_failure", "path": "post-drive-28f/friction-broad-01/broad04/control-baseline-latest/result.json", "sha256": "a6a299fbe3bcd7cf785881164a3dcb991a26d7b1daf5c8961075d6b5a498a712"},
+    {"id": "raw-vw-continuous-28c", "kind": "analysis", "path": "rlogs/0000028c--0ea8954ea3--3/rlog", "sha256": "f2d0411e41caaa9bd1e3a9980b0680e680226a11d67ae4a73c66702e689a266f"},
+    {"id": "raw-instrumented-cutout-290", "kind": "analysis", "path": "rlogs/00000290--9c1e61afa1--15/rlog", "sha256": "e2a2deb7da98d662168267de3d7ab92c1e2cc51f4205ab4cabbd951e3dc2384d"},
+    {"id": "raw-ordinary-28c", "kind": "analysis", "path": "rlogs/0000028c--0ea8954ea3--4/rlog", "sha256": "b4be056404cc2b850a934afc324106fd4847caaf7fa966e8d846e501a0fb167b"},
+    {"id": "raw-hard-right-28a", "kind": "analysis", "path": "rlogs/0000028a--601b728d66--46/rlog", "sha256": "b48eed4e4922390ee0811b0b968e9f9a11200985c4c46ca130f23098d7eb546e"},
+    {"id": "raw-retained-rounding-28c", "kind": "analysis", "path": "rlogs/0000028c--0ea8954ea3--10/rlog", "sha256": "dd8d618553ea4b7a48ac4ab12c8a98e464535a777b64cc1e85d59d3605c2617f"},
+    {"id": "raw-outward-crossing-28f", "kind": "analysis", "path": "rlogs/0000028f--1fd872c052--13/rlog", "sha256": "5531f640f646a7f08392ee6949bfe7c0ff2f623536eb672f66324fb0c5e81a8a"}
+  ],
+  "unavailable": {"matched_conditions": "No confirmed same-direction repeat at matched speed and entry position; no paired physical conclusion.", "successful_corner": "No independent rider-confirmed successful passage identified in the supplied annotations; command successes are not physical successes.", "withheld": "All selected cases were already examined during tuning. No untouched validation set is available."},
+  "version": "1"
+}
