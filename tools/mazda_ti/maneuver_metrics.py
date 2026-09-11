@@ -15,12 +15,13 @@ import math
 NS = 1_000_000_000
 GROUPS = ('lane', 'speed', 'steering', 'yaw', 'accel', 'roll', 'controls', 'command')
 STATUSES = ('measured_estimate', 'right_censored', 'unresolved', 'unscorable')
+DEFAULT_MAX_GAP_S = 0.2
 
 
 @dataclass(frozen=True)
 class Parameters:
   params_id: str
-  max_gap_s: float = 0.2
+  max_gap_s: float = DEFAULT_MAX_GAP_S
   smooth_span_s: float = 0.25
   velocity_span_s: float = 0.5
   plateau_deadband_mps: float = 0.02
@@ -346,7 +347,7 @@ def orient(rows, window):
   duration (a mean curvature of at least 1e-4 per metre).
   """
   lane = healthy_rows(rows, ('lane',))
-  w = elapsed_weights(lane, window[0], window[1], int(0.2 * NS))
+  w = elapsed_weights(lane, window[0], window[1], int(round(DEFAULT_MAX_GAP_S * NS)))
   observed = sum(w)
   if observed <= 0:
     return {'direction': None, 'mean_curvature_per_m': None, 'status': 'unscorable', 'reason': 'no_lane_rows'}
@@ -629,24 +630,32 @@ def hold_late_wide(rows, window, anchors, params, direction):
 
 
 def path_quality(rows, window, anchors, params):
-  """Elapsed-time RMS and p95 of |e| and time outside the corridor; no re-centering."""
+  """Elapsed-time RMS and p95 of |e| and time outside the corridor, on the smoothed offset; no re-centering."""
   lane = healthy_rows(rows, ('lane',))
   if not _in_window(lane, window):
     return record('path_rms', unit='m', reason='no_lane_rows')
   w = elapsed_weights(lane, window[0], window[1], params.max_gap_ns)
-  e = [abs(r['lane_offset_m']) for r in lane]
-  cov = _coverage(lane, window[0], window[1], params.max_gap_ns)
+  s = smoothed(lane, 'lane_offset_m', params)
+  e = [abs(x) if x is not None else None for x in s]
+  full = _full_coverage(lane, window[0], window[1], params)
+  cov = {k: full[k] for k in ('valid_duration_s', 'required_duration_s', 'maximum_gap_s')}
+  covered = absence_supported(full, params)
   half = params.corridor_half_width_m
-  outside = sum(wi for wi, x in zip(w, e, strict=True) if half is not None and x > half)
+  supported = [(x, wi) for x, wi in zip(e, w, strict=True) if x is not None]
+  vals, wts = [x for x, _ in supported], [wi for _, wi in supported]
+  outside = sum(wi for x, wi in supported if half is not None and x > half)
   rec = None
   if anchors.get('recovery'):
     r0, r1 = anchors['recovery']['start_ns'], anchors['recovery']['end_ns']
     ws = elapsed_weights(lane, r0, r1, params.max_gap_ns)
-    if sum(ws) > 0:
-      rec = {'rms_m': weighted_rms(e, ws), 'p95_m': weighted_percentile(e, ws, 0.95)}
+    rec_supported = [(x, wi) for x, wi in zip(e, ws, strict=True) if x is not None]
+    if sum(wi for _, wi in rec_supported) > 0:
+      rec = {'rms_m': weighted_rms([x for x, _ in rec_supported], [wi for _, wi in rec_supported]),
+             'p95_m': weighted_percentile([x for x, _ in rec_supported], [wi for _, wi in rec_supported], 0.95)}
   return record('path_rms', unit='m', status='measured_estimate', reason='elapsed_time_weighted',
-                value=weighted_rms(e, w), critical_gap=False, **cov,
-                diagnostics={'p95_m': weighted_percentile(e, w, 0.95), 'time_outside_corridor_s': outside if half is not None else None,
+                value=weighted_rms(vals, wts), critical_gap=not covered, **cov,
+                diagnostics={'p95_m': weighted_percentile(vals, wts, 0.95),
+                             'time_outside_corridor_s': (outside if half is not None else None) if covered else None,
                              'recovery': rec, 'target': 'lane centre, no re-centering'})
 
 
@@ -663,9 +672,11 @@ def comfort_proxy(rows, window, params):
     return record('lateral_jerk_p95', unit='m/s^3', reason='no_supported_derivative')
   vals, ws = [p[0] for p in pairs], [p[1] for p in pairs]
   above = sum(wi for x, wi in pairs if params.j_limit_mps3 is not None and x > params.j_limit_mps3)
-  cov = _coverage(yaw, window[0], window[1], params.max_gap_ns)
+  full = _full_coverage(yaw, window[0], window[1], params)
+  cov = {k: full[k] for k in ('valid_duration_s', 'required_duration_s', 'maximum_gap_s')}
+  covered = absence_supported(full, params)
   return record('lateral_jerk_p95', unit='m/s^3', status='measured_estimate', reason='kinematic_proxy',
-                value=weighted_percentile(vals, ws, 0.95), critical_gap=False, **cov,
+                value=weighted_percentile(vals, ws, 0.95), critical_gap=not covered, **cov,
                 diagnostics={'peak_mps3': max(vals), 'duration_above_limit_s': above if params.j_limit_mps3 is not None else None,
                              'basis': 'kinematic_proxy', 'signal': 'liveLocationKalman calibrated yaw rate times carState speed',
                              'smoothing_s': params.jerk_smooth_span_s, 'derivative_span_s': params.velocity_span_s,

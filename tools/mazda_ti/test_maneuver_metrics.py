@@ -490,3 +490,54 @@ def test_physical_bridge_maps_cycle_peak_to_peak():
   mapped = mm.to_physical_records({'lane_motion_cycles': cyc}, identity, 'unknown')
   assert [p['metric'] for p in mapped] == ['scallop_peak_to_peak']
   assert abs(mapped[0]['value'] - cyc['diagnostics']['peak_to_peak_max_m']) < 1e-9 and mapped[0]['unit'] == 'm'
+
+
+def test_orient_uses_default_max_gap_constant_for_held_weight(monkeypatch):
+  # Finding D: orient's held-weight tolerance must come from the module constant, not a
+  # decoupled literal, so shrinking the constant starves every held sample of weight.
+  assert mm.DEFAULT_PARAMETERS.max_gap_s == mm.DEFAULT_MAX_GAP_S == 0.2
+  rows = make_rows(grid(0, 20), 0.0, curvature=lambda t: bend(t, k=0.004))
+  assert mm.orient(rows, (0, 20 * NS))['direction'] == 1
+  monkeypatch.setattr(mm, 'DEFAULT_MAX_GAP_S', 1e-6)  # far below the 0.05 s sample spacing
+  starved = mm.orient(rows, (0, 20 * NS))
+  assert starved['direction'] is None and starved['reason'] == 'no_lane_rows'
+
+
+def test_path_quality_rms_uses_smoothed_offset_not_raw():
+  # Finding A: a high-frequency offset centred at zero cancels under boxcar smoothing but
+  # not under raw abs(); path_quality's RMS must reflect the smoothed series.
+  rows = mm.oriented(make_rows(grid(0, 20, 200.0), lambda t: 0.2 * math.sin(2 * math.pi * 20.0 * t),
+                               curvature=lambda t: bend(t, entry=3, exit_=9)), 1)
+  q = mm.path_quality(rows, (0, 20 * NS), {'recovery': None}, CAL)
+  raw_rms = mm.weighted_rms([abs(r['lane_offset_m']) for r in rows],
+                            mm.elapsed_weights(rows, 0, 20 * NS, CAL.max_gap_ns))
+  assert raw_rms > 0.1
+  assert q['value'] < raw_rms * 0.1
+
+
+def test_path_quality_and_comfort_proxy_gate_critical_gap_on_full_coverage():
+  # Finding B: a gap inside the window must set critical_gap and null time_outside_corridor_s,
+  # while the observed-part RMS/jerk value is still reported.
+  holed = make_rows([t for t in grid(-1, 21) if not 8.0 < t < 9.8], 0.02, curvature=lambda t: bend(t, entry=3, exit_=9))
+  o = mm.oriented(holed, 1)
+  a = mm.phase_anchors(o, (0, 20 * NS), CAL)
+  q = mm.path_quality(o, (0, 20 * NS), a, CAL)
+  assert q['critical_gap'] is True and q['diagnostics']['time_outside_corridor_s'] is None
+  assert q['status'] == 'measured_estimate' and q['value'] is not None
+
+  identity = {'route': 'r', 'source_sha256': 'a' * 64, 'raw_sha256': {'r--1/rlog': 'b' * 64}, 'window_ns': [0, 20 * NS]}
+  mapped = mm.to_physical_records({'path_rms': q}, identity, 'unknown')
+  assert 'corridor_violation_duration' not in [p['metric'] for p in mapped]
+
+  full = make_rows(grid(-1, 21), 0.02, curvature=lambda t: bend(t, entry=3, exit_=9))
+  fo = mm.oriented(full, 1)
+  fa = mm.phase_anchors(fo, (0, 20 * NS), CAL)
+  fq = mm.path_quality(fo, (0, 20 * NS), fa, CAL)
+  assert fq['critical_gap'] is False and fq['diagnostics']['time_outside_corridor_s'] == 0.0
+  full_mapped = mm.to_physical_records({'path_rms': fq}, identity, 'unknown')
+  assert 'corridor_violation_duration' in [p['metric'] for p in full_mapped]
+
+  cy = mm.comfort_proxy(o, (0, 20 * NS), CAL)
+  assert cy['critical_gap'] is True and cy['value'] is not None
+  fcy = mm.comfort_proxy(fo, (0, 20 * NS), CAL)
+  assert fcy['critical_gap'] is False

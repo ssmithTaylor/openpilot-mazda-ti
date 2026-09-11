@@ -122,6 +122,40 @@ def test_stale_camera_is_lane_unhealthy_and_missing_ti_is_command_unhealthy_only
   assert all(r['health']['lane'] and r['health']['yaw'] for r in rows)
 
 
+def test_camera_age_limit_reads_loaded_module_with_fallback_and_reports_source():
+  # Finding E: the extractor must read the camera-age limit off the loaded lateral_reference
+  # module (not its own copied constant), falling back only when the attribute is absent,
+  # and publish whichever was used plus its source.
+  fit, _ = odr.load_lane_fit()
+  out = odr.extract(odr.serialized(stream()), 10 * NS, 12 * NS, NS, fit)
+  assert out['lane_fit_policy']['max_camera_age_s'] == fit.MAX_CAMERA_AGE
+  assert out['lane_fit_policy']['max_camera_age_source'] == 'selfdrive/car/mazda/lateral_reference.py::MAX_CAMERA_AGE'
+  assert all(r['health']['lane'] for r in out['rows'])  # 38 ms camera age, under the real 0.2 s limit
+
+  class TighterAge:
+    MAX_CAMERA_AGE = 0.03
+
+    def __getattr__(self, name):
+      return getattr(fit, name)
+
+  tightened = odr.extract(odr.serialized(stream()), 10 * NS, 12 * NS, NS, TighterAge())
+  assert tightened['lane_fit_policy']['max_camera_age_s'] == 0.03
+  assert tightened['lane_fit_policy']['max_camera_age_source'] == 'selfdrive/car/mazda/lateral_reference.py::MAX_CAMERA_AGE'
+  # the same 38 ms camera age is unhealthy under the proxy's tighter limit: proves the value is actually used
+  assert all(r['health']['lane'] is False and r['health_reason']['lane'] == 'camera_age' for r in tightened['rows'])
+
+  class NoAge:
+    def __getattr__(self, name):
+      if name == 'MAX_CAMERA_AGE':
+        raise AttributeError(name)
+      return getattr(fit, name)
+
+  fallback = odr.extract(odr.serialized(stream()), 10 * NS, 12 * NS, NS, NoAge())
+  assert fallback['lane_fit_policy']['max_camera_age_s'] == odr.MAX_CAMERA_AGE_S
+  assert fallback['lane_fit_policy']['max_camera_age_source'] == 'fallback_default'
+  assert all(r['health']['lane'] for r in fallback['rows'])  # fallback equals the same 0.2 s default
+
+
 def test_run_binds_hashes_and_refuses_changed_raw_or_existing_output(tmp_path):
   root = tmp_path / 'raw'
   rlog = root / 'route--1' / 'rlog'

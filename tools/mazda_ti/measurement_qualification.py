@@ -132,11 +132,12 @@ def calibrate(request, params, extractor):
     longest_part, longest = max(durations, key=lambda pd: pd[1]) if durations else (None, 0.0)
     stats = {}
     if rec:
-      e = [abs(r['lane_offset_m']) for r in rec]
       w = mm.elapsed_weights(rec, int(rec[0]['mono_ns']), int(rec[-1]['mono_ns']) + 1, params.max_gap_ns)
+      s = mm.smoothed(rec, 'lane_offset_m', params)
+      offset_pairs = [(abs(x), wi) for x, wi in zip(s, w, strict=True) if x is not None]
       v = mm.derivative(rec, 'lane_offset_m', params)
       pairs = [(abs(x), wi) for x, wi in zip(v, w, strict=True) if x is not None]
-      stats = {'p95_abs_offset_m': mm.weighted_percentile(e, w, 0.95),
+      stats = {'p95_abs_offset_m': mm.weighted_percentile([p[0] for p in offset_pairs], [p[1] for p in offset_pairs], 0.95) if offset_pairs else None,
                'p95_abs_velocity_mps': mm.weighted_percentile([p[0] for p in pairs], [p[1] for p in pairs], 0.95) if pairs else None}
     residual = None
     if longest >= params.min_recovery_support_s:

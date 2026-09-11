@@ -225,3 +225,33 @@ def test_evaluate_never_reads_labels_of_holdout(monkeypatch):
   monkeypatch.setattr(mq, 'detection_outcomes', lambda rec, params: seen.append(rec['id']) or original(rec, params))
   mq.evaluate(req, p, fake_extractor({'ra': _smooth_profile(), 'rh': _smooth_profile()}))
   assert seen == ['a']
+
+
+def test_calibrate_e_settle_m_uses_smoothed_offset_not_raw_p95():
+  # Finding A: p95_abs_offset_m must come from the smoothed series, mirroring the velocity
+  # branch, so 20 Hz noise on an otherwise-settled offset is mostly cancelled by the boxcar.
+  amplitude, baseline, noise_hz, cutover = 0.06, 0.02, 13.0, 9.1
+
+  def offset(t):
+    return 0.5 if t < cutover else baseline + amplitude * math.sin(2 * math.pi * noise_hz * (t - cutover))
+
+  times = grid(0, 20, 100.0)
+  profiles = {'ra': (offset, times), 'rb': (offset, times)}
+  req = request([case('a', labels=SMOOTH), case('b', labels=SMOOTH)])
+  out = mq.calibrate(req, mm.DEFAULT_PARAMETERS, fake_extractor(profiles))
+  smoothed_p95 = out['cases']['a']['recovery_stats']['p95_abs_offset_m']
+  assert smoothed_p95 is not None
+
+  # Reconstruct the same continuous-recovery rows calibrate used and compute the raw
+  # (pre-fix) p95 directly from the unsmoothed offset, for comparison.
+  rows = make_rows(times, offset, curvature=lambda t: bend(t, entry=3, exit_=9))
+  oriented_rows = mm.oriented(rows, 1)
+  anchors = mm.phase_anchors(oriented_rows, (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  rec = mq._continuous_recovery_rows(oriented_rows, anchors, mm.DEFAULT_PARAMETERS)
+  raw_e = [abs(r['lane_offset_m']) for r in rec]
+  raw_w = mm.elapsed_weights(rec, int(rec[0]['mono_ns']), int(rec[-1]['mono_ns']) + 1, mm.DEFAULT_PARAMETERS.max_gap_ns)
+  raw_p95 = mm.weighted_percentile(raw_e, raw_w, 0.95)
+
+  assert smoothed_p95 < raw_p95
+  assert raw_p95 / smoothed_p95 > 2.0
+  assert out['params'].e_settle_m == mq._round_up(smoothed_p95, 0.01)

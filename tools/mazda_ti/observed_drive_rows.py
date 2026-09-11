@@ -69,6 +69,11 @@ def _group(ok, reason):
 
 
 def extract(events, start_ns, end_ns, margin_ns, fit):
+  camera_age_limit_source = 'selfdrive/car/mazda/lateral_reference.py::MAX_CAMERA_AGE'
+  if hasattr(fit, 'MAX_CAMERA_AGE'):
+    camera_age_limit = float(fit.MAX_CAMERA_AGE)
+  else:
+    camera_age_limit, camera_age_limit_source = MAX_CAMERA_AGE_S, 'fallback_default'
   models, cars, llks, prms, ctls, tis, init = [], [], [], [], [], [], []
   lo, hi = start_ns - margin_ns, end_ns + margin_ns
   for ev in events:
@@ -134,7 +139,7 @@ def extract(events, start_ns, end_ns, margin_ns, fit):
       health['lane'], reason['lane'] = _group(False, 'invalid_event')
     elif not m['fit'].valid:
       health['lane'], reason['lane'] = _group(False, m['fit'].reason)
-    elif not 0 <= camera_age <= MAX_CAMERA_AGE_S:
+    elif not 0 <= camera_age <= camera_age_limit:
       health['lane'], reason['lane'] = _group(False, 'camera_age')
     else:
       health['lane'], reason['lane'] = _group(True, 'valid')
@@ -183,7 +188,8 @@ def extract(events, start_ns, end_ns, margin_ns, fit):
   return {'rows': rows, 'initdata': init, 'unhealthy_count_by_group_and_reason': unhealthy,
           'camera_age_s': ({'min': min(ages), 'max': max(ages), 'median': statistics.median(ages)} if ages else None),
           'lane_fit_policy': {'source': 'selfdrive/car/mazda/lateral_reference.py::fit_lane_context',
-                              'min_lane_probability': float(fit.MIN_LANE_PROBABILITY), 'max_camera_age_s': MAX_CAMERA_AGE_S,
+                              'min_lane_probability': float(fit.MIN_LANE_PROBABILITY), 'max_camera_age_s': camera_age_limit,
+                              'max_camera_age_source': camera_age_limit_source,
                               'clock_assumption': 'camerad boot-time EOF and monotonic publication assumed unsuspended; ages outside [0, max] are unhealthy'}}
 
 
