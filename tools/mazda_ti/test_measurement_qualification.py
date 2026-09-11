@@ -185,8 +185,13 @@ def test_evaluate_seals_holdout_and_reports_three_outcome_tables(tmp_path):
   sealed = json.loads((tmp_path / 'eval' / 'holdout-sealed.json').read_text())
   text = (tmp_path / 'eval' / 'report.md').read_text()
   assert 'h' in sealed['cases'] and 'metrics' in sealed['cases']['h']
+  assert sealed['params']['sha256'] == '2' * 64 and sealed['params']['path'] == 'params.json' and sealed['params_id'] == result['params_id']
+  assert sealed['request']['sha256'] == '1' * 64 and sealed['request']['path'] == 'request.json'
+  assert 'runtime' in sealed and 'python_version' in sealed['runtime'] and sealed['runtime'] == result['runtime']
   assert result['holdout'] == {'case_ids': ['h'], 'count': 1, 'sealed_sha256': mq.sha256(tmp_path / 'eval' / 'holdout-sealed.json')}
   assert 'settling_time' not in json.dumps(result['holdout']) and '"h"' not in json.dumps(result['development'])
+  assert 'runtime' not in result['holdout'] and 'params' not in result['holdout']
+  assert 'settling_time' not in text.split('## Holdout (sealed)')[1]
   assert 'holdout' in text and 'unresolved' in text and 'not_detected' in text
   assert 'tools/mazda_ti/measurement_qualification.py' in result['source_sha256'] and sealed['source_sha256'] == result['source_sha256']
   assert result['report']['coverage_totals'] == {'development_cases': 3, 'holdout_cases': 1, 'development_input_unavailable': 0,

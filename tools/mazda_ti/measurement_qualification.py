@@ -413,14 +413,17 @@ def write_evaluation(result, output_dir, request_path, params_path, *, request_s
   if out.exists():
     raise FileExistsError(out)
   out.mkdir(parents=True)
+  runtime = environment()
   sealed = out / 'holdout-sealed.json'
-  write_json(sealed, {'format_version': 1, 'params_id': result['params_id'], 'source_sha256': result['source_sha256'],
-                      'request_content_sha256': result['request_sha256'], 'cases': result['holdout'],
+  write_json(sealed, {'format_version': 1, 'request': {'path': str(request_path), 'sha256': request_sha256},
+                      'params': {'path': str(params_path), 'sha256': params_sha256}, 'params_id': result['params_id'],
+                      'source_sha256': result['source_sha256'], 'request_content_sha256': result['request_sha256'],
+                      'runtime': runtime, 'cases': result['holdout'],
                       'note': 'Outcome-blind measurements; no labels were supplied or read for these cases'})
   sealed_hash = sha256(sealed)
   public = {'format_version': 1, 'scope': 'Observed-drive measurement qualification; no handling verdict',
             'request': {'path': str(request_path), 'sha256': request_sha256}, 'params': {'path': str(params_path), 'sha256': params_sha256, 'values': result['params']},
-            'params_id': result['params_id'], 'runtime': environment(), 'source_sha256': result['source_sha256'],
+            'params_id': result['params_id'], 'runtime': runtime, 'source_sha256': result['source_sha256'],
             'request_content_sha256': result['request_sha256'], 'development': result['development'],
             'holdout': {'case_ids': sorted(result['holdout']), 'count': len(result['holdout']), 'sealed_sha256': sealed_hash},
             'report': result['report']}
@@ -441,7 +444,7 @@ def main(argv=None):
   sub = parser.add_subparsers(dest='stage', required=True)
   c = sub.add_parser('calibrate')
   c.add_argument('--request', type=Path, required=True)
-  c.add_argument('--params', type=Path, default=None)
+  c.add_argument('--params', type=Path, default=None, help='Base parameter file; defaults to the built-in draft')
   c.add_argument('--params-out', type=Path, required=True)
   c.add_argument('--output', type=Path, required=True)
   c.set_defaults(func=_cli_calibrate)
