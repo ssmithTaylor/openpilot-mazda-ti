@@ -9,7 +9,7 @@ import argparse
 import hashlib
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import statistics
 import sys
@@ -33,7 +33,7 @@ def validate_request(request):
   if request.get('format_version') != 1 or not isinstance(request.get('data_roots'), dict) or not request['data_roots']:
     raise ValueError('Request needs format_version 1 and named data_roots')
   for name, root in request['data_roots'].items():
-    if not isinstance(root, str) or not Path(root).is_absolute():
+    if not isinstance(root, str) or not (PureWindowsPath(root).is_absolute() or PurePosixPath(root).is_absolute()):
       raise ValueError(f'data_roots[{name!r}] must be an absolute path string')
   cases = request.get('cases')
   if not isinstance(cases, list) or not cases:

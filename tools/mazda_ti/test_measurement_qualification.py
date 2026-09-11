@@ -66,6 +66,10 @@ def test_request_validation_rejects_outcome_fields_on_holdout_and_bad_windows():
   bad = request([case('a', labels=SMOOTH)]); bad['data_roots'] = {'raw': 'relative/path'}
   with pytest.raises(ValueError, match='data_roots'):
     mq.validate_request(bad)
+  posix = request([case('a', labels=SMOOTH)]); posix['data_roots'] = {'raw': '/abs/posix'}
+  mq.validate_request(posix)
+  windows = request([case('a', labels=SMOOTH)]); windows['data_roots'] = {'raw': 'C:/x'}
+  mq.validate_request(windows)
 
 
 def _smooth_profile(residual=0.05, decay=0.6):
