@@ -207,9 +207,10 @@ def test_slow_continuous_oscillation_still_counts():
 
 def test_cycles_never_chain_across_an_observation_gap():
   params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
-  # a peak, then a 3 s gap, then a trough and a peak: two fragments that combined would look like one cycle
+  # a peak, then a 2.5 s gap, then a trough and a peak: two fragments that combined would look like one cycle.
+  # Each fragment must carry the filters' support (smooth 0.125 s + velocity 0.25 s past the extremum).
   f = lambda t: 0.4 * math.sin(2 * math.pi * t / 3.0)
-  times = [t for t in grid(0, 6) if not 1.0 < t < 4.0]
+  times = [t for t in grid(0, 7.5) if not 2.0 < t < 4.5]
   ex = mm.extrema(make_rows(times, f), 'lane_offset_m', params)
   assert {e['segment'] for e in ex} == {0, 1}
   assert mm.cycle_episodes(ex, params)['cycle_count'] == 0
