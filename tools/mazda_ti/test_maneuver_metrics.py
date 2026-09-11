@@ -324,6 +324,25 @@ def test_settling_unresolved_when_gap_precedes_first_dwell_and_later_dwell_is_re
   assert s['status'] == 'unresolved'
   assert s['lower_bound_s'] is not None and s['lower_bound_s'] < 1.0
   assert s['diagnostics']['later_dwell_observation']['start_s'] > 10.6
+  assert s['critical_gap'] is True
+
+
+def test_settling_gap_after_confirmed_dwell_is_not_critical_and_matches_gap_free_value():
+  # Same decaying-offset fixture as test_settling_measures_first_confirmed_dwell: the offset
+  # settles and dwells for >= t_dwell_s well before 15 s, so a 1.0 s lane gap later in the
+  # recovery (15.0-16.0 s) falls after the first confirmed dwell and must not affect the
+  # outcome: the first scan already confirms the dwell before it ever reaches the gap.
+  offset = lambda t: 0.5 if t < 9.5 else 0.5 * math.exp(-(t - 9.5) / 0.6)
+  full_rows, full_anchors = _recovery_case(offset)
+  full = mm.settling(full_rows, (0, 20 * NS), full_anchors, CAL)
+  assert full['status'] == 'measured_estimate' and full['critical_gap'] is False
+
+  gapped_times = [t for t in grid(0, 20) if not 15.0 < t < 16.0]
+  gapped_rows, gapped_anchors = _recovery_case(offset, times=gapped_times)
+  gapped = mm.settling(gapped_rows, (0, 20 * NS), gapped_anchors, CAL)
+  assert gapped['status'] == 'measured_estimate'
+  assert gapped['critical_gap'] is False
+  assert gapped['value'] == full['value']
 
 
 def test_settling_with_intervention_overlapping_recovery_is_assisted():

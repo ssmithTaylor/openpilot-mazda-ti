@@ -531,8 +531,12 @@ def settling(rows, window, anchors, params, interventions=()):
       # first scan could not cross, so it is reported on the clip's own timeline.
       diag['later_dwell_observation'] = {'start_s': times[later_i] / NS,
                                          'residual_offset_m': abs(e[later_i])}
+    # A gap the first scan could not cross before any dwell was confirmed leaves the settling
+    # time itself unresolved: flag it critical. (A gap after an already-confirmed dwell does
+    # not reach here at all -- the measured_estimate branch above returns first with the
+    # default critical_gap=False from base.)
     return record('settling_time', unit='s', status='unresolved', reason='gap_before_first_dwell',
-                  lower_bound_s=bound, diagnostics=diag, **base)
+                  lower_bound_s=bound, diagnostics=diag, **{**base, 'critical_gap': True})
   return record('settling_time', unit='s', status='right_censored', reason='recovery_ended_before_dwell',
                 lower_bound_s=bound, diagnostics=diag, **base)
 
