@@ -324,3 +324,102 @@ def cycle_episodes(extrema_list, params):
   return {'cycle_count': sum(e['cycles'] for e in episodes), 'episode_count': len(episodes),
           'longest_episode_cycles': max((e['cycles'] for e in episodes), default=0),
           'truncated_cycles': truncated, 'episodes': episodes}
+
+
+SIGNED_FIELDS = ('lane_offset_m', 'lane_heading10_rad', 'lane_heading20_rad', 'road_curvature10_per_m',
+                 'road_curvature20_per_m', 'steering_angle_deg', 'steering_rate_dps', 'yaw_rate_rps',
+                 'yaw_lateral_accel_mps2', 'device_lateral_accel_mps2', 'roll_rad', 'request_mps2',
+                 'actual_mps2', 'ti_command_counts')
+MIN_BEND_CURVATURE = 1e-4
+
+
+def _in_window(rows, window):
+  return [r for r in rows if window[0] <= _t(r) < window[1]]
+
+
+def orient(rows, window):
+  """Direction from the elapsed-time integral of road curvature over lane-healthy rows; never from commands.
+
+  A bend need not fill the window: the sign of the curvature integral identifies the
+  sustained bend, and its magnitude must exceed MIN_BEND_CURVATURE times the observed
+  duration (a mean curvature of at least 1e-4 per metre).
+  """
+  lane = healthy_rows(rows, ('lane',))
+  w = elapsed_weights(lane, window[0], window[1], int(0.2 * NS))
+  observed = sum(w)
+  if observed <= 0:
+    return {'direction': None, 'mean_curvature_per_m': None, 'status': 'unscorable', 'reason': 'no_lane_rows'}
+  integral = sum(wi * float(r['road_curvature10_per_m']) for r, wi in zip(lane, w, strict=True))
+  mean = integral / observed
+  if abs(mean) < MIN_BEND_CURVATURE:
+    return {'direction': None, 'mean_curvature_per_m': mean, 'status': 'unscorable', 'reason': 'no_sustained_bend'}
+  return {'direction': 1 if mean > 0 else -1, 'mean_curvature_per_m': mean, 'status': 'measured_estimate', 'reason': 'valid'}
+
+
+def oriented(rows, direction):
+  """Copy rows with every signed field multiplied by direction (positive = inside of the bend)."""
+  out = []
+  for r in rows:
+    c = dict(r)
+    for key in SIGNED_FIELDS:
+      if c.get(key) is not None:
+        c[key] = direction * c[key]
+    out.append(c)
+  return out
+
+
+def _first_sustained(times, series, start_i, predicate, persist_ns, max_gap_ns):
+  """First index i >= start_i where predicate holds on valid values, without a gap over max_gap_ns, for persist_ns."""
+  i = start_i
+  while i < len(times):
+    if series[i] is None or not predicate(series[i]):
+      i += 1
+      continue
+    j = i
+    while (j + 1 < len(times) and series[j + 1] is not None and predicate(series[j + 1])
+           and times[j + 1] - times[j] <= max_gap_ns):
+      j += 1
+    if times[j] - times[i] >= persist_ns:
+      return i
+    i = j + 1
+  return None
+
+
+def phase_anchors(rows, window, params):
+  """Entry from curvature*speed^2, then speed frozen at entry so slowing cannot create an unwind."""
+  lane = _in_window(healthy_rows(rows, ('lane', 'speed')), window)
+  base = {'anchor_source': 'model_road_geometry', 'v_entry_mps': None, 'entry_ns': None, 'peak_ns': None,
+          'unwind_ns': None, 'recovery': None, 'absent_phases': [], 'critical_gap': False, 'coverage': {},
+          'instantaneous_exit_crossing_ns': None, 'status': 'unscorable', 'reason': 'no_lane_rows',
+          'limits': ['Model-derived road geometry, not surveyed truth; rider/geographic windows only bound the search']}
+  if not lane:
+    return base
+  times = [_t(r) for r in lane]
+  persist = int(round(params.anchor_persistence_s * NS))
+  a_live = smoothed([{**r, '_a': r['road_curvature10_per_m'] * r['speed_mps'] ** 2} for r in lane], '_a', params)
+  entry_i = _first_sustained(times, a_live, 0, lambda v: v >= params.entry_accel_mps2, persist, params.max_gap_ns)
+  if entry_i is None:
+    return {**base, 'absent_phases': ['entry', 'sustained', 'unwind', 'recovery'], 'reason': 'no_entry'}
+  v_entry = float(lane[entry_i]['speed_mps'])
+  a_road = smoothed([{**r, '_a': r['road_curvature10_per_m'] * v_entry ** 2} for r in lane], '_a', params)
+  peak_i = max((i for i in range(entry_i, len(times)) if a_road[i] is not None), key=lambda i: a_road[i])
+  unwind_i = _first_sustained(times, a_road, peak_i, lambda v: v <= params.exit_accel_mps2, persist, params.max_gap_ns)
+  live_exit = _first_sustained(times, a_live, peak_i, lambda v: v <= params.exit_accel_mps2, persist, params.max_gap_ns)
+  gaps = [(times[k], times[k + 1]) for k in range(len(times) - 1) if times[k + 1] - times[k] > params.max_gap_ns]
+  def touches(t):
+    return t is not None and any(lo <= t + persist and t - persist <= hi for lo, hi in gaps)
+  result = {**base, 'v_entry_mps': v_entry, 'entry_ns': times[entry_i], 'peak_ns': times[peak_i],
+            'instantaneous_exit_crossing_ns': times[live_exit] if live_exit is not None else None,
+            'status': 'measured_estimate', 'reason': 'valid'}
+  if unwind_i is None:
+    result['absent_phases'] = ['unwind', 'recovery']
+    result['critical_gap'] = touches(times[entry_i])
+    result['coverage'] = {'entry_to_end_s': (times[-1] - times[entry_i]) / NS}
+    return result
+  unwind = times[unwind_i]
+  result['unwind_ns'] = unwind
+  result['recovery'] = {'start_ns': unwind, 'end_ns': min(unwind + int(round(params.recovery_horizon_s * NS)), window[1])}
+  result['critical_gap'] = touches(times[entry_i]) or touches(unwind)
+  result['coverage'] = {'entry_to_unwind_s': (unwind - times[entry_i]) / NS,
+                        'recovery_observed_s': (min(times[-1], result['recovery']['end_ns']) - unwind) / NS}
+  return result

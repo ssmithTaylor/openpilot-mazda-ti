@@ -220,3 +220,55 @@ def test_small_wiggles_below_prominence_do_not_count():
   params = mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'a_min_m': 0.1})
   ex = mm.extrema(make_rows(grid(0, 6), lambda t: 0.02 * math.sin(2 * math.pi * t)), 'lane_offset_m', params)
   assert mm.cycle_episodes(ex, params)['cycle_count'] == 0
+
+
+def test_orient_uses_road_curvature_sign_only():
+  right = make_rows(grid(0, 20), 0.0, curvature=lambda t: bend(t, k=0.004), command=lambda t: -600)
+  left = make_rows(grid(0, 20), 0.0, curvature=lambda t: bend(t, k=-0.004), command=lambda t: 600)
+  assert mm.orient(right, (0, 20 * NS))['direction'] == 1   # bend covers 6 of 20 s; still oriented
+  assert mm.orient(left, (0, 20 * NS))['direction'] == -1
+  assert mm.orient(strip(right, ('command', 'controls')), (0, 20 * NS)) == mm.orient(right, (0, 20 * NS))
+  flat = mm.orient(make_rows(grid(0, 10), 0.0, curvature=0.0), (0, 10 * NS))
+  assert flat['direction'] is None and flat['reason'] == 'no_sustained_bend'
+
+
+def test_oriented_flips_every_signed_field_consistently():
+  rows = make_rows(grid(0, 1), 0.3, curvature=-0.004, command=-500)
+  o = mm.oriented(rows, -1)
+  r = o[5]
+  assert r['lane_offset_m'] == -0.3 and r['road_curvature10_per_m'] == 0.004 and r['ti_command_counts'] == 500
+  assert r['steering_angle_deg'] == -17.0 and r['yaw_lateral_accel_mps2'] > 0
+  assert r['lane_width_m'] == 3.6 and r['speed_mps'] == 24.0
+
+
+def test_anchors_follow_road_curvature_inside_window():
+  rows = mm.oriented(make_rows(grid(0, 20), 0.0, curvature=lambda t: bend(t, entry=3, exit_=9)), 1)
+  a = mm.phase_anchors(rows, (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  assert a['status'] == 'measured_estimate' and a['anchor_source'] == 'model_road_geometry'
+  assert abs(a['entry_ns'] / NS - 3.2) < 0.4      # first sustained instant, shifted by smoothing support
+  assert abs(a['unwind_ns'] / NS - 9.2) < 0.4
+  assert a['recovery'] == {'start_ns': a['unwind_ns'], 'end_ns': a['unwind_ns'] + 8 * NS}
+  assert a['absent_phases'] == [] and a['critical_gap'] is False
+
+
+def test_anchors_ignore_command_and_controller_streams():
+  base = mm.oriented(make_rows(grid(0, 20), 0.0, curvature=lambda t: bend(t, entry=3, exit_=9), command=lambda t: 600 if t < 6 else 0), 1)
+  a = mm.phase_anchors(base, (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  b = mm.phase_anchors(strip(base, ('command', 'controls', 'roll', 'accel')), (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  assert a == b
+
+
+def test_slowing_on_constant_curvature_does_not_create_unwind():
+  # curvature constant 0.004 from 3 s onward; speed drops from 24 to 8 m/s after 9 s
+  rows = mm.oriented(make_rows(grid(0, 20), 0.0, curvature=lambda t: 0.004 if t >= 3 else 0.0,
+                               speed=lambda t: 24.0 if t < 9 else 8.0), 1)
+  a = mm.phase_anchors(rows, (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  assert a['unwind_ns'] is None and 'unwind' in a['absent_phases']
+  assert a['instantaneous_exit_crossing_ns'] is not None and abs(a['instantaneous_exit_crossing_ns'] / NS - 9.0) < 0.5
+
+
+def test_gap_touching_anchor_is_critical():
+  times = [t for t in grid(0, 20) if not 9.2 < t < 9.8]
+  rows = mm.oriented(make_rows(times, 0.0, curvature=lambda t: bend(t, entry=3, exit_=9)), 1)
+  a = mm.phase_anchors(rows, (0, 20 * NS), mm.DEFAULT_PARAMETERS)
+  assert a['critical_gap'] is True
