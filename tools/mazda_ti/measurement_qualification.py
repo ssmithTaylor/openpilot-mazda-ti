@@ -249,15 +249,207 @@ def _cli_calibrate(args):
   write_calibration(result, args.params_out, args.output)
 
 
+FAMILIES = {'cycles': 'lane_motion_cycles', 'held_inward': 'late_wide_excursion', 'over_release': 'late_wide_excursion',
+            'hold_late_wide_sequence': 'late_wide_excursion', 'settling': 'settling_time'}
+LABEL_TO_FAMILY = {'scalloping': 'cycles', 'held_inward': 'held_inward', 'over_release': 'over_release', 'settling': 'settling'}
+SYMPTOM_VALUES = {'scalloping': 'present', 'held_inward': 'present', 'over_release': 'present', 'settling': 'problem'}
+
+
+def _annotation_list(case):
+  return [dict(a) for a in (case.get('annotations') or [])]
+
+
+def measure_case(request, case, params, extractor):
+  extracted = case_rows(request, case, extractor)
+  window = tuple(case['window_ns'])
+  orient = mm.orient(extracted['rows'], window)
+  direction = orient['direction']
+  rows = mm.oriented(extracted['rows'], direction) if direction else extracted['rows']
+  anchors = (mm.phase_anchors(rows, window, params) if direction else
+             {'anchor_source': 'model_road_geometry', 'entry_ns': None, 'unwind_ns': None, 'recovery': None,
+              'critical_gap': None, 'coverage': {}, 'absent_phases': ['entry', 'sustained', 'unwind', 'recovery'],
+              'status': 'unscorable', 'reason': orient['reason']})
+  ann = _annotation_list(case)
+  metrics = {'settling_time': mm.settling(rows, window, anchors, params, interventions=ann),
+             'lane_motion_cycles': mm.cycles(rows, window, params),
+             'late_wide_excursion': (mm.hold_late_wide(rows, window, anchors, params, direction) if direction else
+                                     mm.record('late_wide_excursion', unit='m', reason=orient['reason'])),
+             'path_rms': mm.path_quality(rows, window, anchors, params),
+             'lateral_jerk_p95': mm.comfort_proxy(rows, window, params),
+             **mm.annotations(ann, window, labels=case.get('labels'))}
+  identity = {'route': case['route'], 'source_sha256': hashlib.sha256(json.dumps(extracted['source_sha256'], sort_keys=True).encode()).hexdigest(),
+              'raw_sha256': dict(extracted['raw_sha256']), 'window_ns': list(window)}
+  return {'id': case['id'], 'role': case['role'], 'route': case['route'], 'window_ns': list(window),
+          'window_source': case['window_source'], 'contact_status': case['contact_status'],
+          'extraction': {k: extracted.get(k) for k in ('raw_sha256', 'source_sha256', 'unhealthy_count_by_group_and_reason', 'camera_age_s', 'lane_fit_policy', 'initdata')},
+          'row_count': len(extracted['rows']), 'orientation': orient, 'anchors': anchors, 'metrics': metrics,
+          'physical_verdicts': mm.physical_verdicts(metrics, identity, case['contact_status'])}
+
+
+def unavailable_case(case):
+  """A case whose exact inputs are missing or changed: kept in every denominator, never measured."""
+  reason = 'input_unavailable'
+  metrics = {name: mm.record(name, unit=unit, reason=reason, diagnostics={'input_problems': case['input_status']['problems']})
+             for name, unit in (('settling_time', 's'), ('lane_motion_cycles', 'cycles'), ('late_wide_excursion', 'm'),
+                                ('path_rms', 'm'), ('lateral_jerk_p95', 'm/s^3'), ('boundary_crossings', 'events'), ('driver_catches', 'events'))}
+  return {'id': case['id'], 'role': case['role'], 'route': case['route'], 'window_ns': list(case['window_ns']),
+          'window_source': case['window_source'], 'contact_status': case['contact_status'], 'extraction': None, 'row_count': 0,
+          'orientation': {'direction': None, 'status': 'unscorable', 'reason': reason}, 'input_problems': case['input_status']['problems'],
+          'anchors': {'anchor_source': 'model_road_geometry', 'entry_ns': None, 'unwind_ns': None, 'recovery': None, 'critical_gap': None,
+                      'coverage': {}, 'absent_phases': ['entry', 'sustained', 'unwind', 'recovery'], 'status': 'unscorable', 'reason': reason},
+          'metrics': metrics, 'physical_verdicts': []}
+
+
+def detection_outcomes(case_record, params):
+  m = case_record['metrics']
+  out = {}
+  s = m['settling_time']
+  if s['status'] == 'measured_estimate':
+    out['settling'] = 'detected' if s['value'] > params.t_settle_max_s else 'not_detected'
+  elif s['status'] in ('right_censored', 'unresolved') and s['lower_bound_s'] is not None and s['lower_bound_s'] > params.t_settle_max_s:
+    out['settling'] = 'detected'
+  else:
+    out['settling'] = 'unresolved'
+  c = m['lane_motion_cycles']
+  out['cycles'] = ('detected' if c['value'] >= 1 else 'not_detected') if c['status'] == 'measured_estimate' else 'unresolved'
+  h = m['late_wide_excursion']
+  if h['status'] in ('measured_estimate', 'right_censored') and h['diagnostics'].get('coverage_adequate') is True:
+    held = h['diagnostics']['inward_dwell_s'] > params.t_dwell_s
+    wide = h['value'] is not None and h['value'] > params.corridor_half_width_m
+    out['held_inward'] = 'detected' if held else 'not_detected'
+    out['over_release'] = 'detected' if wide else 'not_detected'
+    # The complaint sequence needs both; a modest inside offset alone is not the complaint.
+    out['hold_late_wide_sequence'] = 'detected' if (held and wide) else 'not_detected'
+  else:
+    out['held_inward'] = out['over_release'] = out['hold_late_wide_sequence'] = 'unresolved'
+  return out
+
+
+def evaluate(request, params, extractor):
+  from tools.mazda_ti.observed_drive_rows import source_hashes
+  validate_request(request)
+  sources_before = source_hashes()
+  for name in ('e_settle_m', 'v_settle_mps', 'a_min_m', 't_settle_max_s', 'corridor_half_width_m'):
+    if getattr(params, name) is None:
+      raise ValueError(f'evaluate requires calibrated {name}')
+  development, holdout = {}, {}
+  for c in request['cases']:
+    rec = unavailable_case(c) if not c.get('input_status', {'ok': True})['ok'] else measure_case(request, c, params, extractor)
+    (holdout if c['role'] == 'holdout' else development)[c['id']] = rec
+  false_alarms, detection, disagreements, unscorable = {}, {}, [], []
+  for c in request['cases']:
+    if c['role'] != 'development':
+      continue
+    rec = development[c['id']]
+    outcomes = detection_outcomes(rec, params)
+    rec['detection_outcomes'] = outcomes
+    for family, metric in FAMILIES.items():
+      if rec['metrics'][metric]['status'] == 'unscorable':
+        unscorable.append({'case': c['id'], 'family': family, 'reason': rec['metrics'][metric]['reason']})
+    labels = c.get('labels') or {}
+    if is_smooth_control(c):
+      # Individual detectors on a smooth pass are diagnostics; the sequence detector is the alarm.
+      false_alarms[c['id']] = {k: outcomes[k] for k in ('settling', 'cycles', 'hold_late_wide_sequence')}
+      for family, outcome in outcomes.items():
+        if outcome == 'detected':
+          disagreements.append({'case': c['id'], 'family': family, 'label': 'smooth', 'outcome': outcome})
+    symptoms = {k: v for k, v in labels.items() if k in LABEL_TO_FAMILY and v == SYMPTOM_VALUES[k]}
+    if symptoms:
+      detection[c['id']] = {k: outcomes[LABEL_TO_FAMILY[k]] for k in symptoms}
+      for k, outcome in detection[c['id']].items():
+        if outcome == 'not_detected':
+          disagreements.append({'case': c['id'], 'family': LABEL_TO_FAMILY[k], 'label': k, 'outcome': outcome})
+  totals = {'development_cases': len(development), 'holdout_cases': len(holdout),
+            'development_input_unavailable': sum(1 for r in development.values() if r.get('input_problems')),
+            'holdout_input_unavailable': sum(1 for r in holdout.values() if r.get('input_problems')),
+            'development_measured': sum(1 for r in development.values() if not r.get('input_problems'))}
+  report = {'coverage_totals': totals, 'false_alarms': false_alarms, 'symptom_detection': detection, 'disagreements': disagreements,
+            'unscorable': unscorable,
+            'validation_status': {'status': 'unresolved', 'reason': 'development cases were previously inspected; holdout results are sealed without independent labels',
+                                  'holdout_count': len(holdout)},
+            'limits': ['Lane geometry is model-derived, not surveyed truth', 'Latest-publication join, not exact consumed identity',
+                       'TI counts are command evidence, not delivered torque', 'Boundary distances are reference-point proxies without vehicle footprint',
+                       'Thresholds are draft calibration values, not accepted physical limits',
+                       'Development cases are calibration evidence, not validation']}
+  if source_hashes() != sources_before:
+    raise ValueError('Source files changed during evaluation')
+  return {'params_id': params.params_id, 'params': params.as_dict(), 'development': development, 'holdout': holdout,
+          'report': report, 'source_sha256': sources_before, 'request_sha256': request_digest(request)}
+
+
+def _md_table(headers, rows):
+  lines = ['| ' + ' | '.join(headers) + ' |', '| ' + ' | '.join('---' for _ in headers) + ' |']
+  lines += ['| ' + ' | '.join(str(x) for x in row) + ' |' for row in rows]
+  return lines
+
+
+def render_report(result, holdout_sha256):
+  r = result['report']
+  lines = ['# Observed-drive measurement qualification', '',
+           f"Parameters `{result['params_id']}`. Measurement qualification only: no handling verdict, no physical acceptance.", '',
+           '## False alarms per labelled smooth maneuver', '']
+  lines += _md_table(['case', 'settling', 'cycles', 'hold_late_wide_sequence'], [(cid, o['settling'], o['cycles'], o['hold_late_wide_sequence']) for cid, o in r['false_alarms'].items()])
+  lines += ['', '## Symptom detection within label scope', '']
+  lines += _md_table(['case', 'label', 'outcome'], [(cid, k, v) for cid, d in r['symptom_detection'].items() for k, v in d.items()])
+  lines += ['', '## Disagreements (calibration gaps)', '']
+  lines += _md_table(['case', 'family', 'label', 'outcome'], [(d['case'], d['family'], d['label'], d['outcome']) for d in r['disagreements']]) if r['disagreements'] else ['none']
+  t = r['coverage_totals']
+  lines += ['', '## Coverage totals', '', f"Development cases {t['development_cases']} (measured {t['development_measured']}, inputs unavailable {t['development_input_unavailable']}); holdout cases {t['holdout_cases']} (inputs unavailable {t['holdout_input_unavailable']}).", '', '## Unscorable', '']
+  lines += _md_table(['case', 'family', 'reason'], [(u['case'], u['family'], u['reason']) for u in r['unscorable']]) if r['unscorable'] else ['none']
+  lines += ['', '## Per-case records', '']
+  for cid, rec in result['development'].items():
+    a = rec['anchors']
+    lines += [f'### {cid}', '', f"Role development; contact `{rec['contact_status']}`; rows {rec['row_count']}; orientation {rec['orientation']['direction']}; anchors status `{a['status']}` (entry {a.get('entry_ns')}, unwind {a.get('unwind_ns')}, critical gap {a.get('critical_gap')}).", '']
+    lines += _md_table(['metric', 'status', 'value', 'unit', 'lower bound s', 'reason'],
+                       [(k, m['status'], m['value'], m['unit'], m['lower_bound_s'], m['reason']) for k, m in rec['metrics'].items()])
+    lines += ['', 'Physical evidence boundary: ' + ', '.join(f"{v['metric']}={v['status']}" for v in rec['physical_verdicts']), '']
+  lines += ['## Holdout (sealed)', '', f"{r['validation_status']['holdout_count']} cases sealed in `holdout-sealed.json` (SHA-256 `{holdout_sha256}`). Validation status: {r['validation_status']['status']}.", '',
+            '## Limits', ''] + [f'- {x}' for x in r['limits']]
+  return '\n'.join(lines) + '\n'
+
+
+def write_evaluation(result, output_dir, request_path, params_path, *, request_sha256, params_sha256):
+  out = Path(output_dir)
+  if out.exists():
+    raise FileExistsError(out)
+  out.mkdir(parents=True)
+  sealed = out / 'holdout-sealed.json'
+  write_json(sealed, {'format_version': 1, 'params_id': result['params_id'], 'source_sha256': result['source_sha256'],
+                      'request_content_sha256': result['request_sha256'], 'cases': result['holdout'],
+                      'note': 'Outcome-blind measurements; no labels were supplied or read for these cases'})
+  sealed_hash = sha256(sealed)
+  public = {'format_version': 1, 'scope': 'Observed-drive measurement qualification; no handling verdict',
+            'request': {'path': str(request_path), 'sha256': request_sha256}, 'params': {'path': str(params_path), 'sha256': params_sha256, 'values': result['params']},
+            'params_id': result['params_id'], 'runtime': environment(), 'source_sha256': result['source_sha256'],
+            'request_content_sha256': result['request_sha256'], 'development': result['development'],
+            'holdout': {'case_ids': sorted(result['holdout']), 'count': len(result['holdout']), 'sealed_sha256': sealed_hash},
+            'report': result['report']}
+  write_json(out / 'result.json', public)
+  (out / 'report.md').write_text(render_report(result, sealed_hash), encoding='utf-8', newline='\n')
+
+
+def _cli_evaluate(args):
+  from tools.mazda_ti.observed_drive_rows import run as extractor
+  request = read_json(args.request)
+  params = mm.Parameters(**read_json(args.params))
+  result = evaluate(request, params, extractor)
+  write_evaluation(result, args.output, args.request, args.params, request_sha256=sha256(args.request), params_sha256=sha256(args.params))
+
+
 def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   sub = parser.add_subparsers(dest='stage', required=True)
   c = sub.add_parser('calibrate')
   c.add_argument('--request', type=Path, required=True)
-  c.add_argument('--params', type=Path, default=None, help='Base parameter file; defaults to the built-in draft')
+  c.add_argument('--params', type=Path, default=None)
   c.add_argument('--params-out', type=Path, required=True)
   c.add_argument('--output', type=Path, required=True)
   c.set_defaults(func=_cli_calibrate)
+  e = sub.add_parser('evaluate')
+  e.add_argument('--request', type=Path, required=True)
+  e.add_argument('--params', type=Path, required=True)
+  e.add_argument('--output', type=Path, required=True)
+  e.set_defaults(func=_cli_evaluate)
   args = parser.parse_args(argv)
   args.func(args)
 

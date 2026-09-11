@@ -138,3 +138,85 @@ def test_write_calibration_refuses_existing_files(tmp_path):
   assert cal['cases']['a']['extraction']['raw_sha256'] == {'ra--1/rlog': 'a' * 64}
   with pytest.raises(FileExistsError):
     mq.write_calibration(out, tmp_path / 'params.json', tmp_path / 'calibration2.json')
+
+
+def _cal_params():
+  return mm.Parameters(**{**mm.DEFAULT_PARAMETERS.as_dict(), 'params_id': 'cal-test', 'e_settle_m': 0.15, 'v_settle_mps': 0.1,
+                          'a_min_m': 0.1, 't_settle_max_s': 3.0, 'corridor_half_width_m': 0.15})
+
+
+def test_detection_outcomes_use_three_values_and_never_alarm_on_short_censoring():
+  p = _cal_params()
+  smooth_rec = {'metrics': {'settling_time': mm.record('settling_time', unit='s', status='right_censored', reason='x', lower_bound_s=1.0),
+                            'lane_motion_cycles': mm.record('lane_motion_cycles', unit='cycles', status='measured_estimate', reason='counted', value=0),
+                            'late_wide_excursion': mm.record('late_wide_excursion', unit='m', status='measured_estimate', reason='x', value=0.0,
+                                                             diagnostics={'inward_dwell_s': 6.0, 'coverage_adequate': True})}}
+  # held inside for 6 s with no outward excursion is a modest-offset pass, not the complaint sequence
+  assert mq.detection_outcomes(smooth_rec, p) == {'settling': 'unresolved', 'cycles': 'not_detected', 'held_inward': 'detected',
+                                                  'over_release': 'not_detected', 'hold_late_wide_sequence': 'not_detected'}
+  seq = {'metrics': {**smooth_rec['metrics'], 'late_wide_excursion': mm.record('late_wide_excursion', unit='m', status='measured_estimate', reason='x', value=0.4,
+                                                                               diagnostics={'inward_dwell_s': 6.0, 'coverage_adequate': True})}}
+  sparse = {'metrics': {**smooth_rec['metrics'], 'late_wide_excursion': mm.record('late_wide_excursion', unit='m', status='unresolved', reason='interval_not_fully_observed', value=0.0,
+                                                                                  diagnostics={'inward_dwell_s': 0.0, 'coverage_adequate': False})}}
+  assert mq.detection_outcomes(sparse, p)['held_inward'] == 'unresolved'
+  assert mq.detection_outcomes(seq, p)['hold_late_wide_sequence'] == 'detected' and mq.detection_outcomes(seq, p)['over_release'] == 'detected'
+  long_rec = {'metrics': {**smooth_rec['metrics'], 'settling_time': mm.record('settling_time', unit='s', status='right_censored', reason='x', lower_bound_s=3.5)}}
+  assert mq.detection_outcomes(long_rec, p)['settling'] == 'detected'
+  unscorable = {'metrics': {**smooth_rec['metrics'], 'lane_motion_cycles': mm.record('lane_motion_cycles', unit='cycles', reason='no_lane_rows')}}
+  assert mq.detection_outcomes(unscorable, p)['cycles'] == 'unresolved'
+
+
+def test_evaluate_seals_holdout_and_reports_three_outcome_tables(tmp_path):
+  p = _cal_params()
+  profiles = {'ra': _smooth_profile(), 'rs': (lambda t: 0.5 if t < 9.5 else (0.5 if t < 18.6 else 0.0), None),
+              'rc': (lambda t: 0.4 * math.sin(2 * math.pi * t / 3.0) if 3 <= t <= 9 else 0.0, None), 'rh': _smooth_profile()}
+  req = request([case('a', labels=SMOOTH), case('s', labels={**SMOOTH, 'settling': 'problem'}, contact='confirmed_no_intervention'),
+                 case('c', labels={**SMOOTH, 'scalloping': 'present'}), case('h', role='holdout')])
+  out = mq.evaluate(req, p, fake_extractor(profiles))
+  assert set(out['development']) == {'a', 's', 'c'} and set(out['holdout']) == {'h'}
+  fa = out['report']['false_alarms']['a']
+  assert fa == {'settling': 'not_detected', 'cycles': 'not_detected', 'hold_late_wide_sequence': 'not_detected'}
+  assert out['report']['symptom_detection']['c']['scalloping'] == 'detected'
+  assert out['report']['symptom_detection']['s']['settling'] in ('detected', 'unresolved')
+  assert out['report']['validation_status']['status'] == 'unresolved'
+  assert out['development']['a']['physical_verdicts'][0]['metric'] == 'minimum_left_clearance'
+  mq.write_evaluation(out, tmp_path / 'eval', Path('request.json'), Path('params.json'), request_sha256='1' * 64, params_sha256='2' * 64)
+  result = json.loads((tmp_path / 'eval' / 'result.json').read_text())
+  sealed = json.loads((tmp_path / 'eval' / 'holdout-sealed.json').read_text())
+  text = (tmp_path / 'eval' / 'report.md').read_text()
+  assert 'h' in sealed['cases'] and 'metrics' in sealed['cases']['h']
+  assert result['holdout'] == {'case_ids': ['h'], 'count': 1, 'sealed_sha256': mq.sha256(tmp_path / 'eval' / 'holdout-sealed.json')}
+  assert 'settling_time' not in json.dumps(result['holdout']) and '"h"' not in json.dumps(result['development'])
+  assert 'holdout' in text and 'unresolved' in text and 'not_detected' in text
+  assert 'tools/mazda_ti/measurement_qualification.py' in result['source_sha256'] and sealed['source_sha256'] == result['source_sha256']
+  assert result['report']['coverage_totals'] == {'development_cases': 3, 'holdout_cases': 1, 'development_input_unavailable': 0,
+                                                 'holdout_input_unavailable': 0, 'development_measured': 3}
+
+
+def test_unavailable_inputs_stay_in_the_denominator_as_unscorable(tmp_path):
+  p = _cal_params()
+  gone = case('g', labels=SMOOTH)
+  gone['input_status'] = {'ok': False, 'problems': [{'rlog': 'rg--1/rlog', 'reason': 'file absent'}]}
+  req = request([case('a', labels=SMOOTH), gone, case('h', role='holdout')])
+  calls = []
+  def extractor(*args):
+    calls.append(args[1][0])
+    return fake_extractor({'ra': _smooth_profile(), 'rh': _smooth_profile()})(*args)
+  out = mq.evaluate(req, p, extractor)
+  assert 'rg--1/rlog' not in calls
+  assert out['development']['g']['metrics']['settling_time']['reason'] == 'input_unavailable'
+  assert out['report']['false_alarms']['g'] == {'settling': 'unresolved', 'cycles': 'unresolved', 'hold_late_wide_sequence': 'unresolved'}
+  assert {u['case'] for u in out['report']['unscorable'] if u['reason'] == 'input_unavailable'} == {'g'}
+  assert out['report']['coverage_totals']['development_input_unavailable'] == 1 and out['report']['coverage_totals']['development_cases'] == 2
+  with pytest.raises(ValueError, match='e_settle_m'):
+    mq.calibrate(request([case('a', labels=SMOOTH), gone]), mm.DEFAULT_PARAMETERS, extractor)
+
+
+def test_evaluate_never_reads_labels_of_holdout(monkeypatch):
+  p = _cal_params()
+  req = request([case('a', labels=SMOOTH), case('h', role='holdout')])
+  seen = []
+  original = mq.detection_outcomes
+  monkeypatch.setattr(mq, 'detection_outcomes', lambda rec, params: seen.append(rec['id']) or original(rec, params))
+  mq.evaluate(req, p, fake_extractor({'ra': _smooth_profile(), 'rh': _smooth_profile()}))
+  assert seen == ['a']
