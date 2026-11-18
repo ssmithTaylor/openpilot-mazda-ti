@@ -13,6 +13,9 @@ MIN_PERCENT = 10
 
 DELETE_LAST = ['boot', 'crash']
 
+# full-resolution camera files, deleted before any log (the small qcamera.ts preview is kept)
+VIDEO_SUFFIXES = ('.hevc',)
+
 PRESERVE_ATTR_NAME = 'user.preserve'
 PRESERVE_ATTR_VALUE = b'1'
 PRESERVE_COUNT = 5
@@ -44,6 +47,41 @@ def get_preserved_segments(dirs_by_creation: list[str]) -> list[str]:
   return preserved
 
 
+def delete_videos(delete_order: list[str]) -> bool:
+  """Remove the full-resolution camera files of the earliest segment that still has any.
+
+  The camera files are about 225 MB of a 270 MB segment, so dropping them first keeps the logs
+  (rlog, qlog) and the small preview video several times longer than deleting whole segments.
+  Returns True if something was removed, so the caller only falls back to deleting whole
+  segments once no camera files are left.
+  """
+  for delete_dir in delete_order:
+    delete_path = os.path.join(Paths.log_root(), delete_dir)
+    try:
+      names = os.listdir(delete_path)
+    except OSError:
+      continue
+
+    if any(name.endswith(".lock") for name in names):
+      continue
+
+    videos = [name for name in names if name.endswith(VIDEO_SUFFIXES)]
+    if not videos:
+      continue
+
+    removed = False
+    for name in videos:
+      try:
+        cloudlog.info(f"deleting {os.path.join(delete_path, name)}")
+        os.remove(os.path.join(delete_path, name))
+        removed = True
+      except OSError:
+        cloudlog.exception(f"issue deleting {os.path.join(delete_path, name)}")
+    if removed:
+      return True
+  return False
+
+
 def deleter_thread(exit_event):
   while not exit_event.is_set():
     out_of_bytes = get_available_bytes(default=MIN_BYTES + 1) < MIN_BYTES
@@ -54,9 +92,15 @@ def deleter_thread(exit_event):
 
       # skip deleting most recent N preserved segments (and their prior segment)
       preserved_dirs = get_preserved_segments(dirs)
+      delete_order = sorted(dirs, key=lambda d: (d in DELETE_LAST, d in preserved_dirs))
+
+      # camera files go first; logs are only deleted once no camera files are left
+      if delete_videos(delete_order):
+        exit_event.wait(.1)
+        continue
 
       # remove the earliest directory we can
-      for delete_dir in sorted(dirs, key=lambda d: (d in DELETE_LAST, d in preserved_dirs)):
+      for delete_dir in delete_order:
         delete_path = os.path.join(Paths.log_root(), delete_dir)
 
         if any(name.endswith(".lock") for name in os.listdir(delete_path)):

@@ -90,6 +90,32 @@ class TestDeleter(UploaderTestCase):
       self.make_file_with_data("crash", self.seg_format2[:-4]),
     ])
 
+  def test_videos_deleted_before_logs(self):
+    # every segment's camera files go, oldest first, before any log is touched
+    logs = [self.make_file_with_data(self.seg_format.format(i), "rlog") for i in range(2)]
+    self.assertDeleteOrder([
+      self.make_file_with_data(self.seg_format.format(0), "fcamera.hevc"),
+      self.make_file_with_data(self.seg_format.format(1), "ecamera.hevc"),
+      logs[0],
+      logs[1],
+    ])
+
+  def test_preview_video_kept_with_logs(self):
+    seg = self.seg_format.format(0)
+    video = self.make_file_with_data(seg, "dcamera.hevc")
+    preview = self.make_file_with_data(seg, "qcamera.ts")
+    rlog = self.make_file_with_data(seg, "rlog")
+    newer = self.make_file_with_data(self.seg_format.format(1), "fcamera.hevc", lock=True)
+
+    order = [seg, self.seg_format.format(1)]
+    assert deleter.delete_videos(order)
+    assert not video.exists()
+    assert preview.exists() and rlog.exists(), "Log or preview deleted with the camera file"
+
+    # nothing left that may go: the newer segment is locked, the older one has no camera file
+    assert not deleter.delete_videos(order)
+    assert newer.exists(), "Camera file deleted from a locked segment"
+
   def test_no_delete_when_available_space(self):
     f_path = self.make_file_with_data(self.seg_dir, self.f_type)
 
