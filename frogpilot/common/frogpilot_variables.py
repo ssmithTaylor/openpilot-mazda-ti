@@ -307,6 +307,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatFrictionComp", "0", 3, "0"),
   ("LatCommitSetpoint", "0", 3, "0"),
   ("LatDamping", "0", 3, "0"),
+  ("TiDither", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -724,6 +725,12 @@ class FrogPilotVariables:
     toggle.lat_damping = (params.get_bool("LatDamping")
                           if toggle.tuning_level >= level["LatDamping"]
                           else default.get_bool("LatDamping"))
+    # Identification dither on the TI command (selfdrive/car/mazda/ti_dither.py). Added before the TI limits, which
+    # bound the total exactly as before; read live by the car controller and fades out within 0.25 s when switched
+    # off, so safe to flip while driving. Default off.
+    toggle.ti_dither = (params.get_bool("TiDither")
+                        if toggle.tuning_level >= level["TiDither"]
+                        else default.get_bool("TiDither"))
     toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
                                 if toggle.tuning_level >= level["LatFrictionComp"]
                                 else default.get_bool("LatFrictionComp"))
