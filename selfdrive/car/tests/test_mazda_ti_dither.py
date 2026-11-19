@@ -174,7 +174,8 @@ def ccp():
 
 def host(dither, enabled):
   h = NS(CP=NS(flags=1), ccp=ccp(), apply_steer_last=0, ti_apply_steer_last=0, record_ti_stats=lambda *a: None,
-         ti_dither_enabled=enabled, frame=0)
+         ti_dither_enabled=enabled, frame=0, ti_dither_seen=False, ti_dither_frames=0,
+         ti_reported_last=0)
   if dither:
     h.ti_dither = TiDither()
   return h
@@ -189,7 +190,8 @@ def step(h, steer, *, lat_active=True, ti_allowed=True, v=25.0, driver=-1.0, pre
   cs = NS(out=NS(vEgo=v, steeringPressed=pressed, steeringTorque=driver, leftBlinker=False, rightBlinker=False),
           ti_lkas_allowed=ti_allowed)
   env = dict(self=h, CC=cc, CS=cs, car=car, MazdaFlags=NS(TORQUE_INTERCEPTOR=1),
-             apply_driver_steer_torque_limits=DRIVER_LIMITS, apply_ti_steer_torque_limits=TI_LIMITS)
+             apply_driver_steer_torque_limits=DRIVER_LIMITS, apply_ti_steer_torque_limits=TI_LIMITS,
+             rate_room=td.rate_room)
   exec(BLOCK if hasattr(h, 'ti_dither') else BARE_BLOCK, env)
   h.frame += 1
   a = env['new_actuators']
@@ -228,7 +230,7 @@ def test_dither_on_never_exceeds_the_existing_limits_and_is_recoverable(seed):
   on = host(True, True)
   saw = 0
   for row in drive(seed):
-    prev = on.ti_apply_steer_last
+    prev, shadow = on.ti_apply_steer_last, on.ti_reported_last
     r = step(on, **row)
     if not (row['lat_active'] and row['ti_allowed']):
       assert r['dither'] == 0 and r['sent'] == 0
@@ -243,7 +245,17 @@ def test_dither_on_never_exceeds_the_existing_limits_and_is_recoverable(seed):
     assert -max(up, on.ccp.TI_STEER_DELTA_DOWN) <= r['sent'] - prev <= max(up, on.ccp.TI_STEER_DELTA_DOWN)
     # Reconstruction from logged fields only.
     assert r['can'] == r['sent'] == r['diag_lim']
-    assert r['can'] - int(round(r['steer'] * TI_MAX)) == r['dither']
+    # Reported: the limiter's output for the undithered request on the undithered history while the dither is
+    # running, else the command sent. Applied dither = sent - reported, bounded by the dither's peak.
+    reported = int(round(r['steer'] * TI_MAX))
+    if on.ti_dither.envelope > 0.0:
+      assert reported == TI_LIMITS(base, shadow, row['driver'], on.ccp)
+    else:
+      assert reported == r['sent']
+    applied = r['can'] - reported
+    assert abs(applied) <= td.peak_counts()
+    if r['sent'] == r['requested'] and reported == base:
+      assert applied == r['dither']
     assert r['diag_req'] - int(round(r['cc_steer'] * TI_MAX)) == r['dither']
     saw += r['dither'] != 0
   assert saw > 1000
@@ -274,3 +286,94 @@ def test_lateral_off_or_ti_not_running_zeroes_the_dither_at_once():
     step(on, 0.05)
   r = step(on, 0.05, lat_active=False)
   assert r['dither'] == 0 and r['sent'] == 0 and on.ti_dither.envelope == 0.0
+
+
+def test_driver_touch_zeroes_the_dither_at_once():
+  for touch in (dict(pressed=True, driver=9.0), dict(driver=4.5), dict(driver=-6.0)):
+    on = host(True, True)
+    for k in range(frames(3)):
+      step(on, 0.05)
+    assert on.ti_dither.envelope == 1.0
+    r = step(on, 0.05, **touch)
+    assert r['dither'] == 0 and on.ti_dither.envelope == 0.0
+  # A blinker still fades (it is not a touch).
+  d = TiDither()
+  for k in range(frames(2)):
+    d.update(True, k, **QUIET)
+  d.update(True, frames(2), **{**QUIET, 'blinker': True})
+  assert 0.0 < d.envelope < 1.0
+
+
+@pytest.mark.parametrize('preset', sorted(td.PRESETS))
+def test_defaults_leave_room_and_a_tight_rate_limit_switches_the_dither_off(preset):
+  limits = ccp()
+  assert td.rate_room(limits) == 6 and td.rate_room_ok(td.rate_room(limits), preset)
+  for up in (1, 2, 3, 5):
+    tight = NS(**{**vars(limits), 'TI_STEER_DELTA_UP': up})
+    assert td.rate_room(tight) == up
+    assert td.rate_room_ok(up, preset) == (up >= td.RATE_ROOM_FACTOR * td.max_slew_per_frame(preset))
+  assert not td.rate_room_ok(5, preset)
+  # A knee inside the dither's working range brings in the high-range rate.
+  kneed = NS(**{**vars(limits), 'TI_STEER_DELTA_UP_KNEE': 200, 'TI_STEER_DELTA_UP_HIGH': 2})
+  assert td.rate_room(kneed) == 2
+  d = TiDither(preset)
+  out = [d.update(True, k, **QUIET, room=1) for k in range(frames(5))]
+  assert not any(out) and d.envelope == 0.0
+
+
+def test_car_controller_with_delta_up_1_sends_no_dither():
+  on = host(True, True)
+  on.ccp.TI_STEER_DELTA_UP = 1
+  on.ccp.TI_STEER_DELTA_UP_HIGH = 1
+  rows = [step(on, 0.01) for _ in range(frames(5))]
+  assert all(r['dither'] == 0 for r in rows)
+
+
+def test_clipped_frames_report_the_undithered_limiter_output():
+  """Where the limiter clips the dithered total (a fast ramp), the reported command is what the limiter sends for the
+  undithered request from the same state, so controlsd's limited flag reflects the controller's own request."""
+  on, ref = host(True, True), host(True, False)
+  for k in range(frames(3)):
+    step(on, 0.02)
+    step(ref, 0.02)
+  ref_rows = []
+  for k in range(frames(1)):
+    m = k % 30 if (k // 30) % 2 == 0 else 30 - k % 30
+    ref_rows.append(step(ref, (20 + 7 * m) / TI_MAX))
+  saw_clip = 0
+  for k in range(frames(1)):
+    prev, shadow = on.ti_apply_steer_last, on.ti_reported_last
+    m = k % 30 if (k // 30) % 2 == 0 else 30 - k % 30
+    r = step(on, (20 + 7 * m) / TI_MAX)    # a 7 count/frame zig-zag below 300: the rising half is rate limited
+    base = int(round(r['cc_steer'] * TI_MAX))
+    assert r['sent'] == TI_LIMITS(base + r['dither'], prev, -1.0, on.ccp)
+    assert int(round(r['steer'] * TI_MAX)) == TI_LIMITS(base, shadow, -1.0, on.ccp)
+    # The undithered history is exactly the run without the dither.
+    assert int(round(r['steer'] * TI_MAX)) == ref_rows[k]['sent']
+    saw_clip += r['dither'] != 0 and r['sent'] != base + r['dither']
+  assert saw_clip > 10
+
+
+def _ti_config():
+  tree = ast.parse((ROOT / 'selfdrive/car/mazda/carcontroller.py').read_text(encoding='utf-8'))
+  cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CarController')
+  fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'ti_config')
+  env = dict(TI_DITHER_PRESET=td.ACTIVE_PRESET)
+  exec(compile(ast.Module(body=[fn], type_ignores=[]), 'ti_config', 'exec'), env)
+  return env['ti_config']
+
+
+def test_stats_stamp_names_dithered_runs_only():
+  cfg = _ti_config()
+  off = host(True, False)
+  off.ti_steer_threshold = 6
+  for k in range(frames(3)):
+    step(off, 0.05)
+  assert 'TiDither' not in cfg(off)
+  on = host(True, True)
+  on.ti_steer_threshold = 6
+  for k in range(frames(3)):
+    step(on, 0.05)
+  stamp = cfg(on)['TiDither']
+  assert stamp['preset'] == td.ACTIVE_PRESET and stamp['frames'] == on.ti_dither_frames > 100
+  assert {k: v for k, v in cfg(on).items() if k != 'TiDither'} == cfg(off)

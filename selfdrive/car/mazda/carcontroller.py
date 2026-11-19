@@ -7,7 +7,7 @@ from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_s
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
 from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE, TI_LIMIT_BOUNDS
-from openpilot.selfdrive.car.mazda.ti_dither import TiDither
+from openpilot.selfdrive.car.mazda.ti_dither import ACTIVE_PRESET as TI_DITHER_PRESET, TiDither, rate_room
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -58,9 +58,17 @@ class CarController(CarControllerBase):
     # toggles, so switching it off fades the dither out within FADE_OUT_S of the toggles reaching card.
     self.ti_dither = TiDither()
     self.ti_dither_enabled = False
+    self.ti_reported_last = 0
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
+    self.reset_ti_counters()
+    # Frames of this measurement run on which the dither was non-zero. Only stamped into the run's config when the
+    # toggle was on at some point, so a run without the dither carries exactly the payload it always did.
+    self.ti_dither_seen = False
+    self.ti_dither_frames = 0
+
+  def reset_ti_counters(self):
     self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "rate_limited_low",
                                     "rate_limited_high", "driver_limited",
                                     "at_clip", "peak_cmd", "peak_desired", "deficit",
@@ -84,6 +92,10 @@ class CarController(CarControllerBase):
     }
     if self.ti_steer_threshold is not None:
       cfg["TiSteerThreshold"] = self.ti_steer_threshold
+    # Identification dither (ti_dither.py): present only for a run during which the TiDither toggle was on, so the
+    # run is recognisable as dithered and kept out of A/B comparisons; absent otherwise (payload unchanged).
+    if getattr(self, "ti_dither_seen", False):
+      cfg["TiDither"] = {"preset": TI_DITHER_PRESET, "frames": self.ti_dither_frames}
     return cfg
 
   def record_ti_stats(self, CS, desired, sent):
@@ -388,6 +400,7 @@ class CarController(CarControllerBase):
     ti_apply_steer = 0
     new_steer = ti_new_steer = 0
     ti_dither = 0
+    ti_reported = None   # the TI command reported to controlsd when it differs from the one sent (dither on)
     stock_previous, ti_previous = self.apply_steer_last, self.ti_apply_steer_last
 
     if CC.latActive:
@@ -400,8 +413,9 @@ class CarController(CarControllerBase):
         if CS.ti_lkas_allowed:
           ti_new_steer = int(round(CC.actuators.steer * self.ccp.TI_STEER_MAX))
           # Identification dither, TI path only, added BEFORE the limiter so every existing bound still applies to
-          # the total. Zero whenever the toggle is off (ti_dither.py). getattr: tools/mazda_ti/test_diagnostics.py
-          # executes this block on a minimal host that has no dither, which must keep the undithered path.
+          # the total. Zero whenever the toggle is off (ti_dither.py). getattr, here and at the reset below:
+          # tools/mazda_ti/test_diagnostics.py executes this block on a minimal host that has no dither, which must
+          # keep the undithered path.
           dither = getattr(self, "ti_dither", None)
           if dither is not None:
             ti_dither = dither.update(
@@ -409,18 +423,32 @@ class CarController(CarControllerBase):
               driver_torque=CS.out.steeringTorque,
               blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
               base_request=ti_new_steer, ti_max=self.ccp.TI_STEER_MAX,
-              lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature)
+              lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, room=rate_room(self.ccp))
             ti_new_steer += ti_dither
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
                                                     CS.out.steeringTorque, self.ccp)
+          if dither is not None and dither.envelope > 0.0:
+            # What the car would be sent had there been no dither: the same pure limiter on the undithered request,
+            # run on its own (undithered) history, ti_reported_last. Running it on the sent history instead would
+            # see every dither swing as a step and report rate limiting that is not there. This is what controlsd
+            # compares with its requests, so its limited flag (and the integrator freeze) see the real limiting of
+            # the controller's request and never the dither.
+            ti_reported = apply_ti_steer_torque_limits(ti_new_steer - ti_dither, self.ti_reported_last,
+                                                       CS.out.steeringTorque, self.ccp)
+            self.ti_dither_frames += ti_dither != 0
         # Recorded outside the ti_lkas_allowed gate on purpose: that flag is false precisely when
         # the TI has left RUN or is ramping down, which are the frames the health counters exist
         # to catch. Gating on it would make them structurally unreachable.
         self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and not (CC.latActive and CS.ti_lkas_allowed):
-      self.ti_dither.reset()   # lateral control off or TI not in RUN: dither zero at once, next fade-in from nothing
+    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      # The undithered limiter history; equal to the sent one whenever the dither is idle.
+      self.ti_reported_last = ti_apply_steer if ti_reported is None else ti_reported
+      self.ti_dither_seen |= self.ti_dither_enabled
+      dither = getattr(self, "ti_dither", None)   # same guard as in the steering block above
+      if dither is not None and not (CC.latActive and CS.ti_lkas_allowed):
+        dither.reset()   # lateral control off or TI not in RUN: zero at once, next fade-in from nothing
 
     if self.CP.flags & MazdaFlags.GEN1:
       if CC.cruiseControl.cancel:
@@ -544,11 +572,12 @@ class CarController(CarControllerBase):
       # multiplier 40 vs 1), so reporting the stock command trains it on a signal the car is not
       # following. Falls back to the stock command whenever the TI is bypassed, which is correct
       # because the stock LKAS path is then the only thing steering.
-      # With the identification dither on, `steer` is reported WITHOUT the dither: controlsd flags the output as
-      # limited (and freezes the integrator) when it matches none of the recent requests to 1e-2, i.e. 6 counts, and
-      # a dither of that size is not a limit. steerOutputCan stays the command actually sent, so the dither of this
-      # apply is steerOutputCan - round(steer * TI_STEER_MAX). With the dither off (0) this is the old expression.
-      new_actuators.steer = (ti_apply_steer - ti_dither) / self.ccp.TI_STEER_MAX
+      # With the identification dither on, `steer` is the limiter's output for the UNDITHERED request: controlsd
+      # flags the output as limited (and freezes the integrator) when it matches none of the recent requests to 1e-2,
+      # i.e. 6 counts, and a dither of that size is not a limit. steerOutputCan stays the command actually sent, so
+      # steerOutputCan - round(steer * TI_STEER_MAX) is the dither as applied. With the dither off (or zero this
+      # frame) ti_reported is None and this is the old expression.
+      new_actuators.steer = (ti_apply_steer if ti_reported is None else ti_reported) / self.ccp.TI_STEER_MAX
       new_actuators.steerOutputCan = ti_apply_steer
     else:
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX
