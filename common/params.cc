@@ -587,6 +587,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiTuningStats", PERSISTENT},
     {"TiTuningStatsHistory", PERSISTENT},
     {"TiTuningStatsPrevious", PERSISTENT},
+    {"TiTestProgress", PERSISTENT},
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

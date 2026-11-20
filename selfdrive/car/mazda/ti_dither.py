@@ -96,6 +96,32 @@ def gate_open(*, v_ego, steering_pressed, driver_torque, blinker, base_request, 
           and abs(lat_demand) <= MAX_LAT_DEMAND_MPS2)
 
 
+def gate_reason(*, engaged, enabled, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
+                lat_demand, holdoff, room=None):
+  """Display only: why the dither is or is not running, as one short code for the on-car Tests screen. Not used by
+  `TiDither.update` or anywhere in the command path; the car controller calls it only when it publishes test
+  progress (every 5 s, and only while a test is on). Same conditions, in the same order of precedence, as `update`."""
+  if not engaged:
+    return "inactive"
+  if not enabled:
+    return "off"
+  if steering_pressed or abs(driver_torque) >= DRIVER_QUIET_COUNTS:
+    return "touch"
+  if room is not None and not rate_room_ok(room):
+    return "rate"
+  if blinker:
+    return "blinker"
+  if holdoff > 0:
+    return "holdoff"
+  if v_ego < MIN_SPEED_MPS:
+    return "speed"
+  if abs(base_request) > MAX_BASE_FRACTION * ti_max:
+    return "command"
+  if abs(lat_demand) > MAX_LAT_DEMAND_MPS2:
+    return "curve"
+  return "ok"
+
+
 class TiDither:
   def __init__(self, preset=ACTIVE_PRESET):
     self.preset = preset

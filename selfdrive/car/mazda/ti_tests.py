@@ -1,0 +1,445 @@
+"""On-car tests for the Mazda TI: definitions, their validation, and the progress accountant.
+
+The tests are DATA: ti_tests.json next to this file, read at start by the car controller (this module) and by the
+Tests screen in the UI (selfdrive/ui/qt/sidebar.cc, loadTiTests), so adding or changing a definition needs no build.
+A test is "these existing boolean toggles at these values, and collect N seconds of a metric, optionally per speed
+bin". The screen renders entirely from the file plus what this module publishes.
+
+Safety envelope. A definition can only switch keys in ALLOWED_SETTINGS (code, not data), and only to the one value
+listed there as "on"; "off" is always the other value. It cannot set numbers or limits. Nothing here reaches the
+steering command: the toggles are read by the car controller exactly as when they are switched in Settings, and this
+module only READS what the car controller already computed (speed, lateral active, whether the dither was applied
+on this frame) and counts it.
+
+Validation is strict and the same in the UI: an entry with anything unexpected is ignored as a whole and reported (a
+log line here, a line on the screen); never a crash and never a partial apply. A test with an `alternate` block
+(switching a setting automatically between arms) is checked for shape but not supported yet: it is ignored with the
+reason "not supported yet". test_mazda_ti_tests.py checks that the C++ copy of the limits and the allow-list agrees.
+
+Progress lives in ONE params key, PROGRESS_KEY, as JSON: {<test id>: {<bin>: seconds}}, or for a test with arms
+{<test id>: {<arm>: {<bin>: seconds}}}. <bin> is a bin label from the definition, "other" (speeds outside every bin)
+or "all" (a test without bins). The tmpfs copy (params_memory) also carries "_live": what this process saw in the
+last stats interval ({seq, t: wall clock, on, active, status}); test ids cannot start with "_". The tmpfs copy is written at the
+stats cadence (5 s) while a test is on; the flash copy (no "_live") at most once a minute while counting, plus once
+IDLE_FLUSH_S after counting stops, so progress survives ignition-off and reboot. The accountant only ever ADDS what
+it counted since its last publish to whatever the tmpfs copy holds (or, after a reboot, the flash copy), so the UI
+resets a test by deleting its entry from both copies: no reset protocol and no second key.
+"""
+import json
+import math
+import re
+import time
+from pathlib import Path
+
+DEFINITIONS_PATH = Path(__file__).with_name("ti_tests.json")
+PROGRESS_KEY = "TiTestProgress"
+LIVE_KEY = "_live"
+DT = 0.01
+MS_TO_MPH = 1.0 / 0.44704
+
+# The only param keys a definition may switch: param key -> (frogpilot_toggles attribute that shows what the car
+# actually applies, the value that means "on"). Each is a plain boolean, exposed in Settings and read live by the car
+# controller. Mirrored in selfdrive/ui/qt/sidebar.cc (TI_TEST_ALLOWED); test_mazda_ti_tests.py checks the two agree.
+ALLOWED_SETTINGS = {"TiDither": ("ti_dither", True)}
+# Settings that report "applied on this frame" to the accountant (metric active_seconds).
+ACTIVE_SOURCES = ("TiDither",)
+
+METRICS = ("active_seconds", "engaged_seconds")
+BIN_BY = ("speed_mph",)
+SWITCH_WHEN = ("straight_only", "between_engagements")
+
+FILE_KEYS = {"version", "tests"}
+TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"}
+TEST_REQUIRED = {"id", "title", "description", "settings", "progress"}
+SETTING_KEYS = {"key", "on"}
+PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins"}
+PROGRESS_REQUIRED = {"metric", "target_seconds"}
+AUTO_OFF_KEYS = {"at_ignition_off"}
+ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"}
+ARM_KEYS = {"id", "settings"}
+
+MAX_TESTS = 2
+MAX_SETTINGS = 3
+MAX_BINS = 5
+MIN_ARMS = 2
+MAX_ARMS = 4
+MIN_TARGET_S = 10
+MAX_TARGET_S = 7200
+MIN_DWELL_S = 30
+MAX_DWELL_S = 3600
+MAX_SPEED_MPH = 100
+MAX_TITLE = 40
+MAX_DESCRIPTION = 200
+MAX_ID = 32
+MAX_LABEL = 16
+ID_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,16}")
+OTHER_BIN = "other"
+ALL_BIN = "all"
+UNSUPPORTED = "alternate is not supported yet (test ignored)"
+
+FLUSH_S = 60.0        # flash copy at most this often while counting
+IDLE_FLUSH_S = 15.0   # ...and once this long after the last flash write when counting has stopped
+
+# What the Tests screen shows as a test's status line, from the dither's gate (ti_dither.gate_reason). Display only.
+REASON_TEXT = {
+  "inactive": "Waiting: steering not engaged or interceptor not running",
+  "off": "Waiting: the car has not applied the setting yet",
+  "touch": "Paused: hand on the wheel",
+  "rate": "Off: interceptor rate limit set too low for it",
+  "blinker": "Paused: blinker or lane change",
+  "holdoff": "Paused: 3 s after a touch or blinker",
+  "speed": "Waiting: too slow",
+  "command": "Waiting: steering command too large",
+  "curve": "Waiting: curve",
+  "ok": "Running",
+}
+
+
+class TestDef:
+  def __init__(self, id, title, description, settings, metric, target_seconds, bins, at_ignition_off):
+    self.id = id
+    self.title = title
+    self.description = description
+    self.settings = settings                 # ((param key, on value), ...)
+    self.toggles = tuple((ALLOWED_SETTINGS[k][0], on) for k, on in settings)
+    self.keys = frozenset(k for k, _ in settings)
+    self.metric = metric
+    self.target_seconds = target_seconds
+    self.bins = bins                         # ((low mph, high mph, label, required), ...) sorted by low, or ()
+    self.at_ignition_off = at_ignition_off
+
+  def enabled(self, toggles):
+    """Every setting at its "on" value in the live toggles (what the car applies, after the tuning-level gate)."""
+    for attr, on in self.toggles:
+      v = getattr(toggles, attr, None)
+      if not isinstance(v, bool) or v != on:
+        return False
+    return True
+
+  def bin_for(self, speed_mph):
+    """Half-open bins [low, high); speeds outside every bin count under OTHER_BIN. Unbinned: ALL_BIN."""
+    if not self.bins:
+      return ALL_BIN
+    for low, high, label, _ in self.bins:
+      if low <= speed_mph < high:
+        return label
+    return OTHER_BIN
+
+
+def _number(x):
+  return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _text(x, longest):
+  return isinstance(x, str) and x.strip() != "" and len(x) <= longest
+
+
+def _settings(raw):
+  """(((key, on), ...), None) or (None, reason)."""
+  if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_SETTINGS:
+    return None, f"settings must list 1-{MAX_SETTINGS} toggles"
+  pairs = []
+  for s in raw:
+    if not isinstance(s, dict) or set(s) != SETTING_KEYS:
+      return None, "each setting is exactly {key, on}"
+    key, on = s["key"], s["on"]
+    if not isinstance(key, str) or key not in ALLOWED_SETTINGS:
+      return None, f"setting {key!r} is not allowed"
+    if not isinstance(on, bool) or on != ALLOWED_SETTINGS[key][1]:
+      return None, f"setting {key}: on must be {str(ALLOWED_SETTINGS[key][1]).lower()}"
+    if any(k == key for k, _ in pairs):
+      return None, f"setting {key} twice"
+    pairs.append((key, on))
+  return tuple(pairs), None
+
+
+def _bins(raw):
+  """(((low, high, label, required), ...), None) or (None, reason)."""
+  if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_BINS:
+    return None, f"bins must list 1-{MAX_BINS} bins"
+  out = []
+  for b in raw:
+    if not isinstance(b, list) or len(b) != 4:
+      return None, "each bin is [low, high, label, required]"
+    low, high, label, required = b
+    if not isinstance(label, str) or not LABEL_RE.fullmatch(label) or label in (OTHER_BIN, ALL_BIN):
+      return None, "bad bin label"
+    if not (_number(low) and _number(high) and 0 <= low < high <= MAX_SPEED_MPH):
+      return None, f"bin {label}: need 0 <= low < high <= {MAX_SPEED_MPH}"
+    if not isinstance(required, bool):
+      return None, f"bin {label}: required must be true or false"
+    out.append((float(low), float(high), label, required))
+  out.sort(key=lambda x: x[0])
+  for a, c in zip(out, out[1:]):
+    if c[0] < a[1]:
+      return None, f"bins {a[2]} and {c[2]} overlap"
+  if len({x[2] for x in out}) != len(out):
+    return None, "bin label twice"
+  if not any(x[3] for x in out):
+    return None, "at least one bin must be required"
+  return tuple(out), None
+
+
+def _alternate(a):
+  """None when the block has the reserved shape, else the reason."""
+  if not isinstance(a, dict) or set(a) != ALTERNATE_KEYS:
+    return "alternate is exactly {arms, min_dwell_s, switch_when}"
+  arms = a["arms"]
+  if not isinstance(arms, list) or not MIN_ARMS <= len(arms) <= MAX_ARMS:
+    return f"alternate: arms must list {MIN_ARMS}-{MAX_ARMS} arms"
+  ids = set()
+  for arm in arms:
+    if not isinstance(arm, dict) or set(arm) != ARM_KEYS:
+      return "alternate: each arm is exactly {id, settings}"
+    if not isinstance(arm["id"], str) or not LABEL_RE.fullmatch(arm["id"]) or arm["id"] in ids:
+      return "alternate: bad or repeated arm id"
+    ids.add(arm["id"])
+    _, why = _settings(arm["settings"])
+    if why is not None:
+      return f"alternate arm {arm['id']}: {why}"
+  if not (_number(a["min_dwell_s"]) and MIN_DWELL_S <= a["min_dwell_s"] <= MAX_DWELL_S):
+    return f"alternate: min_dwell_s must be {MIN_DWELL_S}-{MAX_DWELL_S} s"
+  if a["switch_when"] not in SWITCH_WHEN:
+    return "alternate: unknown switch_when"
+  return None
+
+
+def validate_test(t):
+  """(TestDef, None) or (None, reason). Anything unexpected rejects the whole entry; a well-formed `alternate` block
+  rejects it too, with the reason UNSUPPORTED."""
+  if not isinstance(t, dict):
+    return None, "not an object"
+  unknown = set(t) - TEST_KEYS
+  if unknown:
+    return None, f"unknown key {sorted(unknown)[0]}"
+  missing = TEST_REQUIRED - set(t)
+  if missing:
+    return None, f"missing {sorted(missing)[0]}"
+  if not isinstance(t["id"], str) or not ID_RE.fullmatch(t["id"]):
+    return None, f"id must be a-z then up to {MAX_ID - 1} of a-z 0-9 _"
+  if not _text(t["title"], MAX_TITLE):
+    return None, f"title must be 1-{MAX_TITLE} characters"
+  if not _text(t["description"], MAX_DESCRIPTION):
+    return None, f"description must be 1-{MAX_DESCRIPTION} characters"
+
+  settings, why = _settings(t["settings"])
+  if why is not None:
+    return None, why
+
+  p = t["progress"]
+  if not isinstance(p, dict):
+    return None, "progress must be an object"
+  unknown = set(p) - PROGRESS_KEYS
+  if unknown:
+    return None, f"unknown progress key {sorted(unknown)[0]}"
+  missing = PROGRESS_REQUIRED - set(p)
+  if missing:
+    return None, f"progress: missing {sorted(missing)[0]}"
+  if p["metric"] not in METRICS:
+    return None, "unknown metric"
+  if p["metric"] == "active_seconds" and not any(k in ACTIVE_SOURCES for k, _ in settings):
+    return None, "active_seconds needs a setting that reports applied time"
+  if not (_number(p["target_seconds"]) and MIN_TARGET_S <= p["target_seconds"] <= MAX_TARGET_S):
+    return None, f"target_seconds must be {MIN_TARGET_S}-{MAX_TARGET_S}"
+  bins = ()
+  if ("bins" in p) != ("bin_by" in p):
+    return None, "bins and bin_by go together"
+  if "bins" in p:
+    if p["bin_by"] not in BIN_BY:
+      return None, "unknown bin_by"
+    bins, why = _bins(p["bins"])
+    if why is not None:
+      return None, why
+
+  at_off = False
+  if "auto_off" in t:
+    a = t["auto_off"]
+    if not isinstance(a, dict) or set(a) - AUTO_OFF_KEYS or not all(isinstance(v, bool) for v in a.values()):
+      return None, "auto_off is {at_ignition_off: true/false}"
+    at_off = a.get("at_ignition_off", False)
+
+  if "alternate" in t:
+    why = _alternate(t["alternate"])
+    return None, why if why is not None else UNSUPPORTED
+
+  return TestDef(t["id"], t["title"], t["description"], settings, p["metric"], float(p["target_seconds"]), bins,
+                 at_off), None
+
+
+def validate_document(doc):
+  """([TestDef], [error lines]). A bad file yields no tests; a bad entry is skipped on its own."""
+  if not isinstance(doc, dict) or set(doc) != FILE_KEYS or not _number(doc["version"]) or doc["version"] != 1:
+    return [], ["file: must be exactly {\"version\": 1, \"tests\": [...]}"]
+  if not isinstance(doc["tests"], list):
+    return [], ["file: tests must be a list"]
+  tests, errors, ids = [], [], set()
+  for i, t in enumerate(doc["tests"]):
+    name = t["id"] if isinstance(t, dict) and isinstance(t.get("id"), str) and t["id"] else f"#{i + 1}"
+    if i >= MAX_TESTS:
+      errors.append(f"{name}: more than {MAX_TESTS} tests")
+      continue
+    test, why = validate_test(t)
+    if test is None:
+      errors.append(f"{name}: {why}")
+    elif test.id in ids:
+      errors.append(f"{name}: id twice")
+    else:
+      ids.add(test.id)
+      tests.append(test)
+  return tests, errors
+
+
+def load_definitions(path=DEFINITIONS_PATH):
+  try:
+    with open(path, encoding="utf-8") as f:
+      doc = json.load(f)
+  except (OSError, ValueError) as e:
+    return [], [f"file: cannot read ({type(e).__name__})"]
+  return validate_document(doc)
+
+
+def parse_progress(raw):
+  """The progress mapping, cleaned, or None when absent or unusable. Entries of tests that are no longer defined are
+  kept (they keep their numbers until reset); bad values are dropped; top-level keys starting with "_" (the live
+  block) are left out."""
+  if not raw:
+    return None
+  try:
+    doc = json.loads(raw)
+  except (ValueError, TypeError):
+    return None
+  if not isinstance(doc, dict):
+    return None
+  out = {}
+  for tid, entry in doc.items():
+    if not isinstance(tid, str) or tid.startswith("_") or not isinstance(entry, dict):
+      continue
+    clean = {}
+    for k, v in entry.items():
+      if _number(v) and v >= 0:
+        clean[k] = float(v)
+      elif isinstance(v, dict):
+        clean[k] = {b: float(x) for b, x in v.items() if _number(x) and x >= 0}
+    out[tid] = clean
+  return out
+
+
+def _log(msg):
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.warning(msg)
+  except Exception:
+    pass
+
+
+class TestAccountant:
+  """Counts each enabled test's metric per bin. update() runs every frame and is a handful of comparisons; publish()
+  runs at the stats cadence. Both only read their inputs. Any unexpected error disables the accountant for the rest
+  of the process (logged once) instead of reaching the car controller."""
+
+  def __init__(self, tests, params, params_memory):
+    self.tests = list(tests)
+    self.params = params
+    self.params_memory = params_memory
+    self.pending = {}            # test id -> {(arm or None, bin): frames} counted since the last publish
+    self.seen_interval = set()   # enabled at any frame since the last publish
+    self.run_seen = set()        # enabled at any frame of the current measurement run (stats stamp)
+    self.live_shown = False      # the last live block published listed a test as on
+    self.unsaved = False
+    self.last_flush = None
+    self.seq = 0
+    self.failed = False
+
+  def _fail(self, where):
+    self.failed = True
+    _log(f"ti_tests: accountant disabled after an error in {where}")
+
+  def update(self, toggles, v_ego, engaged, active_keys, arms=None):
+    """One frame. `active_keys`: the ACTIVE_SOURCES applied on this frame. `arms`: {test id: arm} for tests that
+    alternate (none can be loaded yet), else None."""
+    if self.failed:
+      return
+    try:
+      for t in self.tests:
+        if not t.enabled(toggles):
+          continue
+        self.seen_interval.add(t.id)
+        self.run_seen.add(t.id)
+        counting = (not t.keys.isdisjoint(active_keys)) if t.metric == "active_seconds" else bool(engaged)
+        if counting:
+          arm = arms.get(t.id) if arms else None
+          counted = self.pending.setdefault(t.id, {})
+          slot = (arm, t.bin_for(v_ego * MS_TO_MPH))
+          counted[slot] = counted.get(slot, 0) + 1
+    except Exception:
+      self._fail("update")
+
+  def wants_reasons(self):
+    return bool(self.seen_interval) and not self.failed
+
+  def _base(self):
+    doc = parse_progress(self.params_memory.get(PROGRESS_KEY, encoding="utf8"))
+    if doc is None:
+      doc = parse_progress(self.params.get(PROGRESS_KEY, encoding="utf8"))
+    return doc if doc is not None else {}
+
+  def _status(self, on, reasons):
+    status = {}
+    for t in self.tests:
+      if t.id in on:
+        for key in sorted(t.keys):
+          text = REASON_TEXT.get((reasons or {}).get(key))
+          if text is not None:
+            status[t.id] = text
+            break
+    return status
+
+  def publish(self, now, reasons=None, wall=None):
+    """`now`: a monotonic clock in seconds. `reasons`: {setting key: ti_dither.gate_reason code}. `wall`: the wall
+    clock for the live block's "t" (default time.time()); the UI compares it with its own clock to tell a live block
+    from one left over by an earlier drive. Writes the tmpfs copy when a test was on, something is unsaved or the last
+    live block still lists a test as on, and the flash copy at the rate in the module docstring."""
+    if self.failed or not (self.pending or self.seen_interval or self.unsaved or self.live_shown):
+      return
+    try:
+      doc = self._base()
+      changed = bool(self.pending)
+      for tid, counted in self.pending.items():
+        entry = doc.setdefault(tid, {})
+        for (arm, b), n in counted.items():
+          into = entry
+          if arm is not None:
+            into = entry.get(arm)
+            if not isinstance(into, dict):
+              into = entry[arm] = {}
+          prev = into.get(b)
+          into[b] = round((prev if _number(prev) else 0.0) + n * DT, 2)
+      on, active = sorted(self.seen_interval), sorted(self.pending)
+      self.pending, self.seen_interval = {}, set()
+      self.seq += 1
+      live = {"seq": self.seq, "t": round(time.time() if wall is None else wall, 1), "on": on, "active": active,
+              "status": self._status(on, reasons)}
+      self.params_memory.put(PROGRESS_KEY, json.dumps({**doc, LIVE_KEY: live}))
+      self.live_shown = bool(on)
+      self.unsaved = self.unsaved or changed
+      if self.unsaved:
+        since = None if self.last_flush is None else now - self.last_flush
+        if since is None or since >= FLUSH_S or (not changed and since >= IDLE_FLUSH_S):
+          self.params.put_nonblocking(PROGRESS_KEY, json.dumps(doc))
+          self.last_flush = now
+          self.unsaved = False
+    except Exception:
+      self._fail("publish")
+
+
+def make_accountant(params, params_memory, path=DEFINITIONS_PATH):
+  """The accountant for the valid tests in the file, or None when there are none. Never raises."""
+  try:
+    tests, errors = load_definitions(path)
+    for e in errors:
+      _log(f"ti_tests: definition ignored: {e}")
+    return TestAccountant(tests, params, params_memory) if tests else None
+  except Exception:
+    _log("ti_tests: definitions not loaded")
+    return None

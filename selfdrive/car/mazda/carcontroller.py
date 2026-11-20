@@ -7,7 +7,8 @@ from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_s
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
 from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE, TI_LIMIT_BOUNDS
-from openpilot.selfdrive.car.mazda.ti_dither import ACTIVE_PRESET as TI_DITHER_PRESET, TiDither, rate_room
+from openpilot.selfdrive.car.mazda.ti_dither import ACTIVE_PRESET as TI_DITHER_PRESET, TiDither, gate_reason, rate_room
+from openpilot.selfdrive.car.mazda.ti_tests import make_accountant
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -26,6 +27,9 @@ FLAG_MAX_AGE_S = 7 * 24 * 3600
 
 # Completed measurement runs retained. Enough to hold a session's worth of A/B steps.
 RUN_HISTORY = 5
+
+# What the dither reports to the test accountant on a frame it was applied (ti_tests.ACTIVE_SOURCES).
+TI_DITHER_ACTIVE = ("TiDither",)
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -59,6 +63,10 @@ class CarController(CarControllerBase):
     self.ti_dither = TiDither()
     self.ti_dither_enabled = False
     self.ti_reported_last = 0
+    # On-car tests (ti_tests.py, definitions in ti_tests.json): counts each enabled test's metric for the Tests
+    # screen. Outside the command path: it only reads what this controller already computed. None when the file
+    # holds no valid test, and on every car without the interceptor.
+    self.ti_tests = make_accountant(self.params, self.params_memory) if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -67,6 +75,9 @@ class CarController(CarControllerBase):
     # toggle was on at some point, so a run without the dither carries exactly the payload it always did.
     self.ti_dither_seen = False
     self.ti_dither_frames = 0
+    tests = getattr(self, "ti_tests", None)
+    if tests is not None:
+      tests.run_seen = set()
 
   def reset_ti_counters(self):
     self.ti_stats = {k: 0 for k in ("engaged", "short", "rate_limited", "rate_limited_low",
@@ -96,7 +107,31 @@ class CarController(CarControllerBase):
     # run is recognisable as dithered and kept out of A/B comparisons; absent otherwise (payload unchanged).
     if getattr(self, "ti_dither_seen", False):
       cfg["TiDither"] = {"preset": TI_DITHER_PRESET, "frames": self.ti_dither_frames}
+    # On-car tests (ti_tests.json) that were on at any point of this run, by id; absent otherwise (payload unchanged).
+    tests = getattr(self, "ti_tests", None)
+    if tests is not None and tests.run_seen:
+      cfg["Tests"] = sorted(tests.run_seen)
     return cfg
+
+  def publish_ti_tests(self, CS, CC, ti_request):
+    """Test progress, at the stats cadence. `ti_request` is this frame's undithered TI request. The dither's gate
+    reason is display only (ti_dither.gate_reason) and computed only while a test is on."""
+    tests = getattr(self, "ti_tests", None)
+    if tests is None:
+      return
+    reasons = {}
+    if tests.wants_reasons():
+      try:
+        reasons["TiDither"] = gate_reason(
+          engaged=bool(CC.latActive and CS.ti_lkas_allowed), enabled=self.ti_dither_enabled, v_ego=CS.out.vEgo,
+          steering_pressed=CS.out.steeringPressed, driver_torque=CS.out.steeringTorque,
+          blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
+          base_request=ti_request, ti_max=self.ccp.TI_STEER_MAX,
+          lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, holdoff=self.ti_dither.holdoff,
+          room=rate_room(self.ccp))
+      except Exception:
+        pass
+    tests.publish(time.monotonic(), reasons)
 
   def record_ti_stats(self, CS, desired, sent):
     # Counters for A/B-ing a tuning change over a chosen stretch of road. "short" is how often the
@@ -593,15 +628,23 @@ class CarController(CarControllerBase):
         self.check_flag_request(CS, CC, ti_apply_steer)
         self.check_clear_request()
 
+      # On-car tests: count this frame (ti_dither is non-zero exactly on the frames ti_dither_frames counts), after
+      # every output of the frame has been computed; the accountant only reads, and never raises.
+      tests = getattr(self, "ti_tests", None)
+      if tests is not None:
+        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, TI_DITHER_ACTIVE if ti_dither != 0 else ())
+
       # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
       # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a
       # new thread's stack has to be allocated and faulted in. At 1Hz that cost landed in the
       # 100Hz thread that builds the steering frame once a second, on a fixed phase -- visible in
       # the logs as a skipped carState frame at exactly 1Hz, which then made the 20Hz consumers
       # polling carState fail their all_checks and flag their own output invalid, which controlsd
-      # reports as commIssue. Five seconds of staleness costs the counters nothing.
+      # reports as commIssue. Five seconds of staleness costs the counters nothing. The test progress rides on the
+      # same cadence (a tmpfs write; its flash copy at most once a minute, ti_tests.py).
       if self.frame % 500 == 0:
         self.publish_ti_stats()
+        self.publish_ti_tests(CS, CC, ti_new_steer - ti_dither)
 
     self.frame += 1
     Timer.tick()

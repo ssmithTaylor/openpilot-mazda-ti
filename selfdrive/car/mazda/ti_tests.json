@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "tests": [
+    {
+      "id": "ti_dither",
+      "title": "Steering identification signal",
+      "description": "Small known wobble on the interceptor command. Runs by itself on straights above 34 mph, hands off, no blinker.",
+      "settings": [
+        {"key": "TiDither", "on": true}
+      ],
+      "progress": {
+        "metric": "active_seconds",
+        "target_seconds": 300,
+        "bin_by": "speed_mph",
+        "bins": [
+          [36, 40, "36-40", false],
+          [43, 50, "43-50", true],
+          [56, 62, "56-62", false]
+        ]
+      }
+    }
+  ]
+}
