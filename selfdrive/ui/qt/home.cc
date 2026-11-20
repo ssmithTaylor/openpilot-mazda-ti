@@ -172,6 +172,9 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   drove_this_cycle = false;
   auto_refresh = new ScreenRefreshOverlay(remaining);
   auto_refresh->on_finished = [this, remaining](int completed) {
+    // Disarm until the next drive ends. Otherwise a tap to stop (which banks a remainder and leaves
+    // LastScreenRefresh unstamped) passes every check above on the next tick and starts it again.
+    offroad_since = 0;
     const int left = remaining - completed;
     if (left > 0) {
       params.putInt("ScreenRefreshRemaining", left);
