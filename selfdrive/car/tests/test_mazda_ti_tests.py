@@ -491,6 +491,13 @@ def test_gate_reason_codes_have_texts(change, code):
   assert code in tt.REASON_TEXT
 
 
+def test_gate_reason_uses_the_confirmed_touch_when_given():
+  blip = {**QUIET, "driver_torque": 4.0}
+  assert td.gate_reason(**blip) == "touch"                    # no state given: every reading counts
+  assert td.gate_reason(**blip, touch=False) == "ok"          # the dither's own verdict: not confirmed
+  assert td.gate_reason(**QUIET, touch=True) == "touch"
+
+
 def test_gate_reason_ok_exactly_when_the_dither_would_fade_in():
   for change in [{}, dict(v_ego=12.0), dict(blinker=True), dict(lat_demand=2.0), dict(base_request=400)]:
     args = {**QUIET, **change}

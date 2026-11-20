@@ -112,7 +112,8 @@ class CarController(CarControllerBase):
     # Identification dither (ti_dither.py): present only for a run during which the TiDither toggle was on, so the
     # run is recognisable as dithered and kept out of A/B comparisons; absent otherwise (payload unchanged).
     if getattr(self, "ti_dither_seen", False):
-      cfg["TiDither"] = {"preset": TI_DITHER_PRESET, "frames": self.ti_dither_frames}
+      cfg["TiDither"] = {"preset": TI_DITHER_PRESET, "frames": self.ti_dither_frames,
+                         "touch_confirm": self.ti_dither.touch_confirm_frames}
     # On-car tests (ti_tests.json) that were on at any point of this run, by id; absent otherwise (payload unchanged).
     tests = getattr(self, "ti_tests", None)
     if tests is not None and tests.run_seen:
@@ -134,7 +135,7 @@ class CarController(CarControllerBase):
           blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
           base_request=ti_request, ti_max=self.ccp.TI_STEER_MAX,
           lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, holdoff=self.ti_dither.holdoff,
-          room=rate_room(self.ccp))
+          room=rate_room(self.ccp), touch=self.ti_dither.touch)
       except Exception:
         pass
     tests.publish(time.monotonic(), reasons)

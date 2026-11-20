@@ -115,6 +115,63 @@ def test_holdoff_after_driver_touch_or_blinker(touch):
   assert max(abs(v) for v in later) > 0
 
 
+def _settled():
+  d = TiDither()
+  for k in range(frames(2)):
+    d.update(True, k, **QUIET)
+  assert d.envelope == 1.0 and d.holdoff == 0
+  return d, frames(2)
+
+
+@pytest.mark.parametrize('reading', [4.0, -4.0, 5.0, -5.9])
+def test_a_brief_small_torque_reading_is_not_a_touch(reading):
+  # Route 339: 110 of the 139 touch trips above the gate speed were one or two readings, 90 % of them exactly 4.
+  assert td.TOUCH_CONFIRM_FRAMES == 3 and td.DRIVER_FIRM_COUNTS == 6.0
+  d, k = _settled()
+  for i in range(td.TOUCH_CONFIRM_FRAMES - 1):
+    d.update(True, k + i, **{**QUIET, 'driver_torque': reading})
+    assert d.envelope == 1.0 and d.holdoff == 0 and not d.touch
+  d.update(True, k + 2, **QUIET)                       # quiet again: the count starts over
+  for i in range(td.TOUCH_CONFIRM_FRAMES - 1):
+    d.update(True, k + 3 + i, **{**QUIET, 'driver_torque': reading})
+  assert d.envelope == 1.0 and d.holdoff == 0 and not d.touch
+
+
+@pytest.mark.parametrize('reading', [4.0, -5.0])
+def test_a_small_torque_reading_held_for_three_frames_is_a_touch(reading):
+  d, k = _settled()
+  out = [d.update(True, k + i, **{**QUIET, 'driver_torque': reading}) for i in range(td.TOUCH_CONFIRM_FRAMES)]
+  assert out[-1] == 0 and d.envelope == 0.0 and d.touch and d.holdoff == frames(td.HOLDOFF_S)
+  out = [d.update(True, k + 3 + i, **{**QUIET, 'driver_torque': reading}) for i in range(50)]   # still held
+  assert not any(out) and d.touch and d.holdoff == frames(td.HOLDOFF_S)
+
+
+@pytest.mark.parametrize('touch', [dict(driver_torque=6.0), dict(driver_torque=-9.0), dict(steering_pressed=True),
+                                   dict(steering_pressed=True, driver_torque=4.0)])
+def test_a_firm_reading_or_the_pressed_flag_is_a_touch_at_once(touch):
+  d, k = _settled()
+  assert d.update(True, k, **{**QUIET, **touch}) == 0
+  assert d.envelope == 0.0 and d.touch and d.holdoff == frames(td.HOLDOFF_S)
+
+
+def test_confirm_frames_of_one_is_the_first_drives_gate():
+  # Route 339 was driven with every reading of 4 counts or more a touch: a replay of it needs that gate.
+  d = TiDither(touch_confirm_frames=1)
+  for k in range(frames(2)):
+    d.update(True, k, **QUIET)
+  assert d.update(True, frames(2), **{**QUIET, 'driver_torque': 4.0}) == 0
+  assert d.envelope == 0.0 and d.holdoff == frames(td.HOLDOFF_S)
+
+
+def test_reset_starts_the_touch_count_over():
+  d, k = _settled()
+  d.update(True, k, **{**QUIET, 'driver_torque': 4.0})
+  d.update(True, k + 1, **{**QUIET, 'driver_torque': 4.0})
+  d.reset()                                            # lateral control dropped between the readings
+  d.update(True, k + 2, **{**QUIET, 'driver_torque': 4.0})
+  assert not d.touch and d.holdoff == 0
+
+
 def test_reset_is_immediate():
   d = TiDither()
   for k in range(frames(2)):
@@ -289,7 +346,7 @@ def test_lateral_off_or_ti_not_running_zeroes_the_dither_at_once():
 
 
 def test_driver_touch_zeroes_the_dither_at_once():
-  for touch in (dict(pressed=True, driver=9.0), dict(driver=4.5), dict(driver=-6.0)):
+  for touch in (dict(pressed=True, driver=9.0), dict(driver=6.5), dict(driver=-6.0)):
     on = host(True, True)
     for k in range(frames(3)):
       step(on, 0.05)
@@ -376,4 +433,5 @@ def test_stats_stamp_names_dithered_runs_only():
     step(on, 0.05)
   stamp = cfg(on)['TiDither']
   assert stamp['preset'] == td.ACTIVE_PRESET and stamp['frames'] == on.ti_dither_frames > 100
+  assert stamp['touch_confirm'] == td.TOUCH_CONFIRM_FRAMES
   assert {k: v for k, v in cfg(on).items() if k != 'TiDither'} == cfg(off)

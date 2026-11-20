@@ -19,7 +19,8 @@ The stock command, CAN definitions and panda safety are untouched.
 When. Only while lateral control is active and the TI is in RUN, the toggle is on, speed >= MIN_SPEED_MPS, the driver
 is not touching the wheel, no blinker or lane change, the undithered TI request is at most MAX_BASE_FRACTION of
 TI_STEER_MAX and the desired lateral acceleration is at most MAX_LAT_DEMAND_MPS2. After a driver touch or a blinker
-it stays off for HOLDOFF_S. It fades in over FADE_IN_S and out over FADE_OUT_S with a raised-cosine envelope; a driver
+it stays off for HOLDOFF_S (a touch: steeringPressed, a firm torque reading, or a small one that persists for
+TOUCH_CONFIRM_FRAMES frames; see the constants). It fades in over FADE_IN_S and out over FADE_OUT_S with a raised-cosine envelope; a driver
 touch, lateral control dropping or the TI leaving RUN zero it at once, and so does a live rate limit with too little
 room for it (`rate_room`).
 
@@ -51,7 +52,12 @@ ACTIVE_PRESET = 1
 MIN_SPEED_MPS = 15.0          # above the LKAS_BLOCK clear speed (14.5 m/s): stock path consistently unblocked
 MAX_BASE_FRACTION = 0.5       # undithered TI request at most half of TI_STEER_MAX: far from the clip and the knee
 MAX_LAT_DEMAND_MPS2 = 1.0     # desired lateral acceleration v^2 * |curvature|: gentle curves and straights only
-DRIVER_QUIET_COUNTS = 4.0     # |driver torque| must stay under this (and steeringPressed false)
+DRIVER_QUIET_COUNTS = 4.0     # |driver torque| at or above this for TOUCH_CONFIRM_FRAMES frames running is a touch
+DRIVER_FIRM_COUNTS = 6.0      # |driver torque| at or above this is a touch on the first frame (as is steeringPressed)
+# The first dither drive (2026-11-19) treated every reading at or above DRIVER_QUIET_COUNTS as a touch: 110 of its 139
+# touch trips above the gate speed lasted one or two frames, 90 % of them a reading of exactly 4 counts, hands off,
+# and each cost the hold-off and the fade-in. A reading has to persist now unless it is firm or the pressed flag is up.
+TOUCH_CONFIRM_FRAMES = 3
 HOLDOFF_S = 3.0               # off for this long after a driver touch, a blinker or a lane change
 FADE_IN_S = 1.0
 FADE_OUT_S = 0.25
@@ -97,15 +103,17 @@ def gate_open(*, v_ego, steering_pressed, driver_torque, blinker, base_request, 
 
 
 def gate_reason(*, engaged, enabled, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
-                lat_demand, holdoff, room=None):
+                lat_demand, holdoff, room=None, touch=None):
   """Display only: why the dither is or is not running, as one short code for the on-car Tests screen. Not used by
   `TiDither.update` or anywhere in the command path; the car controller calls it only when it publishes test
-  progress (every 5 s, and only while a test is on). Same conditions, in the same order of precedence, as `update`."""
+  progress (every 5 s, and only while a test is on). Same conditions, in the same order of precedence, as `update`.
+  `touch`: the dither's own confirmed verdict (`TiDither.touch`); None: every reading at or above
+  DRIVER_QUIET_COUNTS counts."""
   if not engaged:
     return "inactive"
   if not enabled:
     return "off"
-  if steering_pressed or abs(driver_torque) >= DRIVER_QUIET_COUNTS:
+  if (steering_pressed or abs(driver_torque) >= DRIVER_QUIET_COUNTS) if touch is None else touch:
     return "touch"
   if room is not None and not rate_room_ok(room):
     return "rate"
@@ -123,14 +131,22 @@ def gate_reason(*, engaged, enabled, v_ego, steering_pressed, driver_torque, bli
 
 
 class TiDither:
-  def __init__(self, preset=ACTIVE_PRESET):
+  def __init__(self, preset=ACTIVE_PRESET, touch_confirm_frames=TOUCH_CONFIRM_FRAMES):
     self.preset = preset
+    self.touch_confirm_frames = touch_confirm_frames   # 1: the first drive's gate (a replay of that drive)
+    self.loud = 0             # frames running with |driver torque| >= DRIVER_QUIET_COUNTS
+    self.touch = False        # the latest update's verdict: the driver is touching the wheel
     self.envelope = 0.0       # 0..1, linear; the applied gain is its raised-cosine shape
     self.holdoff = 0          # frames left before the dither may fade in again
     self.last = 0             # the integer dither of the latest update
 
   def reset(self):
     """Lateral control off or TI not in RUN: zero at once, start any later fade-in from nothing."""
+    self._zero()
+    self.loud = 0
+    self.touch = False
+
+  def _zero(self):
     self.envelope = 0.0
     self.last = 0
 
@@ -142,18 +158,23 @@ class TiDither:
     """The integer dither (TI counts) to add to this frame's TI request. Call only while lateral control is active
     and the TI is allowed; otherwise call `reset`. `room`: `rate_room` of the live limits (None: not checked).
 
-    A driver touch (steeringPressed or |driver torque| >= DRIVER_QUIET_COUNTS) and too little rate room zero the
-    dither at once; every other exit fades it out over FADE_OUT_S."""
-    touch = steering_pressed or abs(driver_torque) >= DRIVER_QUIET_COUNTS
+    A driver touch and too little rate room zero the dither at once; every other exit fades it out over FADE_OUT_S.
+    A touch is steeringPressed, |driver torque| >= DRIVER_FIRM_COUNTS, or |driver torque| >= DRIVER_QUIET_COUNTS on
+    `touch_confirm_frames` updates running; a shorter small reading changes nothing."""
+    magnitude = abs(driver_torque)
+    self.loud = self.loud + 1 if magnitude >= DRIVER_QUIET_COUNTS else 0
+    touch = self.touch = bool(steering_pressed or magnitude >= DRIVER_FIRM_COUNTS
+                              or self.loud >= self.touch_confirm_frames)
     if touch or blinker:
       self.holdoff = int(round(HOLDOFF_S / DT))
     elif self.holdoff > 0:
       self.holdoff -= 1
     if touch or (room is not None and not rate_room_ok(room, self.preset)):
-      self.reset()
+      self._zero()
       return 0
+    # Not a touch (above): the gate's own touch terms are given quiet values so an unconfirmed reading does not fade.
     want = enabled and self.holdoff == 0 and gate_open(
-      v_ego=v_ego, steering_pressed=steering_pressed, driver_torque=driver_torque, blinker=blinker,
+      v_ego=v_ego, steering_pressed=False, driver_torque=0.0, blinker=blinker,
       base_request=base_request, ti_max=ti_max, lat_demand=lat_demand)
     if want:
       self.envelope = min(1.0, self.envelope + DT / FADE_IN_S)
