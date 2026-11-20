@@ -87,6 +87,16 @@ void Sidebar::updateTheme() {
 
 void Sidebar::showEvent(QShowEvent *event) {
   updateTheme();
+
+  // The test card's counters stop while the sidebar is hidden, so start them over: it reads ON · WAIT until the
+  // dithered-frame count is seen to rise again
+  testFramesPrev = -1;
+  testIdleSeconds = 99;
+  testMismatchSeconds = 0;
+  testTick = UI_FREQ - 1;
+  if (showTest) {
+    updateTestStatus();
+  }
 }
 
 void Sidebar::mousePressEvent(QMouseEvent *event) {
@@ -102,7 +112,7 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
 
   if (onroad && showTest && test_rect.contains(pos)) {
     // Same write the Settings toggle makes; the updateFrogPilotToggles() below makes it live
-    testRequested = !testRequested;
+    testRequested = !params.getBool("TiDither");
     testMismatchSeconds = 0;
     params.putBool("TiDither", testRequested);
     updateTestStatus();
