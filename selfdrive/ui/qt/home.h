@@ -95,6 +95,8 @@ private:
   void updateAutoScreenRefresh(bool started);
 
   qint64 offroad_since = 0;
+  // Epoch seconds before which the auto pass may not start again, set by a tap; 0 when not deferred.
+  qint64 refresh_not_before = 0;
   bool drove_this_cycle = false;
   // Both cached at the offroad transition rather than read in the idle loop, which otherwise runs
   // at UI_FREQ for as long as the device sits parked. idle_window_s is how long the device will

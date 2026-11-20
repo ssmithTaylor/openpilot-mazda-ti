@@ -39,6 +39,8 @@ namespace {
   // scheduled around, and below which a pass is not worth starting at all.
   constexpr qint64 AUTO_REFRESH_MARGIN_S = 60;
   constexpr qint64 AUTO_REFRESH_MIN_RUN_S = 60;
+  // A tap on the automatic pass puts it off by this long rather than ending it for the drive.
+  constexpr qint64 AUTO_REFRESH_TAP_DEFER_S = 5 * 60;
 
   // FrogPilot's offroad shutdown setting, in the same shape frogpilot_variables computes it:
   // (setting - 3) hours from 4 up, setting * 15 minutes below. Setting 0 means the device powers
@@ -151,6 +153,10 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   if (now - offroad_since < delay) {
     return;
   }
+  // Put off by a tap on the previous pass in this offroad period.
+  if (now < refresh_not_before) {
+    return;
+  }
   // Weekly, like a TV's compensation cycle. Running a bright full-screen pass after every drive
   // would itself age the panel faster than the wear it is spreading.
   const qint64 last = params.getInt("LastScreenRefresh");
@@ -172,10 +178,13 @@ void HomeWindow::updateAutoScreenRefresh(bool started) {
   drove_this_cycle = false;
   auto_refresh = new ScreenRefreshOverlay(remaining);
   auto_refresh->on_finished = [this, remaining](int completed) {
-    // Disarm until the next drive ends. Otherwise a tap to stop (which banks a remainder and leaves
-    // LastScreenRefresh unstamped) passes every check above on the next tick and starts it again.
-    offroad_since = 0;
     const int left = remaining - completed;
+    // Stopped early while still parked (a drive start has already cleared offroad_since): put the
+    // next attempt off, or the banked remainder passes every check above on the next tick and the
+    // tap appears to restart it.
+    if (left > 0 && offroad_since != 0) {
+      refresh_not_before = QDateTime::currentSecsSinceEpoch() + AUTO_REFRESH_TAP_DEFER_S;
+    }
     if (left > 0) {
       params.putInt("ScreenRefreshRemaining", left);
     } else {
@@ -226,6 +235,7 @@ void HomeWindow::offroadTransition(bool offroad) {
   // on boot too, and taking over the screen two minutes after switching the device on, having
   // driven nowhere, is not what "after a drive" means.
   offroad_since = (offroad && drove_this_cycle) ? QDateTime::currentSecsSinceEpoch() : 0;
+  refresh_not_before = 0;  // a tap's deferral belongs to the offroad period it was made in
   if (offroad_since != 0) {
     // Cached here so the idle loop does not re-read them at UI_FREQ for however long the device
     // sits parked. Neither can change without another transition through this function.
