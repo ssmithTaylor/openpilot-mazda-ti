@@ -23,7 +23,10 @@ last stats interval ({seq, t: wall clock, on, active, status}); test ids cannot 
 stats cadence (5 s) while a test is on; the flash copy (no "_live") at most once a minute while counting, plus once
 IDLE_FLUSH_S after counting stops, so progress survives ignition-off and reboot. The accountant only ever ADDS what
 it counted since its last publish to whatever the tmpfs copy holds (or, after a reboot, the flash copy), so the UI
-resets a test by deleting its entry from both copies: no reset protocol and no second key.
+resets a test by deleting its entry from both copies. So that a publish which read the record just before the
+deletion cannot bring the entry back, the UI also leaves {"_reset": {<test id>: token}} in the tmpfs copy; the next
+publish drops that entry again, removes the marker, flushes flash at once and echoes the token in
+_live.reset_done; the UI repeats the request until it sees the echo (no second key).
 """
 import json
 import math
@@ -34,6 +37,7 @@ from pathlib import Path
 DEFINITIONS_PATH = Path(__file__).with_name("ti_tests.json")
 PROGRESS_KEY = "TiTestProgress"
 LIVE_KEY = "_live"
+RESET_KEY = "_reset"
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
@@ -325,6 +329,18 @@ def parse_progress(raw):
   return out
 
 
+def parse_resets(raw):
+  """The UI's reset requests in the tmpfs copy: {test id: token}; empty when absent or unusable."""
+  try:
+    doc = json.loads(raw) if raw else None
+  except (ValueError, TypeError):
+    return {}
+  marks = doc.get(RESET_KEY) if isinstance(doc, dict) else None
+  if not isinstance(marks, dict):
+    return {}
+  return {tid: v for tid, v in marks.items() if isinstance(tid, str) and _number(v)}
+
+
 def _log(msg):
   try:
     from openpilot.common.swaglog import cloudlog
@@ -349,6 +365,7 @@ class TestAccountant:
     self.unsaved = False
     self.last_flush = None
     self.seq = 0
+    self.reset_done = {}         # test id -> the UI's reset token this process applied (echoed in the live block)
     self.failed = False
 
   def _fail(self, where):
@@ -379,10 +396,13 @@ class TestAccountant:
     return bool(self.seen_interval) and not self.failed
 
   def _base(self):
-    doc = parse_progress(self.params_memory.get(PROGRESS_KEY, encoding="utf8"))
-    if doc is None:
-      doc = parse_progress(self.params.get(PROGRESS_KEY, encoding="utf8"))
-    return doc if doc is not None else {}
+    """(progress, resets): the tmpfs copy and the UI's reset requests in it, else the flash copy and none."""
+    raw = self.params_memory.get(PROGRESS_KEY, encoding="utf8")
+    doc = parse_progress(raw)
+    if doc is not None:
+      return doc, parse_resets(raw)
+    doc = parse_progress(self.params.get(PROGRESS_KEY, encoding="utf8"))
+    return (doc if doc is not None else {}), {}
 
   def _status(self, on, reasons):
     status = {}
@@ -403,8 +423,13 @@ class TestAccountant:
     if self.failed or not (self.pending or self.seen_interval or self.unsaved or self.live_shown):
       return
     try:
-      doc = self._base()
-      changed = bool(self.pending)
+      doc, resets = self._base()
+      # The UI's "Reset progress": drop the entry here too, so a publish that read the record just before the UI
+      # deleted it cannot bring it back, and say so in the live block (the UI repeats the request until it sees it)
+      for tid, token in resets.items():
+        doc.pop(tid, None)
+        self.reset_done[tid] = token
+      changed = bool(self.pending) or bool(resets)
       for tid, counted in self.pending.items():
         entry = doc.setdefault(tid, {})
         for (arm, b), n in counted.items():
@@ -419,13 +444,13 @@ class TestAccountant:
       self.pending, self.seen_interval = {}, set()
       self.seq += 1
       live = {"seq": self.seq, "t": round(time.time() if wall is None else wall, 1), "on": on, "active": active,
-              "status": self._status(on, reasons)}
+              "status": self._status(on, reasons), "reset_done": dict(self.reset_done)}
       self.params_memory.put(PROGRESS_KEY, json.dumps({**doc, LIVE_KEY: live}))
       self.live_shown = bool(on)
       self.unsaved = self.unsaved or changed
       if self.unsaved:
         since = None if self.last_flush is None else now - self.last_flush
-        if since is None or since >= FLUSH_S or (not changed and since >= IDLE_FLUSH_S):
+        if since is None or since >= FLUSH_S or (not changed and since >= IDLE_FLUSH_S) or resets:
           self.params.put_nonblocking(PROGRESS_KEY, json.dumps(doc))
           self.last_flush = now
           self.unsaved = False

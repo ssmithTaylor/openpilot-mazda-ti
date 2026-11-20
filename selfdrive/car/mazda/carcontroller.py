@@ -8,7 +8,12 @@ from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
 from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE, TI_LIMIT_BOUNDS
 from openpilot.selfdrive.car.mazda.ti_dither import ACTIVE_PRESET as TI_DITHER_PRESET, TiDither, gate_reason, rate_room
-from openpilot.selfdrive.car.mazda.ti_tests import make_accountant
+try:
+  # On-car tests: optional. If the module cannot be imported, the tests are off and this controller runs exactly as
+  # without them (self.ti_tests is None).
+  from openpilot.selfdrive.car.mazda.ti_tests import make_accountant
+except Exception:
+  make_accountant = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -65,8 +70,9 @@ class CarController(CarControllerBase):
     self.ti_reported_last = 0
     # On-car tests (ti_tests.py, definitions in ti_tests.json): counts each enabled test's metric for the Tests
     # screen. Outside the command path: it only reads what this controller already computed. None when the file
-    # holds no valid test, and on every car without the interceptor.
-    self.ti_tests = make_accountant(self.params, self.params_memory) if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None
+    # holds no valid test or the module is missing, and on every car without the interceptor.
+    self.ti_tests = (make_accountant(self.params, self.params_memory)
+                     if make_accountant is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
     self.reset_ti_stats()
 
   def reset_ti_stats(self):

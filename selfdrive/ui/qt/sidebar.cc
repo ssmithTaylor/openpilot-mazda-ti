@@ -34,10 +34,15 @@ constexpr int TI_TEST_MAX_STATUS = 80;
 constexpr int TI_TEST_STALE_S = 12;          // the car side publishes every 5 s
 constexpr int TI_TEST_MISMATCH_S = 2;        // requested but not applied for longer than this: NOT APPLIED
 constexpr int TI_TEST_IDLE_CLOSE_MS = 15000;  // the Tests page closes itself after this long without a touch
+constexpr int TI_TEST_INPUT_DELAY_MS = 400;   // ...and ignores touches this long after it opens
+constexpr int TI_TEST_RESET_POLLS = 15;       // a reset request is repeated for this many polls until echoed
+constexpr double TI_TEST_CONTROLS_STALE_S = 0.5;  // controlsState older than this counts as an alert
 
 const char *const TI_TEST_DEFINITIONS = "../car/mazda/ti_tests.json";  // the UI runs in selfdrive/ui
 const char *const TI_TEST_PROGRESS_KEY = "TiTestProgress";
 const char *const TI_TEST_LIVE_KEY = "_live";
+const char *const TI_TEST_RESET_KEY = "_reset";
+const char *const TI_TEST_CRASH_LOG = "/data/error_logs/error.txt";
 const char *const TI_TEST_OTHER = "other";
 const char *const TI_TEST_ALL = "all";
 const char *const TI_TEST_UNSUPPORTED = "alternate is not supported yet (test ignored)";
@@ -336,6 +341,59 @@ void tiTestRemove(Params &store, const QString &key) {
   store.put(TI_TEST_PROGRESS_KEY, QJsonDocument(after).toJson(QJsonDocument::Compact).toStdString());
 }
 
+// A reset request in the tmpfs copy: the entry deleted and {"_reset": {id: token}} left for the car side, which drops
+// the entry on its next publish too and echoes the token in _live.reset_done (ti_tests.py). An empty tmpfs copy (after
+// a reboot) starts from the flash copy, so the car side, which then reads the tmpfs copy, keeps the other entries.
+void tiTestMark(Params &store, Params &fallback, const QString &key, qint64 token) {
+  std::string raw = store.get(TI_TEST_PROGRESS_KEY);
+  if (raw.empty()) {
+    raw = fallback.get(TI_TEST_PROGRESS_KEY);
+  }
+  const QJsonObject before = QJsonDocument::fromJson(QByteArray::fromStdString(raw)).object();
+  QJsonObject after;
+  for (const QString &k : before.keys()) {
+    if (k != key) {
+      after[k] = before.value(k);
+    }
+  }
+  QJsonObject marks = before.value(TI_TEST_RESET_KEY).toObject();
+  marks[key] = double(token);
+  after[TI_TEST_RESET_KEY] = marks;
+  store.put(TI_TEST_PROGRESS_KEY, QJsonDocument(after).toJson(QJsonDocument::Compact).toStdString());
+}
+
+// One allow-listed setting to "off", written only if it is currently "on" (ALL TESTS OFF and the end-of-drive
+// switch-off both use exactly this)
+bool tiTestSwitchOff(Params &store, const QString &key, bool on) {
+  const std::string k = key.toStdString();
+  if (tiTestAllowed(key) == nullptr || !store.checkKey(k) || store.getBool(k) != on) {
+    return false;
+  }
+  store.putBool(k, !on);
+  return true;
+}
+
+// True whenever the road view would show an alert. Mirrors OnroadAlerts::getAlert (onroad/alerts.cc:31-90), which is
+// a protected member there: the crash log, a controlsState or frogpilotControlsState alert of any size,
+// controlsState not yet received this drive, or controlsState stale (the UI's own "Controls Unresponsive" alerts)
+bool tiTestsAlertShowing(const UIState &s, const FrogPilotUIState &fs) {
+  auto &sm = *(s.sm);
+  const SubMaster &fpsm = *(fs.sm);
+  if (QFile::exists(TI_TEST_CRASH_LOG)) {
+    return true;
+  }
+  if (sm.rcv_frame("controlsState") < s.scene.started_frame) {
+    return true;
+  }
+  if ((nanos_since_boot() - sm.rcv_time("controlsState")) / 1e9 > TI_TEST_CONTROLS_STALE_S) {
+    return true;
+  }
+  const cereal::ControlsState::Reader &cs = sm["controlsState"].getControlsState();
+  const cereal::FrogPilotControlsState::Reader &fpcs = fpsm["frogpilotControlsState"].getFrogpilotControlsState();
+  return cs.getAlertSize() != cereal::ControlsState::AlertSize::NONE ||
+         static_cast<cereal::ControlsState::AlertSize>(fpcs.getAlertSize()) != cereal::ControlsState::AlertSize::NONE;
+}
+
 // The tests card and page exist only on a TI-equipped Mazda at tuning level 3, as the Settings toggle does
 bool tiTestsAllowed(const UIState &s, const FrogPilotUIState &fs) {
   auto &sm = *(s.sm);
@@ -408,6 +466,25 @@ void TiTests::poll(const QJsonObject &toggles) {
   const double age = QDateTime::currentSecsSinceEpoch() - live.value("t").toDouble();
   const bool fresh = live.value("t").isDouble() && age > -TI_TEST_STALE_S && age < TI_TEST_STALE_S;
 
+  // Reset requests not yet echoed by the car side: repeat one whose marker a car-side write overwrote
+  if (!pending_resets.keys().isEmpty()) {
+    reset_polls++;
+    const QJsonObject echoed = live.value("reset_done").toObject();
+    const QJsonObject marks = progress.value(TI_TEST_RESET_KEY).toObject();
+    QMap<QString, qint64> still;
+    for (const QString &id : pending_resets.keys()) {
+      const qint64 token = pending_resets.value(id);
+      if (echoed.value(id).toDouble() == double(token) || reset_polls > TI_TEST_RESET_POLLS) {
+        continue;
+      }
+      if (!(marks.value(id).toDouble() == double(token))) {
+        tiTestMark(tests_params_memory, tests_params, id, token);
+      }
+      still.insert(id, token);
+    }
+    pending_resets = still;
+  }
+
   views.resize(defs.size());
   for (size_t i = 0; i < defs.size(); i++) {
     const TiTestDef &def = defs[i];
@@ -444,7 +521,7 @@ void TiTests::poll(const QJsonObject &toggles) {
     view.seconds.clear();
     for (const QString &key : entry.keys()) {
       if (entry.value(key).isDouble()) {
-        view.seconds[key] = entry.value(key).toDouble();
+        view.seconds.insert(key, entry.value(key).toDouble());
       }
     }
 
@@ -485,9 +562,7 @@ void TiTests::toggle(int i) {
 // Every allow-listed key to "off", whatever the definitions say (works with a broken file too)
 void TiTests::allOff() {
   for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
-    if (tests_params.checkKey(a.key) && tests_params.getBool(a.key) == a.on) {
-      tests_params.putBool(a.key, !a.on);
-    }
+    tiTestSwitchOff(tests_params, QString(a.key), a.on);
   }
   for (TiTestView &view : views) {
     view.mismatch_ticks = 0;
@@ -500,8 +575,11 @@ void TiTests::resetProgress(int i) {
   if (i < 0 || i >= (int)defs.size()) {
     return;
   }
-  tiTestRemove(tests_params_memory, defs[i].id);
+  const qint64 token = QDateTime::currentMSecsSinceEpoch();
   tiTestRemove(tests_params, defs[i].id);
+  tiTestMark(tests_params_memory, tests_params, defs[i].id, token);
+  pending_resets.insert(defs[i].id, token);
+  reset_polls = 0;
   if (i < (int)views.size()) {
     views[i].seconds.clear();
   }
@@ -516,10 +594,7 @@ void TiTests::driveEnded() {
       continue;
     }
     for (const QPair<QString, bool> &s : def.settings) {
-      if (tests_params.getBool(s.first.toStdString()) == s.second) {
-        tests_params.putBool(s.first.toStdString(), !s.second);
-        changed = true;
-      }
+      changed = tiTestSwitchOff(tests_params, s.first, s.second) || changed;
     }
   }
   if (changed) {
@@ -529,7 +604,7 @@ void TiTests::driveEnded() {
   const QJsonObject live_copy = QJsonDocument::fromJson(QByteArray::fromStdString(tests_params_memory.get(TI_TEST_PROGRESS_KEY))).object();
   QJsonObject kept;
   for (const QString &k : live_copy.keys()) {
-    if (k != TI_TEST_LIVE_KEY) {
+    if (!k.startsWith("_")) {  // not the live block or a reset request
       kept[k] = live_copy.value(k);
     }
   }
@@ -609,6 +684,7 @@ QString TiTests::binFor(const TiTestDef &def, double speed_mph) {
 
 TestsWindow::TestsWindow(QWidget *parent) : QWidget(parent) {
   idle.start();
+  opened.start();
 
   ticker = new QTimer(this);
   QObject::connect(ticker, &QTimer::timeout, [this]() {
@@ -616,11 +692,18 @@ TestsWindow::TestsWindow(QWidget *parent) : QWidget(parent) {
   });
 }
 
-void TestsWindow::openPage() {
+// False (and the page stays closed) while the road view shows an alert
+bool TestsWindow::openPage() {
+  if (tiTestsAlertShowing(*uiState(), *frogpilotUIState())) {
+    return false;
+  }
   tests.load();
   idle.start();
+  opened.start();
+  pressed_control = 0;
   tick_count = 0;
   refresh();
+  return true;
 }
 
 void TestsWindow::showEvent(QShowEvent *event) {
@@ -642,18 +725,10 @@ void TestsWindow::tick() {
     return;
   }
   const UIState &s = *uiState();
-  auto &sm = *(s.sm);
 
-  // Back to the driving screen at the end of the drive, after 15 s without a touch, and at once for an alert that
-  // needs the driver
-  if (!s.scene.started || idle.elapsed() > TI_TEST_IDLE_CLOSE_MS) {
-    leave();
-    return;
-  }
-  const auto cs = sm["controlsState"].getControlsState();
-  const auto alert_size = cs.getAlertSize();
-  if (alert_size == cereal::ControlsState::AlertSize::MID || alert_size == cereal::ControlsState::AlertSize::FULL ||
-      (alert_size != cereal::ControlsState::AlertSize::NONE && cs.getAlertStatus() != cereal::ControlsState::AlertStatus::NORMAL)) {
+  // Back to the driving screen at the end of the drive, after 15 s without a touch, and at once for ANY alert the
+  // road view would show
+  if (!s.scene.started || idle.elapsed() > TI_TEST_IDLE_CLOSE_MS || tiTestsAlertShowing(s, *frogpilotUIState())) {
     leave();
     return;
   }
@@ -700,35 +775,67 @@ QRect TestsWindow::resetRect(int i) const {
   return QRect(width() - 430, rowTop(i) + 10, 400, 110);
 }
 
-void TestsWindow::mousePressEvent(QMouseEvent *event) {
-  const QPoint pos = event->pos();
-  idle.start();
-
+// Controls: 1 BACK, 2 ALL TESTS OFF, 10 + i the on/off box of test i, 20 + i its Reset progress; 0 none
+int TestsWindow::controlAt(const QPoint &pos) const {
   if (backRect().contains(pos)) {
+    return 1;
+  }
+  if (allOffRect().contains(pos)) {
+    return 2;
+  }
+  for (int i = 0; i < (int)tests.defs.size(); i++) {
+    if (toggleRect(i).contains(pos)) {
+      return 10 + i;
+    }
+    if (resetRect(i).contains(pos)) {
+      return 20 + i;
+    }
+  }
+  return 0;
+}
+
+// A press only records which control it is on, and none in the first moment after the page opens (the on/off box
+// sits where the sidebar card was, so a second tap or a bounce of the opening tap must not switch the test)
+void TestsWindow::mousePressEvent(QMouseEvent *event) {
+  idle.start();
+  pressed_control = opened.elapsed() < TI_TEST_INPUT_DELAY_MS ? 0 : controlAt(event->pos());
+}
+
+// A control acts on release, and only when press and release are on the same control
+void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
+  idle.start();
+  const int control = controlAt(event->pos());
+  const int pressed = pressed_control;
+  pressed_control = 0;
+  if (control == 0 || control != pressed) {
+    return;
+  }
+
+  if (control == 1) {
     leave();
     return;
   }
-  if (allOffRect().contains(pos)) {
+  if (control == 2) {
     tests.allOff();
     refresh();
     return;
   }
-  for (int i = 0; i < (int)tests.defs.size(); i++) {
-    if (toggleRect(i).contains(pos)) {
-      tests.toggle(i);
-      refresh();
-      return;
-    }
-    if (resetRect(i).contains(pos)) {
-      const QString prompt = QString("Reset the time collected for \"%1\"? This cannot be undone.").arg(tests.defs[i].title);
-      if (ConfirmationDialog::confirm(prompt, QString("Reset"), this)) {
-        tests.resetProgress(i);
-      }
-      idle.start();
-      refresh();
-      return;
-    }
+  const int i = control >= 20 ? control - 20 : control - 10;
+  if (i < 0 || i >= (int)tests.defs.size()) {
+    return;
   }
+  if (control < 20) {
+    tests.toggle(i);
+    refresh();
+    return;
+  }
+  const QString prompt = QString("Reset the time collected for \"%1\"? This cannot be undone.").arg(tests.defs[i].title);
+  if (ConfirmationDialog::confirm(prompt, QString("Reset"), this)) {
+    tests.resetProgress(i);
+  }
+  idle.start();
+  opened.start();  // the dialog's own taps end here: no stray input right after it closes
+  refresh();
 }
 
 void TestsWindow::drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const {
@@ -761,8 +868,13 @@ void TestsWindow::drawTest(QPainter &p, int i) {
   p.setFont(InterFont(64, QFont::Bold));
   p.drawText(toggle_r.adjusted(10, 10, -10, -toggle_r.height() / 3), Qt::AlignCenter, view.state);
   p.setFont(InterFont(36));
-  p.drawText(toggle_r.adjusted(10, toggle_r.height() * 2 / 3 - 20, -10, -10), Qt::AlignCenter,
+  p.drawText(toggle_r.adjusted(10, toggle_r.height() * 2 / 3 - 20, -10, def.off_at_ignition_off ? -70 : -10), Qt::AlignCenter,
              view.requested ? QString("tap to switch off") : QString("tap to switch on"));
+  if (def.off_at_ignition_off) {
+    p.setFont(InterFont(28));
+    p.drawText(QRect(toggle_r.x() + 10, toggle_r.bottom() - 60, toggle_r.width() - 20, 50), Qt::AlignCenter,
+               QString("turns off when the car is switched off"));
+  }
 
   drawBox(p, resetRect(i), QColor(0x33, 0x33, 0x33), white, QString("Reset progress"), 40);
 
@@ -1042,7 +1154,7 @@ void Sidebar::mouseReleaseEvent(QMouseEvent *event) {
     pm->send("userFlag", msg);
   } else if (settings_btn.contains(event->pos())) {
     emit openSettings();
-  } else if (open_tests) {
+  } else if (open_tests && !tiTestsAlertShowing(*uiState(), *frogpilotUIState())) {
     emit openTests();
   }
 }

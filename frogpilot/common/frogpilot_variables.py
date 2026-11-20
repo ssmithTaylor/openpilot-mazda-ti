@@ -110,7 +110,8 @@ DEVELOPER_SIDEBAR_METRICS = {
 EXCLUDED_KEYS = {
   "AvailableModels", "AvailableModelNames", "CalibratedLateralAcceleration", "CalibrationProgress", "CarParamsPersistent",
   "CurvatureData", "ExperimentalLongitudinalEnabled", "KonikMinutes", "MapBoxRequests", "ModelDrivesAndScores", "ModelVersions",
-  "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches"
+  "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches",
+  "TiTestProgress"
 }
 
 TINYGRAD_FILES = [

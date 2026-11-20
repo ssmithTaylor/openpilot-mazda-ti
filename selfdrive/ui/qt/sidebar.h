@@ -73,6 +73,8 @@ private:
   void setTest(int i, bool on);
 
   QStringList logged_errors;
+  QMap<QString, qint64> pending_resets;  // test id -> reset token, until the car side echoes it
+  int reset_polls = 0;
   Params tests_params;
   Params tests_params_memory{"/dev/shm/params"};
 };
@@ -83,13 +85,14 @@ private:
 class TestsWindow : public QWidget {
 public:
   explicit TestsWindow(QWidget *parent = nullptr);
-  void openPage();
+  bool openPage();
 
   std::function<void()> on_close;
 
 protected:
   void paintEvent(QPaintEvent *event) override;
   void mousePressEvent(QMouseEvent *event) override;
+  void mouseReleaseEvent(QMouseEvent *event) override;
   void showEvent(QShowEvent *event) override;
   void hideEvent(QHideEvent *event) override;
 
@@ -103,12 +106,15 @@ private:
   QRect allOffRect() const;
   QRect toggleRect(int i) const;
   QRect resetRect(int i) const;
+  int controlAt(const QPoint &pos) const;
   void drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const;
   void drawTest(QPainter &p, int i);
 
   TiTests tests;
   QTimer *ticker;
   QElapsedTimer idle;
+  QElapsedTimer opened;          // input is ignored for a moment after the page opens
+  int pressed_control = 0;       // the control under the last accepted press; 0: none
   int tick_count = 0;
   bool is_metric = false;
   bool have_speed = false;

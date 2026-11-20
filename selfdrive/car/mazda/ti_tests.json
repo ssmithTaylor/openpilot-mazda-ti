@@ -17,7 +17,8 @@
           [43, 50, "43-50", true],
           [56, 62, "56-62", false]
         ]
-      }
+      },
+      "auto_off": {"at_ignition_off": true}
     }
   ]
 }

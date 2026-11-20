@@ -32,8 +32,9 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
     closeSettings();
   };
   QObject::connect(homeWindow, &HomeWindow::openTests, [=]() {
-    testsWindow->openPage();
-    main_layout->setCurrentWidget(testsWindow);
+    if (testsWindow->openPage()) {  // false while an alert is showing
+      main_layout->setCurrentWidget(testsWindow);
+    }
   });
 
   onboardingWindow = new OnboardingWindow(this);

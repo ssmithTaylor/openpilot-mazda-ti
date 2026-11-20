@@ -83,7 +83,7 @@ def test_shipped_definitions_are_valid_and_define_the_dither_bands():
   d = tests[0]
   assert d.settings == (("TiDither", True),) and d.metric == "active_seconds" and d.target_seconds == 300
   assert d.bins == ((36, 40, "36-40", False), (43, 50, "43-50", True), (56, 62, "56-62", False))
-  assert not d.at_ignition_off
+  assert d.at_ignition_off                       # never stays armed silently across drives
   # Every bin starts above the dither's minimum speed, so all of it is reachable.
   assert min(b[0] for b in d.bins) * MPH > td.MIN_SPEED_MPS
 
@@ -253,7 +253,8 @@ def test_counts_only_applied_frames_while_enabled_and_keeps_optional_bins():
   a.publish(0.0)
   d = live(a)
   assert d["t1"] == {"b": 1.0, "a": 0.3, "other": 0.2}
-  assert {k: v for k, v in d["_live"].items() if k != "t"} == {"seq": 1, "on": ["t1"], "active": ["t1"], "status": {}}
+  assert {k: v for k, v in d["_live"].items() if k != "t"} == {"seq": 1, "on": ["t1"], "active": ["t1"], "status": {},
+                                                                        "reset_done": {}}
   assert abs(d["_live"]["t"] - time.time()) < 60
   assert "_live" not in stored(a.params)          # the flash copy holds progress only
 
@@ -295,10 +296,12 @@ def test_live_block_seq_status_and_the_final_publish_after_switching_off():
   assert live(a)["_live"]["status"] == {"t1": tt.REASON_TEXT["curve"]}
   frames(a, 10, active=())                        # on, not applied
   a.publish(5.0, {"TiDither": "nonsense"}, 5.0)   # unknown code: no status line
-  assert live(a)["_live"] == {"seq": 2, "t": 5.0, "on": ["t1"], "active": [], "status": {}}
+  assert live(a)["_live"] == {"seq": 2, "t": 5.0, "on": ["t1"], "active": [], "status": {},
+                              "reset_done": {}}
   frames(a, 10, toggles=OFF)                      # switched off: one more publish says so, then silence
   a.publish(10.0, None, 10.0)
-  assert live(a)["_live"] == {"seq": 3, "t": 10.0, "on": [], "active": [], "status": {}}
+  assert live(a)["_live"] == {"seq": 3, "t": 10.0, "on": [], "active": [], "status": {},
+                              "reset_done": {}}
   writes = a.params_memory.writes
   for k in range(5):
     frames(a, 10, toggles=OFF)
@@ -402,6 +405,76 @@ def test_run_stamp_lists_tests_that_were_on():
   assert a.run_seen == {"t1"}
 
 
+
+def ui_reset(store, tid, token):
+  """What the UI's Reset progress does to the tmpfs copy (sidebar.cc tiTestMark): entry deleted, marker left."""
+  d = json.loads(store.store[tt.PROGRESS_KEY])
+  d.pop(tid, None)
+  d.setdefault(tt.RESET_KEY, {})[tid] = token
+  store.store[tt.PROGRESS_KEY] = json.dumps(d)
+
+
+def test_reset_marker_is_honoured_echoed_removed_and_flushed():
+  a = accountant(binned(), unbinned())
+  frames(a, 300)
+  a.publish(0.0)
+  flushes = a.params.nonblocking
+  ui_reset(a.params_memory, "t1", 1234567890123)
+  frames(a, 100)
+  a.publish(5.0)                                  # within FLUSH_S of the last flush, but a reset flushes at once
+  d = live(a)
+  assert d["t1"] == {"b": 1.0}                    # only what was counted since
+  assert d["t2"] == {"all": 4.0}                  # other tests untouched
+  assert tt.RESET_KEY not in d and d["_live"]["reset_done"] == {"t1": 1234567890123}
+  assert a.params.nonblocking == flushes + 1 and stored(a.params)["t1"] == {"b": 1.0}
+  assert tt.RESET_KEY not in stored(a.params)
+
+
+def test_reset_survives_a_publish_that_overwrote_it():
+  # The race: the car side read the record, the UI deleted the entry and left its marker, the car side wrote the
+  # record back as it had read it (entry back, marker gone). The UI sees no echo and no marker and asks again; the
+  # next publish drops the entry.
+  a = accountant(binned())
+  frames(a, 300)
+  a.publish(0.0)
+  before = a.params_memory.store[tt.PROGRESS_KEY]
+  ui_reset(a.params_memory, "t1", 7)
+  a.params_memory.store[tt.PROGRESS_KEY] = before                 # overwritten by the racing publish
+  assert tt.RESET_KEY not in live(a) and 7 not in live(a)["_live"]["reset_done"].values()
+  ui_reset(a.params_memory, "t1", 7)                              # the UI repeats it
+  frames(a, 10)
+  a.publish(5.0)
+  assert live(a)["t1"] == {"b": 0.1} and live(a)["_live"]["reset_done"] == {"t1": 7}
+
+
+def test_reset_after_a_reboot_keeps_the_other_tests():
+  # After a reboot the tmpfs copy is empty; the UI seeds it from the flash copy (sidebar.cc tiTestMark), so the car
+  # side, which then reads the tmpfs copy, still has every other entry.
+  a = accountant(binned(), unbinned())
+  a.params.store[tt.PROGRESS_KEY] = json.dumps({"t1": {"b": 9.0}, "t2": {"all": 50.0}})
+  seeded = json.loads(a.params.store[tt.PROGRESS_KEY])
+  seeded.pop("t1")
+  seeded[tt.RESET_KEY] = {"t1": 3}
+  a.params_memory.store[tt.PROGRESS_KEY] = json.dumps(seeded)
+  frames(a, 100)
+  a.publish(0.0)
+  assert live(a)["t1"] == {"b": 1.0} and live(a)["t2"] == {"all": 51.0}
+  assert stored(a.params) == {"t1": {"b": 1.0}, "t2": {"all": 51.0}}
+
+
+def test_a_reset_marker_only_in_flash_or_malformed_is_ignored():
+  a = accountant(binned())
+  a.params.store[tt.PROGRESS_KEY] = json.dumps({"t1": {"b": 9.0}, tt.RESET_KEY: {"t1": 1}})
+  frames(a, 100)
+  a.publish(0.0)
+  assert live(a)["t1"]["b"] == 10.0 and live(a)["_live"]["reset_done"] == {}
+  for marks in ('"x"', '{"t1": "y"}', '[1]'):
+    b = accountant(binned())
+    b.params_memory.store[tt.PROGRESS_KEY] = '{"t1": {"b": 2.0}, "%s": %s}' % (tt.RESET_KEY, marks)
+    frames(b, 100)
+    b.publish(0.0)
+    assert live(b)["t1"]["b"] == 3.0
+
 # ---- the dither's display-only gate reason ---------------------------------------------------------------------
 
 QUIET = dict(engaged=True, enabled=True, v_ego=25.0, steering_pressed=False, driver_torque=-1.0, blinker=False,
@@ -488,6 +561,36 @@ def test_the_accountant_is_outside_the_steering_block():
   assert 'ti_tests' not in names and 'publish_ti_tests' not in names and 'TI_DITHER_ACTIVE' not in names
 
 
+
+def test_a_missing_or_broken_tests_module_leaves_the_controller_without_tests(monkeypatch):
+  import sys as _sys
+  tree = ast.parse((ROOT / 'selfdrive/car/mazda/carcontroller.py').read_text(encoding='utf-8'))
+  guard = next(n for n in tree.body if isinstance(n, ast.Try)
+               and any(isinstance(x, ast.ImportFrom) and x.module.endswith('ti_tests') for x in ast.walk(n)))
+  monkeypatch.setitem(_sys.modules, 'openpilot.selfdrive.car.mazda.ti_tests', None)   # import raises ImportError
+  env = {}
+  exec(compile(ast.Module(body=[guard], type_ignores=[]), 'guard', 'exec'), env)
+  assert env['make_accountant'] is None
+  cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CarController')
+  init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+  assign = next(n for n in init.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Attribute) and t.attr == 'ti_tests' for t in n.targets))
+  h = NS(params=None, params_memory=None)
+  exec(compile(ast.Module(body=[assign], type_ignores=[]), 'init', 'exec'),
+       dict(self=h, CP=NS(flags=8), MazdaFlags=NS(TORQUE_INTERCEPTOR=8), make_accountant=None))
+  assert h.ti_tests is None
+  # and the module itself imports normally in this tree
+  monkeypatch.delitem(_sys.modules, 'openpilot.selfdrive.car.mazda.ti_tests')
+  env = {}
+  exec(compile(ast.Module(body=[guard], type_ignores=[]), 'guard', 'exec'), env)
+  assert env['make_accountant'] is tt.make_accountant or env['make_accountant'].__name__ == 'make_accountant'
+
+
+def test_progress_is_kept_out_of_toggle_resets_and_backups():
+  variables = (ROOT / 'frogpilot/common/frogpilot_variables.py').read_text(encoding='utf-8')
+  excluded = re.search(r'^EXCLUDED_KEYS = \{(.*?)\}', variables, re.S | re.M).group(1)
+  assert '"%s"' % tt.PROGRESS_KEY in excluded
+
 # ---- registration ----------------------------------------------------------------------------------------------
 
 def test_progress_key_and_allow_listed_settings_are_registered():
@@ -526,7 +629,11 @@ def test_qt_limits_agree():
     assert consts.pop(name) == getattr(tt, name), name
   # UI-only: status line length, staleness of the live block (the car publishes every 5 s), NOT APPLIED delay,
   # auto-close
-  assert set(consts) == {'MAX_STATUS', 'STALE_S', 'MISMATCH_S', 'IDLE_CLOSE_MS'}
+  assert set(consts) == {'MAX_STATUS', 'STALE_S', 'MISMATCH_S', 'IDLE_CLOSE_MS', 'INPUT_DELAY_MS', 'RESET_POLLS',
+                         'CONTROLS_STALE_S'}
+  assert consts['INPUT_DELAY_MS'] >= 300 and consts['CONTROLS_STALE_S'] <= 0.5
+  # a reset request is repeated for longer than two of the car side's 5 s publishes (polls are 1 s)
+  assert consts['RESET_POLLS'] > 10
   assert consts['STALE_S'] > 5 and consts['IDLE_CLOSE_MS'] == 15000
   assert all(len(text) <= consts['MAX_STATUS'] for text in tt.REASON_TEXT.values())
 
@@ -540,7 +647,10 @@ def test_qt_key_sets_and_names_agree():
   assert lists == {}
   strings = dict(re.findall(r'const char \*const TI_TEST_(\w+) = "([^"]*)";', src))
   assert strings == {'DEFINITIONS': '../car/mazda/ti_tests.json', 'PROGRESS_KEY': tt.PROGRESS_KEY,
-                     'LIVE_KEY': tt.LIVE_KEY, 'OTHER': tt.OTHER_BIN, 'ALL': tt.ALL_BIN, 'UNSUPPORTED': tt.UNSUPPORTED}
+                     'LIVE_KEY': tt.LIVE_KEY, 'RESET_KEY': tt.RESET_KEY, 'OTHER': tt.OTHER_BIN, 'ALL': tt.ALL_BIN,
+                     'UNSUPPORTED': tt.UNSUPPORTED, 'CRASH_LOG': '/data/error_logs/error.txt'}
+  # the crash log the road view shows "openpilot crashed" for (onroad/alerts.cc)
+  assert '"/data/error_logs/error.txt"' in (ROOT / 'selfdrive/ui/qt/onroad/alerts.cc').read_text(encoding='utf-8')
   values = (ROOT / 'selfdrive/car/mazda/values.py').read_text(encoding='utf-8')
   assert re.search(r'TORQUE_INTERCEPTOR = (\d+)', values).group(1) == '8'
   assert 'getFlags() & 8) != 0' in src
