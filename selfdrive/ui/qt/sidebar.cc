@@ -1,8 +1,888 @@
 #include "selfdrive/ui/qt/sidebar.h"
 
-#include <QMouseEvent>
+#include <algorithm>
 
+#include <QDateTime>
+#include <QDebug>
+#include <QJsonArray>
+#include <QMouseEvent>
+#include <QPainter>
+
+#include "common/util.h"
 #include "selfdrive/ui/qt/util.h"
+#include "selfdrive/ui/qt/widgets/input.h"
+
+// Mazda TI on-car tests. Mirrors selfdrive/car/mazda/ti_tests.py; selfdrive/car/tests/test_mazda_ti_tests.py checks
+// that these limits, key sets and the allow-list agree with the Python copy.
+namespace {
+
+constexpr int TI_TEST_MAX_TESTS = 2;
+constexpr int TI_TEST_MAX_SETTINGS = 3;
+constexpr int TI_TEST_MAX_BINS = 5;
+constexpr int TI_TEST_MIN_ARMS = 2;
+constexpr int TI_TEST_MAX_ARMS = 4;
+constexpr double TI_TEST_MIN_TARGET_S = 10;
+constexpr double TI_TEST_MAX_TARGET_S = 7200;
+constexpr double TI_TEST_MIN_DWELL_S = 30;
+constexpr double TI_TEST_MAX_DWELL_S = 3600;
+constexpr double TI_TEST_MAX_SPEED_MPH = 100;
+constexpr int TI_TEST_MAX_TITLE = 40;
+constexpr int TI_TEST_MAX_DESCRIPTION = 200;
+constexpr int TI_TEST_MAX_ID = 32;
+constexpr int TI_TEST_MAX_LABEL = 16;
+constexpr int TI_TEST_MAX_STATUS = 80;
+constexpr int TI_TEST_STALE_S = 12;          // the car side publishes every 5 s
+constexpr int TI_TEST_MISMATCH_S = 2;        // requested but not applied for longer than this: NOT APPLIED
+constexpr int TI_TEST_IDLE_CLOSE_MS = 15000;  // the Tests page closes itself after this long without a touch
+
+const char *const TI_TEST_DEFINITIONS = "../car/mazda/ti_tests.json";  // the UI runs in selfdrive/ui
+const char *const TI_TEST_PROGRESS_KEY = "TiTestProgress";
+const char *const TI_TEST_LIVE_KEY = "_live";
+const char *const TI_TEST_OTHER = "other";
+const char *const TI_TEST_ALL = "all";
+const char *const TI_TEST_UNSUPPORTED = "alternate is not supported yet (test ignored)";
+
+struct TiTestAllowed {
+  const char *key;     // the param a definition may switch
+  const char *toggle;  // the frogpilot_toggles value that shows what the car applies
+  bool on;             // the value that means "on"; "off" is the other one
+};
+const TiTestAllowed TI_TEST_ALLOWED[] = {
+  {"TiDither", "ti_dither", true},
+};
+
+const QStringList TI_TEST_ACTIVE_SOURCES = {"TiDither"};
+const QStringList TI_TEST_METRICS = {"active_seconds", "engaged_seconds"};
+const QStringList TI_TEST_BIN_BY = {"speed_mph"};
+const QStringList TI_TEST_SWITCH_WHEN = {"straight_only", "between_engagements"};
+const QStringList TI_TEST_FILE_KEYS = {"version", "tests"};
+const QStringList TI_TEST_TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"};
+const QStringList TI_TEST_TEST_REQUIRED = {"id", "title", "description", "settings", "progress"};
+const QStringList TI_TEST_SETTING_KEYS = {"key", "on"};
+const QStringList TI_TEST_PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins"};
+const QStringList TI_TEST_PROGRESS_REQUIRED = {"metric", "target_seconds"};
+const QStringList TI_TEST_AUTO_OFF_KEYS = {"at_ignition_off"};
+const QStringList TI_TEST_ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"};
+const QStringList TI_TEST_ARM_KEYS = {"id", "settings"};
+
+const TiTestAllowed *tiTestAllowed(const QString &key) {
+  for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
+    if (key == a.key) {
+      return &a;
+    }
+  }
+  return nullptr;
+}
+
+bool tiTestBool(const QJsonValue &v) {
+  return v == QJsonValue(true) || v == QJsonValue(false);
+}
+
+// A string that is not blank and at most `longest` characters (a non-string reads as empty)
+bool tiTestText(const QJsonValue &v, int longest) {
+  const QString s = v.toString();
+  return !s.trimmed().isEmpty() && s.length() <= longest;
+}
+
+// id: a-z, then a-z 0-9 _ (ti_tests.ID_RE). Label: A-Z a-z 0-9 _ . - (ti_tests.LABEL_RE)
+bool tiTestChars(const QString &s, int longest, bool id) {
+  const std::string t = s.toStdString();
+  if (t.empty() || (int)t.size() > longest) {
+    return false;
+  }
+  for (size_t k = 0; k < t.size(); k++) {
+    const char c = t[k];
+    const bool lower = c >= 'a' && c <= 'z';
+    const bool digit = c >= '0' && c <= '9';
+    const bool ok = id ? (lower || (k > 0 && (digit || c == '_')))
+                       : (lower || digit || (c >= 'A' && c <= 'Z') || c == '_' || c == '.' || c == '-');
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Every key of o is allowed, and every required key is present
+bool tiTestKeys(const QJsonObject &o, const QStringList &allowed, const QStringList &required) {
+  for (const QString &k : o.keys()) {
+    if (!allowed.contains(k)) {
+      return false;
+    }
+  }
+  for (const QString &k : required) {
+    if (!o.contains(k)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Empty when valid
+QString tiTestSettings(const QJsonValue &raw, Params &params, std::vector<QPair<QString, bool>> &out) {
+  out.clear();
+  const QString count = QString("settings must list 1-%1 toggles").arg(TI_TEST_MAX_SETTINGS);
+  if (!raw.isArray()) {
+    return count;
+  }
+  for (const QJsonValue &s : raw.toArray()) {
+    if ((int)out.size() >= TI_TEST_MAX_SETTINGS) {
+      return count;
+    }
+    const QJsonObject o = s.toObject();
+    if (!s.isObject() || !tiTestKeys(o, TI_TEST_SETTING_KEYS, TI_TEST_SETTING_KEYS)) {
+      return QString("each setting is exactly {key, on}");
+    }
+    const QString key = o.value("key").toString();
+    const TiTestAllowed *allowed = tiTestAllowed(key);
+    if (allowed == nullptr || !params.checkKey(key.toStdString())) {
+      return QString("setting %1 is not allowed").arg(key);
+    }
+    if (!tiTestBool(o.value("on")) || o.value("on").toBool() != allowed->on) {
+      return QString("setting %1: wrong on value").arg(key);
+    }
+    for (const QPair<QString, bool> &pair : out) {
+      if (pair.first == key) {
+        return QString("setting %1 twice").arg(key);
+      }
+    }
+    out.push_back(QPair<QString, bool>(key, allowed->on));
+  }
+  return out.empty() ? count : QString();
+}
+
+QString tiTestBins(const QJsonValue &raw, std::vector<TiTestBin> &out) {
+  out.clear();
+  const QString count = QString("bins must list 1-%1 bins").arg(TI_TEST_MAX_BINS);
+  if (!raw.isArray()) {
+    return count;
+  }
+  for (const QJsonValue &b : raw.toArray()) {
+    if ((int)out.size() >= TI_TEST_MAX_BINS) {
+      return count;
+    }
+    QJsonValue parts[4];
+    int n = 0;
+    for (const QJsonValue &part : b.toArray()) {
+      if (n < 4) {
+        parts[n] = part;
+      }
+      n++;
+    }
+    if (!b.isArray() || n != 4) {
+      return QString("each bin is [low, high, label, required]");
+    }
+    TiTestBin bin;
+    bin.label = parts[2].toString();
+    if (!tiTestChars(bin.label, TI_TEST_MAX_LABEL, false) || bin.label == TI_TEST_OTHER || bin.label == TI_TEST_ALL) {
+      return QString("bad bin label");
+    }
+    bin.low = parts[0].toDouble();
+    bin.high = parts[1].toDouble();
+    if (!parts[0].isDouble() || !parts[1].isDouble() || !(bin.low >= 0 && bin.low < bin.high && bin.high <= TI_TEST_MAX_SPEED_MPH)) {
+      return QString("bin %1: need 0 <= low < high <= %2").arg(bin.label).arg(TI_TEST_MAX_SPEED_MPH);
+    }
+    if (!tiTestBool(parts[3])) {
+      return QString("bin %1: required must be true or false").arg(bin.label);
+    }
+    bin.required = parts[3].toBool();
+    out.push_back(bin);
+  }
+  if (out.empty()) {
+    return count;
+  }
+  std::sort(out.begin(), out.end(), [](const TiTestBin &x, const TiTestBin &y) { return x.low < y.low; });
+  bool any_required = out[0].required;
+  for (size_t k = 1; k < out.size(); k++) {
+    if (out[k].low < out[k - 1].high) {
+      return QString("bins %1 and %2 overlap").arg(out[k - 1].label).arg(out[k].label);
+    }
+    for (size_t j = 0; j < k; j++) {
+      if (out[j].label == out[k].label) {
+        return QString("bin label twice");
+      }
+    }
+    any_required = any_required || out[k].required;
+  }
+  return any_required ? QString() : QString("at least one bin must be required");
+}
+
+// The reserved `alternate` block: empty when it has the reserved shape
+QString tiTestAlternate(const QJsonValue &raw, Params &params) {
+  const QJsonObject a = raw.toObject();
+  if (!raw.isObject() || !tiTestKeys(a, TI_TEST_ALTERNATE_KEYS, TI_TEST_ALTERNATE_KEYS) || !a.value("arms").isArray()) {
+    return QString("alternate is exactly {arms, min_dwell_s, switch_when}");
+  }
+  QStringList ids;
+  for (const QJsonValue &arm : a.value("arms").toArray()) {
+    const QJsonObject o = arm.toObject();
+    if (!arm.isObject() || !tiTestKeys(o, TI_TEST_ARM_KEYS, TI_TEST_ARM_KEYS)) {
+      return QString("alternate: each arm is exactly {id, settings}");
+    }
+    const QString arm_id = o.value("id").toString();
+    if (!tiTestChars(arm_id, TI_TEST_MAX_LABEL, false) || ids.contains(arm_id)) {
+      return QString("alternate: bad or repeated arm id");
+    }
+    ids.append(arm_id);
+    std::vector<QPair<QString, bool>> arm_settings;
+    const QString why = tiTestSettings(o.value("settings"), params, arm_settings);
+    if (!why.isEmpty()) {
+      return QString("alternate arm %1: %2").arg(arm_id).arg(why);
+    }
+  }
+  if (ids.size() < TI_TEST_MIN_ARMS || ids.size() > TI_TEST_MAX_ARMS) {
+    return QString("alternate: arms must list %1-%2 arms").arg(TI_TEST_MIN_ARMS).arg(TI_TEST_MAX_ARMS);
+  }
+  const double dwell = a.value("min_dwell_s").toDouble();
+  if (!a.value("min_dwell_s").isDouble() || !(dwell >= TI_TEST_MIN_DWELL_S && dwell <= TI_TEST_MAX_DWELL_S)) {
+    return QString("alternate: min_dwell_s must be %1-%2 s").arg(TI_TEST_MIN_DWELL_S).arg(TI_TEST_MAX_DWELL_S);
+  }
+  if (!TI_TEST_SWITCH_WHEN.contains(a.value("switch_when").toString())) {
+    return QString("alternate: unknown switch_when");
+  }
+  return QString();
+}
+
+// One test entry (ti_tests.validate_test). Empty when valid; a well-formed `alternate` block returns UNSUPPORTED.
+QString tiTestValidate(const QJsonValue &raw, Params &params, TiTestDef &def) {
+  const QJsonObject t = raw.toObject();
+  if (!raw.isObject()) {
+    return QString("not an object");
+  }
+  if (!tiTestKeys(t, TI_TEST_TEST_KEYS, TI_TEST_TEST_REQUIRED)) {
+    return QString("unknown or missing key");
+  }
+  def.id = t.value("id").toString();
+  if (!tiTestChars(def.id, TI_TEST_MAX_ID, true)) {
+    return QString("id must be a-z then up to %1 of a-z 0-9 _").arg(TI_TEST_MAX_ID - 1);
+  }
+  if (!tiTestText(t.value("title"), TI_TEST_MAX_TITLE)) {
+    return QString("title must be 1-%1 characters").arg(TI_TEST_MAX_TITLE);
+  }
+  def.title = t.value("title").toString();
+  if (!tiTestText(t.value("description"), TI_TEST_MAX_DESCRIPTION)) {
+    return QString("description must be 1-%1 characters").arg(TI_TEST_MAX_DESCRIPTION);
+  }
+  QString why = tiTestSettings(t.value("settings"), params, def.settings);
+  if (!why.isEmpty()) {
+    return why;
+  }
+
+  const QJsonObject p = t.value("progress").toObject();
+  if (!t.value("progress").isObject() || !tiTestKeys(p, TI_TEST_PROGRESS_KEYS, TI_TEST_PROGRESS_REQUIRED)) {
+    return QString("progress: unknown or missing key");
+  }
+  def.metric = p.value("metric").toString();
+  if (!TI_TEST_METRICS.contains(def.metric)) {
+    return QString("unknown metric");
+  }
+  if (def.metric == "active_seconds") {
+    bool source = false;
+    for (const QPair<QString, bool> &s : def.settings) {
+      source = source || TI_TEST_ACTIVE_SOURCES.contains(s.first);
+    }
+    if (!source) {
+      return QString("active_seconds needs a setting that reports applied time");
+    }
+  }
+  def.target = p.value("target_seconds").toDouble();
+  if (!p.value("target_seconds").isDouble() || !(def.target >= TI_TEST_MIN_TARGET_S && def.target <= TI_TEST_MAX_TARGET_S)) {
+    return QString("target_seconds must be %1-%2").arg(TI_TEST_MIN_TARGET_S).arg(TI_TEST_MAX_TARGET_S);
+  }
+  def.bins.clear();
+  if (p.contains("bins") != p.contains("bin_by")) {
+    return QString("bins and bin_by go together");
+  }
+  if (p.contains("bins")) {
+    if (!TI_TEST_BIN_BY.contains(p.value("bin_by").toString())) {
+      return QString("unknown bin_by");
+    }
+    why = tiTestBins(p.value("bins"), def.bins);
+    if (!why.isEmpty()) {
+      return why;
+    }
+  }
+
+  def.off_at_ignition_off = false;
+  if (t.contains("auto_off")) {
+    const QJsonObject a = t.value("auto_off").toObject();
+    const QJsonValue at_off = a.value("at_ignition_off");
+    if (!t.value("auto_off").isObject() || !tiTestKeys(a, TI_TEST_AUTO_OFF_KEYS, QStringList()) ||
+        (a.contains("at_ignition_off") && !tiTestBool(at_off))) {
+      return QString("auto_off is {at_ignition_off: true/false}");
+    }
+    def.off_at_ignition_off = at_off.toBool();
+  }
+
+  if (t.contains("alternate")) {
+    why = tiTestAlternate(t.value("alternate"), params);
+    return why.isEmpty() ? QString(TI_TEST_UNSUPPORTED) : why;
+  }
+  return QString();
+}
+
+// A progress document without one top-level key; written back only when the key was there
+void tiTestRemove(Params &store, const QString &key) {
+  const QJsonObject before = QJsonDocument::fromJson(QByteArray::fromStdString(store.get(TI_TEST_PROGRESS_KEY))).object();
+  if (!before.contains(key)) {
+    return;
+  }
+  QJsonObject after;
+  for (const QString &k : before.keys()) {
+    if (k != key) {
+      after[k] = before.value(k);
+    }
+  }
+  store.put(TI_TEST_PROGRESS_KEY, QJsonDocument(after).toJson(QJsonDocument::Compact).toStdString());
+}
+
+// The tests card and page exist only on a TI-equipped Mazda at tuning level 3, as the Settings toggle does
+bool tiTestsAllowed(const UIState &s, const FrogPilotUIState &fs) {
+  auto &sm = *(s.sm);
+  return sm.rcv_frame("carParams") > 0 && fs.frogpilot_toggles.value("car_make").toString() == "mazda" &&
+         (sm["carParams"].getCarParams().getFlags() & 8) != 0 &&  // MazdaFlags.TORQUE_INTERCEPTOR (selfdrive/car/mazda/values.py)
+         fs.frogpilot_toggles.value("tuning_level").toInt() >= 3;
+}
+
+}  // namespace
+
+void TiTests::load() {
+  defs.clear();
+  errors.clear();
+
+  const QString json = QString::fromStdString(util::read_file(TI_TEST_DEFINITIONS));
+  const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+  const QJsonObject root = doc.object();
+  if (json.isEmpty()) {
+    errors.append(QString("Invalid definition file: cannot read selfdrive/car/mazda/ti_tests.json"));
+  } else if (!doc.isObject() || !tiTestKeys(root, TI_TEST_FILE_KEYS, TI_TEST_FILE_KEYS) ||
+             !root.value("version").isDouble() || root.value("version").toDouble() != 1.0) {
+    errors.append(QString("Invalid definition file: must be exactly {version: 1, tests: [...]}"));
+  } else if (!root.value("tests").isArray()) {
+    errors.append(QString("Invalid definition file: tests must be a list"));
+  } else {
+    int index = 0;
+    for (const QJsonValue &raw : root.value("tests").toArray()) {
+      index++;
+      const QString given = raw.toObject().value("id").toString();
+      const QString name = given.isEmpty() ? QString("#%1").arg(index) : given;
+      if (index > TI_TEST_MAX_TESTS) {
+        errors.append(QString("Invalid definition: %1: more than %2 tests").arg(name).arg(TI_TEST_MAX_TESTS));
+        continue;
+      }
+      TiTestDef def;
+      const QString why = tiTestValidate(raw, tests_params, def);
+      bool twice = false;
+      for (const TiTestDef &d : defs) {
+        twice = twice || d.id == def.id;
+      }
+      if (why == TI_TEST_UNSUPPORTED) {
+        errors.append(QString("Not supported yet: %1 (automatic alternating), test ignored").arg(name));
+      } else if (!why.isEmpty()) {
+        errors.append(QString("Invalid definition: %1: %2").arg(name).arg(why));
+      } else if (twice) {
+        errors.append(QString("Invalid definition: %1: id twice").arg(name));
+      } else {
+        defs.push_back(def);
+      }
+    }
+  }
+  views.assign(defs.size(), TiTestView());
+
+  if (errors != logged_errors) {
+    for (const QString &e : errors) {
+      qWarning() << "ti_tests:" << e;
+    }
+    logged_errors = errors;
+  }
+}
+
+void TiTests::poll(const QJsonObject &toggles) {
+  // The tmpfs copy is the live one (with the car side's _live block); the flash copy after a reboot
+  std::string raw = tests_params_memory.get(TI_TEST_PROGRESS_KEY);
+  if (raw.empty()) {
+    raw = tests_params.get(TI_TEST_PROGRESS_KEY);
+  }
+  const QJsonObject progress = QJsonDocument::fromJson(QByteArray::fromStdString(raw)).object();
+  const QJsonObject live = progress.value(TI_TEST_LIVE_KEY).toObject();
+  const double age = QDateTime::currentSecsSinceEpoch() - live.value("t").toDouble();
+  const bool fresh = live.value("t").isDouble() && age > -TI_TEST_STALE_S && age < TI_TEST_STALE_S;
+
+  views.resize(defs.size());
+  for (size_t i = 0; i < defs.size(); i++) {
+    const TiTestDef &def = defs[i];
+    TiTestView &view = views[i];
+
+    int on_count = 0;
+    bool effective = true;
+    for (const QPair<QString, bool> &s : def.settings) {
+      if (tests_params.getBool(s.first.toStdString()) == s.second) {
+        on_count++;
+      }
+      const TiTestAllowed *allowed = tiTestAllowed(s.first);
+      if (allowed == nullptr || !(toggles.value(allowed->toggle) == QJsonValue(s.second))) {
+        effective = false;
+      }
+    }
+    view.requested = on_count == (int)def.settings.size();
+    view.any_on = on_count > 0;
+    view.mismatch_ticks = (view.requested && !effective) ? view.mismatch_ticks + 1 : 0;
+
+    view.active = false;
+    if (fresh) {
+      for (const QJsonValue &a : live.value("active").toArray()) {
+        view.active = view.active || a.toString() == def.id;
+      }
+    }
+    view.status = fresh ? live.value("status").toObject().value(def.id).toString().left(TI_TEST_MAX_STATUS) : QString();
+    view.arm = fresh ? live.value("arm").toObject().value(def.id).toString().left(TI_TEST_MAX_LABEL) : QString();
+
+    QJsonObject entry = progress.value(def.id).toObject();
+    if (!view.arm.isEmpty() && entry.value(view.arm).isObject()) {
+      entry = entry.value(view.arm).toObject();
+    }
+    view.seconds.clear();
+    for (const QString &key : entry.keys()) {
+      if (entry.value(key).isDouble()) {
+        view.seconds[key] = entry.value(key).toDouble();
+      }
+    }
+
+    view.light = false;
+    if (view.requested && view.mismatch_ticks > TI_TEST_MISMATCH_S) {
+      view.state = "NOT APPLIED";
+      view.color = QColor(201, 34, 49);
+    } else if (view.requested && view.active) {
+      view.state = "ON · ACTIVE";
+      view.color = QColor(0x17, 0x86, 0x44);
+    } else if (view.requested || view.any_on) {
+      view.state = view.requested ? "ON · WAIT" : "PARTLY ON";
+      view.color = QColor(218, 202, 37);
+      view.light = true;
+    } else {
+      view.state = "OFF";
+      view.color = QColor(0x54, 0x54, 0x54);
+    }
+  }
+}
+
+void TiTests::setTest(int i, bool on) {
+  for (const QPair<QString, bool> &s : defs[i].settings) {
+    tests_params.putBool(s.first.toStdString(), on ? s.second : !s.second);
+  }
+}
+
+// Same writes as the Settings toggles; updateFrogPilotToggles() makes them live, as in Sidebar::mousePressEvent
+void TiTests::toggle(int i) {
+  if (i < 0 || i >= (int)defs.size() || i >= (int)views.size()) {
+    return;
+  }
+  setTest(i, !views[i].requested);
+  views[i].mismatch_ticks = 0;
+  updateFrogPilotToggles();
+}
+
+// Every allow-listed key to "off", whatever the definitions say (works with a broken file too)
+void TiTests::allOff() {
+  for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
+    if (tests_params.checkKey(a.key) && tests_params.getBool(a.key) == a.on) {
+      tests_params.putBool(a.key, !a.on);
+    }
+  }
+  for (TiTestView &view : views) {
+    view.mismatch_ticks = 0;
+  }
+  updateFrogPilotToggles();
+}
+
+// Reset = the test's entry deleted from both copies (ti_tests.py); the car side only ever adds to what is there
+void TiTests::resetProgress(int i) {
+  if (i < 0 || i >= (int)defs.size()) {
+    return;
+  }
+  tiTestRemove(tests_params_memory, defs[i].id);
+  tiTestRemove(tests_params, defs[i].id);
+  if (i < (int)views.size()) {
+    views[i].seconds.clear();
+  }
+}
+
+// At the end of a drive (onroad -> offroad): switch off the tests that ask for it, and copy the live progress to
+// flash so the last minute of counting survives a power-down before the next drive
+void TiTests::driveEnded() {
+  bool changed = false;
+  for (const TiTestDef &def : defs) {
+    if (!def.off_at_ignition_off) {
+      continue;
+    }
+    for (const QPair<QString, bool> &s : def.settings) {
+      if (tests_params.getBool(s.first.toStdString()) == s.second) {
+        tests_params.putBool(s.first.toStdString(), !s.second);
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    updateFrogPilotToggles();
+  }
+
+  const QJsonObject live_copy = QJsonDocument::fromJson(QByteArray::fromStdString(tests_params_memory.get(TI_TEST_PROGRESS_KEY))).object();
+  QJsonObject kept;
+  for (const QString &k : live_copy.keys()) {
+    if (k != TI_TEST_LIVE_KEY) {
+      kept[k] = live_copy.value(k);
+    }
+  }
+  if (!kept.keys().isEmpty()) {
+    tests_params.putNonBlocking(TI_TEST_PROGRESS_KEY, QJsonDocument(kept).toJson(QJsonDocument::Compact).toStdString());
+  }
+}
+
+bool TiTests::done(int i) const {
+  if (i < 0 || i >= (int)defs.size() || i >= (int)views.size()) {
+    return false;
+  }
+  const TiTestDef &def = defs[i];
+  if (def.bins.empty()) {
+    return views[i].seconds.value(TI_TEST_ALL, 0.0) >= def.target;
+  }
+  for (const TiTestBin &bin : def.bins) {
+    if (bin.required && views[i].seconds.value(bin.label, 0.0) < def.target) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int TiTests::countOn() const {
+  int n = 0;
+  for (const TiTestView &view : views) {
+    n += view.any_on ? 1 : 0;
+  }
+  return n;
+}
+
+// Collected share of the required time of the tests that are on, 0-100; -1 when none is on
+int TiTests::overallPercent() const {
+  double sum = 0;
+  int n = 0;
+  for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
+    if (!views[i].requested) {
+      continue;
+    }
+    const TiTestDef &def = defs[i];
+    if (def.bins.empty()) {
+      sum += std::min(1.0, views[i].seconds.value(TI_TEST_ALL, 0.0) / def.target);
+      n++;
+    }
+    for (const TiTestBin &bin : def.bins) {
+      if (bin.required) {
+        sum += std::min(1.0, views[i].seconds.value(bin.label, 0.0) / def.target);
+        n++;
+      }
+    }
+  }
+  return n > 0 ? int(100.0 * sum / n) : -1;
+}
+
+// A bin in the device's units (the definitions are in mph), as data_settings.cc shows speeds
+QString TiTests::binText(const TiTestBin &bin, bool metric) {
+  const double conversion = metric ? MILE_TO_KM : 1.0;
+  return QString("%1-%2 %3").arg(qRound(bin.low * conversion)).arg(qRound(bin.high * conversion))
+                            .arg(metric ? QString("km/h") : QString("mph"));
+}
+
+// The bin a speed counts in, half-open [low, high) as in ti_tests.TestDef.bin_for
+QString TiTests::binFor(const TiTestDef &def, double speed_mph) {
+  if (def.bins.empty()) {
+    return QString(TI_TEST_ALL);
+  }
+  for (const TiTestBin &bin : def.bins) {
+    if (bin.low <= speed_mph && speed_mph < bin.high) {
+      return bin.label;
+    }
+  }
+  return QString(TI_TEST_OTHER);
+}
+
+// TestsWindow: the full-screen Tests page
+
+TestsWindow::TestsWindow(QWidget *parent) : QWidget(parent) {
+  idle.start();
+
+  ticker = new QTimer(this);
+  QObject::connect(ticker, &QTimer::timeout, [this]() {
+    tick();
+  });
+}
+
+void TestsWindow::openPage() {
+  tests.load();
+  idle.start();
+  tick_count = 0;
+  refresh();
+}
+
+void TestsWindow::showEvent(QShowEvent *event) {
+  ticker->start(250);
+}
+
+void TestsWindow::hideEvent(QHideEvent *event) {
+  ticker->stop();
+}
+
+void TestsWindow::leave() {
+  if (on_close) {
+    on_close();
+  }
+}
+
+void TestsWindow::tick() {
+  if (!isVisible()) {
+    return;
+  }
+  const UIState &s = *uiState();
+  auto &sm = *(s.sm);
+
+  // Back to the driving screen at the end of the drive, after 15 s without a touch, and at once for an alert that
+  // needs the driver
+  if (!s.scene.started || idle.elapsed() > TI_TEST_IDLE_CLOSE_MS) {
+    leave();
+    return;
+  }
+  const auto cs = sm["controlsState"].getControlsState();
+  const auto alert_size = cs.getAlertSize();
+  if (alert_size == cereal::ControlsState::AlertSize::MID || alert_size == cereal::ControlsState::AlertSize::FULL ||
+      (alert_size != cereal::ControlsState::AlertSize::NONE && cs.getAlertStatus() != cereal::ControlsState::AlertStatus::NORMAL)) {
+    leave();
+    return;
+  }
+
+  if (++tick_count % 4 == 0) {
+    refresh();
+  }
+}
+
+void TestsWindow::refresh() {
+  const UIState &s = *uiState();
+  auto &sm = *(s.sm);
+
+  is_metric = s.scene.is_metric;
+  have_speed = sm.rcv_frame("carState") > 0;
+  speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
+  tests.poll(frogpilotUIState()->frogpilot_toggles);
+  update();
+}
+
+int TestsWindow::rowTop(int i) const {
+  return 210 + i * rowHeight();
+}
+
+int TestsWindow::rowHeight() const {
+  const int footer = tests.errors.isEmpty() ? 0 : 30 + 50 * std::min(2, (int)tests.errors.size());
+  const int n = std::max(1, (int)tests.defs.size());
+  return (height() - 20 - footer - 210) / n;
+}
+
+QRect TestsWindow::backRect() const {
+  return QRect(30, 24, 440, 150);
+}
+
+QRect TestsWindow::allOffRect() const {
+  return QRect(width() - 670, 24, 640, 150);
+}
+
+QRect TestsWindow::toggleRect(int i) const {
+  return QRect(30, rowTop(i) + 10, 600, rowHeight() - 30);
+}
+
+QRect TestsWindow::resetRect(int i) const {
+  return QRect(width() - 430, rowTop(i) + 10, 400, 110);
+}
+
+void TestsWindow::mousePressEvent(QMouseEvent *event) {
+  const QPoint pos = event->pos();
+  idle.start();
+
+  if (backRect().contains(pos)) {
+    leave();
+    return;
+  }
+  if (allOffRect().contains(pos)) {
+    tests.allOff();
+    refresh();
+    return;
+  }
+  for (int i = 0; i < (int)tests.defs.size(); i++) {
+    if (toggleRect(i).contains(pos)) {
+      tests.toggle(i);
+      refresh();
+      return;
+    }
+    if (resetRect(i).contains(pos)) {
+      const QString prompt = QString("Reset the time collected for \"%1\"? This cannot be undone.").arg(tests.defs[i].title);
+      if (ConfirmationDialog::confirm(prompt, QString("Reset"), this)) {
+        tests.resetProgress(i);
+      }
+      idle.start();
+      refresh();
+      return;
+    }
+  }
+}
+
+void TestsWindow::drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const {
+  p.setPen(Qt::NoPen);
+  p.setBrush(fill);
+  p.drawRoundedRect(r, 24, 24);
+  p.setPen(ink);
+  p.setFont(InterFont(px, QFont::Bold));
+  p.drawText(r, Qt::AlignCenter, text);
+}
+
+void TestsWindow::drawTest(QPainter &p, int i) {
+  if (i >= (int)tests.views.size()) {
+    return;
+  }
+  const TiTestDef &def = tests.defs[i];
+  const TiTestView &view = tests.views[i];
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0xa0, 0xa0, 0xa0);
+  const int top = rowTop(i);
+  const int row_h = rowHeight();
+
+  // The on/off control: state in colour and words
+  const QRect toggle_r = toggleRect(i);
+  const QColor ink = view.light ? QColor(0, 0, 0) : white;
+  p.setPen(Qt::NoPen);
+  p.setBrush(view.color);
+  p.drawRoundedRect(toggle_r, 30, 30);
+  p.setPen(ink);
+  p.setFont(InterFont(64, QFont::Bold));
+  p.drawText(toggle_r.adjusted(10, 10, -10, -toggle_r.height() / 3), Qt::AlignCenter, view.state);
+  p.setFont(InterFont(36));
+  p.drawText(toggle_r.adjusted(10, toggle_r.height() * 2 / 3 - 20, -10, -10), Qt::AlignCenter,
+             view.requested ? QString("tap to switch off") : QString("tap to switch on"));
+
+  drawBox(p, resetRect(i), QColor(0x33, 0x33, 0x33), white, QString("Reset progress"), 40);
+
+  // Title (DONE when every required bin has its time), the car side's arm and status lines when it publishes them
+  const int x0 = toggle_r.right() + 40;
+  const int x1 = width() - 30;
+  const int head_w = resetRect(i).left() - 20 - x0;
+  const bool finished = tests.done(i);
+  QString heading = def.title;
+  if (!view.arm.isEmpty()) {
+    heading += "  ·  arm " + view.arm;
+  }
+  p.setPen(finished ? QColor(0x33, 0xcc, 0x66) : white);
+  p.setFont(InterFont(50, QFont::Bold));
+  p.drawText(QRect(x0, top + 10, head_w, 60), Qt::AlignLeft | Qt::AlignVCenter, finished ? "DONE · " + heading : heading);
+  if (!view.status.isEmpty()) {
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(38));
+    p.drawText(QRect(x0, top + 75, head_w, 45), Qt::AlignLeft | Qt::AlignVCenter, view.status);
+  }
+
+  // One bar per bin (or one for a test without bins), then "other speeds"; the current bin outlined
+  const int lines = def.bins.empty() ? 1 : (int)def.bins.size() + 1;
+  const int area_top = top + 135;
+  const int lh = std::max(30, std::min(90, (top + row_h - 20 - area_top) / lines));
+  const int px = std::max(24, std::min(46, lh * 55 / 100));
+  const QString current = have_speed ? TiTests::binFor(def, speed_mph) : QString();
+  const int label_w = 360;
+  const int value_w = 400;
+  const int bar_x = x0 + label_w + 20;
+  const int bar_w = std::max(100, x1 - value_w - 20 - bar_x);
+
+  for (int k = 0; k < lines; k++) {
+    const int line_y = area_top + k * lh;
+    QString key = QString(TI_TEST_ALL);
+    QString label = QString("all speeds");
+    bool required = true;
+    bool has_bar = true;
+    if (!def.bins.empty() && k < (int)def.bins.size()) {
+      key = def.bins[k].label;
+      label = TiTests::binText(def.bins[k], is_metric);
+      required = def.bins[k].required;
+    } else if (!def.bins.empty()) {
+      key = QString(TI_TEST_OTHER);
+      label = QString("other speeds");
+      has_bar = false;
+    }
+    const double collected = view.seconds.value(key, 0.0);
+    const bool here = key == current;
+
+    if (here) {
+      QPen pen = QPen(white);
+      pen.setWidth(4);
+      p.setPen(pen);
+      p.setBrush(Qt::NoBrush);
+      p.drawRoundedRect(QRect(x0 - 12, line_y + 2, x1 - x0 + 24, lh - 4), 12, 12);
+    }
+
+    p.setPen(required ? white : grey);
+    p.setFont(InterFont(px, here ? QFont::Bold : QFont::Normal));
+    p.drawText(QRect(x0, line_y, label_w, lh), Qt::AlignLeft | Qt::AlignVCenter, label);
+
+    QString value = QString("%1 s").arg(int(collected));
+    if (has_bar) {
+      const QRect bar = QRect(bar_x, line_y + lh / 4, bar_w, lh / 2);
+      const double fraction = std::min(1.0, std::max(0.0, collected / def.target));
+      p.setPen(Qt::NoPen);
+      p.setBrush(QColor(0x33, 0x33, 0x33));
+      p.drawRoundedRect(bar, 8, 8);
+      if (fraction > 0) {
+        p.setBrush(fraction >= 1.0 ? QColor(0x17, 0x86, 0x44) : QColor(0x46, 0x5B, 0xEA));
+        p.drawRoundedRect(QRect(bar.x(), bar.y(), std::max(16, int(bar.width() * fraction)), bar.height()), 8, 8);
+      }
+      if (!required) {
+        p.setPen(white);
+        p.setFont(InterFont(std::max(22, px - 14)));
+        p.drawText(bar, Qt::AlignCenter, QString("optional"));
+      }
+      value = QString("%1 / %2 s").arg(int(collected)).arg(int(def.target));
+    }
+    p.setPen(required ? white : grey);
+    p.setFont(InterFont(px, QFont::DemiBold));
+    p.drawText(QRect(x1 - value_w, line_y, value_w, lh), Qt::AlignRight | Qt::AlignVCenter, value);
+  }
+}
+
+void TestsWindow::paintEvent(QPaintEvent *event) {
+  QPainter p(this);
+  p.setRenderHint(QPainter::Antialiasing);
+  p.fillRect(rect(), QColor(0, 0, 0));
+
+  const QColor white(0xff, 0xff, 0xff);
+  drawBox(p, backRect(), QColor(0x33, 0x33, 0x33), white, QString("BACK"), 70);
+  drawBox(p, allOffRect(), QColor(201, 34, 49), white, QString("ALL TESTS OFF"), 60);
+  p.setPen(white);
+  p.setFont(InterFont(80, QFont::Bold));
+  p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));
+
+  if (tests.defs.empty()) {
+    p.setFont(InterFont(56, QFont::DemiBold));
+    p.drawText(QRect(30, rowTop(0), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
+  }
+  for (int i = 0; i < (int)tests.defs.size(); i++) {
+    drawTest(p, i);
+  }
+
+  // Definitions that were ignored, and why (at most two lines)
+  const int shown = std::min(2, (int)tests.errors.size());
+  p.setPen(QColor(218, 202, 37));
+  p.setFont(InterFont(34));
+  for (int k = 0; k < shown; k++) {
+    QString line = tests.errors[k];
+    if (k == 1 && tests.errors.size() > 2) {
+      line = QString("... and %1 more ignored definitions (see the log)").arg(tests.errors.size() - 1);
+    }
+    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 60, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
+  }
+}
+
+// Sidebar
 
 void Sidebar::drawMetric(QPainter &p, const QPair<QString, QString> &label, QColor c, int y) {
   const QRect rect = {30, y, 240, 126};
@@ -88,13 +968,12 @@ void Sidebar::updateTheme() {
 void Sidebar::showEvent(QShowEvent *event) {
   updateTheme();
 
-  // The test card's counters stop while the sidebar is hidden, so start them over: it reads ON · WAIT until the
-  // dithered-frame count is seen to rise again
-  testFramesPrev = -1;
-  testIdleSeconds = 99;
-  testMismatchSeconds = 0;
+  // The tests card, when it is up, reads the definitions again each time the sidebar opens (a small file) and
+  // shows the state at once
   testTick = UI_FREQ - 1;
   if (showTest) {
+    tiTests.load();
+    tiTests.poll(frogpilotUIState()->frogpilot_toggles);
     updateTestStatus();
   }
 }
@@ -111,11 +990,8 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
   static int showTemp = 0;
 
   if (onroad && showTest && test_rect.contains(pos)) {
-    // Same write the Settings toggle makes; the updateFrogPilotToggles() below makes it live
-    testRequested = !params.getBool("TiDither");
-    testMismatchSeconds = 0;
-    params.putBool("TiDither", testRequested);
-    updateTestStatus();
+    // Opens the Tests page on release, the way the settings button opens Settings
+    tests_pressed = true;
   } else if (cpuRect.contains(pos) && isDeveloperUI) {
     showChip = (showChip + 1) % 3;
 
@@ -153,6 +1029,9 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
 }
 
 void Sidebar::mouseReleaseEvent(QMouseEvent *event) {
+  const bool open_tests = tests_pressed && onroad && showTest && test_rect.contains(event->pos());
+  tests_pressed = false;
+
   if (flag_pressed || settings_pressed) {
     flag_pressed = settings_pressed = false;
     update();
@@ -163,11 +1042,20 @@ void Sidebar::mouseReleaseEvent(QMouseEvent *event) {
     pm->send("userFlag", msg);
   } else if (settings_btn.contains(event->pos())) {
     emit openSettings();
+  } else if (open_tests) {
+    emit openTests();
   }
 }
 
 void Sidebar::offroadTransition(bool offroad) {
+  const bool drive_ended = onroad && offroad;
   onroad = !offroad;
+
+  // Mazda TI tests: the end of a drive (not the offroad state at boot)
+  if (drive_ended && tiTestsAllowed(*uiState(), *frogpilotUIState())) {
+    tiTests.load();
+    tiTests.driveEnded();
+  }
 
   // FrogPilot variables
   if (onroad) {
@@ -266,51 +1154,55 @@ void Sidebar::updateState(const UIState &s, const FrogPilotUIState &fs) {
     }
   }
 
-  // Mazda TI dither test card, refreshed once a second
+  // Mazda TI tests card, refreshed once a second
   if (++testTick >= UI_FREQ) {
     testTick = 0;
 
-    bool tiCar = sm.rcv_frame("carParams") > 0 && fs.frogpilot_toggles.value("car_make").toString() == "mazda" &&
-                 (sm["carParams"].getCarParams().getFlags() & 8) != 0;  // MazdaFlags.TORQUE_INTERCEPTOR (selfdrive/car/mazda/values.py)
-    bool testVisible = tiCar && fs.frogpilot_toggles.value("tuning_level").toInt() >= 3;
-
-    if (testVisible) {
-      testRequested = params.getBool("TiDither");
-      testEffective = fs.frogpilot_toggles.value("ti_dither").toBool();
-      testFrames = QJsonDocument::fromJson(QString::fromStdString(params_memory.get("TiTuningStats")).toUtf8()).object()
-                     .value("config").toObject().value("TiDither").toObject().value("frames").toInt();
-
-      // The stats are published every 5 s, so "active" means the dithered-frame count rose within the last 6 s
-      if (testFramesPrev >= 0 && testFrames > testFramesPrev) {
-        testIdleSeconds = 0;
-      } else if (testIdleSeconds < 99) {
-        testIdleSeconds++;
-      }
-      testFramesPrev = testFrames;
-      testMismatchSeconds = (testRequested && !testEffective) ? testMismatchSeconds + 1 : 0;
-    }
-
+    // Driving screen only: nothing is read or shown offroad or on any other car
+    const bool testVisible = onroad && tiTestsAllowed(s, fs);
     if (testVisible != showTest) {
       showTest = testVisible;
+      if (showTest) {
+        tiTests.load();
+      }
       update();
     }
     if (showTest) {
+      tiTests.poll(fs.frogpilot_toggles);
       updateTestStatus();
     }
   }
 }
 
+// TESTS / the most urgent state of any test / how many are on and the share of their required time collected
 void Sidebar::updateTestStatus() {
-  QString dithered = QString::number(testFrames / 100) + tr(" s");
-
-  ItemStatus testStatus = {{tr("DITHER"), tr("OFF")}, QColor(0x54, 0x54, 0x54)};
-  if (testRequested && !testEffective && testMismatchSeconds > 2) {
-    testStatus = {{tr("DITHER"), tr("NOT APPLIED")}, danger_color};
-  } else if (testRequested && testEffective && testIdleSeconds <= 6) {
-    testStatus = {{tr("DITHER"), tr("ON · ACTIVE") + "\n" + dithered}, QColor(0x17, 0x86, 0x44)};
-  } else if (testRequested) {
-    testStatus = {{tr("DITHER"), tr("ON · WAIT") + "\n" + dithered}, warning_color};
+  bool not_applied = false;
+  bool active = false;
+  bool waiting = false;
+  for (const TiTestView &view : tiTests.views) {
+    not_applied = not_applied || view.state == "NOT APPLIED";
+    active = active || view.state == "ON · ACTIVE";
+    waiting = waiting || view.any_on;
   }
+
+  ItemStatus testStatus = {{tr("TESTS"), tr("ALL OFF")}, QColor(0x54, 0x54, 0x54)};
+  if (tiTests.defs.empty()) {
+    testStatus = {{tr("TESTS"), tr("NONE VALID")}, QColor(0x54, 0x54, 0x54)};
+  } else if (not_applied) {
+    testStatus = {{tr("TESTS"), tr("NOT APPLIED")}, danger_color};
+  } else if (active) {
+    testStatus = {{tr("TESTS"), tr("ON · ACTIVE")}, QColor(0x17, 0x86, 0x44)};
+  } else if (waiting) {
+    testStatus = {{tr("TESTS"), tr("ON · WAIT")}, warning_color};
+  }
+
+  const int on = tiTests.countOn();
+  const int percent = tiTests.overallPercent();
+  QString summary = tr("tap to open");
+  if (on > 0) {
+    summary = percent >= 0 ? QString("%1 ON · %2%").arg(on).arg(percent) : QString("%1 ON").arg(on);
+  }
+  testStatus.first.second += "\n" + summary;
   setProperty("testStatus", QVariant::fromValue(testStatus));
 }
 

@@ -56,6 +56,7 @@ public:
 signals:
   void openSettings(int index = 0, const QString &param = "");
   void closeSettings();
+  void openTests();
 
 public slots:
   void offroadTransition(bool offroad);

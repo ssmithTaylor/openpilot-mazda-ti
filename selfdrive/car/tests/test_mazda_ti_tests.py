@@ -505,3 +505,47 @@ def test_progress_key_and_allow_listed_settings_are_registered():
     assert re.search(r'toggle\.%s = \(params\.get_bool\("%s"\)' % (toggle, key), variables)
     assert '"%s"' % key in live_keys
   assert set(tt.ACTIVE_SOURCES) <= set(tt.ALLOWED_SETTINGS)
+
+
+# ---- agreement with the Qt copy (selfdrive/ui/qt/sidebar.cc) -------------------------------------------------
+
+def _cc_source():
+  return (ROOT / 'selfdrive/ui/qt/sidebar.cc').read_text(encoding='utf-8')
+
+
+def test_qt_allow_list_agrees():
+  block = re.search(r'TI_TEST_ALLOWED\[\] = \{(.*?)\};', _cc_source(), re.S).group(1)
+  allowed = {k: (t, on == 'true') for k, t, on in re.findall(r'\{"(\w+)",\s*"(\w+)",\s*(true|false)\}', block)}
+  assert allowed == tt.ALLOWED_SETTINGS
+
+
+def test_qt_limits_agree():
+  consts = {k: float(v) for k, v in re.findall(r'constexpr (?:int|double) TI_TEST_(\w+) = ([\d.]+);', _cc_source())}
+  for name in ('MAX_TESTS', 'MAX_SETTINGS', 'MAX_BINS', 'MIN_ARMS', 'MAX_ARMS', 'MIN_TARGET_S', 'MAX_TARGET_S',
+               'MIN_DWELL_S', 'MAX_DWELL_S', 'MAX_SPEED_MPH', 'MAX_TITLE', 'MAX_DESCRIPTION', 'MAX_ID', 'MAX_LABEL'):
+    assert consts.pop(name) == getattr(tt, name), name
+  # UI-only: status line length, staleness of the live block (the car publishes every 5 s), NOT APPLIED delay,
+  # auto-close
+  assert set(consts) == {'MAX_STATUS', 'STALE_S', 'MISMATCH_S', 'IDLE_CLOSE_MS'}
+  assert consts['STALE_S'] > 5 and consts['IDLE_CLOSE_MS'] == 15000
+  assert all(len(text) <= consts['MAX_STATUS'] for text in tt.REASON_TEXT.values())
+
+
+def test_qt_key_sets_and_names_agree():
+  src = _cc_source()
+  lists = {k: re.findall(r'"([^"]*)"', v) for k, v in re.findall(r'const QStringList TI_TEST_(\w+) = \{([^}]*)\};', src)}
+  for name in ('ACTIVE_SOURCES', 'METRICS', 'BIN_BY', 'SWITCH_WHEN', 'FILE_KEYS', 'TEST_KEYS', 'TEST_REQUIRED',
+               'SETTING_KEYS', 'PROGRESS_KEYS', 'PROGRESS_REQUIRED', 'AUTO_OFF_KEYS', 'ALTERNATE_KEYS', 'ARM_KEYS'):
+    assert set(lists.pop(name)) == set(getattr(tt, name)), name
+  assert lists == {}
+  strings = dict(re.findall(r'const char \*const TI_TEST_(\w+) = "([^"]*)";', src))
+  assert strings == {'DEFINITIONS': '../car/mazda/ti_tests.json', 'PROGRESS_KEY': tt.PROGRESS_KEY,
+                     'LIVE_KEY': tt.LIVE_KEY, 'OTHER': tt.OTHER_BIN, 'ALL': tt.ALL_BIN, 'UNSUPPORTED': tt.UNSUPPORTED}
+  values = (ROOT / 'selfdrive/car/mazda/values.py').read_text(encoding='utf-8')
+  assert re.search(r'TORQUE_INTERCEPTOR = (\d+)', values).group(1) == '8'
+  assert 'getFlags() & 8) != 0' in src
+
+
+def test_definitions_path_seen_from_the_ui_resolves_to_the_file():
+  # The UI runs with selfdrive/ui as its working directory (window.cc loads "../assets/fonts/...").
+  assert (ROOT / 'selfdrive/ui' / '../car/mazda/ti_tests.json').resolve() == tt.DEFINITIONS_PATH.resolve()

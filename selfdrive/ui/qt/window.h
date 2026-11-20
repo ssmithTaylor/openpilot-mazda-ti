@@ -23,6 +23,9 @@ private:
   SettingsWindow *settingsWindow;
   OnboardingWindow *onboardingWindow;
 
+  // Mazda TI tests page (sidebar.h), opened from the sidebar's TESTS card on the driving screen
+  TestsWindow *testsWindow;
+
   // FrogPilot variables
   Params params;
 };

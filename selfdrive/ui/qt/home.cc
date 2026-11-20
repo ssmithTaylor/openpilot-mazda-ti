@@ -75,6 +75,7 @@ HomeWindow::HomeWindow(QWidget* parent) : QWidget(parent) {
   sidebar = new Sidebar(this);
   main_layout->addWidget(sidebar);
   QObject::connect(sidebar, &Sidebar::openSettings, this, &HomeWindow::openSettings);
+  QObject::connect(sidebar, &Sidebar::openTests, this, &HomeWindow::openTests);
 
   slayout = new QStackedLayout();
   main_layout->addLayout(slayout);

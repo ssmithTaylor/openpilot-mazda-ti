@@ -24,6 +24,18 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
     homeWindow->showDriverView(true);
   });
 
+  // Mazda TI tests page: a page of this stack like the settings, and closed the same way (closeSettings brings back
+  // the driving screen and the sidebar as they were)
+  testsWindow = new TestsWindow(this);
+  main_layout->addWidget(testsWindow);
+  testsWindow->on_close = [=]() {
+    closeSettings();
+  };
+  QObject::connect(homeWindow, &HomeWindow::openTests, [=]() {
+    testsWindow->openPage();
+    main_layout->setCurrentWidget(testsWindow);
+  });
+
   onboardingWindow = new OnboardingWindow(this);
   main_layout->addWidget(onboardingWindow);
   QObject::connect(onboardingWindow, &OnboardingWindow::onboardingDone, [=]() {
@@ -39,7 +51,7 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
     }
   });
   QObject::connect(device(), &Device::interactiveTimeout, [=]() {
-    if (main_layout->currentWidget() == settingsWindow) {
+    if (main_layout->currentWidget() == settingsWindow || main_layout->currentWidget() == testsWindow) {
       closeSettings();
     }
   });
