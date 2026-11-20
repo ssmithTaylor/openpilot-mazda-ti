@@ -28,8 +28,10 @@ Reconstruction from logs (no new log fields).
                      whose logMonoTime is carOutput.appliedCarControlMonoTime (exact);
   applied dither   = carOutput.actuatorsOutput.steerOutputCan - round(actuatorsOutput.steer * mazdaDiagnostics.tiMax)
                      (carcontroller reports `steer` as the limiter's output for the UNDITHERED request; steerOutputCan
-                     and tiLimited are the command sent). It equals the requested dither except where the limiter
-                     clipped, and its magnitude never exceeds it.
+                     and tiLimited are the command sent). It equals the requested dither except while the limiter
+                     is clipping or rate-limiting the command: the sent and undithered limiter histories then
+                     differ, so frame by frame the applied dither can be larger than the requested one or of the
+                     opposite sign, but its magnitude never exceeds the preset's peak (22 counts for preset 1).
 The unit waveform is `waveform(frame)` with frame = carOutput.applySequence - 1 (the car controller's frame counter).
 """
 import math

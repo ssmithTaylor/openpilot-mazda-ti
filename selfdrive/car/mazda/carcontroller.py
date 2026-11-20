@@ -575,8 +575,10 @@ class CarController(CarControllerBase):
       # With the identification dither on, `steer` is the limiter's output for the UNDITHERED request: controlsd
       # flags the output as limited (and freezes the integrator) when it matches none of the recent requests to 1e-2,
       # i.e. 6 counts, and a dither of that size is not a limit. steerOutputCan stays the command actually sent, so
-      # steerOutputCan - round(steer * TI_STEER_MAX) is the dither as applied. With the dither off (or zero this
-      # frame) ti_reported is None and this is the old expression.
+      # steerOutputCan - round(steer * TI_STEER_MAX) is the dither as applied. ti_reported is None, and this is the
+      # old expression, whenever the dither's envelope is zero (toggle off, gate closed and faded out, or a touch);
+      # while the envelope is above zero it is set on every frame, including frames where the dither itself rounds
+      # to zero.
       new_actuators.steer = (ti_apply_steer if ti_reported is None else ti_reported) / self.ccp.TI_STEER_MAX
       new_actuators.steerOutputCan = ti_apply_steer
     else:
