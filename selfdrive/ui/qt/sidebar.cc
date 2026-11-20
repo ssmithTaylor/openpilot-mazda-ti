@@ -24,6 +24,25 @@ void Sidebar::drawMetric(QPainter &p, const QPair<QString, QString> &label, QCol
   p.drawText(rect.adjusted(22, 0, 0, 0), Qt::AlignCenter, label.first + "\n" + label.second);
 }
 
+// drawMetric, but in the taller test_rect and a size smaller so "NOT APPLIED" fits on one line
+void Sidebar::drawTestCard(QPainter &p) {
+  p.setPen(Qt::NoPen);
+  p.setBrush(QBrush(test_status.second));
+  p.setClipRect(test_rect.x() + 4, test_rect.y(), 18, test_rect.height(), Qt::ClipOperation::ReplaceClip);
+  p.drawRoundedRect(QRect(test_rect.x() + 4, test_rect.y() + 4, 100, test_rect.height() - 8), 18, 18);
+  p.setClipping(false);
+
+  QPen pen = QPen(QColor(0xff, 0xff, 0xff, 0x55));
+  pen.setWidth(2);
+  p.setPen(pen);
+  p.setBrush(Qt::NoBrush);
+  p.drawRoundedRect(test_rect, 20, 20);
+
+  p.setPen(QColor(0xff, 0xff, 0xff));
+  p.setFont(InterFont(30, QFont::DemiBold));
+  p.drawText(test_rect.adjusted(22, 0, 0, 0), Qt::AlignCenter, test_status.first.first + "\n" + test_status.first.second);
+}
+
 Sidebar::Sidebar(QWidget *parent) : QFrame(parent), onroad(false), flag_pressed(false), settings_pressed(false) {
   connect(this, &Sidebar::valueChanged, [=] { update(); });
 
@@ -81,7 +100,13 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
   static int showMemory = 0;
   static int showTemp = 0;
 
-  if (cpuRect.contains(pos) && isDeveloperUI) {
+  if (onroad && showTest && test_rect.contains(pos)) {
+    // Same write the Settings toggle makes; the updateFrogPilotToggles() below makes it live
+    testRequested = !testRequested;
+    testMismatchSeconds = 0;
+    params.putBool("TiDither", testRequested);
+    updateTestStatus();
+  } else if (cpuRect.contains(pos) && isDeveloperUI) {
     showChip = (showChip + 1) % 3;
 
     isCPU = showChip == 1;
@@ -230,6 +255,53 @@ void Sidebar::updateState(const UIState &s, const FrogPilotUIState &fs) {
       setProperty("storageStatus", QVariant::fromValue(storageStatus));
     }
   }
+
+  // Mazda TI dither test card, refreshed once a second
+  if (++testTick >= UI_FREQ) {
+    testTick = 0;
+
+    bool tiCar = sm.rcv_frame("carParams") > 0 && fs.frogpilot_toggles.value("car_make").toString() == "mazda" &&
+                 (sm["carParams"].getCarParams().getFlags() & 8) != 0;  // MazdaFlags.TORQUE_INTERCEPTOR (selfdrive/car/mazda/values.py)
+    bool testVisible = tiCar && fs.frogpilot_toggles.value("tuning_level").toInt() >= 3;
+
+    if (testVisible) {
+      testRequested = params.getBool("TiDither");
+      testEffective = fs.frogpilot_toggles.value("ti_dither").toBool();
+      testFrames = QJsonDocument::fromJson(QString::fromStdString(params_memory.get("TiTuningStats")).toUtf8()).object()
+                     .value("config").toObject().value("TiDither").toObject().value("frames").toInt();
+
+      // The stats are published every 5 s, so "active" means the dithered-frame count rose within the last 6 s
+      if (testFramesPrev >= 0 && testFrames > testFramesPrev) {
+        testIdleSeconds = 0;
+      } else if (testIdleSeconds < 99) {
+        testIdleSeconds++;
+      }
+      testFramesPrev = testFrames;
+      testMismatchSeconds = (testRequested && !testEffective) ? testMismatchSeconds + 1 : 0;
+    }
+
+    if (testVisible != showTest) {
+      showTest = testVisible;
+      update();
+    }
+    if (showTest) {
+      updateTestStatus();
+    }
+  }
+}
+
+void Sidebar::updateTestStatus() {
+  QString dithered = QString::number(testFrames / 100) + tr(" s");
+
+  ItemStatus testStatus = {{tr("DITHER"), tr("OFF")}, QColor(0x54, 0x54, 0x54)};
+  if (testRequested && !testEffective && testMismatchSeconds > 2) {
+    testStatus = {{tr("DITHER"), tr("NOT APPLIED")}, danger_color};
+  } else if (testRequested && testEffective && testIdleSeconds <= 6) {
+    testStatus = {{tr("DITHER"), tr("ON · ACTIVE") + "\n" + dithered}, QColor(0x17, 0x86, 0x44)};
+  } else if (testRequested) {
+    testStatus = {{tr("DITHER"), tr("ON · WAIT") + "\n" + dithered}, warning_color};
+  }
+  setProperty("testStatus", QVariant::fromValue(testStatus));
 }
 
 void Sidebar::paintEvent(QPaintEvent *event) {
@@ -292,7 +364,9 @@ void Sidebar::paintEvent(QPaintEvent *event) {
   } else {
     drawMetric(p, panda_status.first, panda_status.second, 496);
   }
-  if (isMemoryUsage) {
+  if (onroad && showTest) {
+    drawTestCard(p);
+  } else if (isMemoryUsage) {
     drawMetric(p, memory_status.first, memory_status.second, 654);
   } else if (isStorageLeft || isStorageUsed) {
     drawMetric(p, storage_status.first, storage_status.second, 654);

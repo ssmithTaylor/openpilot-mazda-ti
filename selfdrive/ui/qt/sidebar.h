@@ -23,6 +23,7 @@ class Sidebar : public QFrame {
   Q_PROPERTY(ItemStatus chipStatus MEMBER chip_status NOTIFY valueChanged)
   Q_PROPERTY(ItemStatus memoryStatus MEMBER memory_status NOTIFY valueChanged)
   Q_PROPERTY(ItemStatus storageStatus MEMBER storage_status NOTIFY valueChanged)
+  Q_PROPERTY(ItemStatus testStatus MEMBER test_status NOTIFY valueChanged)
 
 public:
   explicit Sidebar(QWidget* parent = 0);
@@ -40,6 +41,7 @@ protected:
   void mousePressEvent(QMouseEvent *event) override;
   void mouseReleaseEvent(QMouseEvent *event) override;
   void drawMetric(QPainter &p, const QPair<QString, QString> &label, QColor c, int y);
+  void drawTestCard(QPainter &p);
 
   QPixmap home_img, flag_img, settings_img;
   bool onroad, flag_pressed, settings_pressed;
@@ -55,6 +57,7 @@ protected:
 
   const QRect home_btn = QRect(60, 860, 180, 180);
   const QRect settings_btn = QRect(50, 35, 200, 117);
+  const QRect test_rect = QRect(30, 654, 240, 186);
   const QColor good_color = QColor(255, 255, 255);
   const QColor warning_color = QColor(218, 202, 37);
   const QColor danger_color = QColor(201, 34, 49);
@@ -64,7 +67,7 @@ protected:
   int net_strength = 0;
 
   // FrogPilot variables
-  ItemStatus chip_status, memory_status, storage_status;
+  ItemStatus chip_status, memory_status, storage_status, test_status;
 
 private:
   std::unique_ptr<PubMaster> pm;
@@ -72,6 +75,7 @@ private:
   // FrogPilot variables
   void showEvent(QShowEvent *event);
   void updateTheme();
+  void updateTestStatus();
 
   bool isCPU;
   bool isDeveloperUI;
@@ -83,7 +87,19 @@ private:
   bool isStorageLeft;
   bool isStorageUsed;
 
+  // Mazda TI dither test card (TI car at tuning level 3, driving screen only)
+  bool showTest = false;
+  bool testEffective = false;
+  bool testRequested = false;
+
+  int testFrames = 0;
+  int testFramesPrev = -1;
+  int testIdleSeconds = 99;
+  int testMismatchSeconds = 0;
+  int testTick = UI_FREQ - 1;
+
   Params params;
+  Params params_memory{"/dev/shm/params"};
 
   QColor sidebar_color1;
   QColor sidebar_color2;
