@@ -415,6 +415,7 @@ static void progressTexts() {
   CHECK(abLeftText(1200, 1200, 20) == "A/B complete: the tests take over");
   CHECK(fraction(10, 20) == 0.5 && fraction(30, 20) == 1.0 && fraction(-1, 20) == 0.0 && fraction(1, 0) == 1.0);
   CHECK(windowLabel(0, false) == "21-27 mph" && windowRowText(0, 3, 12, 540, false) == "3 of 12 done; hold 24 mph for about 9 min");
+  CHECK(windowRowText(0, 3, 12, 540, false, true) == "3 of 12 done (optional, counts if it happens)");
   CHECK(windowRowText(1, 12, 12, 0, false) == "12 of 12 done" && windowRowText(1, 0, 0, 0, false) == "no test needs this window");
   CHECK(windowRowText(3, 0, 12, 1, true) == "0 of 12 done; hold 116 km/h for about 1 min");
   for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
@@ -494,7 +495,7 @@ static void planAndBands() {
     {"tests must cover all four windows", [](PlanFields &x) { x.windows = {"21-27"}; }},
     {"tests must be sweep, pulses, ladder", [](PlanFields &x) { x.test_ids = {"ti_dither"}; }},
     {"no plan name", [](PlanFields &x) { x.named = false; }},
-    {"only the lowest window may be optional", [](PlanFields &x) { x.optional_bad = true; }},
+    {"optional must be true or false", [](PlanFields &x) { x.optional_bad = true; }},
   };
   for (const Case &c : cases) {
     PlanFields q = goodPlan();
@@ -516,6 +517,7 @@ static void planAndBands() {
   }
   CHECK(startLook(true, Run::Stopped, true, false).label == "PLAN INVALID" && !startLook(true, Run::Stopped, true, false).enabled);
   CHECK(startLook(true, Run::Stopped, true, true).enabled);
+  CHECK(startLook(true, Run::Stopped, true, true, true).label == "START: A/B relay" && planLine(true, "", true, "LatNoFrictionRelay", false) == "PLAN: friction relay A/B");
 
   // the bands: one figure each, the alternation and the tests merged
   HomeState hs;
@@ -610,36 +612,45 @@ static void listAndStatusAgree() {
   CHECK(states > 100000 && highlighted > 1000 && nocount > 1000);
 }
 
-static void lowWindowOptional() {
+static void testsOptional() {
   PlanFields p = goodPlan();
-  p.low_optional = true;
+  for (int w = 0; w < 4; w++) p.optional_win[w] = true;
   CHECK(planProblem(p).empty());
+  // the standard plan: the alternation alone, every test optional
   HomeState s;
-  s.configured = true; s.target_min = 10; s.ab_stored_a_s = s.ab_stored_b_s = 100; s.low_optional = true;
-  s.tests_left_s[0] = 600; s.tests_left_s[1] = s.tests_left_s[2] = 60; s.tests_left_s[3] = 60;
+  s.configured = true; s.target_min = 10; s.ab_stored_a_s = s.ab_stored_b_s = 0;
+  for (int w = 0; w < 4; w++) { s.tests_optional[w] = true; s.tests_left_s[w] = 600; }
   Band b[MAX_BANDS];
   int n = bandsFromState(s, b);
-  CHECK(n == 2 && b[0].target_mph == 45 && b[1].target_mph == 72);          // no 24 mph band; the alternation's band and 72 mph
-  s.configured = false;
+  CHECK(n == 1 && b[0].target_mph == 45 && b[0].lo == 35 && b[0].hi == 56);
+  CHECK(b[0].minutes == std::ceil(2 * 10 * OVERHEAD_ALT - 1e-9) && b[0].minutes == 28);      // 20 scored minutes, about 28 engaged
+  CHECK(bandText(b[0], false) == "45 mph  28 min" && bandRange(b[0], false) == "36-55 mph");
+  CHECK(bandsTotalMinutes(b, n) == 28);
+  s.ab_stored_a_s = s.ab_stored_b_s = 300;
   n = bandsFromState(s, b);
-  CHECK(n == 3 && b[0].target_mph == 38 && b[1].target_mph == 52 && b[2].target_mph == 72);
-  // only the optional window still needs something: the plan is DONE
-  HomeState d;
-  d.run = Run::All; d.engaged = true; d.have_speed = true; d.mph = 24; d.low_optional = true; d.tests_left_s[0] = 600;
+  CHECK(n == 1 && b[0].minutes == std::ceil(2 * 5 * OVERHEAD_ALT - 1e-9));
+  s.ab_stored_a_s = s.ab_stored_b_s = 600;                                  // both sides at target: no band at all, DONE
+  n = bandsFromState(s, b);
+  CHECK(n == 0 && bandsTotalMinutes(b, n) == 0);
+  HomeState d = s;
+  d.run = Run::Plan; d.plan_mode = "tests"; d.engaged = true; d.have_speed = true; d.mph = 45; d.ab_complete = true;
   confirm(d);
-  d.tests_active = false;
-  CHECK(home(d).primary.text == "DONE: TESTS COMPLETE");
-  d.low_optional = false;
-  CHECK(home(d).primary.text != "DONE: TESTS COMPLETE");                      // required: still a band
-  // tests that do run there are said to be a bonus, and the list never shows the band
-  HomeState o = d;
-  o.low_optional = true; o.tests_left_s[3] = 60; o.tests_active = true;
-  CHECK(home(o).primary.text == "OPTIONAL: TESTS COUNT" && home(o).primary.tone == Tone::Running);
-  Band ob[MAX_BANDS];
-  const int on = bandsFromState(o, ob);
-  CHECK(bandIndexAt(ob, on, 24.0) < 0 && countingBand(o, ob, on) < 0);
-  o.mph = 72;
-  CHECK(home(o).primary.text == "TESTING: HOLD 72 MPH");
+  CHECK(home(d).primary.text == "DONE: ALL COMPLETE" && home(d).second == "Optional tests continue");
+  // the alternation still open: the optional tests never make a band or hold DONE back
+  HomeState o = s;
+  o.ab_stored_a_s = o.ab_stored_b_s = 0;
+  o.run = Run::Plan; o.plan_mode = "tests"; o.engaged = true; o.have_speed = true; o.mph = 24; o.tests_active = true;
+  confirm(o);
+  CHECK(home(o).primary.text == "OPTIONAL: TESTS COUNT" && home(o).primary.tone == Tone::Running);      // a test counting at 24 mph: a bonus
+  o.tests_active = false;
+  CHECK(home(o).primary.text == "NO COUNT AT 24 MPH" && home(o).second == "Hold 45 mph");
+  o.mph = 45; o.plan_mode = "ab"; o.ab_fresh = true; o.ab_state = "running"; o.ab_arm = "A"; o.ab_block = true; o.ab_block_left_s = 100;
+  CHECK(home(o).primary.text == "A/B RUNNING: A");
+  // a required window still makes its band; an optional one does not
+  HomeState m = o;
+  m.tests_optional[0] = false; m.tests_left_s[0] = 100;
+  n = bandsFromState(m, b);
+  CHECK(n == 2 && b[0].target_mph == 24 && b[1].target_mph == 45);
 }
 
 static void setup() {
@@ -663,7 +674,7 @@ int main() {
   progressTexts();
   setupOrderAndChoice();
   planAndBands();
-  lowWindowOptional();
+  testsOptional();
   listAndStatusAgree();
   setup();
   if (failures == 0) {

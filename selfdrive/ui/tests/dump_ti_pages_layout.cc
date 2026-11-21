@@ -85,10 +85,11 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   s.name = name;
   s.title = title;
   s.locked = locked;
-  hs.target_min = 20; hs.ab_stored_known = hs.configured; hs.ab_stored_a_s = 14.2 * 60; hs.ab_stored_b_s = 12.9 * 60;
+  hs.target_min = 10; hs.ab_stored_known = hs.configured; hs.ab_stored_a_s = 6.2 * 60; hs.ab_stored_b_s = 5.3 * 60;
   const bool alt_done = hs.ab_complete || name == "home-gap-alternation-done";
-  if (alt_done) hs.ab_stored_a_s = hs.ab_stored_b_s = 1200;
+  if (alt_done) hs.ab_stored_a_s = hs.ab_stored_b_s = 600;
   hs.tests_left_s[0] = 6.0 * 60 / OVERHEAD_TESTS_LOW; hs.tests_left_s[1] = 4.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[2] = 3.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[3] = 4.0 * 60 / OVERHEAD_TESTS;
+  for (int w = 0; w < 4; w++) hs.tests_optional[w] = true;                     // the standard plan: every test optional
   const HomeLines h = home(hs);
   const ToneColor tc = toneColor(h.primary.tone);
   const int fill[3] = {tc.r, tc.g, tc.b};
@@ -101,8 +102,8 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   textBox(s, Rect{HOME_SECOND.x + 24, HOME_SECOND.y, HOME_SECOND.w - 48, HOME_SECOND.h}, ink, h.second, SECOND_PX);
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
   textBox(s, Rect{HOME_EXPERIMENT.x + 24, HOME_EXPERIMENT.y, HOME_EXPERIMENT.w, HOME_EXPERIMENT.h}, WHITE,
-          planLine(true, "", hs.configured, "LatNoFrictionRelay"), CHOSEN_PX);
-  const StartLook look = startLook(hs.configured, hs.run, carRunning(hs));
+          planLine(true, "", hs.configured, "LatNoFrictionRelay", false), CHOSEN_PX);
+  const StartLook look = startLook(hs.configured, hs.run, carRunning(hs), true, true);
   const int dark_green[3] = {0x0f, 0x4d, 0x28};
   Band bands[MAX_BANDS];
   const int n_bands = bandsFromState(hs, bands);
@@ -121,7 +122,9 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
       s.items.back().sub = "bold";
       textBox(s, Rect{row.x, row.y, row.w - 24, row.h}, grey_ink, bandRange(bands[i], false), DETAIL_PX, "right");
     }
-    textBox(s, Rect{area.x, area.y + n_bands * 70 + 4, area.w, 44}, grey_ink, "About " + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all", DETAIL_PX);
+    if (bandsTotalMinutes(bands, n_bands) > 0) {
+      textBox(s, Rect{area.x, area.y + n_bands * 70 + 4, area.w, 44}, grey_ink, "About " + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all", DETAIL_PX);
+    }
   } else {
     box(s, Page::Home, CTL_START, look.enabled ? BLUE : dark_green, WHITE, look.label, START_PX, look.sub, START_SUB_PX);
   }
@@ -135,7 +138,7 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   lockAndEngaged(s, Page::Home, hs.engaged);
   const double drive[4] = {95, 0, 40, 0};
   textBox(s, HOME_DETAIL, grey_ink, hs.run != Run::Stopped ? thisDriveLine(drive, 4.0 * 60, 3.5 * 60, hs.configured && !alt_done, false) : budget, DETAIL_PX);
-  textBox(s, HOME_DETAIL2, grey_ink, hs.configured ? detailScored(hs.ab_stored_a_s, hs.ab_stored_b_s, 20, alt_done) : "", DETAIL_PX);
+  textBox(s, HOME_DETAIL2, grey_ink, hs.configured ? detailScored(hs.ab_stored_a_s, hs.ab_stored_b_s, 10, alt_done) : "", DETAIL_PX);
   return s;
 }
 
@@ -149,9 +152,9 @@ static Scene setupScene() {
   box(s, pg, CTL_SETUP_RESET, GREY, WHITE, "RESET\nPROGRESS", NAV_PX);
   s.items.push_back({TITLE_SETUP, -1, -1, -1, 255, 255, 255, "PLAN DETAILS", 90, "bold", 0, "center", "text", ""});
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
-  const char *lines[] = {"Next drive: identification tests + friction relay A/B", "Date 2026-11-23. Read from the build; nothing here is chosen on the screen.",
-                         "Tests: sweep, pulses, ladder in the windows 21-27, 35-41, 49-56, 64-80 mph",
-                         "A/B: friction relay, yours (off) against on", "Blocks of 4 min, 10 min per side to finish, at 36-55 mph (35-56 mph range)",
+  const char *lines[] = {"Next drive: friction relay A/B (identification tests optional)", "Date 2026-11-23. Read from the build; nothing here is chosen on the screen.",
+                         "Tests (optional, counted if they happen): sweep, pulses, ladder in all four windows",
+                         "A/B: friction relay, yours (off) against on", "Blocks of 4 min, 10 min per side to finish (about 28 min at 36-55 mph)",
                          "A 6 / 10 min, B 5 / 10 min  (kept across restarts)"};
   for (int i = 0; i < 6; i++) {
     textBox(s, Rect{480, 215 + i * 56, 1660, 52}, i == 0 ? WHITE : grey_ink, lines[i], EXPERIMENT_PX);
@@ -161,8 +164,7 @@ static Scene setupScene() {
       "Alternation, 10 min per side: The question is whether removing the friction relay reduces steering oscillation (direction reversals per second) at 36-55 mph. Pass-to-pass variation is about 0.12 per second per pass of about 86 s; the one earlier comparison showed a drop of about 0.23 per second, about 1.9 times that variation. "
       "Minimum: About 4-5 passes per side (about 6-7 minutes per side) give 80 percent power for an effect of that size. It cannot show an effect as small as closed-loop replay predicted (about 0.05 per second): that would need well over an hour per side and is out of reach of any single drive. "
       "Buffer: 10 minutes per side is that minimum plus about half again, so a second drive is unlikely to be needed.   "
-      "Tests at 21-27 mph (pulses 54 s, ladder 60 s, sweep about 80 s): Pulses and ladder are kept in full: neither has usable data in this window yet. The sweep is cut from 190 s to about 80 s: two earlier drives already cover the sweep in the lowest band, and the wheel's response to the sweep is below the angle sensor's resolution, so more sweep time here adds little. "
-      "Minimum: pulses 54 s and ladder 60 s are the whole requirement there; the sweep's 80 s is a cap, not a measured need. Buffer: none added.";
+      "Tests, all windows (optional): Optional: the owner's decision, 'alteration alone is fine'. At the tests' signal sizes the steering wheel's response is below the angle sensor's resolution, the torque-sensor path is already measured, and the car model is frozen below the limit. They run and are credited when the road allows, everywhere outside the alternation's range from the start and inside it once the alternation is complete.";
   int y = 215 + 6 * 56 + 8;
   std::string line;
   size_t pos = 0;
@@ -189,13 +191,13 @@ static Scene progressScene() {
   box(s, pg, CTL_LOCK, GREY, WHITE, "LOCK PAGE", NAV_PX);
   s.items.push_back({PROG_TITLE, -1, -1, -1, 255, 255, 255, "PROGRESS", 90, "bold", 0, "center", "text", ""});
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
-  textBox(s, PROG_AB_HEAD, WHITE, abProgressText(14.2 * 60, 13.1 * 60, 20), PROGRESS_PX);
+  textBox(s, PROG_AB_HEAD, WHITE, abProgressText(6.2 * 60, 5.3 * 60, 10), PROGRESS_PX);
   s.items.back().sub = "bold";
   s.items.push_back({PROG_AB_BAR_A, 0x33, 0x33, 0x33, 255, 255, 255, "", 0, "", 0, "center", "bar", ""});
-  s.items.push_back({Rect{PROG_AB_BAR_A.x, PROG_AB_BAR_A.y, (int)(PROG_AB_BAR_A.w * fraction(14.2 * 60, 1200)), PROG_AB_BAR_A.h}, BLUE[0], BLUE[1], BLUE[2], 255, 255, 255, "", 0, "", 0, "center", "bar", ""});
+  s.items.push_back({Rect{PROG_AB_BAR_A.x, PROG_AB_BAR_A.y, (int)(PROG_AB_BAR_A.w * fraction(6.2 * 60, 600)), PROG_AB_BAR_A.h}, BLUE[0], BLUE[1], BLUE[2], 255, 255, 255, "", 0, "", 0, "center", "bar", ""});
   s.items.push_back({PROG_AB_BAR_B, 0x33, 0x33, 0x33, 255, 255, 255, "", 0, "", 0, "center", "bar", ""});
-  s.items.push_back({Rect{PROG_AB_BAR_B.x, PROG_AB_BAR_B.y, (int)(PROG_AB_BAR_B.w * fraction(13.1 * 60, 1200)), PROG_AB_BAR_B.h}, AMBER[0], AMBER[1], AMBER[2], 0, 0, 0, "", 0, "", 0, "center", "bar", ""});
-  textBox(s, PROG_AB_LEFT, grey_ink, abLeftText(14.2 * 60, 13.1 * 60, 20), EXPERIMENT_PX);
+  s.items.push_back({Rect{PROG_AB_BAR_B.x, PROG_AB_BAR_B.y, (int)(PROG_AB_BAR_B.w * fraction(5.3 * 60, 600)), PROG_AB_BAR_B.h}, AMBER[0], AMBER[1], AMBER[2], 0, 0, 0, "", 0, "", 0, "center", "bar", ""});
+  textBox(s, PROG_AB_LEFT, grey_ink, abLeftText(6.2 * 60, 5.3 * 60, 10, OVERHEAD_ALT), EXPERIMENT_PX);
   const int done[4] = {3, 12, 5, 0};
   const int total[4] = {12, 12, 12, 12};
   for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
@@ -206,7 +208,7 @@ static Scene progressScene() {
     const bool full = done[w] >= total[w];
     s.items.push_back({Rect{900, y + 8, std::max(24, 1240 * done[w] / total[w]), 36}, full ? GREEN[0] : BLUE[0], full ? GREEN[1] : BLUE[1], full ? GREEN[2] : BLUE[2],
                        255, 255, 255, "", 0, "", 0, "center", "bar", ""});
-    textBox(s, Rect{480, y + 54, 1660, 50}, grey_ink, windowRowText(w, done[w], total[w], 540, false), EXPERIMENT_PX);
+    textBox(s, Rect{480, y + 54, 1660, 50}, grey_ink, windowRowText(w, done[w], total[w], 540, false, true), EXPERIMENT_PX);
   }
   return s;
 }

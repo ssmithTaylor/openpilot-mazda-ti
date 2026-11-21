@@ -1,5 +1,5 @@
 {
-  "name": "Next drive: identification tests + friction relay A/B",
+  "name": "Next drive: friction relay A/B (identification tests optional)",
   "date": "2026-11-23",
   "tests": {
     "ids": [
@@ -10,31 +10,35 @@
     "windows": [
       {
         "window": "21-27",
-        "amount": "pulses 54 s, ladder 60 s, sweep about 80 s (credited seconds)",
-        "reason": "Pulses and ladder are kept in full: neither has usable data in this window yet. The sweep is cut from 190 s to about 80 s: two earlier drives already cover the sweep in the lowest band, and the wheel's response to the sweep is below the angle sensor's resolution, so more sweep time here adds little. The data-needs register lists all six sweep steps as short, so none is singled out: every step keeps its share, scaled to about 80 s.",
-        "minimum": "Pulses 54 s and ladder 60 s are the whole requirement there; the sweep's 80 s is a cap, not a measured need.",
-        "buffer": "None added: the amounts are what each step needs, rounded up to whole units by the generator."
+        "optional": true,
+        "amount": "pulses 54 s, ladder 60 s, sweep about 80 s (credited seconds), if they happen",
+        "reason": "Optional: the owner's decision, 'alteration alone is fine'. At the tests' signal sizes the steering wheel's response is below the angle sensor's resolution, the torque-sensor path is already measured, and the car model is frozen below the limit, so these tests no longer justify a required stretch of driving. They run and are credited when the road allows, everywhere outside the alternation's range from the start and inside it once the alternation is complete.",
+        "minimum": "None required. Pulses 54 s, ladder 60 s and sweep about 80 s are what would complete this window if it happens.",
+        "buffer": "None: optional."
       },
       {
         "window": "35-41",
-        "amount": "sweep 67 s, pulses 80 s, ladder 100 s",
-        "reason": "As reviewed earlier; not changed this round.",
-        "minimum": "As in ti_tests.json.",
-        "buffer": "None added."
+        "optional": true,
+        "amount": "sweep 67 s, pulses 80 s, ladder 100 s, if they happen",
+        "reason": "Same as 21-27 mph: optional.",
+        "minimum": "None required.",
+        "buffer": "None: optional."
       },
       {
         "window": "49-56",
-        "amount": "sweep 57 s, pulses 72 s, ladder 85 s",
-        "reason": "As reviewed earlier; not changed this round.",
-        "minimum": "As in ti_tests.json.",
-        "buffer": "None added."
+        "optional": true,
+        "amount": "sweep 57 s, pulses 72 s, ladder 85 s, if they happen",
+        "reason": "Same as 21-27 mph: optional.",
+        "minimum": "None required.",
+        "buffer": "None: optional."
       },
       {
         "window": "64-80",
-        "amount": "sweep 41 s, pulses 74 s, ladder 75 s",
-        "reason": "As reviewed earlier; not changed this round.",
-        "minimum": "As in ti_tests.json.",
-        "buffer": "None added."
+        "optional": true,
+        "amount": "sweep 41 s, pulses 74 s, ladder 75 s, if they happen",
+        "reason": "Same as 21-27 mph: optional.",
+        "minimum": "None required.",
+        "buffer": "None: optional."
       }
     ]
   },
@@ -51,7 +55,7 @@
     "buffer": "10 minutes per side is that minimum plus about half again, so a second drive is unlikely to be needed."
   },
   "priority": [
-    "the alternation has 35-56 mph until it is complete, except that a test window there gets its time when its tests are behind the alternation",
-    "the tests run everywhere else, and everywhere once it is complete"
+    "the alternation has 35-56 mph until it is complete: nothing optional takes time from it",
+    "the optional tests run everywhere else from the start, and everywhere once it is complete"
   ]
 }

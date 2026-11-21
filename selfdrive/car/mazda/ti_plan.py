@@ -49,6 +49,10 @@ def in_range(prev, mph, ceiling=PLAN_ALT_MAX_MPH):
 
 
 INTERLEAVE_WINDOWS = ("35-41", "49-56")   # the test windows inside the alternation's speed range
+# The standard plan is the alternation alone and every identification test is optional (ti_drive_plan.json): optional items must not take time
+# from a required one, so inside 35-56 mph the alternation has the speeds until it is complete and the tests get them after. Set True only for a
+# plan that REQUIRES tests in those windows (then tests_behind below shares them).
+INTERLEAVE_TESTS_IN_RANGE = False
 
 
 def tests_behind(window, tests_share, alt_share, was_behind):
@@ -58,7 +62,7 @@ def tests_behind(window, tests_share, alt_share, was_behind):
   need with the lower share, handed the windows back and forth: every hand-over costs about 30 s (the blend returns to A and settles,
   the margin hold, the lead-in), and the acceptance replay showed it finishing neither need. `alt_share` and `was_behind` are kept
   for the callers and not used. Pure; the hand-over rules of the plan apply to every change. False when unknown."""
-  if window not in INTERLEAVE_WINDOWS or tests_share is None:
+  if not INTERLEAVE_TESTS_IN_RANGE or window not in INTERLEAVE_WINDOWS or tests_share is None:
     return False
   return tests_share < 1.0 - 1e-6
 

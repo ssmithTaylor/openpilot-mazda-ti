@@ -312,7 +312,7 @@ struct HomeState {
   bool live_fresh = false;                 // the test accountant's live block (TiTestProgress._live) is recent
   bool live_all_on = false;                // ... and says run-all is on (the plan forces it): what the car controller is doing
   bool live_tests_on = false;              // ... and lists a test as on
-  bool low_optional = false;               // the plan marks the 21-27 mph tests optional: not a band, never blocks DONE
+  bool tests_optional[4] = {false, false, false, false};   // the plan marks a window's tests optional: not a band, never blocks DONE
   double tests_left_s[ti_logic::N_WINDOWS] = {0, 0, 0, 0};   // required test seconds still to collect per window (step tests)
   bool ab_stored_known = false;            // the persistent record is for the alternation set up now
   double ab_stored_a_s = 0;                // ... scored seconds per side, kept across ignition cycles
@@ -466,8 +466,8 @@ inline double abMinutesLeft(double a_s, double b_s, double target_min) {
   return (std::max(0.0, t - a_s) + std::max(0.0, t - b_s)) / 60.0;
 }
 
-inline std::string abLeftText(double a_s, double b_s, double target_min) {
-  const double left = abMinutesLeft(a_s, b_s, target_min);
+inline std::string abLeftText(double a_s, double b_s, double target_min, double overhead = 1.0) {
+  const double left = abMinutesLeft(a_s, b_s, target_min) * overhead;
   if (left <= 0.0) {
     return "A/B complete: the tests take over";
   }
@@ -495,10 +495,14 @@ inline std::string windowLabel(int w, bool metric) {
   return buf;
 }
 
-inline std::string windowRowText(int w, int done, int total, double secs_left, bool metric) {
+inline std::string windowRowText(int w, int done, int total, double secs_left, bool metric, bool optional = false) {
   char buf[96];
   if (total <= 0) {
     return "no test needs this window";
+  }
+  if (optional) {                                   // never a band to complete: only said how far it has come
+    std::snprintf(buf, sizeof(buf), "%d of %d done (optional, counts if it happens)", done, total);
+    return buf;
   }
   if (done >= total) {
     std::snprintf(buf, sizeof(buf), "%d of %d done", done, total);
@@ -560,7 +564,7 @@ inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double
 // MEASURED by replaying the two reference drives through the build (accept harness, ti-acceptance branch; not yet by a drive on the car):
 // alternation 1.16-1.33 engaged minutes per scored minute; tests 1.06-1.75, about 1.4 outside the lowest window (where the gates close most of
 // the time: the released drives 33b/33c show the strict gates open about 29% of the time at 21-27 mph).
-constexpr double OVERHEAD_ALT = 1.25;        // mid-range of the replay's 1.16-1.33
+constexpr double OVERHEAD_ALT = 1.4;         // about 1.4 on real roads (the replay's 1.16-1.33 is on its idealised gates): 20 scored min = about 28 engaged min
 constexpr double OVERHEAD_TESTS = 1.4;       // the three higher windows
 constexpr double OVERHEAD_TESTS_LOW = 1.75;  // the lowest window (21-27 mph): the top of the replay's range
 constexpr int MAX_BANDS = 4;
@@ -587,18 +591,29 @@ inline int bandsFromState(const HomeState &s, Band out[MAX_BANDS]) {
   auto win = [&](int w, int target, double minutes) {
     out[n++] = Band{target, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, minutes, false};
   };
-  if (!s.low_optional) {
-    win(0, ti_logic::windowTargetMph(0), t[0]);   // an optional lowest window is shown on the progress page only
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    if (s.tests_optional[w]) {
+      t[w] = 0.0;                                 // optional tests take no part in the plan's minutes; the progress page shows them
+    }
+  }
+  if (!s.tests_optional[0]) {
+    win(0, ti_logic::windowTargetMph(0), t[0]);
   }
   if (altOpen(s)) {
     const double alt = abMinutesLeft(s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) * OVERHEAD_ALT;
     out[n++] = Band{45, (int)ti_ab::PLAN_ALT_MIN_MPH, (int)ti_ab::PLAN_ALT_MAX_MPH, (int)ti_ab::PLAN_ALT_MIN_MPH + 1, (int)ti_ab::PLAN_ALT_MAX_MPH - 1,
                     alt + t[1] + t[2], false};
   } else {
-    win(1, ti_logic::windowTargetMph(1), t[1]);
-    win(2, ti_logic::windowTargetMph(2), t[2]);
+    if (!s.tests_optional[1]) {
+      win(1, ti_logic::windowTargetMph(1), t[1]);
+    }
+    if (!s.tests_optional[2]) {
+      win(2, ti_logic::windowTargetMph(2), t[2]);
+    }
   }
-  win(3, ti_logic::windowTargetMph(3), t[3]);
+  if (!s.tests_optional[3]) {
+    win(3, ti_logic::windowTargetMph(3), t[3]);
+  }
   for (int i = 0; i < n; i++) {
     out[i].minutes = std::ceil(out[i].minutes - 1e-9);
     out[i].done = out[i].minutes <= 0.0;
@@ -764,12 +779,17 @@ inline HomeLines home(const HomeState &s) {
   Band bands[MAX_BANDS];
   const int n = bandsFromState(s, bands);
   if (bandsTotalMinutes(bands, n) <= 0.0) {
+    bool any_optional = false;
+    for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+      any_optional = any_optional || s.tests_optional[w];
+    }
     h.primary = line(plan && s.configured ? "DONE: ALL COMPLETE" : "DONE: TESTS COMPLETE", Tone::Done);
-    h.second = "Extra data still helps";
+    h.second = any_optional ? "Optional tests continue" : "Extra data still helps";
     return h;
   }
   const int here = bandIndexAt(bands, n, s.mph);
-  if (here < 0 && s.low_optional && s.mph >= ti_logic::WINDOWS[0].low && s.mph < ti_logic::WINDOWS[0].high && s.tests_active) {
+  const ti_logic::Zone zone_here = ti_logic::zoneFor(s.mph);
+  if (here < 0 && zone_here.state == ti_logic::ZoneState::Inside && s.tests_optional[zone_here.window] && s.tests_active) {
     h.primary = line("OPTIONAL: TESTS COUNT", Tone::Running);      // credited if they run, but not a band he has to complete
     h.second = "Not required: bonus data";
     return h;
@@ -880,7 +900,7 @@ struct StartLook {
 };
 
 // What the primary control says and whether a tap does anything. Running already: it says RUNNING and a tap does nothing.
-inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool plan_ok = true) {
+inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool plan_ok = true, bool tests_optional = false) {
   StartLook k;
   if (!plan_ok) {                               // nothing runs from an invalid plan
     k.label = "PLAN INVALID";
@@ -889,7 +909,7 @@ inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool
     k.tone = Tone::Held;
     return k;
   }
-  const std::string what = configured ? "tests + A/B relay" : "tests";
+  const std::string what = configured ? (tests_optional ? "A/B relay" : "tests + A/B relay") : "tests";
   if (!confirmed && run != Run::Stopped) {      // the switch says on, the car is not running it: START starts it cleanly
     k.label = "START: " + what;
     k.sub = "The switch shows on but nothing is running";
@@ -937,8 +957,8 @@ inline std::string detailScored(double a_s, double b_s, double target_min, bool 
 struct PlanFields {
   bool named = false;
   bool reasons_ok = false;               // every amount carries its reason, minimum and buffer
-  bool low_optional = false;             // the 21-27 mph tests are optional: credited when they run, never a band to complete
-  bool optional_bad = false;             // `optional` on any other window, or not true
+  bool optional_win[4] = {false, false, false, false};   // per window: its tests are optional (credited when they run, never a band, never block DONE)
+  bool optional_bad = false;             // an `optional` that is not true or false
   std::vector<std::string> test_ids, windows;
   bool has_alt = false;
   std::string setting, a, b_text;       // b_text: "other", or "number" when b is a number
@@ -958,7 +978,7 @@ inline std::string planProblem(const PlanFields &p) {
     return "tests must cover all four windows";
   }
   if (p.optional_bad) {
-    return "only the lowest window may be optional";
+    return "optional must be true or false";
   }
   if (!p.has_alt) {
     return p.reasons_ok ? "" : "an amount has no reason";
@@ -991,14 +1011,14 @@ inline std::string planProblem(const PlanFields &p) {
 }
 
 // The plan in large plain words, or why it cannot run. has_alt with its setting: "PLAN: tests + friction relay A/B"
-inline std::string planLine(bool ok, const std::string &problem, bool has_alt, const char *setting) {
+inline std::string planLine(bool ok, const std::string &problem, bool has_alt, const char *setting, bool tests_required = true) {
   if (!ok) {
     return "PLAN INVALID: " + problem;
   }
   if (!has_alt) {
     return "PLAN: tests";
   }
-  return std::string("PLAN: tests + ") + plainName(setting) + " A/B";
+  return std::string(tests_required ? "PLAN: tests + " : "PLAN: ") + plainName(setting) + " A/B";
 }
 
 // ---- the set-up page ------------------------------------------------------------------------------------------------

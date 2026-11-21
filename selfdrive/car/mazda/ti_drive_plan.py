@@ -34,8 +34,8 @@ def problem(plan):
       return "tests must be sweep, pulses, ladder"
     entries = tests.get("windows", ())
     for e in entries:
-      if isinstance(e, dict) and "optional" in e and (e["optional"] is not True or e.get("window") != WINDOWS[0]):
-        return "only the lowest window may be optional"
+      if isinstance(e, dict) and "optional" in e and not isinstance(e["optional"], bool):
+        return "optional must be true or false"
     if tuple(e.get("window") if isinstance(e, dict) else e for e in entries) != WINDOWS:
       return "tests must cover all four windows"
     alt = plan.get("alternation")

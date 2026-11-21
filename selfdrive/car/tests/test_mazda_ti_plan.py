@@ -781,13 +781,43 @@ def test_the_alternations_tally_survives_a_controls_restart_mid_drive():
 
 # ---- interleaving the tests' windows inside the alternation's range ------------------------------------------------------------
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _interleave_on():
+  """A plan that REQUIRES tests in the windows inside the alternation's range (the standard plan does not: they are optional)."""
+  old = tp.INTERLEAVE_TESTS_IN_RANGE
+  tp.INTERLEAVE_TESTS_IN_RANGE = True
+  try:
+    yield
+  finally:
+    tp.INTERLEAVE_TESTS_IN_RANGE = old
+
+
+def test_with_every_test_optional_nothing_takes_time_from_the_alternation_inside_its_range():
+  assert tp.INTERLEAVE_TESTS_IN_RANGE is False
+  for window in ("35-41", "49-56", "21-27", None):
+    assert not tp.tests_behind(window, 0.0, 1.0, False) and not tp.tests_behind(window, 0.0, 0.0, True)
+  mem, params, car = _two_process_rig()
+  rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  t = toggles()
+  car.run(rn, t, 1.0)
+  mem.d["TiPlanOn"] = True
+  car.run(rn, t, 20.0, mph=45.0)
+  rn.ab.committed = {"A": 10.0, "B": 10.0}
+  car.run(rn, t, 40.0, mph=38.0)                       # inside 35-41 with the tests' progress empty: still the alternation's
+  assert not rn.tests_behind and rn.plan.mode == "ab"
+
+
 def test_tests_behind_serves_a_window_to_its_incomplete_tests_and_nothing_else():
-  assert not tp.tests_behind("21-27", 0.0, 1.0, False) and not tp.tests_behind(None, 0.0, 1.0, False)
-  assert not tp.tests_behind("35-41", None, 0.5, False)                                  # unknown: as before
-  assert tp.tests_behind("35-41", 0.0, 0.0, False) and tp.tests_behind("49-56", 0.99, 1.0, False)
-  assert not tp.tests_behind("35-41", 1.0, 0.1, False) and not tp.tests_behind("49-56", 1.0, 0.0, True)   # done: the alternation has it
-  assert tp.decide(True, False, True, True)[0] == "tests" and tp.decide(True, False, True, False)[0] == "ab"
-  assert tp.decide(True, True, True, True)[0] == "tests" and tp.decide(True, False, False, True)[0] == "tests"
+  with _interleave_on():
+    assert not tp.tests_behind("21-27", 0.0, 1.0, False) and not tp.tests_behind(None, 0.0, 1.0, False)
+    assert not tp.tests_behind("35-41", None, 0.5, False)                                  # unknown: as before
+    assert tp.tests_behind("35-41", 0.0, 0.0, False) and tp.tests_behind("49-56", 0.99, 1.0, False)
+    assert not tp.tests_behind("35-41", 1.0, 0.1, False) and not tp.tests_behind("49-56", 1.0, 0.0, True)   # done: the alternation has it
+    assert tp.decide(True, False, True, True)[0] == "tests" and tp.decide(True, False, True, False)[0] == "ab"
+    assert tp.decide(True, True, True, True)[0] == "tests" and tp.decide(True, False, False, True)[0] == "tests"
 
 
 def _sim_mix(interleave, minutes=64, seed=3):
@@ -842,52 +872,55 @@ def in_alt_range(mph):
 
 
 def test_interleaving_gives_the_tests_in_35_56_their_time_without_starving_the_alternation_on_the_last_drives_mix():
-  seq = _sim_mix(False, minutes=30)                       # a short drive: the alternation (10 min per side) cannot finish in it
-  inter = _sim_mix(True, minutes=30)
-  print("SEQUENTIAL", seq)
-  print("INTERLEAVED", inter)
-  # the old rule: the alternation holds 35-56 mph, so those two windows get nothing while it is open (it is not complete in an hour)
-  assert seq["tests_min"]["35-41"] == 0.0 and seq["tests_min"]["49-56"] == 0.0 and seq["alt_each_min"] < 10.0
-  # the new rule: both windows progress, the alternation still advances, the windows outside the range are untouched by the change
-  assert inter["tests_min"]["35-41"] > 0.5 and inter["tests_min"]["49-56"] > 0.5
-  assert inter["alt_each_min"] > 0.3 * seq["alt_each_min"]
-  assert abs(inter["tests_min"]["21-27"] - seq["tests_min"]["21-27"]) < 0.5 and inter["tests_min"]["64-80"] == seq["tests_min"]["64-80"]
+  with _interleave_on():
+    seq = _sim_mix(False, minutes=30)                       # a short drive: the alternation (10 min per side) cannot finish in it
+    inter = _sim_mix(True, minutes=30)
+    print("SEQUENTIAL", seq)
+    print("INTERLEAVED", inter)
+    # the old rule: the alternation holds 35-56 mph, so those two windows get nothing while it is open (it is not complete in an hour)
+    assert seq["tests_min"]["35-41"] == 0.0 and seq["tests_min"]["49-56"] == 0.0 and seq["alt_each_min"] < 10.0
+    # the new rule: both windows progress, the alternation still advances, the windows outside the range are untouched by the change
+    assert inter["tests_min"]["35-41"] > 0.5 and inter["tests_min"]["49-56"] > 0.5
+    assert inter["alt_each_min"] > 0.3 * seq["alt_each_min"]
+    assert abs(inter["tests_min"]["21-27"] - seq["tests_min"]["21-27"]) < 0.5 and inter["tests_min"]["64-80"] == seq["tests_min"]["64-80"]
 
 
 def test_the_runner_hands_a_test_window_inside_the_range_to_the_tests_when_they_are_behind():
-  mem, params, car = _two_process_rig()
-  rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
-  t = toggles()
-  car.run(rn, t, 1.0)
-  mem.d["TiPlanOn"] = True
-  car.run(rn, t, 20.0, mph=45.0)                       # the gap between the windows: the alternation
-  assert rn.plan.mode == "ab" and rn.ti_tests is not None
-  rn.ab.committed = {"A": 150.0, "B": 150.0}           # half of its target done; the tests' progress is empty
-  car.run(rn, t, 25.0, mph=38.0)                       # inside 35-41: the tests are behind, they get the time
-  assert rn.tests_behind and rn.plan.mode in ("hold", "tests")
-  car.run(rn, t, 20.0, mph=45.0)                       # out of the window again: back to the alternation
-  assert not rn.tests_behind and rn.plan.mode in ("hold", "ab")
-  # with no readable progress the tests never get a visit inside the range (the plan as before)
-  rn2 = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
-  rn2.ti_tests = None
-  assert rn2._tests_behind(v(38.0)) is False
+  with _interleave_on():
+    mem, params, car = _two_process_rig()
+    rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+    t = toggles()
+    car.run(rn, t, 1.0)
+    mem.d["TiPlanOn"] = True
+    car.run(rn, t, 20.0, mph=45.0)                       # the gap between the windows: the alternation
+    assert rn.plan.mode == "ab" and rn.ti_tests is not None
+    rn.ab.committed = {"A": 150.0, "B": 150.0}           # half of its target done; the tests' progress is empty
+    car.run(rn, t, 25.0, mph=38.0)                       # inside 35-41: the tests are behind, they get the time
+    assert rn.tests_behind and rn.plan.mode in ("hold", "tests")
+    car.run(rn, t, 20.0, mph=45.0)                       # out of the window again: back to the alternation
+    assert not rn.tests_behind and rn.plan.mode in ("hold", "ab")
+    # with no readable progress the tests never get a visit inside the range (the plan as before)
+    rn2 = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+    rn2.ti_tests = None
+    assert rn2._tests_behind(v(38.0)) is False
 
 
 def test_a_tests_visit_that_credits_nothing_is_ended_and_not_repeated_at_once():
-  mem, params, car = _two_process_rig()
-  rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
-  rn.ab.set_plan_limits(56.0, 300.0)
-  rn.ab.committed = {"A": 250.0, "B": 250.0}          # the alternation is well ahead (share 0.83); the tests have nothing
-  states = []
-  for sec in range(0, 200, 5):
-    rn.k = sec * 100
-    states.append((sec, rn._tests_behind(v(38.0))))
-  first_visit = [s for s, b in states if b]
-  assert first_visit and first_visit[0] == 0
-  ended = next(s for s, b in states if s > 0 and not b)
-  assert 45 <= ended <= 55                           # VISIT_PATIENCE_S without any credit
-  again = [s for s, b in states if b and s > ended]
-  assert again and again[0] >= ended + 55            # not before the cooldown
+  with _interleave_on():
+    mem, params, car = _two_process_rig()
+    rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+    rn.ab.set_plan_limits(56.0, 300.0)
+    rn.ab.committed = {"A": 250.0, "B": 250.0}          # the alternation is well ahead (share 0.83); the tests have nothing
+    states = []
+    for sec in range(0, 200, 5):
+      rn.k = sec * 100
+      states.append((sec, rn._tests_behind(v(38.0))))
+    first_visit = [s for s, b in states if b]
+    assert first_visit and first_visit[0] == 0
+    ended = next(s for s, b in states if s > 0 and not b)
+    assert 45 <= ended <= 55                           # VISIT_PATIENCE_S without any credit
+    again = [s for s, b in states if b and s > ended]
+    assert again and again[0] >= ended + 55            # not before the cooldown
 
 
 def test_run_all_gives_a_strict_stretch_to_a_test_that_needs_it_and_changes_nothing_without_the_hint():

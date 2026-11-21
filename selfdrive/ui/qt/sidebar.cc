@@ -1354,7 +1354,7 @@ void TestsWindow::homeAct(int control) {
     abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
     TiHomeStrings keep;
     const HomeState hs = homeState(keep);
-    if (!plan_ok || !startLook(ab_configured, hs.run, carRunning(hs), plan_ok).enabled) {
+    if (!plan_ok || !startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]).enabled) {
       return;                   // the car side reports it is running what the label says already
     }
     ab_pin_b_armed = -1.0;
@@ -1549,13 +1549,16 @@ void TestsWindow::loadPlan() {
     const QJsonObject e = v.toObject();
     plan.windows.push_back(e.value("window").toString().toStdString());
     if (e.contains("optional")) {
-      if (e.value("optional") == QJsonValue(true) && e.value("window").toString() == QString("21-27")) {
-        plan.low_optional = true;
-      } else {
+      if (!e.value("optional").isBool()) {
         plan.optional_bad = true;
+      } else {
+        const int wi = (int)plan.windows.size() - 1;
+        if (wi >= 0 && wi < ti_logic::N_WINDOWS) {
+          plan.optional_win[wi] = e.value("optional").toBool();
+        }
       }
     }
-    if (e.value("reason").toString() != QString("As reviewed earlier; not changed this round.")) {
+    if (!e.value("reason").toString().startsWith("Same as")) {
       note(QString("Tests at %1 mph (%2)").arg(e.value("window").toString(), e.value("amount").toString()), e);
     } else {
       note(QString("Tests at %1 mph").arg(e.value("window").toString()), e);
@@ -1782,7 +1785,9 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.configured = ab_configured;
   const UIStatus st = uiState()->status;
   h.engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
-  h.low_optional = plan_ok && plan.low_optional;
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    h.tests_optional[w] = plan_ok && plan.optional_win[w];
+  }
   h.metric = is_metric;
   h.have_speed = have_speed;
   h.mph = speed_mph;
@@ -1883,7 +1888,7 @@ void TestsWindow::drawHome(QPainter &p) {
   p.setPen(plan_ok ? white : QColor(218, 202, 37));
   p.setFont(InterFont(CHOSEN_PX, QFont::DemiBold));
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
-             QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "")));
+             QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "", !(plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]))));
 
   // The bands still needed: one speed and the minutes left, tests and alternation merged. The same model as the status line above.
   Band bands[MAX_BANDS];
@@ -1909,12 +1914,14 @@ void TestsWindow::drawHome(QPainter &p) {
     }
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(DETAIL_PX));
-    p.drawText(QRect(area.x(), area.y() + n_bands * 70 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
-               QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all"));
+    if (bandsTotalMinutes(bands, n_bands) > 0) {
+      p.drawText(QRect(area.x(), area.y() + n_bands * 70 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
+                 QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all"));
+    }
   }
 
   // START (what it will run, and what it replaces), STOP
-  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs), plan_ok);
+  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]);
   if (!show_bands) {
     drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : (plan_ok ? QColor(0x0f, 0x4d, 0x28) : QColor(0x6b, 0x4a, 0x1d)), white,
              QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
@@ -2045,7 +2052,7 @@ void TestsWindow::drawProgress(QPainter &p) {
     drawBar(p, qr(PROG_AB_BAR_B), fraction(b_s, 60.0 * target), amber);
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(EXPERIMENT_PX));
-    p.drawText(qr(PROG_AB_LEFT), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(abLeftText(a_s, b_s, target)));
+    p.drawText(qr(PROG_AB_LEFT), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(abLeftText(a_s, b_s, target, OVERHEAD_ALT)));
   } else {
     p.drawText(qr(PROG_AB_HEAD), Qt::AlignLeft | Qt::AlignVCenter, QString("A/B relay: not used"));
   }
@@ -2063,12 +2070,12 @@ void TestsWindow::drawProgress(QPainter &p) {
     const int y = PROG_ROWS_TOP + w * PROG_ROW_H;
     p.setPen(white);
     p.setFont(InterFont(PROGRESS_PX, QFont::Bold));
-    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)) + ((w == 0 && plan_ok && plan.low_optional) ? QString("  (optional: counts if it happens)") : QString()));
+    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)) + ((plan_ok && plan.optional_win[w]) ? QString("  (optional: counts if it happens)") : QString()));
     drawBar(p, QRect(900, y + 8, 1240, 36), total > 0 ? double(done) / total : 1.0, done >= total ? green : blue);
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(EXPERIMENT_PX));
     p.drawText(QRect(480, y + 54, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
-               QString::fromStdString(windowRowText(w, done, total, secs_left, is_metric)));
+               QString::fromStdString(windowRowText(w, done, total, secs_left, is_metric, plan_ok && plan.optional_win[w])));
   }
 }
 
