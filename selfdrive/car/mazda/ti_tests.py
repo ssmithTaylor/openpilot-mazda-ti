@@ -440,14 +440,15 @@ class TestAccountant:
     self.failed = True
     _log(f"ti_tests: accountant disabled after an error in {where}")
 
-  def update(self, toggles, v_ego, engaged, active_keys, arms=None, credit=None):
+  def update(self, toggles, v_ego, engaged, active_keys, arms=None, credit=None, run_all_forced=False):
     """One frame. `active_keys`: the ACTIVE_SOURCES applied on this frame. `arms`: {test id: arm} for tests that
     alternate (none can be loaded yet), else None. `credit`: (setting key, band, step, seconds) when an
-    identification test (ti_ident) completed a clean chunk on this frame, else None."""
+    identification test (ti_ident) completed a clean chunk on this frame, else None. `run_all_forced`: the drive plan is running
+    the tests in run-all mode (the car controller forces it; the TiIdentAll toggle is NOT set then), so every step test is counted."""
     if self.failed:
       return
     try:
-      run_all = getattr(toggles, RUN_ALL_TOGGLE, None) is True
+      run_all = getattr(toggles, RUN_ALL_TOGGLE, None) is True or run_all_forced is True
       self.all_seen = self.all_seen or run_all
       for t in self.tests:
         if not (t.enabled(toggles) or (run_all and t.metric == "step_seconds")):

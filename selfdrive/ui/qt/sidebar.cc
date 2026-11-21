@@ -909,6 +909,50 @@ bool TiTests::windowLeft(int i, const QString &label, double &secs, int &cells) 
   return false;
 }
 
+// Required items (steps with a need) done and in all, in window w, over the step tests `scope`; the seconds still needed there
+void TiTests::windowShare(const std::vector<int> &scope, int w, int &done, int &total, double &secs_left) const {
+  done = 0;
+  total = 0;
+  secs_left = 0;
+  int open = 0;
+  const QString label = QString(ti_logic::WINDOWS[w].label);
+  for (int i : scope) {
+    if (i < 0 || i >= (int)defs.size() || defs[i].metric != "step_seconds") {
+      continue;
+    }
+    for (const TiTestBin &bin : defs[i].bins) {
+      if (bin.label != label) {
+        continue;
+      }
+      for (int k = 0; k < bin.steps; k++) {
+        const double step_need = k < (int)bin.needs.size() ? bin.needs[k] : defs[i].target;
+        if (step_need > 0) {
+          total++;
+        }
+      }
+    }
+    double secs = 0;
+    int cells = 0;
+    if (windowLeft(i, label, secs, cells)) {
+      secs_left += secs;
+      open += cells;
+    }
+  }
+  done = std::max(0, total - open);
+}
+
+// Seconds credited so far in window w over the step tests `scope` (each step's seconds, and what came beyond its need)
+double TiTests::windowCredited(const std::vector<int> &scope, int w) const {
+  const QString label = QString(ti_logic::WINDOWS[w].label);
+  double sum = 0;
+  for (int i : scope) {
+    if (i >= 0 && i < (int)views.size()) {
+      sum += views[i].step_seconds.value(label, 0.0) + views[i].step_extra.value(label, 0.0);
+    }
+  }
+  return sum;
+}
+
 // The window to ask the driver for, among the step tests `scope` (indices into defs)
 ti_logic::Target TiTests::target(const std::vector<int> &scope, double mph) const {
   double secs[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
@@ -1146,6 +1190,7 @@ void TestsWindow::refresh() {
 
 namespace {
 const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
+const char *const TI_AB_PROGRESS_KEY = "TiAbProgress";
 const char *const TI_AB_ON_KEY = "TiAbOn";
 const char *const TI_AB_PIN_KEY = "TiAbPin";
 const char *const TI_AB_STATUS_KEY = "TiAbStatus";
@@ -1167,6 +1212,9 @@ int TestsWindow::rowHeight() const {
 }
 
 ti_pages::Page TestsWindow::pageNow() const {
+  if (progress_page) {
+    return ti_pages::Page::Progress;
+  }
   if (setup_page) {
     return ti_pages::Page::Setup;
   }
@@ -1262,6 +1310,7 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
 void TestsWindow::goHome() {
   home_page = true;
   setup_page = false;
+  progress_page = false;
   ab_page = false;
 }
 
@@ -1277,10 +1326,16 @@ void TestsWindow::homeAct(int control) {
     setupOpen();
     home_page = false;
     setup_page = true;
-  } else if (control == CTL_NAV_INDIV) {
+  } else if (control == CTL_NAV_PROGRESS) {
     home_page = false;
     setup_page = false;
     ab_page = false;
+    progress_page = true;
+  } else if (control == CTL_NAV_INDIV) {   // (from the progress page)
+    home_page = false;
+    setup_page = false;
+    ab_page = false;
+    progress_page = false;
   } else if (control == CTL_STOP) {
     ab_pin_b_armed = -1.0;
     tests.runOps(stopOps());
@@ -1294,6 +1349,15 @@ void TestsWindow::homeAct(int control) {
     ab_pin_b_armed = -1.0;
     tests.runOps(startOps(ab_configured), [this]() { abSave(); });
     abPoll();
+    // what the counters are now: the drive's own additions are shown against this ("since START")
+    const std::vector<int> scope = stepScope();
+    for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+      drive_base_win[w] = tests.windowCredited(scope, w);
+    }
+    bool known = false;
+    double target = 0;
+    abDisplay(drive_base_a, drive_base_b, known, target);
+    drive_base_set = true;
   }
 }
 
@@ -1309,6 +1373,16 @@ void TestsWindow::setupAct(int control) {
     return;
   }
   const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  if (control == CTL_SETUP_RESET) {       // a deliberate act: asks first, then the stored progress goes (the only way besides a changed experiment)
+    if (ConfirmationDialog::confirm(QString("Reset the A/B progress (minutes per side) to zero? This cannot be undone."), QString("Reset"), this)) {
+      ab_params.remove(TI_AB_PROGRESS_KEY);
+      ab_stored_known = false;
+      ab_stored_a = ab_stored_b = 0;
+    }
+    idle.start();
+    opened.start();                       // the dialog's own taps end here
+    return;
+  }
   if (control == CTL_SETUP_USE) {
     if (ab_configured) {
       ab_params.remove(TI_AB_CONFIG_KEY);   // not used: START runs the tests alone
@@ -1356,12 +1430,12 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     refresh();
     return;
   }
-  if (control == CTL_START || control == CTL_STOP || control == CTL_NAV_SETUP || control == CTL_NAV_INDIV) {
+  if (control == CTL_START || control == CTL_STOP || control == CTL_NAV_SETUP || control == CTL_NAV_PROGRESS || control == CTL_NAV_INDIV) {
     homeAct(control);
     refresh();
     return;
   }
-  if (control >= CTL_SETUP_USE && control <= CTL_SETUP_BLOCK_PLUS) {
+  if (control >= CTL_SETUP_USE && control <= CTL_SETUP_RESET) {
     setupAct(control);
     refresh();
     return;
@@ -1514,6 +1588,43 @@ void TestsWindow::abPoll() {
   if (!ab_on) {
     ab_a_known = abStoredValue(ab_setting, ab_a);   // follows what he stores while the page is open and A/B is off
   }
+  // the persistent progress of the experiment set up now (setting, A and B must match: another experiment's record is not shown)
+  const QJsonObject stored = QJsonDocument::fromJson(QByteArray::fromStdString(ab_params.get(TI_AB_PROGRESS_KEY))).object();
+  const QJsonObject sc = stored.value("committed").toObject();
+  ab_stored_known = ab_configured && ab_a_known && stored.value("setting").toString() == QString(ti_ab::SETTINGS[ab_setting].name) &&
+                    std::fabs(stored.value("a").toDouble(-1e9) - ab_a) < 1e-3 && std::fabs(stored.value("b").toDouble(-1e9) - ab_b) < 1e-3 &&
+                    sc.value("A").isDouble() && sc.value("B").isDouble();
+  ab_stored_a = ab_stored_known ? sc.value("A").toDouble() : 0.0;
+  ab_stored_b = ab_stored_known ? sc.value("B").toDouble() : 0.0;
+}
+
+// The alternation's scored seconds per side to show: what the car side reports now, or the stored record when that is more
+// (stopped, or a new process that has not counted yet). known: either exists. target_min: the plan's, else the default.
+void TestsWindow::abDisplay(double &a_s, double &b_s, bool &known, double &target_min) {
+  a_s = ab_stored_known ? ab_stored_a : 0.0;
+  b_s = ab_stored_known ? ab_stored_b : 0.0;
+  known = ab_stored_known;
+  target_min = ti_ab::PLAN_TARGET_MIN_DEFAULT;
+  if (ab_fresh && ab_configured) {
+    const QJsonObject scored = ab_status.value("scored").toObject();
+    a_s = std::max(a_s, scored.value("A").toDouble());
+    b_s = std::max(b_s, scored.value("B").toDouble());
+    known = true;
+    const double t = ab_status.value("target_s").toDouble(0.0);
+    const QJsonObject plan = ab_status.value("plan").toObject();
+    target_min = plan.value("target_min").toDouble(t > 0 ? t / 60.0 : ti_ab::PLAN_TARGET_MIN_DEFAULT);
+  }
+}
+
+// The step tests (sweep, pulses, ladder), whose windows the run-all mode fills
+std::vector<int> TestsWindow::stepScope() const {
+  std::vector<int> scope;
+  for (int i = 0; i < (int)tests.defs.size(); i++) {
+    if (tests.defs[i].metric == "step_seconds") {
+      scope.push_back(i);
+    }
+  }
+  return scope;
 }
 
 void TestsWindow::abSetOn(bool on) {
@@ -1661,6 +1772,9 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.tests_active = active;
   keep.gate = tests.gate.valid ? tests.gate.reason.toStdString() : std::string();
   h.gate_reason = keep.gate.c_str();
+  bool known = false;
+  abDisplay(h.ab_stored_a_s, h.ab_stored_b_s, known, h.target_min);
+  h.ab_stored_known = known;
   return h;
 }
 
@@ -1720,25 +1834,41 @@ void TestsWindow::drawHome(QPainter &p) {
   // Navigation at the screen edge
   drawBox(p, ctlRect(CTL_BACK), locked ? QColor(0x1a, 0x1a, 0x1a) : grey, locked ? QColor(0x55, 0x55, 0x55) : white, QString("< EXIT"), NAV_PX);
   drawBox(p, ctlRect(CTL_NAV_SETUP), grey, white, QString("SET UP A/B >"), NAV_PX);
-  drawBox(p, ctlRect(CTL_NAV_INDIV), grey, white, QString("INDIVIDUAL\nTESTS >"), NAV_PX);
+  drawBox(p, ctlRect(CTL_NAV_PROGRESS), grey, white, QString("PROGRESS >"), NAV_PX);
   drawEngagedBadge(p, qr(HOME_BADGE));
 
-  // The detail line: why the tests are held, or the alternation's scored minutes against its target
-  QString detail;
+  // Detail (not needed while driving). Line 1: what this drive has added since START. Line 2: why the tests are held, or the
+  // alternation's minutes against its target.
+  QString detail1;
+  if (drive_base_set && hs.run != Run::Stopped) {
+    const std::vector<int> scope = stepScope();
+    double win[ti_logic::N_WINDOWS];
+    for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+      win[w] = std::max(0.0, tests.windowCredited(scope, w) - drive_base_win[w]);
+    }
+    double a_s = 0, b_s = 0, target = 0;
+    bool known = false;
+    abDisplay(a_s, b_s, known, target);
+    detail1 = QString::fromStdString(thisDriveLine(win, std::max(0.0, a_s - drive_base_a), std::max(0.0, b_s - drive_base_b), ab_configured, is_metric));
+  }
+  p.setPen(QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(DETAIL_PX));
+  p.drawText(qr(HOME_DETAIL), Qt::AlignLeft | Qt::AlignVCenter, detail1);
+  QString detail2;
   QColor detail_color(0xc9, 0xc9, 0xc9);
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
-    detail = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
+    detail2 = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
     detail_color = QColor(218, 202, 37);
-  } else if (ab_configured && ab_fresh) {
-    const QJsonObject scored = ab_status.value("scored").toObject();
-    const QJsonObject plan_status = ab_status.value("plan").toObject();
-    detail = QString::fromStdString(detailScored(scored.value("A").toDouble(), scored.value("B").toDouble(),
-                                                 plan_status.value("target_min").toDouble(ti_ab::PLAN_TARGET_MIN_DEFAULT),
-                                                 ab_status.value("complete").toBool()));
+  } else if (ab_configured) {
+    double a_s = 0, b_s = 0, target = 0;
+    bool known = false;
+    abDisplay(a_s, b_s, known, target);
+    if (known) {
+      detail2 = QString::fromStdString(detailScored(a_s, b_s, target, ab_fresh && ab_status.value("complete").toBool()));
+    }
   }
   p.setPen(detail_color);
-  p.setFont(InterFont(DETAIL_PX));
-  p.drawText(qr(HOME_DETAIL), Qt::AlignLeft | Qt::AlignVCenter, detail);
+  p.drawText(qr(HOME_DETAIL2), Qt::AlignLeft | Qt::AlignVCenter, detail2);
 }
 
 // The set-up page: which setting, value B, block length, chosen with the car stopped; stored as it is changed
@@ -1767,6 +1897,7 @@ void TestsWindow::drawSetup(QPainter &p) {
   drawBox(p, ctlRect(CTL_SETUP_B_PLUS), b_editable ? grey : dim_fill, b_editable ? white : dim_ink, QString("+"), ACTION_PX + 24);
   drawBox(p, ctlRect(CTL_SETUP_BLOCK_MINUS), box, box_ink, QString("-"), ACTION_PX + 24);
   drawBox(p, ctlRect(CTL_SETUP_BLOCK_PLUS), box, box_ink, QString("+"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_RESET), box, box_ink, QString("RESET\nPROGRESS"), NAV_PX);
 
   const QRect prev = ctlRect(CTL_SETUP_PREV);
   const QRect next = ctlRect(CTL_SETUP_NEXT);
@@ -1792,6 +1923,62 @@ void TestsWindow::drawSetup(QPainter &p) {
   p.setFont(InterFont(DETAIL_PX));
   p.drawText(QRect(480, 1020, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
              QString::fromStdString(setupNote(running(), have_speed, speed_mph)) + (ti_ab::bendsOnly(s.name) ? QString("  Counts only in bends.") : QString()));
+}
+
+void TestsWindow::drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill) {
+  p.setPen(Qt::NoPen);
+  p.setBrush(QColor(0x33, 0x33, 0x33));
+  p.drawRoundedRect(r, 12, 12);
+  if (fraction > 0) {
+    p.setBrush(fill);
+    p.drawRoundedRect(QRect(r.x(), r.y(), std::max(24, int(r.width() * std::min(1.0, fraction))), r.height()), 12, 12);
+  }
+}
+
+// The progress page: the alternation's two sides against their target with the driving time left, and every test window with
+// its share of required items done and the next thing wanted. Read while stopped; nothing here is needed while driving.
+void TestsWindow::drawProgress(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  const QColor blue(0x46, 0x5B, 0xEA);
+  const QColor amber(218, 202, 37);
+  const QColor green(0x17, 0x86, 0x44);
+  drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< START\nPAGE"), NAV_PX);
+  drawBox(p, ctlRect(CTL_NAV_INDIV), grey, white, QString("INDIVIDUAL\nTESTS >"), NAV_PX);
+  drawTitle(p, qr(PROG_TITLE), QString("PROGRESS"), 90);
+
+  double a_s = 0, b_s = 0, target = 0;
+  bool known = false;
+  abDisplay(a_s, b_s, known, target);
+  p.setPen(white);
+  p.setFont(InterFont(PROGRESS_PX, QFont::Bold));
+  if (ab_configured) {
+    p.drawText(qr(PROG_AB_HEAD), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(abProgressText(a_s, b_s, target)));
+    drawBar(p, qr(PROG_AB_BAR_A), fraction(a_s, 60.0 * target), blue);
+    drawBar(p, qr(PROG_AB_BAR_B), fraction(b_s, 60.0 * target), amber);
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(EXPERIMENT_PX));
+    p.drawText(qr(PROG_AB_LEFT), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(abLeftText(a_s, b_s, target)));
+  } else {
+    p.drawText(qr(PROG_AB_HEAD), Qt::AlignLeft | Qt::AlignVCenter, QString("A/B relay: not used"));
+  }
+
+  const std::vector<int> scope = stepScope();
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    int done = 0, total = 0;
+    double secs_left = 0;
+    tests.windowShare(scope, w, done, total, secs_left);
+    const int y = PROG_ROWS_TOP + w * PROG_ROW_H;
+    p.setPen(white);
+    p.setFont(InterFont(PROGRESS_PX, QFont::Bold));
+    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)));
+    drawBar(p, QRect(900, y + 8, 1240, 36), total > 0 ? double(done) / total : 1.0, done >= total ? green : blue);
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(EXPERIMENT_PX));
+    p.drawText(QRect(480, y + 54, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
+               QString::fromStdString(windowRowText(w, done, total, secs_left, is_metric)));
+  }
 }
 
 // Draws the plain A/B switch page below the shared header; returns the banner line
@@ -1938,6 +2125,11 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   }
   if (setup_page) {
     drawSetup(p);
+    lockBorder();
+    return;
+  }
+  if (progress_page) {
+    drawProgress(p);
     lockBorder();
     return;
   }

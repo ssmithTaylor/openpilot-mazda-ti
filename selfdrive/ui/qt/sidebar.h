@@ -98,6 +98,9 @@ public:
   bool locked();
   void setLocked(bool on);
   bool windowLeft(int i, const QString &label, double &secs, int &cells) const;
+  // Required items done / in all in a window over the step tests `scope`, the seconds still needed, and the seconds credited so far
+  void windowShare(const std::vector<int> &scope, int w, int &done, int &total, double &secs_left) const;
+  double windowCredited(const std::vector<int> &scope, int w) const;
   ti_logic::Target target(const std::vector<int> &scope, double mph) const;
 
   bool done(int i) const;
@@ -169,6 +172,10 @@ private:
   void homeAct(int control);
   void setupAct(int control);
   void setupOpen();
+  void abDisplay(double &a_s, double &b_s, bool &known, double &target_min);
+  void drawProgress(QPainter &p);
+  void drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill);
+  std::vector<int> stepScope() const;
   bool running() const;
   ti_pages::HomeState homeState(struct TiHomeStrings &keep);
   void drawHome(QPainter &p);
@@ -200,6 +207,11 @@ private:
   bool overview = false;         // the run-all overview page instead of a test's page
   bool home_page = true;         // the first page: START / STOP (ti_pages_logic.h); the test pages are the individual tests
   bool setup_page = false;       // the A/B set-up page
+  bool progress_page = false;    // the progress page: the alternation's sides against their target, each test window
+  bool drive_base_set = false;   // what the counters were when START was last pressed (the "since START" line)
+  double drive_base_win[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
+  double drive_base_a = 0;
+  double drive_base_b = 0;
   bool ab_configured = false;    // TiAbConfig names a setting: START runs the plan (tests + A/B relay)
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row
@@ -209,6 +221,9 @@ private:
   bool ab_on = false;                       // TiAbOn (tmpfs)
   bool ab_hold_fresh = false;               // TiTestHold: the car controller's reason for holding the tests, recent
   QString ab_hold_why;                      // ... and the reason (empty: not held)
+  bool ab_stored_known = false;             // TiAbProgress (persistent) is the record of the alternation set up now
+  double ab_stored_a = 0;                   // ... scored seconds per side
+  double ab_stored_b = 0;
   bool ab_plan_on = false;                  // TiPlanOn (tmpfs): the drive plan, A/B then the tests
   void drawPlanLine(QPainter &p);
   bool ab_fresh = false;                    // the car side's status is recent

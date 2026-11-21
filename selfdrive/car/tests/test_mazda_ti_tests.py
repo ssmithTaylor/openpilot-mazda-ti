@@ -682,3 +682,24 @@ def test_the_gate_and_lock_params_are_registered_everywhere_they_must_be():
     assert f'"{key}"' in excluded                                                  # not synced or exported as a setting
   car = (ROOT / 'selfdrive/car/mazda/carcontroller.py').read_text(encoding='utf-8')
   assert 'self.params_memory.put("TiTestGate"' in car
+
+
+# ---- the drive plan forces run-all mode in the car controller; the accountant must count it ---------------------------------
+
+def test_the_plan_forced_run_all_is_credited_although_the_run_all_toggle_is_not_set():
+  defs, errors = tt.load_definitions()
+  assert errors == []
+  sweep = next(t for t in defs if t.id == "ti_sweep")
+  band = sweep.bins[0][2]
+  toggles = NS(ti_dither=False, ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False)   # the plan sets none of them
+  forced = tt.TestAccountant(defs, FakeParams(), FakeParams())
+  forced.update(toggles, 24 * MPH, True, (), credit=("TiSweep", band, 1, 5.0), run_all_forced=True)
+  assert forced.pending_steps.get("ti_sweep", {}).get((band, 1)) == 5.0 and "ti_sweep" in forced.seen_interval
+  plain = tt.TestAccountant(defs, FakeParams(), FakeParams())
+  plain.update(toggles, 24 * MPH, True, (), credit=("TiSweep", band, 1, 5.0))
+  assert plain.pending_steps == {}                    # with nothing on, nothing is counted (unchanged)
+
+
+def test_the_car_controller_tells_the_accountant_when_run_all_is_forced():
+  src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
+  assert "run_all_forced=bool(self.ti_ident_all)" in src

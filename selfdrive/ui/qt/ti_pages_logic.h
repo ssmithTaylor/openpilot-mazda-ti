@@ -47,6 +47,8 @@ constexpr int MAX_PRIMARY_CHARS = 22;
 constexpr int MAX_SECOND_CHARS = 36;
 constexpr int MAX_EXPERIMENT_CHARS = 80;
 constexpr int MAX_DETAIL_CHARS = 70;
+constexpr int MAX_PROGRESS_CHARS = 56;   // a progress line at PROGRESS_PX in a 1660 px box
+constexpr int PROGRESS_PX = 44;
 constexpr int MAX_START_CHARS = 28;      // START label at START_PX
 constexpr int MAX_START_SUB_CHARS = 56;  // its second line at START_SUB_PX
 
@@ -68,7 +70,7 @@ inline int gapBetween(const Rect &a, const Rect &b) {
   return std::max(gx, gy);
 }
 
-enum class Page { Home, Setup, Tests, Overview, Ab };
+enum class Page { Home, Setup, Tests, Overview, Ab, Progress };
 
 // Control ids (also the ids the mouse handler works with)
 enum Ctl {
@@ -90,7 +92,8 @@ enum Ctl {
   CTL_START = 40,
   CTL_STOP = 41,
   CTL_NAV_SETUP = 42,
-  CTL_NAV_INDIV = 43,
+  CTL_NAV_INDIV = 43,    // on the progress page: the individual tests
+  CTL_NAV_PROGRESS = 44, // on the first page: the progress page
   CTL_SETUP_USE = 50,
   CTL_SETUP_PREV = 51,   // previous / next setting
   CTL_SETUP_NEXT = 52,
@@ -98,6 +101,7 @@ enum Ctl {
   CTL_SETUP_B_PLUS = 54,
   CTL_SETUP_BLOCK_MINUS = 55,
   CTL_SETUP_BLOCK_PLUS = 56,
+  CTL_SETUP_RESET = 57,  // RESET PROGRESS (asks first)
 };
 
 struct Control {
@@ -120,8 +124,17 @@ inline int rowHeight(int error_lines) {
 constexpr Rect HOME_PRIMARY = {20, 10, 1720, 150};
 constexpr Rect HOME_SECOND = {20, 160, 1720, 90};
 constexpr Rect HOME_EXPERIMENT = {20, 250, 2120, 60};
-constexpr Rect HOME_DETAIL = {480, 984, 1660, 80};
+constexpr Rect HOME_DETAIL = {480, 976, 1660, 44};     // line 1: what this drive has added
+constexpr Rect HOME_DETAIL2 = {480, 1020, 1660, 44};   // line 2: why tests are held, or the alternation's numbers
 constexpr Rect HOME_BADGE = {20, 990, 360, 70};
+// The progress page's text boxes (not controls)
+constexpr Rect PROG_TITLE = {400, 10, 1340, 180};
+constexpr Rect PROG_AB_HEAD = {480, 210, 1660, 56};
+constexpr Rect PROG_AB_BAR_A = {480, 276, 1660, 44};
+constexpr Rect PROG_AB_BAR_B = {480, 330, 1660, 44};
+constexpr Rect PROG_AB_LEFT = {480, 384, 1660, 50};
+constexpr int PROG_ROWS_TOP = 470;
+constexpr int PROG_ROW_H = 125;                       // four windows, each a label, a bar and one line
 // The individual pages' title row and banner (text, not controls)
 constexpr Rect TITLE_PREV_NEXT = {680, 10, 400, 180};     // between PREV and NEXT
 constexpr Rect TITLE_WIDE = {340, 10, 1140, 180};         // between BACK and the red box
@@ -140,7 +153,7 @@ inline int layout(Page pg, int error_lines, Control *out) {
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
       add(CTL_BACK, 20, 330, 360, 180, "EXIT");
       add(CTL_NAV_SETUP, 20, 550, 360, 180, "SET UP A/B");
-      add(CTL_NAV_INDIV, 20, 770, 360, 180, "INDIVIDUAL TESTS");
+      add(CTL_NAV_PROGRESS, 20, 770, 360, 180, "PROGRESS");
       add(CTL_START, 480, 330, 1660, 272, "START");
       add(CTL_STOP, 480, 692, 1660, 272, "STOP");
       break;
@@ -154,6 +167,12 @@ inline int layout(Page pg, int error_lines, Control *out) {
       add(CTL_SETUP_B_PLUS, 1920, 620, 220, 150, "B +");
       add(CTL_SETUP_BLOCK_MINUS, 480, 810, 220, 150, "BLOCK -");
       add(CTL_SETUP_BLOCK_PLUS, 1920, 810, 220, 150, "BLOCK +");
+      add(CTL_SETUP_RESET, 20, 330, 360, 180, "RESET PROGRESS");
+      break;
+    case Page::Progress:
+      add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
+      add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
+      add(CTL_NAV_INDIV, 20, 330, 360, 180, "INDIVIDUAL TESTS");
       break;
     case Page::Tests:
       add(CTL_BACK, 20, 10, 300, 180, "< START PAGE");
@@ -290,6 +309,10 @@ struct HomeState {
   double target_secs = 0;
   bool tests_active = false;               // the car side counted a test in its last interval
   const char *gate_reason = "";            // command curve lat when the armed test's gate is closed
+  bool ab_stored_known = false;            // the persistent record is for the alternation set up now
+  double ab_stored_a_s = 0;                // ... scored seconds per side, kept across ignition cycles
+  double ab_stored_b_s = 0;
+  double target_min = 20.0;                // scored minutes per side that complete the alternation
 };
 
 struct Line {
@@ -388,12 +411,133 @@ inline int altTargetWindow(double mph) {
   return mph < 45.5 ? 1 : 2;
 }
 
+// ---- progress as progress ---------------------------------------------------------------------------------------------
+inline int wholeMin(double secs) {
+  return secs > 0 ? (int)std::floor(secs / 60.0 + 1e-9) : 0;
+}
+
+inline double fraction(double have, double need) {
+  return need <= 0 ? 1.0 : std::min(1.0, std::max(0.0, have / need));
+}
+
+// "A 14 / 20 min, B 13 / 20 min"
+inline std::string abProgressText(double a_s, double b_s, double target_min) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "A %d / %.0f min, B %d / %.0f min", wholeMin(a_s), target_min, wholeMin(b_s), target_min);
+  return buf;
+}
+
+// Driving time still needed at the alternation's speeds: the scored time still missing on both sides (the sides alternate)
+inline double abMinutesLeft(double a_s, double b_s, double target_min) {
+  const double t = 60.0 * target_min;
+  return (std::max(0.0, t - a_s) + std::max(0.0, t - b_s)) / 60.0;
+}
+
+inline std::string abLeftText(double a_s, double b_s, double target_min) {
+  const double left = abMinutesLeft(a_s, b_s, target_min);
+  if (left <= 0.0) {
+    return "A/B complete: the tests take over";
+  }
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "About %d min of driving at %d-%d mph left", (int)std::ceil(left), (int)ti_ab::PLAN_ALT_MIN_MPH + 1,
+                (int)ti_ab::PLAN_ALT_MAX_MPH - 1);
+  return buf;
+}
+
+// "A/B 14 of 20 min each side done": the second line of the stopped state
+inline std::string stoppedSecond(bool known, double a_s, double b_s, double target_min) {
+  if (!known || (a_s <= 0.0 && b_s <= 0.0)) {
+    return "Nothing is running";
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "A/B %d of %.0f min each side done", wholeMin(std::min(a_s, b_s)), target_min);
+  return buf;
+}
+
+// One window of the tests: "21-27 mph" and "3 of 12 done; hold 24 mph for about 9 min" (done, total: required items)
+inline std::string windowLabel(int w, bool metric) {
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%d-%d %s", speedValue(ti_logic::WINDOWS[w].low, metric), speedValue(ti_logic::WINDOWS[w].high, metric),
+                metric ? "km/h" : "mph");
+  return buf;
+}
+
+inline std::string windowRowText(int w, int done, int total, double secs_left, bool metric) {
+  char buf[96];
+  if (total <= 0) {
+    return "no test needs this window";
+  }
+  if (done >= total) {
+    std::snprintf(buf, sizeof(buf), "%d of %d done", done, total);
+    return buf;
+  }
+  std::snprintf(buf, sizeof(buf), "%d of %d done; hold %d %s for about %d min", done, total, speedValue(ti_logic::windowTargetMph(w), metric),
+                metric ? "km/h" : "mph", std::max(1, (int)std::ceil(secs_left / 60.0)));
+  return buf;
+}
+
+// What the drive has added since START was last pressed: tests, seconds credited per window; the alternation, minutes per side.
+// win_s: credited seconds per window since START; a_s, b_s: scored seconds per side since START; has_ab: an alternation is set up.
+inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double a_s, double b_s, bool has_ab, bool metric) {
+  std::string tests;
+  double total = 0;
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    if (win_s[w] >= 1.0) {
+      char buf[48];
+      std::snprintf(buf, sizeof(buf), "%s%s +%d s", tests.empty() ? "" : ", ", windowLabel(w, metric).substr(0, windowLabel(w, metric).find(' ')).c_str(), (int)win_s[w]);
+      tests += buf;
+      total += win_s[w];
+    }
+  }
+  char ab[48] = "";
+  if (has_ab) {
+    std::snprintf(ab, sizeof(ab), "A/B +%.1f / +%.1f min", a_s / 60.0, b_s / 60.0);
+  }
+  std::string out = "Since START: ";
+  if (tests.empty() && (!has_ab || (a_s < 6.0 && b_s < 6.0))) {
+    return out + "nothing counted yet";
+  }
+  std::string full = out + (tests.empty() ? std::string("tests +0 s") : "tests " + tests) + (has_ab ? std::string("; ") + ab : std::string());
+  if ((int)full.size() <= MAX_DETAIL_CHARS) {
+    return full;
+  }
+  char t[32];
+  std::snprintf(t, sizeof(t), "tests +%s", mmss(total).c_str());
+  return out + t + (has_ab ? std::string("; ") + ab : std::string());
+}
+
+// The speeds that count, nearest first below and above `mph` (the middle of the nearest windows), "Hold 24 or 38 mph"
+inline bool countsNothingAt(double mph) {
+  return ti_logic::zoneFor(mph).state != ti_logic::ZoneState::Inside;
+}
+
+inline std::string nearestCounting(double mph, bool metric) {
+  int lower = -1, upper = -1;
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    if (ti_logic::WINDOWS[w].high <= mph) {
+      lower = w;
+    }
+    if (ti_logic::WINDOWS[w].low > mph && upper < 0) {
+      upper = w;
+    }
+  }
+  char buf[64];
+  const char *unit = metric ? "km/h" : "mph";
+  if (lower >= 0 && upper >= 0) {
+    std::snprintf(buf, sizeof(buf), "Hold %d or %d %s", speedValue(ti_logic::windowTargetMph(lower), metric), speedValue(ti_logic::windowTargetMph(upper), metric), unit);
+  } else {
+    const int w = lower >= 0 ? lower : upper;
+    std::snprintf(buf, sizeof(buf), "Hold %d %s", speedValue(ti_logic::windowTargetMph(w), metric), unit);
+  }
+  return buf;
+}
+
 // The primary line and the second line of the first page.
 inline HomeLines home(const HomeState &s) {
   HomeLines h;
   if (s.run == Run::Stopped) {
-    h.primary = line("STOPPED", Tone::Stopped);
-    h.second = "Nothing is running";
+    h.primary = line("STOPPED: TAP START", Tone::Stopped);   // off after every stop and restart, said plainly
+    h.second = s.configured ? stoppedSecond(s.ab_stored_known, s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) : std::string("Nothing is running");
     return h;
   }
   if (!s.engaged) {
@@ -474,7 +618,12 @@ inline HomeLines home(const HomeState &s) {
   }
   const ti_logic::Zone zone = ti_logic::zoneFor(s.mph);
   const bool inside = zone.state == ti_logic::ZoneState::Inside && zone.window == s.target_window;
-  if (!inside) {
+  if (countsNothingAt(s.mph)) {
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "NO COUNT AT %d %s", speedValue(s.mph, s.metric), speedUnit(s.metric));
+    h.primary = line(buf, Tone::Waiting);
+    h.second = nearestCounting(s.mph, s.metric);
+  } else if (!inside) {
     h.primary = line(holdSpeed(s.target_window, s.metric), Tone::Waiting);
     h.second = nowSpeed(s.mph, s.metric);
   } else if (s.tests_active) {

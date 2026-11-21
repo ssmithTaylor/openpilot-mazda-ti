@@ -13,7 +13,7 @@ using namespace ti_pages;
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { if (failures < 40) std::printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
-static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab};
+static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress};
 
 static int minDim(const Rect &r) { return std::min(r.w, r.h); }
 
@@ -63,7 +63,7 @@ static void homeRules() {
   CHECK(start.w * 10 >= SCREEN_W * 7 && stop.w * 10 >= SCREEN_W * 7);   // most of the width
   CHECK(start.x == stop.x && start.w == stop.w);
   // the text boxes of the page are not under a control
-  const Rect boxes[] = {HOME_PRIMARY, HOME_SECOND, HOME_EXPERIMENT, HOME_DETAIL, HOME_BADGE};
+  const Rect boxes[] = {HOME_PRIMARY, HOME_SECOND, HOME_EXPERIMENT, HOME_DETAIL, HOME_DETAIL2, HOME_BADGE};
   for (const Rect &b : boxes) {
     CHECK(b.x >= 0 && b.right() <= SCREEN_W && b.bottom() <= SCREEN_H);
     for (int i = 0; i < n; i++) {
@@ -80,6 +80,17 @@ static void homeRules() {
       }
       CHECK(pg != Page::Tests || !overlaps(TITLE_PREV_NEXT, d[i].r));
       CHECK(pg == Page::Tests || !overlaps(TITLE_WIDE, d[i].r));
+    }
+  }
+  // the progress page's text boxes are not under a control and fit the screen
+  Control pg_c[MAX_CONTROLS];
+  const int pn = layout(Page::Progress, 0, pg_c);
+  const Rect prog[] = {PROG_TITLE, PROG_AB_HEAD, PROG_AB_BAR_A, PROG_AB_BAR_B, PROG_AB_LEFT,
+                       Rect{480, PROG_ROWS_TOP, 1660, 4 * PROG_ROW_H}};
+  for (const Rect &b : prog) {
+    CHECK(b.right() <= SCREEN_W && b.bottom() <= SCREEN_H);
+    for (int i = 0; i < pn; i++) {
+      CHECK(!overlaps(b, pg_c[i].r));
     }
   }
   // the A/B page: the status panel is not under a control, and the table (six rows of at least 30 px) ends above the page foot
@@ -101,7 +112,8 @@ static void fontsFit() {
   CHECK(MAX_PRIMARY_CHARS * PRIMARY_PX * 0.75 <= HOME_PRIMARY.w);
   CHECK(MAX_SECOND_CHARS * SECOND_PX * 0.62 <= HOME_SECOND.w);
   CHECK(MAX_EXPERIMENT_CHARS * EXPERIMENT_PX * 0.62 <= HOME_EXPERIMENT.w);
-  CHECK(MAX_DETAIL_CHARS * DETAIL_PX * 0.62 <= HOME_DETAIL.w);
+  CHECK(MAX_DETAIL_CHARS * DETAIL_PX * 0.62 <= HOME_DETAIL.w && HOME_DETAIL.h >= DETAIL_PX + 4 && HOME_DETAIL2.h >= DETAIL_PX + 4);
+  CHECK(MAX_PROGRESS_CHARS * PROGRESS_PX * 0.62 <= PROG_AB_HEAD.w && PROGRESS_PX + 4 <= PROG_AB_HEAD.h);
   Rect start{};
   rectOf(Page::Home, CTL_START, 0, start);
   CHECK(MAX_START_CHARS * START_PX * 0.70 <= start.w);
@@ -174,8 +186,17 @@ static void sampleStates() {
   s.run = Run::Plan; s.engaged = true; s.have_speed = true; s.mph = 24; s.plan_mode = "tests"; s.target = true; s.target_window = 0;
   s.target_secs = 100; s.tests_active = true; s.configured = true;
   CHECK(home(s).primary.text == "TESTING: HOLD 24 MPH" && home(s).primary.tone == Tone::Running && home(s).second == "1:40 to go here");
-  s.mph = 31;
-  CHECK(home(s).primary.text == "HOLD 24 MPH" && home(s).primary.tone == Tone::Waiting && home(s).second == "Now 31 mph");
+  s.mph = 38;                                    // inside another window: it counts, but not the one asked for
+  CHECK(home(s).primary.text == "HOLD 24 MPH" && home(s).primary.tone == Tone::Waiting && home(s).second == "Now 38 mph");
+  s.mph = 30;                                    // where nothing counts: said plainly, with the nearest speeds that do
+  CHECK(home(s).primary.text == "NO COUNT AT 30 MPH" && home(s).primary.tone == Tone::Waiting && home(s).second == "Hold 24 or 38 mph");
+  s.mph = 45;
+  CHECK(home(s).primary.text == "NO COUNT AT 45 MPH" && home(s).second == "Hold 38 or 52 mph");
+  s.mph = 17;
+  CHECK(home(s).primary.text == "NO COUNT AT 17 MPH" && home(s).second == "Hold 24 mph");
+  s.mph = 85;
+  CHECK(home(s).primary.text == "NO COUNT AT 85 MPH" && home(s).second == "Hold 72 mph");
+  s.mph = 24;
   s.mph = 24; s.tests_active = false; s.gate_reason = "curve";
   CHECK(home(s).primary.text == "WAITING: STRAIGHT ROAD");
   s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "ab"; s.ab_fresh = true; s.ab_state = "running"; s.ab_arm = "B";
@@ -190,7 +211,11 @@ static void sampleStates() {
   s.ab_complete = true;
   CHECK(home(s).primary.text == "DONE: ALL COMPLETE");
   s = HomeState();
-  CHECK(home(s).primary.text == "STOPPED");
+  CHECK(home(s).primary.text == "STOPPED: TAP START" && home(s).second == "Nothing is running");
+  s.configured = true; s.ab_stored_known = true; s.ab_stored_a_s = 14.7 * 60; s.ab_stored_b_s = 13.2 * 60;
+  CHECK(home(s).primary.text == "STOPPED: TAP START" && home(s).second == "A/B 13 of 20 min each side done");
+  s.ab_stored_known = false;
+  CHECK(home(s).second == "Nothing is running");
   s.run = Run::All;
   CHECK(home(s).primary.text == "WAITING: ENGAGE");
   // km/h on a metric device
@@ -315,6 +340,39 @@ static void startLabels() {
   CHECK(startLook(true, Run::All).enabled);   // run-all with an alternation set up: START moves to the plan
 }
 
+static void progressTexts() {
+  CHECK(abProgressText(14.2 * 60, 13.9 * 60, 20) == "A 14 / 20 min, B 13 / 20 min");
+  CHECK(abMinutesLeft(14 * 60, 13 * 60, 20) == 13.0 && abMinutesLeft(25 * 60, 21 * 60, 20) == 0.0);
+  CHECK(abLeftText(14 * 60, 13 * 60, 20) == "About 13 min of driving at 36-55 mph left");
+  CHECK(abLeftText(1200, 1200, 20) == "A/B complete: the tests take over");
+  CHECK(fraction(10, 20) == 0.5 && fraction(30, 20) == 1.0 && fraction(-1, 20) == 0.0 && fraction(1, 0) == 1.0);
+  CHECK(windowLabel(0, false) == "21-27 mph" && windowRowText(0, 3, 12, 540, false) == "3 of 12 done; hold 24 mph for about 9 min");
+  CHECK(windowRowText(1, 12, 12, 0, false) == "12 of 12 done" && windowRowText(1, 0, 0, 0, false) == "no test needs this window");
+  CHECK(windowRowText(3, 0, 12, 1, true) == "0 of 12 done; hold 116 km/h for about 1 min");
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    for (int m = 0; m < 2; m++) {
+      CHECK((int)windowRowText(w, 11, 999, 99999, m).size() <= MAX_PROGRESS_CHARS);
+      CHECK((int)(windowLabel(w, m) + "  ").size() <= 20);
+    }
+  }
+  CHECK((int)abProgressText(99999, 99999, 20).size() <= MAX_PROGRESS_CHARS && (int)abLeftText(0, 0, 20).size() <= MAX_PROGRESS_CHARS);
+  // this drive: every combination fits the detail line
+  const double none[4] = {0, 0, 0, 0};
+  CHECK(thisDriveLine(none, 0, 0, true, false) == "Since START: nothing counted yet");
+  const double some[4] = {95, 0, 40, 0};
+  CHECK(thisDriveLine(some, 240, 210, true, false) == "Since START: tests 21-27 +95 s, 49-56 +40 s; A/B +4.0 / +3.5 min");
+  CHECK(thisDriveLine(some, 0, 0, false, false) == "Since START: tests 21-27 +95 s, 49-56 +40 s");
+  const double big[4] = {9999, 9999, 9999, 9999};
+  for (int ab = 0; ab < 2; ab++) {
+    for (int m = 0; m < 2; m++) {
+      CHECK((int)thisDriveLine(big, 99999, 99999, ab, m).size() <= MAX_DETAIL_CHARS);
+      CHECK((int)thisDriveLine(some, 12345, 54321, ab, m).size() <= MAX_DETAIL_CHARS);
+    }
+  }
+  CHECK(countsNothingAt(30) && countsNothingAt(33) && countsNothingAt(17) && countsNothingAt(80) && !countsNothingAt(24) && !countsNothingAt(70));
+  CHECK(nearestCounting(30, false) == "Hold 24 or 38 mph");
+}
+
 static void setup() {
   CHECK(setupEditable(false, false, 0) && setupEditable(false, true, 0.5) && !setupEditable(false, true, 25) && !setupEditable(true, true, 0));
   CHECK((int)setupNote(false, true, 0).size() <= MAX_EXPERIMENT_CHARS && (int)setupNote(true, true, 0).size() <= MAX_EXPERIMENT_CHARS);
@@ -332,6 +390,7 @@ int main() {
   experimentWords();
   writes();
   startLabels();
+  progressTexts();
   setup();
   if (failures == 0) {
     std::printf("ok\n");

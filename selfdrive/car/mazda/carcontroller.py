@@ -851,7 +851,8 @@ class CarController(CarControllerBase):
         if ident is not None and ident.emitted and ident.reason in ti_ident_mod.RUNNING_REASONS:
           active = active + (ident.emitted,)    # an identification test running clean (screen: ON · ACTIVE)
         tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, active,
-                     credit=ident.credit if ident is not None else None)
+                     credit=ident.credit if ident is not None else None,
+                     run_all_forced=bool(self.ti_ident_all))
 
       # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
       # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a

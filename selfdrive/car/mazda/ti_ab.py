@@ -155,6 +155,41 @@ def _table_hash():
 
 TABLE_HASH = _table_hash()
 
+# ---- progress that survives an ignition cycle ---------------------------------------------------------------------------
+# The scored seconds per side (and the engaged seconds per window) of the experiment now set up, kept in a persistent param so a
+# fuel stop does not lose them. Keyed by the experiment (the generator/table hash, the setting, the owner's value A, value B): a
+# different experiment starts from zero and the old record is cleared; the A/B set-up page's RESET PROGRESS removes the param.
+# Reading it back changes no gate and cannot start anything: it only fills the counters of an activation that is already allowed.
+PARAM_PROGRESS = "TiAbProgress"
+MAX_STORED_S = 3600.0 * 100
+
+
+def progress_key(cfg):
+  return [TABLE_HASH, cfg.setting, round(float(cfg.a), 4), round(float(cfg.b), 4)]
+
+
+def _stored_seconds(x):
+  if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0.0 or x > MAX_STORED_S:
+    raise ValueError("bad stored seconds")
+  return float(x)
+
+
+def parse_progress(raw):
+  """The stored record as {"key", "committed", "progress"}, or None when absent or in any way unreadable (then zero is used)."""
+  try:
+    if isinstance(raw, (bytes, bytearray)):
+      raw = raw.decode("utf-8")
+    if not raw:
+      return None
+    d = json.loads(raw)
+    if d.get("v") != 1 or not isinstance(d.get("key"), list):
+      return None
+    committed = {a: _stored_seconds(d["committed"][a]) for a in "AB"}
+    progress = {a: {w: _stored_seconds(d["progress"][a].get(w, 0.0)) for w in WINDOW_LABELS} for a in "AB"}
+    return {"key": d["key"], "committed": committed, "progress": progress}
+  except Exception:
+    return None
+
 
 # ---- schedule -------------------------------------------------------------------------------------------------------
 def _uniform(seed, draw):
@@ -321,6 +356,9 @@ class TiAb:
     self.block_len = 0.0
     self.speed_off_high, self.speed_on_high = SPEED_OFF_HIGH, SPEED_ON_HIGH
     self.target_s = None         # drive plan: scored seconds per side that complete the alternation (None: never completes)
+    self.stored_raw = None       # the persistent progress record as last read (TiAbRunner reads it); None: absent
+    self.save_fn = None          # writes (str) or clears (None) the persistent record; None in unit tests
+    self._restored = None        # (key, stored_raw) the counters were last filled from
     self.cfg_valid = False
     self.last_release = None
     self._refused = None
@@ -417,6 +455,44 @@ class TiAb:
     self._event("switch", setting=spec.name, why=why, s_from=s_from, s_to=float(to), ramp_frames=frames,
                 wash_frames=self.wash_left, a=self.cfg.a, b=self.cfg.b, arm="A" if to == 0 else "B", immediate=bool(immediate))
 
+  def _restore(self, cfg, force=False):
+    """Fill the counters from the stored record when it is for this experiment, else zero them (and clear a record of another
+    experiment). Completion is judged on what is restored. Never raises."""
+    try:
+      key = progress_key(cfg)
+      if not force and self._restored == (key, self.stored_raw):
+        return
+      doc = parse_progress(self.stored_raw)
+      self.committed = {"A": 0.0, "B": 0.0}
+      self.progress = {arm: {w: 0.0 for w in WINDOW_LABELS} for arm in "AB"}
+      self.complete = False
+      if doc is not None and doc["key"] == key:
+        self.committed, self.progress = doc["committed"], doc["progress"]
+      elif doc is not None and self.save_fn is not None:
+        self.save_fn(None)                         # the experiment changed: the old record goes
+        self.stored_raw = None
+      self._restored = (key, self.stored_raw)
+      if (self.target_s is not None and self.committed["A"] >= self.target_s and self.committed["B"] >= self.target_s):
+        self.complete = True
+        self._event("complete", committed={a: round(v, 1) for a, v in self.committed.items()}, target_s=self.target_s, restored=True)
+    except Exception:
+      self.committed = {"A": 0.0, "B": 0.0}
+      self.progress = {arm: {w: 0.0 for w in WINDOW_LABELS} for arm in "AB"}
+      self.complete = False
+
+  def _save(self):
+    if self.save_fn is None or self.cfg is None:
+      return
+    try:
+      raw = json.dumps({"v": 1, "key": progress_key(self.cfg), "setting": self.cfg.setting, "a": round(float(self.cfg.a), 4),
+                        "b": round(float(self.cfg.b), 4), "committed": {a: round(v, 2) for a, v in self.committed.items()},
+                        "progress": {a: {w: round(t, 2) for w, t in d.items()} for a, d in self.progress.items()}})
+      self.save_fn(raw)
+      self.stored_raw = raw
+      self._restored = (progress_key(self.cfg), raw)
+    except Exception:
+      pass
+
   def _end_block(self, reason):
     if self.block is None:
       return
@@ -434,6 +510,8 @@ class TiAb:
         and self.committed["B"] >= self.target_s):
       self.complete = True
       self._event("complete", committed={a: round(v, 1) for a, v in self.committed.items()}, target_s=self.target_s)
+    if not voided:
+      self._save()
     self.pending_since, self.wait_hist, self.wait_logged = None, {}, False
 
   def _end_wait(self, outcome):
@@ -528,6 +606,8 @@ class TiAb:
     if on and self.seen_off:
       cfg, msg = self._config(config, stored)
     self.cfg_valid = cfg is not None
+    if cfg is not None and self.cfg_key is None:
+      self._restore(cfg)            # a stopped or restarted experiment picks up its stored progress (no effect on whether anything runs)
     hard, immediate = None, False
     if not on:
       hard = "off"
@@ -593,6 +673,7 @@ class TiAb:
       self.cfg_key = (cfg.setting, cfg.b, cfg.block_s, cfg.seed)
       self.block_len = self.cfg.block_s if self.block_s_override is None else self.block_s_override
       self._reset_activation()
+      self._restore(cfg, force=True)
       self.ramp = Ramp()
       self._event("config", version=VERSION, table=TABLE_HASH, setting=cfg.setting, a=cfg.a, b=cfg.b,
                   block_s=self.block_len, seed=self.seed, seed_given=cfg.seed is not None,
@@ -828,6 +909,8 @@ class TiAbRunner:
   def __init__(self, params, params_memory, log=None, block_s=None, plan_target_min=None):
     self.params, self.memory = params, params_memory
     self.ab = TiAb(log=log, block_s=block_s)
+    self.ab.save_fn = self._save_progress
+    self._written = None
     self.plan = ti_plan.Plan(log=lambda kind, **kw: self.ab._event(kind, **kw))
     self.plan_on, self.plan_ack, self.plan_dead = False, None, False
     self.plan_out = None
@@ -838,6 +921,15 @@ class TiAbRunner:
     self.read_error = ""
     self.published = None
     self.published_k = -10 ** 9
+
+  def _save_progress(self, raw):
+    """Write the experiment's progress (persistent), or clear it (None)."""
+    self._written = (raw, time.time())
+    if raw is None:
+      self.params.remove(PARAM_PROGRESS)
+    else:
+      put = getattr(self.params, "put_nonblocking", None) or self.params.put
+      put(PARAM_PROGRESS, raw)
 
   def _read(self):
     try:
@@ -861,6 +953,14 @@ class TiAbRunner:
         self.config = self.params.get(PARAM_CONFIG)
       except Exception:
         self.config = None
+      try:
+        raw = self.params.get(PARAM_PROGRESS)
+        if isinstance(raw, (bytes, bytearray)):
+          raw = raw.decode("utf-8", "replace")
+        if self._written is None or raw == self._written[0] or time.time() - self._written[1] > 5.0:
+          self.ab.stored_raw = raw         # (a write just made may not have landed yet: until it has, keep what was written)
+      except Exception:
+        self.ab.stored_raw = None
 
   def step(self, toggles, **inputs):
     """`inputs`: engaged, v_ego, curvature, steer, saturated, steering_pressed, driver_torque, lane_change, blinker, ti_ok,

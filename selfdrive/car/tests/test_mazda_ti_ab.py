@@ -753,7 +753,7 @@ def test_the_runner_never_writes_the_owners_param_and_publishes_a_status():
   mem.d["TiAbOn"] = True
   for _ in range(FRAMES(40.0)):
     rn.step(toggles(), **INPUTS)
-  assert set(params.d) == {"TiAbConfig"}                                # nothing written to the persistent store
+  assert set(params.d) <= {"TiAbConfig", "TiAbProgress"}                # the persistent store: the set-up and the experiment's progress only
   assert set(mem.d) <= {"TiAbOn", "TiAbStatus", "TiPlan"}
   st = json.loads(mem.d["TiAbStatus"])
   assert st["setting"] == "SteerKP" and st["a"] == 0.8 and st["b"] == 0.9 and st["state"] == "running"
@@ -1070,7 +1070,7 @@ def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it
   assert 'TI_AB_ON_KEY = "TiAbOn"' in ui and 'TI_AB_PIN_KEY = "TiAbPin"' in ui and 'TI_AB_CONFIG_KEY = "TiAbConfig"' in ui
   # the page writes no tuning setting: its only writes are the three keys
   writes = set(__import__("re").findall(r"ab_(?:memory|params)\.(?:put|putBool|remove)\((\w+)", ui))
-  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY", "TI_PLAN_ON_KEY"}, writes
+  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY", "TI_AB_PROGRESS_KEY", "TI_PLAN_ON_KEY"}, writes
   # the lock is the Tests page's own (the A/B page is a page of the same window)
   assert "class TestsWindow" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
   assert "bool abStoredValue" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
@@ -1093,3 +1093,95 @@ def test_a_cycle_of_the_runner_is_cheap_enough_for_the_100_hz_thread():
     rn.step(t, **INPUTS)
   per = (time.perf_counter() - t0) / n
   assert per < 400e-6, per                       # on a PC; the device is several times slower: see the report for the figure
+
+
+# ---- progress that survives an ignition cycle -------------------------------------------------------------------------------
+
+def _persisting_rig(raw=None, target_s=None, **over):
+  """A Rig whose TiAb has the persistent record `raw` and a save function that keeps what is written (None clears)."""
+  r = Rig(config=cfg(seed=first_b_seed()), **over)
+  r.written = []
+  r.ab.stored_raw = raw
+  r.ab.save_fn = lambda v: r.written.append(v)
+  if target_s is not None:
+    r.ab.set_plan_limits(56.0, target_s)
+  return r
+
+
+def test_scored_minutes_are_written_at_each_block_end_and_restored_for_the_same_experiment():
+  r = _persisting_rig(target_s=600.0)
+  r.secs(75.0)
+  r.secs(75.0)
+  assert r.written and r.written[-1] is not None
+  doc = ab.parse_progress(r.written[-1])
+  assert doc is not None and doc["committed"]["A"] + doc["committed"]["B"] > 0.0
+  # a new process (an ignition cycle): same experiment, same stored record
+  n = _persisting_rig(raw=r.written[-1], target_s=600.0)
+  n.step(5)
+  assert n.ab.committed == doc["committed"]
+  assert all(n.ab.progress[a][w] >= doc["progress"][a][w] for a in "AB" for w in doc["progress"][a])
+
+
+def test_restored_progress_is_judged_for_completion_and_never_starts_the_mode():
+  r = _persisting_rig(target_s=30.0)
+  r.secs(100.0)
+  r.secs(100.0)
+  raw = r.written[-1]
+  doc = ab.parse_progress(raw)
+  assert doc["committed"]["A"] >= 30.0 and doc["committed"]["B"] >= 30.0
+  # a fresh process with the switch OFF: the stored progress fills nothing and nothing runs
+  n = _persisting_rig(raw=raw, target_s=30.0)
+  n.config = cfg(seed=first_b_seed())
+  out = n.step(50, on=False)
+  assert not out.active and n.ab.mode == "off" and n.ab.cfg_key is None and not n.ab.complete
+  assert n.ab.committed == {"A": 0.0, "B": 0.0}
+  # switched on (valid, engaged): completion is judged on the restored total at once, the value stays A and no block starts
+  n.step(5, on=True)
+  assert n.ab.complete and n.ab.block is None and all(not o.active for o in n.outs[-5:])
+  assert n.ab.mode == "complete"
+
+
+def test_a_corrupt_stored_record_falls_back_to_zero():
+  for raw in ("{", "[]", "null", json.dumps({"v": 1}), json.dumps({"v": 2, "key": [], "committed": {}, "progress": {}}),
+              b"\xff\xfe", ""):
+    n = _persisting_rig(raw=raw, target_s=600.0)
+    n.step(5)
+    assert n.ab.committed == {"A": 0.0, "B": 0.0} and not n.ab.complete
+  r = _persisting_rig(target_s=600.0)
+  r.secs(150.0)
+  good = json.loads(r.written[-1])
+  for bad in (-5.0, float("nan"), 1e12, "7", True, None):
+    d = json.loads(json.dumps(good))
+    d["committed"]["A"] = bad
+    n = _persisting_rig(raw=json.dumps(d), target_s=600.0)
+    n.step(5)
+    assert n.ab.committed == {"A": 0.0, "B": 0.0}
+
+
+def test_a_different_experiment_starts_from_zero_and_clears_the_stored_record():
+  r = _persisting_rig(target_s=600.0)
+  r.secs(150.0)
+  raw = r.written[-1]
+  n = _persisting_rig(raw=raw, target_s=600.0)
+  n.config = cfg(seed=first_b_seed(), setting="LatFrictionComp", b=False)   # another setting
+  n.step(5)
+  assert n.ab.committed == {"A": 0.0, "B": 0.0} and n.written == [None]
+  m = _persisting_rig(raw=raw, target_s=600.0)
+  m.over["stored"] = {**STORED, "LatDamping": True}                      # the owner changed his own value A
+  m.config = cfg(seed=first_b_seed(), b=False)
+  m.step(5)
+  assert m.ab.committed == {"A": 0.0, "B": 0.0} and m.written == [None]
+
+
+def test_the_progress_param_is_registered_persistent_and_the_runner_reads_and_writes_it():
+  cc = (ROOT / "common/params.cc").read_text(encoding="utf-8")
+  assert '{"TiAbProgress", PERSISTENT}' in cc and ab.PARAM_PROGRESS == "TiAbProgress"
+  mem = Mem()
+  par = Mem()
+  par.remove = lambda k: par.d.pop(k, None)
+  rn = ab.TiAbRunner(par, mem)
+  assert rn.ab.save_fn is not None
+  rn._save_progress("x")
+  assert par.d["TiAbProgress"] == "x"
+  rn._save_progress(None)
+  assert "TiAbProgress" not in par.d
