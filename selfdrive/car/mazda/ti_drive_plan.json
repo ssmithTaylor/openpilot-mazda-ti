@@ -1,0 +1,18 @@
+{
+  "name": "Next drive: identification tests + friction relay A/B",
+  "date": "2026-11-23",
+  "tests": {
+    "ids": ["ti_sweep", "ti_pulses", "ti_ladder"],
+    "windows": ["21-27", "35-41", "49-56", "64-80"]
+  },
+  "alternation": {
+    "setting": "LatNoFrictionRelay",
+    "a": "stored",
+    "b": "other",
+    "block_min": 4,
+    "target_min_per_side": 20,
+    "min_mph": 35,
+    "max_mph": 56
+  },
+  "priority": ["the alternation has 35-56 mph until it is complete", "the tests run everywhere else, and everywhere once it is complete"]
+}

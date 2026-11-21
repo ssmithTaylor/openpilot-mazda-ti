@@ -178,6 +178,7 @@ private:
   void homeAct(int control);
   void setupAct(int control);
   void setupOpen();
+  void loadPlan();
   void abDisplay(double &a_s, double &b_s, bool &known, double &target_min);
   void drawProgress(QPainter &p);
   void drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill);
@@ -219,9 +220,12 @@ private:
   double drive_base_a = 0;
   double drive_base_b = 0;
   bool ab_configured = false;    // TiAbConfig names a setting: START runs the plan (tests + A/B relay)
-  int saved_setting = -1;        // the stored experiment (TiAbConfig); the set-up page edits a draft until it is confirmed
-  double saved_b = 0;
-  double saved_block = 0;
+  // The plan START runs: selfdrive/car/mazda/ti_drive_plan.json, validated at load (ti_pages::planProblem). Nobody picks an experiment.
+  bool plan_ok = false;
+  QString plan_problem_text;
+  QString plan_name;
+  QString plan_date;
+  ti_pages::PlanFields plan;
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row
   ti_logic::LockReopen reopen;

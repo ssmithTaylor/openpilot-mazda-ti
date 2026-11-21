@@ -39,6 +39,8 @@ def draw_scene(scene, size):
       d.text((x + w / 2, y + h - sub_h / 2 - 20), it["sub"], font=font(it["sub_px"], True), fill=ink, anchor="mm")
     elif it["align"] == "center":
       d.multiline_text((x + w / 2, y + h / 2), it["text"], font=f, fill=ink, anchor="mm", align="center")
+    elif it["align"] == "right":
+      d.multiline_text((x + w, y + h / 2), it["text"], font=f, fill=ink, anchor="rm")
     else:
       d.multiline_text((x, y + h / 2), it["text"], font=f, fill=ink, anchor="lm")
   if scene["locked"]:

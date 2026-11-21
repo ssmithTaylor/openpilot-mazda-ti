@@ -1198,6 +1198,7 @@ void TestsWindow::refresh() {
 
 namespace {
 const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
+const char *const TI_DRIVE_PLAN_FILE = "../car/mazda/ti_drive_plan.json";   // the UI runs in selfdrive/ui
 const char *const TI_AB_PROGRESS_KEY = "TiAbProgress";
 const char *const TI_AB_ON_KEY = "TiAbOn";
 const char *const TI_AB_PIN_KEY = "TiAbPin";
@@ -1353,7 +1354,7 @@ void TestsWindow::homeAct(int control) {
     abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
     TiHomeStrings keep;
     const HomeState hs = homeState(keep);
-    if (!startLook(ab_configured, hs.run, carRunning(hs)).enabled) {
+    if (!plan_ok || !startLook(ab_configured, hs.run, carRunning(hs), plan_ok).enabled) {
       return;                   // the car side reports it is running what the label says already
     }
     ab_pin_b_armed = -1.0;
@@ -1379,55 +1380,17 @@ void TestsWindow::setupOpen() {
 
 void TestsWindow::setupAct(int control) {
   using namespace ti_pages;
-  if (!setupEditable(running(), have_speed, speed_mph)) {
+  if (control != CTL_SETUP_RESET || running()) {
     return;
   }
-  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
-  if (control == CTL_SETUP_RESET) {       // a deliberate act: asks first, then the stored progress goes (the only way besides a changed experiment)
-    if (ConfirmationDialog::confirm(QString("Reset the A/B progress (minutes per side) to zero? This cannot be undone."), QString("Reset"), this)) {
-      ab_params.remove(TI_AB_PROGRESS_KEY);
-      ab_stored_known = false;
-      ab_stored_a = ab_stored_b = 0;
-    }
-    idle.start();
-    opened.start();                       // the dialog's own taps end here
-    return;
+  // a deliberate act: asks first, then the stored progress goes
+  if (ConfirmationDialog::confirm(QString("Reset the A/B progress (minutes per side) to zero? This cannot be undone."), QString("Reset"), this)) {
+    ab_params.remove(TI_AB_PROGRESS_KEY);
+    ab_stored_known = false;
+    ab_stored_a = ab_stored_b = 0;
   }
-  if (control == CTL_SETUP_USE) {
-    const bool same = ab_configured && saved_setting == ab_setting && std::fabs(saved_b - ab_b) < 1e-9 && std::fabs(saved_block - ab_block_min) < 1e-9;
-    if (same) {
-      ab_params.remove(TI_AB_CONFIG_KEY);   // not used: START runs the tests alone
-      ab_configured = false;
-      saved_setting = -1;
-    } else if (ab_a_known) {
-      // Nothing is stored until it is chosen here AND confirmed: there is no default experiment
-      QString text = QString("Run this experiment?\n%1\nBlocks of %2 min.").arg(QString::fromStdString(ti_pages::experimentLine(ab_setting, ab_a_known, ab_a, ab_b)))
-                         .arg((int)ab_block_min);
-      if (ti_pages::notRecommended(s.name)) {
-        text += QString("\n%1.").arg(QString(ti_pages::NOT_RECOMMENDED_TEXT));
-      }
-      if (ConfirmationDialog::confirm(text, QString("Choose"), this)) {
-        ab_configured = true;
-        abSave();
-        saved_setting = ab_setting;
-        saved_b = ab_b;
-        saved_block = ab_block_min;
-      }
-      idle.start();
-      opened.start();                       // the dialog's own taps end here
-    }
-    return;
-  }
-  if (control == CTL_SETUP_PREV || control == CTL_SETUP_NEXT) {
-    ab_setting = ti_pages::setupStep(ab_setting, control == CTL_SETUP_NEXT ? 1 : -1);   // on/off settings first, the number last
-    abFixB(false);
-  } else if (control == CTL_SETUP_B_MINUS || control == CTL_SETUP_B_PLUS) {
-    if (ab_a_known) {
-      ab_b = ti_ab::stepB(s, ab_a, ab_b, control == CTL_SETUP_B_PLUS ? 1 : -1);
-    }
-  } else if (control == CTL_SETUP_BLOCK_MINUS || control == CTL_SETUP_BLOCK_PLUS) {
-    ab_block_min = ti_ab::stepBlock(ab_block_min, control == CTL_SETUP_BLOCK_PLUS ? 1 : -1);
-  }
+  idle.start();
+  opened.start();                       // the dialog's own taps end here
 }
 
 // A control acts on release, and only when press and release are on the same control
@@ -1552,25 +1515,71 @@ bool TestsWindow::abStoredValue(int i, double &value) const {
 }
 
 // Read the saved configuration (the setting, B and the block length) and fix B to something the car side accepts
-void TestsWindow::abOpen() {
-  ab_setting = ti_ab::settingIndex(ti_pages::SETUP_ORDER[0]);   // where the set-up page starts when nothing is chosen (not an experiment)
-  ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
-  bool have_b = false;
-  const QJsonObject cfg = QJsonDocument::fromJson(QByteArray::fromStdString(ab_params.get(TI_AB_CONFIG_KEY))).object();
-  const int i = ti_ab::settingIndex(cfg.value("setting").toString().toStdString().c_str());
-  ab_configured = i >= 0;   // an alternation is set up: START runs the plan (tests + A/B relay)
-  if (i >= 0) {
-    ab_setting = i;
-    const QJsonValue b = cfg.value("b");
-    ab_b = b.isBool() ? (b.toBool() ? 1.0 : 0.0) : b.toDouble(0.0);
-    have_b = b.isBool() || b.isDouble();
+// Reads and checks the shipped plan (the file names the experiment; the code and the driver do not)
+void TestsWindow::loadPlan() {
+  plan = ti_pages::PlanFields();
+  plan_ok = false;
+  plan_name = plan_date = QString();
+  QFile f(TI_DRIVE_PLAN_FILE);
+  QJsonObject o;
+  if (f.open(QIODevice::ReadOnly)) {
+    o = QJsonDocument::fromJson(f.readAll()).object();
   }
-  const double minutes = cfg.value("block_min").toDouble(ti_ab::DEFAULT_BLOCK_MIN);
-  ab_block_min = std::min(ti_ab::MAX_BLOCK_MIN, std::max(ti_ab::MIN_BLOCK_MIN, std::round(minutes)));
-  abFixB(have_b);
-  saved_setting = ab_configured ? ab_setting : -1;
-  saved_b = ab_b;
-  saved_block = ab_block_min;
+  if (o.isEmpty()) {
+    plan_problem_text = QString("plan file missing or unreadable");
+    return;
+  }
+  plan.named = o.value("name").isString() && !o.value("name").toString().trimmed().isEmpty();
+  plan_name = o.value("name").toString();
+  plan_date = o.value("date").toString();
+  for (const QJsonValue &v : o.value("tests").toObject().value("ids").toArray()) {
+    plan.test_ids.push_back(v.toString().toStdString());
+  }
+  for (const QJsonValue &v : o.value("tests").toObject().value("windows").toArray()) {
+    plan.windows.push_back(v.toString().toStdString());
+  }
+  const QJsonValue alt = o.value("alternation");
+  if (alt.isObject()) {
+    const QJsonObject a = alt.toObject();
+    plan.has_alt = true;
+    plan.setting = a.value("setting").toString().toStdString();
+    plan.a = a.value("a").toString().toStdString();
+    plan.b_is_number = a.value("b").isDouble();
+    plan.b = a.value("b").toDouble();
+    plan.b_text = a.value("b").toString().toStdString();
+    plan.block_min = a.value("block_min").toDouble();
+    plan.target_min = a.value("target_min_per_side").toDouble();
+    plan.min_mph = a.value("min_mph").toDouble();
+    plan.max_mph = a.value("max_mph").toDouble();
+  }
+  const std::string why = ti_pages::planProblem(plan);
+  plan_problem_text = QString::fromStdString(why);
+  plan_ok = why.empty();
+}
+
+// What START will run, from the plan: the setting, B and the block length as the plan names them, checked against the owner's
+// stored value A the way the car side checks them. A plan that does not pass is invalid and nothing runs.
+void TestsWindow::abOpen() {
+  loadPlan();
+  ab_configured = false;
+  ab_setting = 0;
+  ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
+  if (plan_ok && plan.has_alt) {
+    ab_setting = ti_ab::settingIndex(plan.setting.c_str());
+    ab_block_min = plan.block_min;
+    const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+    ab_b = s.is_bool ? 0.0 : plan.b;
+    abFixB(!s.is_bool);
+    if (!ab_a_known) {
+      plan_ok = false;
+      plan_problem_text = QString("your value cannot be read");
+    } else if (!s.is_bool && std::fabs(ab_b - plan.b) > 1e-9) {
+      plan_ok = false;
+      plan_problem_text = QString("B not allowed for your value");
+    } else {
+      ab_configured = true;
+    }
+  }
   abPoll();
 }
 
@@ -1841,16 +1850,52 @@ void TestsWindow::drawHome(QPainter &p) {
   p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.second));
 
   // What will run, in plain words
-  const bool a_known = ab_a_known;
-  p.setPen(ab_configured ? white : QColor(0xc9, 0xc9, 0xc9));
+  p.setPen(plan_ok ? white : QColor(218, 202, 37));
   p.setFont(InterFont(CHOSEN_PX, QFont::DemiBold));
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
-             QString::fromStdString(experimentLine(ab_configured ? ab_setting : -1, a_known, ab_a, ab_b)));
+             QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "")));
+
+  // The bands still needed: one speed and the minutes left, the tests and the alternation merged into one figure each
+  const std::vector<int> band_scope = stepScope();
+  double left_s[ti_logic::N_WINDOWS];
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    int done_n = 0, total_n = 0;
+    tests.windowShare(band_scope, w, done_n, total_n, left_s[w]);
+  }
+  double ab_a_s = 0, ab_b_s = 0, ab_target = 0;
+  bool ab_known = false;
+  abDisplay(ab_a_s, ab_b_s, ab_known, ab_target);
+  Band bands[N_BANDS];
+  bandsFor(left_s, ab_configured && abMinutesLeft(ab_a_s, ab_b_s, ab_target) > 0.0, ab_a_s, ab_b_s, ab_target, speed_mph, have_speed, bands);
+  const bool show_bands = carRunning(hs);
+  if (show_bands) {
+    const QRect area = ctlRect(CTL_START);
+    for (int i = 0; i < N_BANDS; i++) {
+      const QRect row(area.x(), area.y() + i * 92, area.width(), 84);
+      const bool here = bands[i].here && !bands[i].done;
+      p.setPen(Qt::NoPen);
+      p.setBrush(here ? QColor(0x17, 0x86, 0x44) : (bands[i].done ? QColor(0x1f, 0x3a, 0x2a) : QColor(0x22, 0x22, 0x22)));
+      p.drawRoundedRect(row, 20, 20);
+      p.setPen(white);
+      p.setFont(InterFont(BAND_PX, QFont::Bold));
+      p.drawText(row.adjusted(24, 0, -420, 0), Qt::AlignLeft | Qt::AlignVCenter,
+                 (bands[i].done ? QString("✓ ") : QString()) + QString::fromStdString(bandText(bands[i], is_metric)));
+      p.setPen(QColor(0xc9, 0xc9, 0xc9));
+      p.setFont(InterFont(DETAIL_PX));
+      p.drawText(row.adjusted(0, 0, -24, 0), Qt::AlignRight | Qt::AlignVCenter, QString::fromStdString(bandRange(bands[i], is_metric)));
+    }
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(DETAIL_PX));
+    p.drawText(QRect(area.x(), area.y() + N_BANDS * 92 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
+               QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands)) + " min of driving left in all"));
+  }
 
   // START (what it will run, and what it replaces), STOP
-  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs));
-  drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : QColor(0x0f, 0x4d, 0x28), white,
-           QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
+  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs), plan_ok);
+  if (!show_bands) {
+    drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : (plan_ok ? QColor(0x0f, 0x4d, 0x28) : QColor(0x6b, 0x4a, 0x1d)), white,
+             QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
+  }
   const bool any = hs.run != Run::Stopped;
   drawBox2(p, ctlRect(CTL_STOP), any ? QColor(201, 34, 49) : QColor(0x6b, 0x1d, 0x25), any ? white : QColor(0xc9, 0xc9, 0xc9),
            QString("STOP"), STOP_PX, QString("stops every test and the A/B relay"), START_SUB_PX);
@@ -1864,6 +1909,9 @@ void TestsWindow::drawHome(QPainter &p) {
   // Detail (not needed while driving). Line 1: what this drive has added since START. Line 2: why the tests are held, or the
   // alternation's minutes against its target.
   QString detail1;
+  if (hs.run == Run::Stopped && plan_ok) {
+    detail1 = QString::fromStdString(budgetLine(bands, is_metric));          // what the whole plan needs of one drive
+  }
   if (drive_base_set && hs.run != Run::Stopped) {
     const std::vector<int> scope = stepScope();
     double win[ti_logic::N_WINDOWS];
@@ -1895,67 +1943,44 @@ void TestsWindow::drawHome(QPainter &p) {
   p.drawText(qr(HOME_DETAIL2), Qt::AlignLeft | Qt::AlignVCenter, detail2);
 }
 
-// The set-up page: which setting, value B, block length, chosen with the car stopped; stored as it is changed
+// The plan's details, read-only: what START runs and what it needs. Nothing here is chosen on the screen.
 void TestsWindow::drawSetup(QPainter &p) {
   using namespace ti_pages;
   const QColor white(0xff, 0xff, 0xff);
   const QColor grey(0x33, 0x33, 0x33);
-  const QColor dim_fill(0x1a, 0x1a, 0x1a);
-  const QColor dim_ink(0x55, 0x55, 0x55);
-  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
-  const bool editable = setupEditable(running(), have_speed, speed_mph);
-
+  const QColor dim(0xc9, 0xc9, 0xc9);
   drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< BACK"), NAV_PX);
-  drawTitle(p, qr(TITLE_SETUP), QString("A/B SET-UP"), 90);
+  drawTitle(p, qr(TITLE_SETUP), QString("PLAN DETAILS"), 90);
+  const bool can_reset = !running();
+  drawBox(p, ctlRect(CTL_SETUP_RESET), can_reset ? grey : QColor(0x1a, 0x1a, 0x1a), can_reset ? white : QColor(0x55, 0x55, 0x55), QString("RESET\nPROGRESS"), NAV_PX);
 
-  const bool same = ab_configured && saved_setting == ab_setting && std::fabs(saved_b - ab_b) < 1e-9 && std::fabs(saved_block - ab_block_min) < 1e-9;
-  drawBox2(p, ctlRect(CTL_SETUP_USE), !editable ? dim_fill : (same ? QColor(0x17, 0x86, 0x44) : QColor(0x46, 0x5B, 0xEA)), editable ? white : dim_ink,
-           same ? QString("EXPERIMENT CHOSEN") : (ab_configured ? QString("CHANGE TO THIS EXPERIMENT") : QString("CHOOSE THIS EXPERIMENT")), ACTION_PX,
-           same ? QString("tap to stop using it") : QString("tap, then confirm (nothing is chosen until then)"), EXPERIMENT_PX);
-
-  const QColor box = editable ? grey : dim_fill;
-  const QColor box_ink = editable ? white : dim_ink;
-  const bool b_editable = editable && ab_a_known && !s.is_bool;
-  drawBox(p, ctlRect(CTL_SETUP_PREV), box, box_ink, QString("<"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_NEXT), box, box_ink, QString(">"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_B_MINUS), b_editable ? grey : dim_fill, b_editable ? white : dim_ink, QString("-"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_B_PLUS), b_editable ? grey : dim_fill, b_editable ? white : dim_ink, QString("+"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_BLOCK_MINUS), box, box_ink, QString("-"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_BLOCK_PLUS), box, box_ink, QString("+"), ACTION_PX + 24);
-  drawBox(p, ctlRect(CTL_SETUP_RESET), box, box_ink, QString("RESET\nPROGRESS"), NAV_PX);
-
-  const QRect prev = ctlRect(CTL_SETUP_PREV);
-  const QRect next = ctlRect(CTL_SETUP_NEXT);
-  p.setPen(white);
-  p.setFont(InterFont(ACTION_PX, QFont::Bold));
-  p.drawText(QRect(prev.right() + 20, prev.top(), next.left() - prev.right() - 40, prev.height() - (notRecommended(s.name) ? 55 : 0)), Qt::AlignCenter,
-             QString("Setting: %1").arg(QString(plainName(s.name))));
-  if (notRecommended(s.name)) {
-    p.setPen(QColor(218, 202, 37));
-    p.setFont(InterFont(DETAIL_PX, QFont::DemiBold));
-    p.drawText(QRect(prev.right() + 20, prev.bottom() - 60, next.left() - prev.right() - 40, 55), Qt::AlignCenter, QString("not recommended yet"));
-    p.setPen(white);
-    p.setFont(InterFont(ACTION_PX, QFont::Bold));
+  QStringList lines;
+  lines << (plan_ok ? plan_name : QString("PLAN INVALID: %1").arg(plan_problem_text));
+  if (plan_ok) {
+    lines << QString("Date %1. Read from the build; nothing here is chosen on the screen.").arg(plan_date);
+    lines << QString("Tests: sweep, pulses, ladder in the windows 21-27, 35-41, 49-56, 64-80 mph");
+    if (plan.has_alt) {
+      const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+      lines << QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
+      lines << QString("Blocks of %1 min, %2 min per side to finish, at 36-55 mph (35-56 mph range)").arg((int)ab_block_min).arg((int)plan.target_min);
+      if (ti_ab::bendsOnly(s.name)) {
+        lines << QString("%1 acts only in bends: minutes count only there").arg(plainName(s.name));
+      }
+    } else {
+      lines << QString("No alternation in this plan");
+    }
+    double a_s = 0, b_s = 0, target = 0;
+    bool known = false;
+    abDisplay(a_s, b_s, known, target);
+    if (plan.has_alt && known) {
+      lines << QString::fromStdString(abProgressText(a_s, b_s, target)) + QString("  (kept across restarts)");
+    }
   }
-  const QRect bm = ctlRect(CTL_SETUP_B_MINUS);
-  const QRect bp = ctlRect(CTL_SETUP_B_PLUS);
-  p.drawText(QRect(bm.right() + 20, bm.top(), bp.left() - bm.right() - 40, bm.height()), Qt::AlignCenter,
-             ab_a_known ? QString("Yours %1 | B %2").arg(QString::fromStdString(valueWord(s, ab_a))).arg(QString::fromStdString(valueWord(s, ab_b)))
-                        : QString("Your value cannot be read"));
-  const QRect km = ctlRect(CTL_SETUP_BLOCK_MINUS);
-  const QRect kp = ctlRect(CTL_SETUP_BLOCK_PLUS);
-  p.drawText(QRect(km.right() + 20, km.top(), kp.left() - km.right() - 40, km.height()), Qt::AlignCenter,
-             QString("Blocks of %1 min").arg((int)ab_block_min));
-
-  p.setPen(QColor(0xc9, 0xc9, 0xc9));
   p.setFont(InterFont(EXPERIMENT_PX));
-  p.drawText(QRect(480, 970, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
-             QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b)));
-  p.setPen(QColor(218, 202, 37));
-  p.setFont(InterFont(DETAIL_PX));
-  p.drawText(QRect(480, 1020, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
-             notRecommended(s.name) ? QString(NOT_RECOMMENDED_TEXT)
-                                    : QString::fromStdString(setupNote(running(), have_speed, speed_mph)) + (ti_ab::bendsOnly(s.name) ? QString("  Counts only in bends.") : QString()));
+  for (int i = 0; i < lines.size(); i++) {
+    p.setPen(i == 0 ? (plan_ok ? white : QColor(218, 202, 37)) : dim);
+    p.drawText(QRect(480, 230 + i * 80, 1660, 70), Qt::AlignLeft | Qt::AlignVCenter, lines[i]);
+  }
 }
 
 void TestsWindow::drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill) {

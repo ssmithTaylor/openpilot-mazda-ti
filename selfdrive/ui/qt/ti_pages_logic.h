@@ -39,6 +39,7 @@ constexpr int CHOSEN_PX = 52;      // the chosen experiment on the first page, i
 constexpr int START_PX = 72;       // START label (its second line: START_SUB_PX)
 constexpr int START_SUB_PX = 40;
 constexpr int STOP_PX = 110;       // STOP
+constexpr int BAND_PX = 64;        // a band still needed: "24 mph  6 min"
 constexpr int NAV_PX = 44;         // navigation, LOCK
 constexpr int ACTION_PX = 56;      // other large controls (set-up page, pins, the switch)
 constexpr int DETAIL_PX = 36;      // the detail line (not needed while driving)
@@ -155,21 +156,14 @@ inline int layout(Page pg, int error_lines, Control *out) {
     case Page::Home:
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
       add(CTL_BACK, 20, 330, 360, 180, "EXIT");
-      add(CTL_NAV_SETUP, 20, 550, 360, 180, "SET UP A/B");
+      add(CTL_NAV_SETUP, 20, 550, 360, 180, "PLAN DETAILS");
       add(CTL_NAV_PROGRESS, 20, 770, 360, 180, "PROGRESS");
       add(CTL_START, 480, 330, 1660, 272, "START");
       add(CTL_STOP, 480, 692, 1660, 272, "STOP");
       break;
-    case Page::Setup:
+    case Page::Setup:                         // the plan's details, read-only; RESET PROGRESS (asks first)
       add(CTL_BACK, 20, 10, 360, 180, "BACK");
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
-      add(CTL_SETUP_USE, 480, 240, 1660, 150, "A/B USED / NOT USED");
-      add(CTL_SETUP_PREV, 480, 430, 220, 150, "SETTING <");
-      add(CTL_SETUP_NEXT, 1920, 430, 220, 150, "SETTING >");
-      add(CTL_SETUP_B_MINUS, 480, 620, 220, 150, "B -");
-      add(CTL_SETUP_B_PLUS, 1920, 620, 220, 150, "B +");
-      add(CTL_SETUP_BLOCK_MINUS, 480, 810, 220, 150, "BLOCK -");
-      add(CTL_SETUP_BLOCK_PLUS, 1920, 810, 220, 150, "BLOCK +");
       add(CTL_SETUP_RESET, 20, 330, 360, 180, "RESET PROGRESS");
       break;
     case Page::Progress:
@@ -772,8 +766,15 @@ struct StartLook {
 };
 
 // What the primary control says and whether a tap does anything. Running already: it says RUNNING and a tap does nothing.
-inline StartLook startLook(bool configured, Run run, bool confirmed = true) {
+inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool plan_ok = true) {
   StartLook k;
+  if (!plan_ok) {                               // nothing runs from an invalid plan
+    k.label = "PLAN INVALID";
+    k.sub = "See PLAN DETAILS";
+    k.enabled = false;
+    k.tone = Tone::Held;
+    return k;
+  }
   const std::string what = configured ? "tests + A/B relay" : "tests";
   if (!confirmed && run != Run::Stopped) {      // the switch says on, the car is not running it: START starts it cleanly
     k.label = "START: " + what;
@@ -813,6 +814,140 @@ inline std::string individualNote(Run run) {
 inline std::string detailScored(double a_s, double b_s, double target_min, bool complete) {
   char buf[96];
   std::snprintf(buf, sizeof(buf), "Scored: A %.1f / B %.1f of %.0f min%s", a_s / 60.0, b_s / 60.0, target_min, complete ? " COMPLETE" : "");
+  return buf;
+}
+
+// ---- the plan START runs (selfdrive/car/mazda/ti_drive_plan.json) ----------------------------------------------------------------
+// The file names what runs; the code that runs it has fixed limits, so a plan is accepted only when it names exactly those. The same
+// rules as ti_drive_plan.py (test_mazda_ti_pages_logic.py compares the reasons). The driver never picks an experiment on the screen.
+struct PlanFields {
+  bool named = false;
+  std::vector<std::string> test_ids, windows;
+  bool has_alt = false;
+  std::string setting, a, b_text;       // b_text: "other", or "number" when b is a number
+  bool b_is_number = false;
+  double b = 0;
+  double block_min = 0, target_min = 0, min_mph = 0, max_mph = 0;
+};
+
+inline std::string planProblem(const PlanFields &p) {
+  if (!p.named) {
+    return "no plan name";
+  }
+  if (p.test_ids != std::vector<std::string>{"ti_sweep", "ti_pulses", "ti_ladder"}) {
+    return "tests must be sweep, pulses, ladder";
+  }
+  if (p.windows != std::vector<std::string>{"21-27", "35-41", "49-56", "64-80"}) {
+    return "tests must cover all four windows";
+  }
+  if (!p.has_alt) {
+    return "";
+  }
+  const int idx = ti_ab::settingIndex(p.setting.c_str());
+  if (idx < 0) {
+    return "setting is not allowed";
+  }
+  if (p.a != "stored") {
+    return "A must be your stored value";
+  }
+  const ti_ab::Setting &st = ti_ab::SETTINGS[idx];
+  if (st.is_bool) {
+    if (p.b_is_number || p.b_text != "other") {
+      return "B must be the other value";
+    }
+  } else if (!p.b_is_number || p.b < st.lo - 1e-9 || p.b > st.hi + 1e-9) {
+    return "B is outside 0.70-1.00";
+  }
+  if (p.block_min < ti_ab::MIN_BLOCK_MIN || p.block_min > ti_ab::MAX_BLOCK_MIN) {
+    return "block length outside 4-10 min";
+  }
+  if (p.target_min != ti_ab::PLAN_TARGET_MIN_DEFAULT) {
+    return "target must be 20 min per side";
+  }
+  if (p.min_mph != ti_ab::PLAN_ALT_MIN_MPH || p.max_mph != ti_ab::PLAN_ALT_MAX_MPH) {
+    return "speed range must be 35-56 mph";
+  }
+  return "";
+}
+
+// The plan in large plain words, or why it cannot run. has_alt with its setting: "PLAN: tests + friction relay A/B"
+inline std::string planLine(bool ok, const std::string &problem, bool has_alt, const char *setting) {
+  if (!ok) {
+    return "PLAN INVALID: " + problem;
+  }
+  if (!has_alt) {
+    return "PLAN: tests";
+  }
+  return std::string("PLAN: tests + ") + plainName(setting) + " A/B";
+}
+
+// ---- the bands still needed, one number each -----------------------------------------------------------------------------------
+// The first page's list while the plan runs: a speed to hold and the engaged minutes still needed there. What the tests and the
+// alternation each need is merged into one figure per band, so the driver does not have to know which one is using the time.
+// Scheduling rule (the one the car side applies; not changed here): inside 35-56 mph the ALTERNATION has the time until it is complete
+// (that is how the plan hands over: tests everywhere else, and everywhere once it is complete), so the 35-41 and 49-56 mph test windows
+// are served after it; the one 36-55 mph figure is therefore alternation minutes plus those two windows' minutes. Outside it the tests
+// run in their own windows. Overheads (fades, hand-overs, wash-in, voided time, gate waits) are estimates, named below.
+constexpr double OVERHEAD_TESTS = 1.3;   // engaged minutes per minute of credited test signal (assumption: the plan never credited on the last drive)
+constexpr double OVERHEAD_ALT = 1.35;    // engaged minutes per scored minute of alternation (wash-in about 11 s per switch, margin and settle waits, partial blocks)
+constexpr int N_BANDS = 3;
+
+struct Band {
+  int target_mph = 0;          // the one speed to hold
+  int lo = 0, hi = 0;          // the range, in small type
+  double minutes = 0;          // engaged minutes still needed, rounded up for display
+  bool done = false;
+  bool here = false;           // the car is inside this band now
+};
+
+// tests_left_s: required seconds still to collect per window (step tests); alt_a_s, alt_b_s: scored seconds so far per side;
+// alt_open: an alternation is part of the plan and not complete
+inline void bandsFor(const double tests_left_s[ti_logic::N_WINDOWS], bool alt_open, double alt_a_s, double alt_b_s, double target_min, double mph,
+                     bool have_speed, Band out[N_BANDS]) {
+  const double t[ti_logic::N_WINDOWS] = {tests_left_s[0] * OVERHEAD_TESTS / 60.0, tests_left_s[1] * OVERHEAD_TESTS / 60.0,
+                                         tests_left_s[2] * OVERHEAD_TESTS / 60.0, tests_left_s[3] * OVERHEAD_TESTS / 60.0};
+  const double alt = alt_open ? abMinutesLeft(alt_a_s, alt_b_s, target_min) * OVERHEAD_ALT : 0.0;
+  out[0] = Band{ti_logic::windowTargetMph(0), (int)ti_logic::WINDOWS[0].low, (int)ti_logic::WINDOWS[0].high, t[0], false, false};
+  out[1] = Band{ti_logic::windowTargetMph(1) + 7, (int)ti_ab::PLAN_ALT_MIN_MPH + 1, (int)ti_ab::PLAN_ALT_MAX_MPH - 1, alt + t[1] + t[2], false, false};
+  out[2] = Band{ti_logic::windowTargetMph(3), (int)ti_logic::WINDOWS[3].low, (int)ti_logic::WINDOWS[3].high, t[3], false, false};
+  for (int i = 0; i < N_BANDS; i++) {
+    out[i].minutes = std::ceil(out[i].minutes - 1e-9);
+    out[i].done = out[i].minutes <= 0.0;
+    out[i].here = have_speed && mph >= out[i].lo && mph < out[i].hi + 1;
+  }
+}
+
+inline double bandsTotalMinutes(const Band b[N_BANDS]) {
+  double sum = 0;
+  for (int i = 0; i < N_BANDS; i++) {
+    sum += b[i].minutes;
+  }
+  return sum;
+}
+
+// "24 mph  6 min" / "done"
+inline std::string bandText(const Band &b, bool metric) {
+  char buf[64];
+  if (b.done) {
+    std::snprintf(buf, sizeof(buf), "%d %s  done", speedValue(b.target_mph, metric), metric ? "km/h" : "mph");
+  } else {
+    std::snprintf(buf, sizeof(buf), "%d %s  %d min", speedValue(b.target_mph, metric), metric ? "km/h" : "mph", (int)b.minutes);
+  }
+  return buf;
+}
+
+inline std::string bandRange(const Band &b, bool metric) {
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%d-%d %s", speedValue(b.lo, metric), speedValue(b.hi, metric), metric ? "km/h" : "mph");
+  return buf;
+}
+
+// The stopped page: what the whole plan needs in one drive, "PLAN NEEDS ABOUT 75 MIN: 24 mph 7, 45 mph 54, 70 mph 5"
+inline std::string budgetLine(const Band b[N_BANDS], bool metric) {
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "PLAN NEEDS ABOUT %d MIN: %d %s %d, %d %s %d, %d %s %d", (int)bandsTotalMinutes(b), speedValue(b[0].target_mph, metric),
+                metric ? "km/h" : "mph", (int)b[0].minutes, speedValue(b[1].target_mph, metric), metric ? "km/h" : "mph", (int)b[1].minutes,
+                speedValue(b[2].target_mph, metric), metric ? "km/h" : "mph", (int)b[2].minutes);
   return buf;
 }
 

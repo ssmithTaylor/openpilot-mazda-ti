@@ -3,6 +3,7 @@
 // renderer (selfdrive/ui/tests/ti_pages_mockup.py) turns them into images and HTML. Not part of the device build.
 //   usage: dump_ti_pages_layout > scenes.json
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -75,7 +76,11 @@ static void lockAndEngaged(Scene &s, Page pg, bool engaged) {
   }
 }
 
-static Scene homeScene(const std::string &name, const std::string &title, const HomeState &hs, bool locked = false) {
+static Scene homeScene(const std::string &name, const std::string &title, HomeState hs, bool locked = false) {
+  if (hs.run != Run::Stopped) {                       // the car side reports what is asked for (the scenes show the wording)
+    hs.car_plan_on = true; hs.live_fresh = hs.live_all_on = hs.live_tests_on = true;
+    if (std::strcmp(hs.plan_mode, "dead") == 0) hs.ab_fresh = true;
+  }
   Scene s;
   s.name = name;
   s.title = title;
@@ -91,53 +96,59 @@ static Scene homeScene(const std::string &name, const std::string &title, const 
   s.items.back().sub = "bold";
   textBox(s, Rect{HOME_SECOND.x + 24, HOME_SECOND.y, HOME_SECOND.w - 48, HOME_SECOND.h}, ink, h.second, SECOND_PX);
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
-  const int setting = hs.configured ? ti_ab::settingIndex("LatNoFrictionRelay") : -1;
-  textBox(s, Rect{HOME_EXPERIMENT.x + 24, HOME_EXPERIMENT.y, HOME_EXPERIMENT.w, HOME_EXPERIMENT.h}, grey_ink,
-          experimentLine(setting, true, 1, 0), EXPERIMENT_PX);
-  const StartLook look = startLook(hs.configured, hs.run);
+  textBox(s, Rect{HOME_EXPERIMENT.x + 24, HOME_EXPERIMENT.y, HOME_EXPERIMENT.w, HOME_EXPERIMENT.h}, WHITE,
+          planLine(true, "", hs.configured, "LatNoFrictionRelay"), CHOSEN_PX);
+  const StartLook look = startLook(hs.configured, hs.run, carRunning(hs));
   const int dark_green[3] = {0x0f, 0x4d, 0x28};
-  box(s, Page::Home, CTL_START, look.enabled ? BLUE : dark_green, WHITE, look.label, START_PX, look.sub, START_SUB_PX);
+  const double left[4] = {6.0 * 60 / 1.3, 4.0 * 60 / 1.3, 3.0 * 60 / 1.3, 4.0 * 60 / 1.3};
+  Band bands[N_BANDS];
+  bandsFor(left, hs.configured, 14.2 * 60, 12.9 * 60, 20, hs.mph, hs.have_speed, bands);
+  if (carRunning(hs)) {
+    Rect area{};
+    rectOf(Page::Home, CTL_START, 0, area);
+    for (int i = 0; i < N_BANDS; i++) {
+      const bool here = bands[i].here && !bands[i].done;
+      const Rect row{area.x, area.y + i * 92, area.w, 84};
+      s.items.push_back({row, here ? 0x17 : 0x22, here ? 0x86 : 0x22, here ? 0x44 : 0x22, 255, 255, 255, "", 0, "", 0, "center", "band", ""});
+      textBox(s, Rect{row.x + 24, row.y, row.w - 420, row.h}, WHITE, bandText(bands[i], false), BAND_PX);
+      s.items.back().sub = "bold";
+      textBox(s, Rect{row.x, row.y, row.w - 24, row.h}, grey_ink, bandRange(bands[i], false), DETAIL_PX, "right");
+    }
+    textBox(s, Rect{area.x, area.y + N_BANDS * 92 + 4, area.w, 44}, grey_ink, "About " + std::to_string((int)bandsTotalMinutes(bands)) + " min of driving left in all", DETAIL_PX);
+  } else {
+    box(s, Page::Home, CTL_START, look.enabled ? BLUE : dark_green, WHITE, look.label, START_PX, look.sub, START_SUB_PX);
+  }
+  const std::string budget = hs.run == Run::Stopped ? budgetLine(bands, false) : "";
   const bool any = hs.run != Run::Stopped;
   const int dark_red[3] = {0x6b, 0x1d, 0x25};
   box(s, Page::Home, CTL_STOP, any ? RED : dark_red, any ? WHITE : grey_ink, "STOP", STOP_PX, "stops every test and the A/B relay", START_SUB_PX);
   box(s, Page::Home, CTL_BACK, locked ? DIM : GREY, locked ? DIMINK : WHITE, "< EXIT", NAV_PX);
-  box(s, Page::Home, CTL_NAV_SETUP, GREY, WHITE, "SET UP A/B >", NAV_PX);
+  box(s, Page::Home, CTL_NAV_SETUP, GREY, WHITE, "PLAN DETAILS >", NAV_PX);
   box(s, Page::Home, CTL_NAV_PROGRESS, GREY, WHITE, "PROGRESS >", NAV_PX);
   lockAndEngaged(s, Page::Home, hs.engaged);
   const double drive[4] = {95, 0, 40, 0};
-  textBox(s, HOME_DETAIL, grey_ink, hs.run != Run::Stopped ? thisDriveLine(drive, 4.0 * 60, 3.5 * 60, hs.configured, false) : "", DETAIL_PX);
+  textBox(s, HOME_DETAIL, grey_ink, hs.run != Run::Stopped ? thisDriveLine(drive, 4.0 * 60, 3.5 * 60, hs.configured, false) : budget, DETAIL_PX);
   textBox(s, HOME_DETAIL2, grey_ink, hs.configured ? detailScored(14.2 * 60, 12.9 * 60, 20, false) : "", DETAIL_PX);
   return s;
 }
 
 static Scene setupScene() {
   Scene s;
-  s.name = "setup";
-  s.title = "A/B set-up page (car stopped)";
+  s.name = "plan-details";
+  s.title = "Plan details (read-only; nothing is chosen on the screen)";
   const Page pg = Page::Setup;
-  const int relay = ti_ab::settingIndex("LatNoFrictionRelay");
-  const ti_ab::Setting &st = ti_ab::SETTINGS[relay];
   box(s, pg, CTL_BACK, GREY, WHITE, "< BACK", NAV_PX);
-  s.items.push_back({TITLE_SETUP, -1, -1, -1, 255, 255, 255, "A/B SET-UP", 90, "bold", 0, "center", "text", ""});
-  box(s, pg, CTL_SETUP_USE, GREEN, WHITE, "A/B RELAY: USED", ACTION_PX, "tap to stop using it", EXPERIMENT_PX);
-  box(s, pg, CTL_SETUP_PREV, GREY, WHITE, "<", ACTION_PX + 24);
-  box(s, pg, CTL_SETUP_NEXT, GREY, WHITE, ">", ACTION_PX + 24);
-  box(s, pg, CTL_SETUP_B_MINUS, DIM, DIMINK, "-", ACTION_PX + 24);
-  box(s, pg, CTL_SETUP_B_PLUS, DIM, DIMINK, "+", ACTION_PX + 24);
-  box(s, pg, CTL_SETUP_BLOCK_MINUS, GREY, WHITE, "-", ACTION_PX + 24);
-  box(s, pg, CTL_SETUP_BLOCK_PLUS, GREY, WHITE, "+", ACTION_PX + 24);
+  box(s, pg, CTL_LOCK, GREY, WHITE, "LOCK PAGE", NAV_PX);
   box(s, pg, CTL_SETUP_RESET, GREY, WHITE, "RESET\nPROGRESS", NAV_PX);
-  Rect a{}, b{};
-  rectOf(pg, CTL_SETUP_PREV, 0, a); rectOf(pg, CTL_SETUP_NEXT, 0, b);
-  textBox(s, Rect{a.right() + 20, a.y, b.x - a.right() - 40, a.h}, WHITE, std::string("Setting: ") + plainName(st.name), ACTION_PX, "center");
-  rectOf(pg, CTL_SETUP_B_MINUS, 0, a); rectOf(pg, CTL_SETUP_B_PLUS, 0, b);
-  textBox(s, Rect{a.right() + 20, a.y, b.x - a.right() - 40, a.h}, WHITE, "Yours " + valueWord(st, 1) + " | B " + valueWord(st, 0), ACTION_PX, "center");
-  rectOf(pg, CTL_SETUP_BLOCK_MINUS, 0, a); rectOf(pg, CTL_SETUP_BLOCK_PLUS, 0, b);
-  textBox(s, Rect{a.right() + 20, a.y, b.x - a.right() - 40, a.h}, WHITE, "Blocks of 4 min", ACTION_PX, "center");
+  s.items.push_back({TITLE_SETUP, -1, -1, -1, 255, 255, 255, "PLAN DETAILS", 90, "bold", 0, "center", "text", ""});
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
-  textBox(s, Rect{480, 970, 1660, 50}, grey_ink, experimentLine(relay, true, 1, 0), EXPERIMENT_PX);
-  textBox(s, Rect{480, 1020, 1660, 50}, AMBER, setupNote(false, true, 0), DETAIL_PX);
-  s.items.push_back({Rect{SCREEN_W - 380, 10, 360, 180}, GREY[0], GREY[1], GREY[2], 255, 255, 255, "LOCK PAGE", NAV_PX, "", 0, "center", "control", "LOCK"});
+  const char *lines[] = {"Next drive: identification tests + friction relay A/B", "Date 2026-11-23. Read from the build; nothing here is chosen on the screen.",
+                         "Tests: sweep, pulses, ladder in the windows 21-27, 35-41, 49-56, 64-80 mph",
+                         "A/B: friction relay, yours (off) against on", "Blocks of 4 min, 20 min per side to finish, at 36-55 mph (35-56 mph range)",
+                         "A 14 / 20 min, B 13 / 20 min  (kept across restarts)"};
+  for (int i = 0; i < 6; i++) {
+    textBox(s, Rect{480, 230 + i * 80, 1660, 70}, i == 0 ? WHITE : grey_ink, lines[i], EXPERIMENT_PX);
+  }
   return s;
 }
 
@@ -272,6 +283,9 @@ int main() {
 
   HomeState waiting = testing;
   waiting.tests_active = false; waiting.gate_reason = "curve";
+  HomeState bandsRun = testing;
+  bandsRun.mph = 45; bandsRun.plan_mode = "tests"; bandsRun.tests_active = false;
+  scenes.push_back(homeScene("home-bands-in-ab-range", "First page: bands still needed, the car is in the 36-55 mph band", bandsRun));
   scenes.push_back(homeScene("home-waiting-straight", "First page: waiting for a straight road", waiting));
 
   HomeState ab;

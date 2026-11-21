@@ -109,13 +109,57 @@ def test_the_qt_page_takes_its_rectangles_and_writes_from_the_header():
   assert SIDEBAR.count('TI_PLAN_ON_KEY, true') == 0 and SIDEBAR.count('"TiPlanOn", true') == 0
 
 
-def test_the_set_up_order_puts_on_off_first_and_the_page_has_no_default_experiment_and_no_silent_save():
-  block = HEADER[HEADER.index("SETUP_ORDER[N_SETUP_ORDER]"):]
-  names = re.findall(r'"(\w+)"', block[:block.index("};")])
-  assert sorted(names) == sorted(ab.ALLOWED) and names[0] == "LatNoFrictionRelay" and names[-1] == "SteerKP"
+def test_nothing_is_chosen_on_the_screen_the_plan_file_names_the_experiment_and_a_bad_plan_runs_nothing():
   body = SIDEBAR[SIDEBAR.index("void TestsWindow::setupAct"):SIDEBAR.index("void TestsWindow::mouseReleaseEvent")]
-  assert "ConfirmationDialog::confirm" in body and body.count("abSave()") == 1       # the one save is after the confirm
-  assert body.index("ConfirmationDialog::confirm(text") < body.index("abSave()")
-  assert "ab_setting = ti_ab::settingIndex(ti_pages::SETUP_ORDER[0])" in SIDEBAR       # an unchosen page starts on the first on/off setting
-  assert "ab_setting = 0;" not in SIDEBAR
-  assert "setupStep(ab_setting" in body
+  assert "CTL_SETUP_RESET" in body and "ConfirmationDialog::confirm" in body and "abSave" not in body and "setupStep" not in body
+  abopen = SIDEBAR[SIDEBAR.index("void TestsWindow::abOpen() {"):SIDEBAR.index("// B for the shown setting")]
+  assert "loadPlan()" in abopen and "plan.setting" in abopen and "TI_AB_CONFIG_KEY" not in abopen        # the stored config is not where the experiment comes from
+  assert "ti_drive_plan.json" in SIDEBAR and "ti_pages::planProblem(plan)" in SIDEBAR
+  assert "!plan_ok ||" in SIDEBAR                                                                          # START does nothing from an invalid plan
+  for control in ("CTL_SETUP_USE", "CTL_SETUP_PREV", "CTL_SETUP_NEXT", "CTL_SETUP_B_MINUS", "CTL_SETUP_BLOCK_PLUS"):
+    assert f"add({control}," not in HEADER                                                                # no editing controls are laid out any more
+
+
+def _load_drive_plan():
+  import importlib.util
+  spec = importlib.util.spec_from_file_location("ti_drive_plan_for_test", MAZDA / "ti_drive_plan.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def test_the_shipped_plan_is_valid_names_the_agreed_experiment_and_matches_the_code_limits():
+  import json as _json
+  dp = _load_drive_plan()
+  plan, why = dp.load()
+  assert why == "" and plan is not None
+  alt = plan["alternation"]
+  assert alt["setting"] == "LatNoFrictionRelay" and alt["a"] == "stored" and alt["b"] == "other" and alt["block_min"] == 4
+  assert (alt["min_mph"], alt["max_mph"], alt["target_min_per_side"]) == (tp.PLAN_ALT_MIN_MPH, tp.PLAN_ALT_MAX_MPH, tp.TARGET_MIN_PER_SIDE)
+  assert alt["setting"] in ab.ALLOWED and alt["block_min"] >= 4
+  defs = _json.loads((MAZDA / "ti_tests.json").read_text(encoding="utf-8"))
+  assert [t["id"] for t in defs["tests"] if t["id"] in dp.STEP_TESTS] == list(plan["tests"]["ids"]) or set(plan["tests"]["ids"]) <= {t["id"] for t in defs["tests"]}
+
+
+def test_an_invalid_plan_is_refused_with_a_reason_and_the_header_agrees():
+  import copy
+  dp = _load_drive_plan()
+  plan, _ = dp.load()
+  mutations = {
+    "setting is not allowed": lambda p: p["alternation"].update(setting="TiSteerMax"),
+    "A must be your stored value": lambda p: p["alternation"].update(a=0.8),
+    "B must be the other value": lambda p: p["alternation"].update(b=1),
+    "block length outside 4-10 min": lambda p: p["alternation"].update(block_min=3),
+    "target must be 20 min per side": lambda p: p["alternation"].update(target_min_per_side=30),
+    "speed range must be 35-56 mph": lambda p: p["alternation"].update(max_mph=70),
+    "tests must cover all four windows": lambda p: p["tests"].update(windows=["21-27"]),
+    "tests must be sweep, pulses, ladder": lambda p: p["tests"].update(ids=["ti_dither"]),
+    "no plan name": lambda p: p.update(name=""),
+  }
+  for why, mutate in mutations.items():
+    bad = copy.deepcopy(plan)
+    mutate(bad)
+    assert dp.problem(bad) == why, why
+  assert dp.problem("nonsense") == "no plan name" and dp.load("missing.json")[0] is None
+  for why in mutations:                                    # every reason the file loader gives is one the screen can word within its line
+    assert len(why) <= 40 and why in HEADER

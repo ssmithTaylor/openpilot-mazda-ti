@@ -460,6 +460,79 @@ static void setupOrderAndChoice() {
   CHECK(PROG_SPLIT.bottom() <= SCREEN_H && PROG_SPLIT.h >= DETAIL_PX + 4);
 }
 
+static PlanFields goodPlan() {
+  PlanFields p;
+  p.named = true;
+  p.test_ids = {"ti_sweep", "ti_pulses", "ti_ladder"};
+  p.windows = {"21-27", "35-41", "49-56", "64-80"};
+  p.has_alt = true; p.setting = "LatNoFrictionRelay"; p.a = "stored"; p.b_text = "other";
+  p.block_min = 4; p.target_min = 20; p.min_mph = 35; p.max_mph = 56;
+  return p;
+}
+
+static void planAndBands() {
+  PlanFields p = goodPlan();
+  CHECK(planProblem(p).empty());
+  struct Case { const char *why; void (*mutate)(PlanFields &); };
+  const Case cases[] = {
+    {"setting is not allowed", [](PlanFields &x) { x.setting = "TiSteerMax"; }},
+    {"A must be your stored value", [](PlanFields &x) { x.a = "0.8"; }},
+    {"B must be the other value", [](PlanFields &x) { x.b_text = "1"; }},
+    {"block length outside 4-10 min", [](PlanFields &x) { x.block_min = 3; }},
+    {"target must be 20 min per side", [](PlanFields &x) { x.target_min = 30; }},
+    {"speed range must be 35-56 mph", [](PlanFields &x) { x.max_mph = 70; }},
+    {"tests must cover all four windows", [](PlanFields &x) { x.windows = {"21-27"}; }},
+    {"tests must be sweep, pulses, ladder", [](PlanFields &x) { x.test_ids = {"ti_dither"}; }},
+    {"no plan name", [](PlanFields &x) { x.named = false; }},
+  };
+  for (const Case &c : cases) {
+    PlanFields q = goodPlan();
+    c.mutate(q);
+    CHECK(planProblem(q) == c.why);
+    CHECK(std::strlen(c.why) <= 40);
+    CHECK((int)planLine(false, planProblem(q), true, "LatNoFrictionRelay").size() <= MAX_CHOSEN_CHARS);
+  }
+  PlanFields kp = goodPlan();
+  kp.setting = "SteerKP"; kp.b_is_number = true; kp.b = 0.85;
+  CHECK(planProblem(kp).empty());
+  kp.b = 1.2;
+  CHECK(planProblem(kp) == "B is outside 0.70-1.00");
+  p.has_alt = false;
+  CHECK(planProblem(p).empty() && planLine(true, "", false, "") == "PLAN: tests");
+  CHECK(planLine(true, "", true, "LatNoFrictionRelay") == "PLAN: tests + friction relay A/B");
+  for (int i = 0; i < ti_ab::N_SETTINGS; i++) {
+    CHECK((int)planLine(true, "", true, ti_ab::SETTINGS[i].name).size() <= MAX_CHOSEN_CHARS);
+  }
+  CHECK(startLook(true, Run::Stopped, true, false).label == "PLAN INVALID" && !startLook(true, Run::Stopped, true, false).enabled);
+  CHECK(startLook(true, Run::Stopped, true, true).enabled);
+
+  // the bands: one figure each, the alternation and the tests merged
+  const double left[4] = {6.0 * 60 / 1.3, 4.0 * 60 / 1.3, 3.0 * 60 / 1.3, 4.0 * 60 / 1.3};
+  Band b[N_BANDS];
+  bandsFor(left, true, 0, 0, 20, 45.0, true, b);
+  CHECK(b[0].target_mph == 24 && b[2].target_mph == 72 && b[1].target_mph == 45 && b[0].minutes == 6 && b[2].minutes == 4);
+  CHECK(b[1].minutes == std::ceil(40 * OVERHEAD_ALT + 7.0 - 1e-9));        // alternation 40 min, both sides still open, plus the two windows
+  CHECK(!b[0].here && b[1].here && !b[2].here && !b[1].done);
+  bandsFor(left, false, 0, 0, 20, 24.0, true, b);
+  CHECK(b[1].minutes == 7 && b[0].here);
+  const double none[4] = {0, 0, 0, 0};
+  bandsFor(none, true, 1200, 1200, 20, 0, false, b);
+  CHECK(b[0].done && b[1].done && b[2].done && bandsTotalMinutes(b) == 0 && !b[0].here);
+  CHECK(bandText(b[0], false) == "24 mph  done");
+  bandsFor(left, true, 600, 300, 20, 70, true, b);
+  CHECK(b[2].here && bandText(b[2], false) == "72 mph  4 min" && bandRange(b[2], false) == "64-80 mph");
+  for (int m = 0; m < 2; m++) {
+    for (int i = 0; i < N_BANDS; i++) {
+      CHECK((int)bandText(b[i], m).size() <= 24 && (int)bandRange(b[i], m).size() <= 24);
+    }
+    const double big[4] = {9e4, 9e4, 9e4, 9e4};
+    bandsFor(big, true, 0, 0, 20, 45, true, b);
+    CHECK((int)budgetLine(b, m).size() <= 128 && (int)bandText(b[1], m).size() <= 24);
+  }
+  bandsFor(left, true, 0, 0, 20, 45, true, b);
+  CHECK(budgetLine(b, false).rfind("PLAN NEEDS ABOUT ", 0) == 0);
+}
+
 static void setup() {
   CHECK(setupEditable(false, false, 0) && setupEditable(false, true, 0.5) && !setupEditable(false, true, 25) && !setupEditable(true, true, 0));
   CHECK((int)setupNote(false, true, 0).size() <= MAX_EXPERIMENT_CHARS && (int)setupNote(true, true, 0).size() <= MAX_EXPERIMENT_CHARS);
@@ -480,6 +553,7 @@ int main() {
   startLabels();
   progressTexts();
   setupOrderAndChoice();
+  planAndBands();
   setup();
   if (failures == 0) {
     std::printf("ok\n");
