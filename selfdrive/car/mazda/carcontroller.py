@@ -14,6 +14,12 @@ try:
   from openpilot.selfdrive.car.mazda.ti_tests import make_accountant
 except Exception:
   make_accountant = None
+try:
+  # Steering identification tests (sweep, ladder, pulses): optional in the same way. Without the module they are off
+  # and this controller runs exactly as without them (self.ti_ident is None).
+  from openpilot.selfdrive.car.mazda import ti_ident as ti_ident_mod
+except Exception:
+  ti_ident_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -35,6 +41,16 @@ RUN_HISTORY = 5
 
 # What the dither reports to the test accountant on a frame it was applied (ti_tests.ACTIVE_SOURCES).
 TI_DITHER_ACTIVE = ("TiDither",)
+
+
+def ti_ident_log(event):
+  """The identification tests' events (run, chunk, stop) into the log, so the signal can be rebuilt exactly
+  (ti_ident.reconstruct). At most a few per ten seconds while a test runs."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_ident", **event)
+  except Exception:
+    pass
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -73,6 +89,13 @@ class CarController(CarControllerBase):
     # holds no valid test or the module is missing, and on every car without the interceptor.
     self.ti_tests = (make_accountant(self.params, self.params_memory)
                      if make_accountant is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
+    # Identification tests (ti_ident.py): off unless exactly one of TiSweep / TiLadder / TiPulses is on, the dither is
+    # off and silent, and the tests accountant is loaded (it says which steps are still to capture). None on every
+    # car without the interceptor or without the module.
+    self.ti_ident = (ti_ident_mod.TiIdent(log=ti_ident_log)
+                     if ti_ident_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
+    self.ti_ident_on = ()
+    self.ti_ident_armed = None
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -81,6 +104,9 @@ class CarController(CarControllerBase):
     # toggle was on at some point, so a run without the dither carries exactly the payload it always did.
     self.ti_dither_seen = False
     self.ti_dither_frames = 0
+    # Identification tests switched on during this run, and their frames with a non-zero signal (stats stamp)
+    self.ti_ident_seen = set()
+    self.ti_ident_frames = {}
     tests = getattr(self, "ti_tests", None)
     if tests is not None:
       tests.run_seen = set()
@@ -118,6 +144,15 @@ class CarController(CarControllerBase):
     tests = getattr(self, "ti_tests", None)
     if tests is not None and tests.run_seen:
       cfg["Tests"] = sorted(tests.run_seen)
+    # Identification tests (ti_ident.py) that were on during this run; absent otherwise (payload unchanged). With the
+    # logged "ti_ident" events this is what an offline reader needs to rebuild the signal.
+    seen = getattr(self, "ti_ident_seen", None)
+    if seen and ti_ident_mod is not None:
+      ident = getattr(self, "ti_ident", None)
+      cfg["TiIdent"] = {k: {"version": ti_ident_mod.VERSION, "table": ti_ident_mod.TABLE_HASH[k],
+                            "frames": self.ti_ident_frames.get(k, 0),
+                            "touch_confirm": ident.touch_confirm_frames if ident is not None else None}
+                        for k in sorted(seen)}
     return cfg
 
   def publish_ti_tests(self, CS, CC, ti_request):
@@ -138,6 +173,10 @@ class CarController(CarControllerBase):
           room=rate_room(self.ccp), touch=self.ti_dither.touch)
       except Exception:
         pass
+    ident = getattr(self, "ti_ident", None)
+    if ident is not None and tests.wants_reasons():
+      for key in getattr(self, "ti_ident_on", ()):
+        reasons[key] = ident.reason if key == self.ti_ident_armed else "other"
     tests.publish(time.monotonic(), reasons)
 
   def record_ti_stats(self, CS, desired, sent):
@@ -425,6 +464,9 @@ class CarController(CarControllerBase):
     self.ti_steer_threshold = getattr(frogpilot_toggles, "ti_steer_threshold", None)
     # Absent (older toggles JSON) reads as off.
     self.ti_dither_enabled = bool(getattr(frogpilot_toggles, "ti_dither", False))
+    if ti_ident_mod is not None:
+      self.ti_ident_on = tuple(k for k in ti_ident_mod.KEYS
+                               if getattr(frogpilot_toggles, ti_ident_mod.TOGGLES[k], False) is True)
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
@@ -442,6 +484,7 @@ class CarController(CarControllerBase):
     ti_apply_steer = 0
     new_steer = ti_new_steer = 0
     ti_dither = 0
+    ti_ident = 0         # the identification tests' counts (ti_ident.py); zero whenever none runs
     ti_reported = None   # the TI command reported to controlsd when it differs from the one sent (dither on)
     stock_previous, ti_previous = self.apply_steer_last, self.ti_apply_steer_last
 
@@ -467,17 +510,38 @@ class CarController(CarControllerBase):
               base_request=ti_new_steer, ti_max=self.ccp.TI_STEER_MAX,
               lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, room=rate_room(self.ccp))
             ti_new_steer += ti_dither
+          # Identification tests: the same place and the same rules as the dither, never both at once (armed only
+          # while the dither toggle is off and the dither silent, and only one test toggle on). getattr: as above.
+          ident = getattr(self, "ti_ident", None)
+          if ident is not None:
+            tests = getattr(self, "ti_tests", None)
+            on = self.ti_ident_on
+            armed = on[0] if (len(on) == 1 and tests is not None and not self.ti_dither_enabled
+                              and (dither is None or dither.envelope == 0.0)) else None
+            self.ti_ident_armed = armed
+            ti_ident = ident.update(
+              armed, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
+              driver_torque=CS.out.steeringTorque,
+              blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
+              base_request=ti_new_steer - ti_dither, ti_max=self.ccp.TI_STEER_MAX,
+              lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, curvature=CC.actuators.curvature,
+              lkas_blocked=getattr(CS, "lkas_blocked", None),
+              room=ti_ident_mod.rate_room(self.ccp, armed) if armed is not None else None,
+              remaining=tests.remaining if tests is not None else None)
+            ti_new_steer += ti_ident
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
                                                     CS.out.steeringTorque, self.ccp)
-          if dither is not None and dither.envelope > 0.0:
+          if (dither is not None and dither.envelope > 0.0) or (ident is not None and ident.emitted):
             # What the car would be sent had there been no dither: the same pure limiter on the undithered request,
             # run on its own (undithered) history, ti_reported_last. Running it on the sent history instead would
             # see every dither swing as a step and report rate limiting that is not there. This is what controlsd
             # compares with its requests, so its limited flag (and the integrator freeze) see the real limiting of
             # the controller's request and never the dither.
-            ti_reported = apply_ti_steer_torque_limits(ti_new_steer - ti_dither, self.ti_reported_last,
+            ti_reported = apply_ti_steer_torque_limits(ti_new_steer - ti_dither - ti_ident, self.ti_reported_last,
                                                        CS.out.steeringTorque, self.ccp)
             self.ti_dither_frames += ti_dither != 0
+            if ti_ident != 0:
+              self.ti_ident_frames[ident.emitted] = self.ti_ident_frames.get(ident.emitted, 0) + 1
         # Recorded outside the ti_lkas_allowed gate on purpose: that flag is false precisely when
         # the TI has left RUN or is ramping down, which are the frames the health counters exist
         # to catch. Gating on it would make them structurally unreachable.
@@ -491,6 +555,11 @@ class CarController(CarControllerBase):
       dither = getattr(self, "ti_dither", None)   # same guard as in the steering block above
       if dither is not None and not (CC.latActive and CS.ti_lkas_allowed):
         dither.reset()   # lateral control off or TI not in RUN: zero at once, next fade-in from nothing
+      ident = getattr(self, "ti_ident", None)
+      if ident is not None:
+        self.ti_ident_seen |= set(self.ti_ident_on)
+        if not (CC.latActive and CS.ti_lkas_allowed):
+          ident.reset(self.frame)   # the same for the identification tests
 
     if self.CP.flags & MazdaFlags.GEN1:
       if CC.cruiseControl.cancel:
@@ -639,7 +708,9 @@ class CarController(CarControllerBase):
       # every output of the frame has been computed; the accountant only reads, and never raises.
       tests = getattr(self, "ti_tests", None)
       if tests is not None:
-        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, TI_DITHER_ACTIVE if ti_dither != 0 else ())
+        ident = getattr(self, "ti_ident", None)
+        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, TI_DITHER_ACTIVE if ti_dither != 0 else (),
+                     credit=ident.credit if ident is not None else None)
 
       # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through
       # std::async on nearly every call, and this is a SCHED_FIFO process under mlockall where a
@@ -651,7 +722,7 @@ class CarController(CarControllerBase):
       # same cadence (a tmpfs write; its flash copy at most once a minute, ti_tests.py).
       if self.frame % 500 == 0:
         self.publish_ti_stats()
-        self.publish_ti_tests(CS, CC, ti_new_steer - ti_dither)
+        self.publish_ti_tests(CS, CC, ti_new_steer - ti_dither - ti_ident)
 
     self.frame += 1
     Timer.tick()

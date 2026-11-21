@@ -17,7 +17,8 @@ log line here, a line on the screen); never a crash and never a partial apply. A
 reason "not supported yet". test_mazda_ti_tests.py checks that the C++ copy of the limits and the allow-list agrees.
 
 Progress lives in ONE params key, PROGRESS_KEY, as JSON: {<test id>: {<bin>: seconds}}, or for a test with arms
-{<test id>: {<arm>: {<bin>: seconds}}}. <bin> is a bin label from the definition, "other" (speeds outside every bin)
+{<test id>: {<arm>: {<bin>: seconds}}}, or for a step_seconds test (ti_ident.py) {<test id>: {<bin>: {<step>:
+seconds}}}, <step> the step's index as a string; such a bin needs steps[k] x target_seconds in all. <bin> is a bin label from the definition, "other" (speeds outside every bin)
 or "all" (a test without bins). The tmpfs copy (params_memory) also carries "_live": what this process saw in the
 last stats interval ({seq, t: wall clock, on, active, status}); test ids cannot start with "_". The tmpfs copy is written at the
 stats cadence (5 s) while a test is on; the flash copy (no "_live") at most once a minute while counting, plus once
@@ -44,11 +45,13 @@ MS_TO_MPH = 1.0 / 0.44704
 # The only param keys a definition may switch: param key -> (frogpilot_toggles attribute that shows what the car
 # actually applies, the value that means "on"). Each is a plain boolean, exposed in Settings and read live by the car
 # controller. Mirrored in selfdrive/ui/qt/sidebar.cc (TI_TEST_ALLOWED); test_mazda_ti_tests.py checks the two agree.
-ALLOWED_SETTINGS = {"TiDither": ("ti_dither", True)}
+ALLOWED_SETTINGS = {"TiDither": ("ti_dither", True), "TiSweep": ("ti_sweep", True), "TiLadder": ("ti_ladder", True),
+                    "TiPulses": ("ti_pulses", True)}
 # Settings that report "applied on this frame" to the accountant (metric active_seconds).
 ACTIVE_SOURCES = ("TiDither",)
 
-METRICS = ("active_seconds", "engaged_seconds")
+# step_seconds: the identification tests of ti_ident.py, which credit whole clean chunks per (band, step) themselves.
+METRICS = ("active_seconds", "engaged_seconds", "step_seconds")
 BIN_BY = ("speed_mph",)
 SWITCH_WHEN = ("straight_only", "between_engagements")
 
@@ -56,15 +59,16 @@ FILE_KEYS = {"version", "tests"}
 TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"}
 TEST_REQUIRED = {"id", "title", "description", "settings", "progress"}
 SETTING_KEYS = {"key", "on"}
-PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins"}
+PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps"}
 PROGRESS_REQUIRED = {"metric", "target_seconds"}
 AUTO_OFF_KEYS = {"at_ignition_off"}
 ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"}
 ARM_KEYS = {"id", "settings"}
 
-MAX_TESTS = 2
+MAX_TESTS = 4
 MAX_SETTINGS = 3
 MAX_BINS = 5
+MAX_STEPS = 16
 MIN_ARMS = 2
 MAX_ARMS = 4
 MIN_TARGET_S = 10
@@ -97,11 +101,16 @@ REASON_TEXT = {
   "command": "Waiting: steering command too large",
   "curve": "Waiting: curve",
   "ok": "Running",
+  # the identification tests (ti_ident.TiIdent.reason)
+  "other": "Waiting: another test is on",
+  "band": "Waiting: speed outside the test bands",
+  "regime": "Waiting: steering mode settling (28-31 mph or a change)",
+  "band_done": "Waiting: this speed band is complete",
 }
 
 
 class TestDef:
-  def __init__(self, id, title, description, settings, metric, target_seconds, bins, at_ignition_off):
+  def __init__(self, id, title, description, settings, metric, target_seconds, bins, at_ignition_off, steps=()):
     self.id = id
     self.title = title
     self.description = description
@@ -112,6 +121,7 @@ class TestDef:
     self.target_seconds = target_seconds
     self.bins = bins                         # ((low mph, high mph, label, required), ...) sorted by low, or ()
     self.at_ignition_off = at_ignition_off
+    self.steps = steps                       # step_seconds: steps to capture per bin, in the order of `bins`
 
   def enabled(self, toggles):
     """Every setting at its "on" value in the live toggles (what the car applies, after the tuning-level gate)."""
@@ -158,12 +168,18 @@ def _settings(raw):
   return tuple(pairs), None
 
 
-def _bins(raw):
-  """(((low, high, label, required), ...), None) or (None, reason)."""
+def _bins(raw, steps=None):
+  """(((low, high, label, required), ...), None) or (None, reason); with `steps` (step_seconds), ((bins, steps),
+  None), the step counts paired with the bins as written and kept in the sorted order."""
   if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_BINS:
     return None, f"bins must list 1-{MAX_BINS} bins"
+  if steps is not None:
+    if not isinstance(steps, list) or len(steps) != len(raw):
+      return None, "steps must list one count per bin"
+    if not all(_number(n) and n == int(n) and 1 <= n <= MAX_STEPS for n in steps):
+      return None, f"steps must be whole numbers 1-{MAX_STEPS}"
   out = []
-  for b in raw:
+  for i, b in enumerate(raw):
     if not isinstance(b, list) or len(b) != 4:
       return None, "each bin is [low, high, label, required]"
     low, high, label, required = b
@@ -173,7 +189,7 @@ def _bins(raw):
       return None, f"bin {label}: need 0 <= low < high <= {MAX_SPEED_MPH}"
     if not isinstance(required, bool):
       return None, f"bin {label}: required must be true or false"
-    out.append((float(low), float(high), label, required))
+    out.append((float(low), float(high), label, required, int(steps[i]) if steps is not None else 0))
   out.sort(key=lambda x: x[0])
   for a, c in zip(out, out[1:]):
     if c[0] < a[1]:
@@ -182,7 +198,9 @@ def _bins(raw):
     return None, "bin label twice"
   if not any(x[3] for x in out):
     return None, "at least one bin must be required"
-  return tuple(out), None
+  if steps is not None:
+    return (tuple(x[:4] for x in out), tuple(x[4] for x in out)), None
+  return tuple(x[:4] for x in out), None
 
 
 def _alternate(a):
@@ -207,6 +225,14 @@ def _alternate(a):
   if a["switch_when"] not in SWITCH_WHEN:
     return "alternate: unknown switch_when"
   return None
+
+
+def _ident_check(key, bins, steps, target):
+  try:
+    from openpilot.selfdrive.car.mazda import ti_ident
+  except Exception:
+    return "identification tests not available"
+  return ti_ident.check_definition(key, bins, steps, target)
 
 
 def validate_test(t):
@@ -246,13 +272,30 @@ def validate_test(t):
     return None, "active_seconds needs a setting that reports applied time"
   if not (_number(p["target_seconds"]) and MIN_TARGET_S <= p["target_seconds"] <= MAX_TARGET_S):
     return None, f"target_seconds must be {MIN_TARGET_S}-{MAX_TARGET_S}"
-  bins = ()
+  bins, steps = (), ()
   if ("bins" in p) != ("bin_by" in p):
     return None, "bins and bin_by go together"
+  if "steps" in p and p["metric"] != "step_seconds":
+    return None, "steps go with step_seconds"
+  if p["metric"] == "step_seconds" and not ("bins" in p and "steps" in p):
+    return None, "step_seconds needs bins and steps"
   if "bins" in p:
     if p["bin_by"] not in BIN_BY:
       return None, "unknown bin_by"
-    bins, why = _bins(p["bins"])
+    if p["metric"] == "step_seconds":
+      got, why = _bins(p["bins"], p["steps"])
+      if why is None:
+        bins, steps = got
+    else:
+      bins, why = _bins(p["bins"])
+    if why is not None:
+      return None, why
+  if p["metric"] == "step_seconds":
+    # The generator is code: the definition must describe exactly what it does (one setting, its bands, steps and
+    # time per step), so the screen shows what the car really collects.
+    if len(settings) != 1:
+      return None, "step_seconds needs exactly one setting"
+    why = _ident_check(settings[0][0], bins, steps, float(p["target_seconds"]))
     if why is not None:
       return None, why
 
@@ -268,7 +311,7 @@ def validate_test(t):
     return None, why if why is not None else UNSUPPORTED
 
   return TestDef(t["id"], t["title"], t["description"], settings, p["metric"], float(p["target_seconds"]), bins,
-                 at_off), None
+                 at_off, steps), None
 
 
 def validate_document(doc):
@@ -366,15 +409,19 @@ class TestAccountant:
     self.last_flush = None
     self.seq = 0
     self.reset_done = {}         # test id -> the UI's reset token this process applied (echoed in the live block)
+    self.pending_steps = {}      # test id -> {(band, step): seconds} credited since the last publish (step_seconds)
+    self.doc = None              # the progress as of the last publish (step_seconds bookkeeping); None: not read yet
+    self.step_tests = {k: t for t in self.tests if t.metric == "step_seconds" for k in t.keys}
     self.failed = False
 
   def _fail(self, where):
     self.failed = True
     _log(f"ti_tests: accountant disabled after an error in {where}")
 
-  def update(self, toggles, v_ego, engaged, active_keys, arms=None):
+  def update(self, toggles, v_ego, engaged, active_keys, arms=None, credit=None):
     """One frame. `active_keys`: the ACTIVE_SOURCES applied on this frame. `arms`: {test id: arm} for tests that
-    alternate (none can be loaded yet), else None."""
+    alternate (none can be loaded yet), else None. `credit`: (setting key, band, step, seconds) when an
+    identification test (ti_ident) completed a clean chunk on this frame, else None."""
     if self.failed:
       return
     try:
@@ -383,6 +430,12 @@ class TestAccountant:
           continue
         self.seen_interval.add(t.id)
         self.run_seen.add(t.id)
+        if t.metric == "step_seconds":
+          if credit is not None and credit[0] in t.keys:
+            slot = (credit[1], credit[2])
+            counted = self.pending_steps.setdefault(t.id, {})
+            counted[slot] = counted.get(slot, 0.0) + credit[3]
+          continue
         counting = (not t.keys.isdisjoint(active_keys)) if t.metric == "active_seconds" else bool(engaged)
         if counting:
           arm = arms.get(t.id) if arms else None
@@ -391,6 +444,23 @@ class TestAccountant:
           counted[slot] = counted.get(slot, 0) + 1
     except Exception:
       self._fail("update")
+
+  def remaining(self, key, band, step):
+    """Seconds still to capture for a step of the identification test switched by `key` in `band` (0 when complete or
+    unknown, so nothing runs on a broken accountant). Reads params once per process at most; never raises."""
+    t = self.step_tests.get(key)
+    if t is None or self.failed:
+      return 0.0
+    try:
+      if self.doc is None:
+        self.doc = self._base()[0]
+      entry = self.doc.get(t.id, {}).get(band, {})
+      have = entry.get(str(step), 0.0) if isinstance(entry, dict) else 0.0
+      have += self.pending_steps.get(t.id, {}).get((band, step), 0.0)
+      return max(0.0, t.target_seconds - have)
+    except Exception:
+      self._fail("remaining")
+      return 0.0
 
   def wants_reasons(self):
     return bool(self.seen_interval) and not self.failed
@@ -420,7 +490,8 @@ class TestAccountant:
     clock for the live block's "t" (default time.time()); the UI compares it with its own clock to tell a live block
     from one left over by an earlier drive. Writes the tmpfs copy when a test was on, something is unsaved or the last
     live block still lists a test as on, and the flash copy at the rate in the module docstring."""
-    if self.failed or not (self.pending or self.seen_interval or self.unsaved or self.live_shown):
+    if self.failed or not (self.pending or self.pending_steps or self.seen_interval or self.unsaved or
+                           self.live_shown):
       return
     try:
       doc, resets = self._base()
@@ -429,7 +500,7 @@ class TestAccountant:
       for tid, token in resets.items():
         doc.pop(tid, None)
         self.reset_done[tid] = token
-      changed = bool(self.pending) or bool(resets)
+      changed = bool(self.pending) or bool(self.pending_steps) or bool(resets)
       for tid, counted in self.pending.items():
         entry = doc.setdefault(tid, {})
         for (arm, b), n in counted.items():
@@ -440,8 +511,17 @@ class TestAccountant:
               into = entry[arm] = {}
           prev = into.get(b)
           into[b] = round((prev if _number(prev) else 0.0) + n * DT, 2)
-      on, active = sorted(self.seen_interval), sorted(self.pending)
-      self.pending, self.seen_interval = {}, set()
+      for tid, counted in self.pending_steps.items():
+        entry = doc.setdefault(tid, {})
+        for (b, step), secs in counted.items():
+          into = entry.get(b)
+          if not isinstance(into, dict):
+            into = entry[b] = {}
+          prev = into.get(str(step))
+          into[str(step)] = round((prev if _number(prev) else 0.0) + secs, 2)
+      on, active = sorted(self.seen_interval), sorted(set(self.pending) | set(self.pending_steps))
+      self.pending, self.pending_steps, self.seen_interval = {}, {}, set()
+      self.doc = doc
       self.seq += 1
       live = {"seq": self.seq, "t": round(time.time() if wall is None else wall, 1), "on": on, "active": active,
               "status": self._status(on, reasons), "reset_done": dict(self.reset_done)}

@@ -111,7 +111,7 @@ EXCLUDED_KEYS = {
   "AvailableModels", "AvailableModelNames", "CalibratedLateralAcceleration", "CalibrationProgress", "CarParamsPersistent",
   "CurvatureData", "ExperimentalLongitudinalEnabled", "KonikMinutes", "MapBoxRequests", "ModelDrivesAndScores", "ModelVersions",
   "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches",
-  "TiTestProgress"
+  "TiTestProgress", "TiTestQueue"
 }
 
 TINYGRAD_FILES = [
@@ -309,6 +309,9 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("LatCommitSetpoint", "0", 3, "0"),
   ("LatDamping", "0", 3, "0"),
   ("TiDither", "0", 3, "0"),
+  ("TiSweep", "0", 3, "0"),
+  ("TiLadder", "0", 3, "0"),
+  ("TiPulses", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -480,6 +483,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TiFlaggedMoments", "", 3, ""),
   ("TiTuningStatsHistory", "", 3, ""),
   ("TiTestProgress", "", 3, ""),
+  ("TiTestQueue", "", 3, ""),
   ("AutoScreenRefresh", "1", 0, "1"),
   ("LastScreenRefresh", "0", 0, "0"),
   ("ScreenRefreshRemaining", "0", 0, "0"),
@@ -733,6 +737,18 @@ class FrogPilotVariables:
     toggle.ti_dither = (params.get_bool("TiDither")
                         if toggle.tuning_level >= level["TiDither"]
                         else default.get_bool("TiDither"))
+    # Steering identification tests (selfdrive/car/mazda/ti_ident.py): sweep, amplitude ladder, short pulses. Same
+    # envelope as the dither (added before the TI limits, fade out within 0.25 s, zero at a touch); switched from the
+    # Tests screen only, default off.
+    toggle.ti_sweep = (params.get_bool("TiSweep")
+                       if toggle.tuning_level >= level["TiSweep"]
+                       else default.get_bool("TiSweep"))
+    toggle.ti_ladder = (params.get_bool("TiLadder")
+                        if toggle.tuning_level >= level["TiLadder"]
+                        else default.get_bool("TiLadder"))
+    toggle.ti_pulses = (params.get_bool("TiPulses")
+                        if toggle.tuning_level >= level["TiPulses"]
+                        else default.get_bool("TiPulses"))
     toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
                                 if toggle.tuning_level >= level["LatFrictionComp"]
                                 else default.get_bool("LatFrictionComp"))

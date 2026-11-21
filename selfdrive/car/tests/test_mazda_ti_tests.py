@@ -79,7 +79,8 @@ OFF = NS(ti_dither=False)
 def test_shipped_definitions_are_valid_and_define_the_dither_bands():
   tests, errors = tt.load_definitions()
   assert errors == []
-  assert [t.id for t in tests] == ["ti_dither"]
+  # The queue order on the Tests screen: the dither, then the three identification tests (ti_ident.py)
+  assert [t.id for t in tests] == ["ti_dither", "ti_sweep", "ti_ladder", "ti_pulses"]
   d = tests[0]
   assert d.settings == (("TiDither", True),) and d.metric == "active_seconds" and d.target_seconds == 300
   assert d.bins == ((36, 40, "36-40", False), (43, 50, "43-50", True), (56, 62, "56-62", False))
@@ -613,7 +614,10 @@ def test_progress_key_and_allow_listed_settings_are_registered():
     # a plain boolean with a default of "off", read into the live toggles under this name, and notified live
     assert re.search(r'\("%s", "%d", \d, "[01]"\)' % (key, int(not on)), variables)
     assert re.search(r'toggle\.%s = \(params\.get_bool\("%s"\)' % (toggle, key), variables)
-    assert '"%s"' % key in live_keys
+    # The identification tests are switched from the Tests screen only (it notifies the toggles itself); the dither
+    # also has a Settings toggle, which must notify live.
+    if key == "TiDither":
+      assert '"%s"' % key in live_keys
   assert set(tt.ACTIVE_SOURCES) <= set(tt.ALLOWED_SETTINGS)
 
 
@@ -631,7 +635,7 @@ def test_qt_allow_list_agrees():
 
 def test_qt_limits_agree():
   consts = {k: float(v) for k, v in re.findall(r'constexpr (?:int|double) TI_TEST_(\w+) = ([\d.]+);', _cc_source())}
-  for name in ('MAX_TESTS', 'MAX_SETTINGS', 'MAX_BINS', 'MIN_ARMS', 'MAX_ARMS', 'MIN_TARGET_S', 'MAX_TARGET_S',
+  for name in ('MAX_TESTS', 'MAX_SETTINGS', 'MAX_BINS', 'MAX_STEPS', 'MIN_ARMS', 'MAX_ARMS', 'MIN_TARGET_S', 'MAX_TARGET_S',
                'MIN_DWELL_S', 'MAX_DWELL_S', 'MAX_SPEED_MPH', 'MAX_TITLE', 'MAX_DESCRIPTION', 'MAX_ID', 'MAX_LABEL'):
     assert consts.pop(name) == getattr(tt, name), name
   # UI-only: status line length, staleness of the live block (the car publishes every 5 s), NOT APPLIED delay,

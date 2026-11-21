@@ -25,6 +25,7 @@ struct TiTestBin {
   double high = 0;
   QString label;
   bool required = false;
+  int steps = 0;                               // step_seconds: steps in this bin, each needs target_seconds; else 0
 };
 
 struct TiTestDef {
@@ -47,6 +48,7 @@ struct TiTestView {
   QString status;                  // the car side's status line; empty when absent or stale
   QString arm;                     // the car side's arm label; empty when absent or stale
   QMap<QString, double> seconds;   // bin label, "other" or "all" -> seconds collected
+  QMap<QString, double> step_seconds;  // step_seconds tests: bin label -> its steps' seconds, each clipped to the target
   int mismatch_ticks = 0;
 };
 
@@ -58,10 +60,14 @@ public:
   void allOff();
   void resetProgress(int i);
   void driveEnded();
+  int queued();
+  bool moveQueue(int from, int to);
 
   bool done(int i) const;
   int countOn() const;
   int overallPercent() const;
+  double have(int i, const TiTestBin &bin) const;
+  static double need(const TiTestDef &def, const TiTestBin &bin);
   static QString binText(const TiTestBin &bin, bool metric);
   static QString binFor(const TiTestDef &def, double speed_mph);
 
@@ -100,12 +106,14 @@ private:
   void leave();
   void tick();
   void refresh();
-  int rowTop(int i) const;
+  int rowTop() const;
   int rowHeight() const;
   QRect backRect() const;
   QRect allOffRect() const;
-  QRect toggleRect(int i) const;
-  QRect resetRect(int i) const;
+  QRect prevRect() const;
+  QRect nextRect() const;
+  QRect toggleRect() const;
+  QRect resetRect() const;
   int controlAt(const QPoint &pos) const;
   void drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const;
   void drawTest(QPainter &p, int i);
@@ -115,6 +123,7 @@ private:
   QElapsedTimer idle;
   QElapsedTimer opened;          // input is ignored for a moment after the page opens
   int pressed_control = 0;       // the control under the last accepted press; 0: none
+  int queue_pos = -1;            // the queued test on the page; -1: read the queue at the next refresh
   int tick_count = 0;
   bool is_metric = false;
   bool have_speed = false;

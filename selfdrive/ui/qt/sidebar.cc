@@ -1,6 +1,7 @@
 #include "selfdrive/ui/qt/sidebar.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <QDateTime>
 #include <QDebug>
@@ -16,9 +17,10 @@
 // that these limits, key sets and the allow-list agree with the Python copy.
 namespace {
 
-constexpr int TI_TEST_MAX_TESTS = 2;
+constexpr int TI_TEST_MAX_TESTS = 4;
 constexpr int TI_TEST_MAX_SETTINGS = 3;
 constexpr int TI_TEST_MAX_BINS = 5;
+constexpr int TI_TEST_MAX_STEPS = 16;
 constexpr int TI_TEST_MIN_ARMS = 2;
 constexpr int TI_TEST_MAX_ARMS = 4;
 constexpr double TI_TEST_MIN_TARGET_S = 10;
@@ -46,6 +48,7 @@ const char *const TI_TEST_CRASH_LOG = "/data/error_logs/error.txt";
 const char *const TI_TEST_OTHER = "other";
 const char *const TI_TEST_ALL = "all";
 const char *const TI_TEST_UNSUPPORTED = "alternate is not supported yet (test ignored)";
+const char *const TESTS_QUEUE_KEY = "TiTestQueue";  // UI only: the id of the queued test the Tests page shows
 
 struct TiTestAllowed {
   const char *key;     // the param a definition may switch
@@ -54,17 +57,20 @@ struct TiTestAllowed {
 };
 const TiTestAllowed TI_TEST_ALLOWED[] = {
   {"TiDither", "ti_dither", true},
+  {"TiSweep", "ti_sweep", true},
+  {"TiLadder", "ti_ladder", true},
+  {"TiPulses", "ti_pulses", true},
 };
 
 const QStringList TI_TEST_ACTIVE_SOURCES = {"TiDither"};
-const QStringList TI_TEST_METRICS = {"active_seconds", "engaged_seconds"};
+const QStringList TI_TEST_METRICS = {"active_seconds", "engaged_seconds", "step_seconds"};
 const QStringList TI_TEST_BIN_BY = {"speed_mph"};
 const QStringList TI_TEST_SWITCH_WHEN = {"straight_only", "between_engagements"};
 const QStringList TI_TEST_FILE_KEYS = {"version", "tests"};
 const QStringList TI_TEST_TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"};
 const QStringList TI_TEST_TEST_REQUIRED = {"id", "title", "description", "settings", "progress"};
 const QStringList TI_TEST_SETTING_KEYS = {"key", "on"};
-const QStringList TI_TEST_PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins"};
+const QStringList TI_TEST_PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps"};
 const QStringList TI_TEST_PROGRESS_REQUIRED = {"metric", "target_seconds"};
 const QStringList TI_TEST_AUTO_OFF_KEYS = {"at_ignition_off"};
 const QStringList TI_TEST_ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"};
@@ -156,7 +162,8 @@ QString tiTestSettings(const QJsonValue &raw, Params &params, std::vector<QPair<
   return out.empty() ? count : QString();
 }
 
-QString tiTestBins(const QJsonValue &raw, std::vector<TiTestBin> &out) {
+// `steps` (step_seconds only; undefined otherwise): one count per bin, in the order the bins are written
+QString tiTestBins(const QJsonValue &raw, const QJsonValue &steps, std::vector<TiTestBin> &out) {
   out.clear();
   const QString count = QString("bins must list 1-%1 bins").arg(TI_TEST_MAX_BINS);
   if (!raw.isArray()) {
@@ -195,6 +202,19 @@ QString tiTestBins(const QJsonValue &raw, std::vector<TiTestBin> &out) {
   }
   if (out.empty()) {
     return count;
+  }
+  if (!steps.isUndefined()) {
+    const QJsonArray counts = steps.toArray();
+    if (!steps.isArray() || counts.size() != (int)out.size()) {
+      return QString("steps must list one count per bin");
+    }
+    for (int k = 0; k < counts.size(); k++) {
+      const double n = counts.at(k).toDouble();
+      if (!counts.at(k).isDouble() || !(n >= 1 && n <= TI_TEST_MAX_STEPS) || n != double(int(n))) {
+        return QString("steps must be whole numbers 1-%1").arg(TI_TEST_MAX_STEPS);
+      }
+      out[k].steps = int(n);
+    }
   }
   std::sort(out.begin(), out.end(), [](const TiTestBin &x, const TiTestBin &y) { return x.low < y.low; });
   bool any_required = out[0].required;
@@ -298,11 +318,17 @@ QString tiTestValidate(const QJsonValue &raw, Params &params, TiTestDef &def) {
   if (p.contains("bins") != p.contains("bin_by")) {
     return QString("bins and bin_by go together");
   }
+  if (p.contains("steps") && def.metric != "step_seconds") {
+    return QString("steps go with step_seconds");
+  }
+  if (def.metric == "step_seconds" && !(p.contains("bins") && p.contains("steps"))) {
+    return QString("step_seconds needs bins and steps");
+  }
   if (p.contains("bins")) {
     if (!TI_TEST_BIN_BY.contains(p.value("bin_by").toString())) {
       return QString("unknown bin_by");
     }
-    why = tiTestBins(p.value("bins"), def.bins);
+    why = tiTestBins(p.value("bins"), p.value("steps"), def.bins);
     if (!why.isEmpty()) {
       return why;
     }
@@ -524,6 +550,21 @@ void TiTests::poll(const QJsonObject &toggles) {
         view.seconds.insert(key, entry.value(key).toDouble());
       }
     }
+    // A step_seconds bin is {step index: seconds}; it counts its steps 0..steps-1, each up to target_seconds
+    view.step_seconds.clear();
+    if (def.metric == "step_seconds") {
+      for (const TiTestBin &bin : def.bins) {
+        const QJsonObject steps = entry.value(bin.label).toObject();
+        double sum = 0;
+        for (int k = 0; k < bin.steps; k++) {
+          const QJsonValue v = steps.value(QString::number(k));
+          if (v.isDouble()) {
+            sum += std::min(v.toDouble(), def.target);
+          }
+        }
+        view.step_seconds.insert(bin.label, sum);
+      }
+    }
 
     view.light = false;
     if (view.requested && view.mismatch_ticks > TI_TEST_MISMATCH_S) {
@@ -582,7 +623,46 @@ void TiTests::resetProgress(int i) {
   reset_polls = 0;
   if (i < (int)views.size()) {
     views[i].seconds.clear();
+    views[i].step_seconds.clear();
   }
+}
+
+// The queued test (TESTS_QUEUE_KEY): that id when it is a loaded test, else the first test not done, else the first
+int TiTests::queued() {
+  const std::string key = TESTS_QUEUE_KEY;
+  const QString id = tests_params.checkKey(key) ? QString::fromStdString(tests_params.get(key)) : QString();
+  for (int i = 0; i < (int)defs.size(); i++) {
+    if (defs[i].id == id) {
+      return i;
+    }
+  }
+  for (int i = 0; i < (int)defs.size(); i++) {
+    if (!done(i)) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+// The queue pointer from test `from` to test `to`. A test that is on moves with it: off for the one left, on for the
+// new one; one that is off only moves the pointer. Only ever on a tap, never by itself.
+bool TiTests::moveQueue(int from, int to) {
+  if (from < 0 || from >= (int)defs.size() || to < 0 || to >= (int)defs.size() || from == to) {
+    return false;
+  }
+  const std::string key = TESTS_QUEUE_KEY;
+  if (tests_params.checkKey(key)) {
+    tests_params.put(key, defs[to].id.toStdString());
+  }
+  if (from < (int)views.size() && views[from].requested) {
+    setTest(from, false);
+    setTest(to, true);
+    for (TiTestView &view : views) {
+      view.mismatch_ticks = 0;
+    }
+    updateFrogPilotToggles();
+  }
+  return true;
 }
 
 // At the end of a drive (onroad -> offroad): switch off the tests that ask for it, and copy the live progress to
@@ -622,11 +702,23 @@ bool TiTests::done(int i) const {
     return views[i].seconds.value(TI_TEST_ALL, 0.0) >= def.target;
   }
   for (const TiTestBin &bin : def.bins) {
-    if (bin.required && views[i].seconds.value(bin.label, 0.0) < def.target) {
+    if (bin.required && have(i, bin) < need(def, bin)) {
       return false;
     }
   }
   return true;
+}
+
+// Seconds a bin has (step_seconds: its steps' clipped sum) and needs (step_seconds: steps x target_seconds)
+double TiTests::have(int i, const TiTestBin &bin) const {
+  if (i < 0 || i >= (int)defs.size() || i >= (int)views.size()) {
+    return 0.0;
+  }
+  return defs[i].metric == "step_seconds" ? views[i].step_seconds.value(bin.label, 0.0) : views[i].seconds.value(bin.label, 0.0);
+}
+
+double TiTests::need(const TiTestDef &def, const TiTestBin &bin) {
+  return bin.steps > 0 ? bin.steps * def.target : def.target;
 }
 
 int TiTests::countOn() const {
@@ -652,7 +744,7 @@ int TiTests::overallPercent() const {
     }
     for (const TiTestBin &bin : def.bins) {
       if (bin.required) {
-        sum += std::min(1.0, views[i].seconds.value(bin.label, 0.0) / def.target);
+        sum += std::min(1.0, have((int)i, bin) / need(def, bin));
         n++;
       }
     }
@@ -701,6 +793,7 @@ bool TestsWindow::openPage() {
   idle.start();
   opened.start();
   pressed_control = 0;
+  queue_pos = -1;
   tick_count = 0;
   refresh();
   return true;
@@ -746,17 +839,21 @@ void TestsWindow::refresh() {
   have_speed = sm.rcv_frame("carState") > 0;
   speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
   tests.poll(frogpilotUIState()->frogpilot_toggles);
+  // The queue is read when the page opens; after that only PREV / NEXT move the shown test
+  if (queue_pos < 0 || queue_pos >= (int)tests.defs.size()) {
+    queue_pos = tests.queued();
+  }
   update();
 }
 
-int TestsWindow::rowTop(int i) const {
-  return 210 + i * rowHeight();
+// One test at a time: the queued one, below the header and its banner line
+int TestsWindow::rowTop() const {
+  return 260;
 }
 
 int TestsWindow::rowHeight() const {
   const int footer = tests.errors.isEmpty() ? 0 : 30 + 50 * std::min(2, (int)tests.errors.size());
-  const int n = std::max(1, (int)tests.defs.size());
-  return (height() - 20 - footer - 210) / n;
+  return height() - 20 - footer - rowTop();
 }
 
 QRect TestsWindow::backRect() const {
@@ -767,15 +864,29 @@ QRect TestsWindow::allOffRect() const {
   return QRect(width() - 670, 24, 640, 150);
 }
 
-QRect TestsWindow::toggleRect(int i) const {
-  return QRect(30, rowTop(i) + 10, 600, rowHeight() - 30);
+// PREV and NEXT share the header between BACK and ALL TESTS OFF with the "TEST k OF n" line
+QRect TestsWindow::prevRect() const {
+  const int left = backRect().right() + 20;
+  const int w = std::min(300, (allOffRect().left() - 20 - left) / 3);
+  return QRect(left, 24, w, 150);
 }
 
-QRect TestsWindow::resetRect(int i) const {
-  return QRect(width() - 430, rowTop(i) + 10, 400, 110);
+QRect TestsWindow::nextRect() const {
+  const int right = allOffRect().left() - 20;
+  const int w = std::min(300, (right - backRect().right() - 20) / 3);
+  return QRect(right - w, 24, w, 150);
 }
 
-// Controls: 1 BACK, 2 ALL TESTS OFF, 10 + i the on/off box of test i, 20 + i its Reset progress; 0 none
+QRect TestsWindow::toggleRect() const {
+  return QRect(30, rowTop() + 10, 600, rowHeight() - 30);
+}
+
+QRect TestsWindow::resetRect() const {
+  return QRect(width() - 430, rowTop() + 10, 400, 110);
+}
+
+// Controls: 1 BACK, 2 ALL TESTS OFF, 3 PREV, 4 NEXT (none at the ends of the queue), 10 + i the on/off box of the
+// shown test i, 20 + i its Reset progress; 0 none
 int TestsWindow::controlAt(const QPoint &pos) const {
   if (backRect().contains(pos)) {
     return 1;
@@ -783,13 +894,20 @@ int TestsWindow::controlAt(const QPoint &pos) const {
   if (allOffRect().contains(pos)) {
     return 2;
   }
-  for (int i = 0; i < (int)tests.defs.size(); i++) {
-    if (toggleRect(i).contains(pos)) {
-      return 10 + i;
-    }
-    if (resetRect(i).contains(pos)) {
-      return 20 + i;
-    }
+  if (queue_pos < 0 || queue_pos >= (int)tests.defs.size()) {
+    return 0;
+  }
+  if (prevRect().contains(pos)) {
+    return queue_pos > 0 ? 3 : 0;
+  }
+  if (nextRect().contains(pos)) {
+    return queue_pos + 1 < (int)tests.defs.size() ? 4 : 0;
+  }
+  if (toggleRect().contains(pos)) {
+    return 10 + queue_pos;
+  }
+  if (resetRect().contains(pos)) {
+    return 20 + queue_pos;
   }
   return 0;
 }
@@ -820,8 +938,16 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     refresh();
     return;
   }
+  if (control == 3 || control == 4) {
+    const int to = control == 3 ? queue_pos - 1 : queue_pos + 1;
+    if (tests.moveQueue(queue_pos, to)) {
+      queue_pos = to;
+    }
+    refresh();
+    return;
+  }
   const int i = control >= 20 ? control - 20 : control - 10;
-  if (i < 0 || i >= (int)tests.defs.size()) {
+  if (i < 0 || i >= (int)tests.defs.size() || i != queue_pos) {
     return;
   }
   if (control < 20) {
@@ -855,11 +981,11 @@ void TestsWindow::drawTest(QPainter &p, int i) {
   const TiTestView &view = tests.views[i];
   const QColor white(0xff, 0xff, 0xff);
   const QColor grey(0xa0, 0xa0, 0xa0);
-  const int top = rowTop(i);
+  const int top = rowTop();
   const int row_h = rowHeight();
 
   // The on/off control: state in colour and words
-  const QRect toggle_r = toggleRect(i);
+  const QRect toggle_r = toggleRect();
   const QColor ink = view.light ? QColor(0, 0, 0) : white;
   p.setPen(Qt::NoPen);
   p.setBrush(view.color);
@@ -876,12 +1002,12 @@ void TestsWindow::drawTest(QPainter &p, int i) {
                QString("turns off when the car is switched off"));
   }
 
-  drawBox(p, resetRect(i), QColor(0x33, 0x33, 0x33), white, QString("Reset progress"), 40);
+  drawBox(p, resetRect(), QColor(0x33, 0x33, 0x33), white, QString("Reset progress"), 40);
 
   // Title (DONE when every required bin has its time), the car side's arm and status lines when it publishes them
   const int x0 = toggle_r.right() + 40;
   const int x1 = width() - 30;
-  const int head_w = resetRect(i).left() - 20 - x0;
+  const int head_w = resetRect().left() - 20 - x0;
   const bool finished = tests.done(i);
   QString heading = def.title;
   if (!view.arm.isEmpty()) {
@@ -913,16 +1039,22 @@ void TestsWindow::drawTest(QPainter &p, int i) {
     QString label = QString("all speeds");
     bool required = true;
     bool has_bar = true;
+    double collected = view.seconds.value(key, 0.0);
+    double needed = def.target;
+    int steps = 0;
     if (!def.bins.empty() && k < (int)def.bins.size()) {
       key = def.bins[k].label;
       label = TiTests::binText(def.bins[k], is_metric);
       required = def.bins[k].required;
+      collected = tests.have(i, def.bins[k]);
+      needed = TiTests::need(def, def.bins[k]);
+      steps = def.bins[k].steps;
     } else if (!def.bins.empty()) {
       key = QString(TI_TEST_OTHER);
       label = QString("other speeds");
       has_bar = false;
+      collected = view.seconds.value(key, 0.0);
     }
-    const double collected = view.seconds.value(key, 0.0);
     const bool here = key == current;
 
     if (here) {
@@ -940,7 +1072,7 @@ void TestsWindow::drawTest(QPainter &p, int i) {
     QString value = QString("%1 s").arg(int(collected));
     if (has_bar) {
       const QRect bar = QRect(bar_x, line_y + lh / 4, bar_w, lh / 2);
-      const double fraction = std::min(1.0, std::max(0.0, collected / def.target));
+      const double fraction = std::min(1.0, std::max(0.0, collected / needed));
       p.setPen(Qt::NoPen);
       p.setBrush(QColor(0x33, 0x33, 0x33));
       p.drawRoundedRect(bar, 8, 8);
@@ -954,6 +1086,10 @@ void TestsWindow::drawTest(QPainter &p, int i) {
         p.drawText(bar, Qt::AlignCenter, QString("optional"));
       }
       value = QString("%1 / %2 s").arg(int(collected)).arg(int(def.target));
+      if (steps > 0) {  // step_seconds: the time still to collect in this band
+        const int left = int(std::ceil(needed - collected));
+        value = collected >= needed ? QString("done") : QString("%1:%2 left").arg(left / 60).arg(left % 60, 2, 10, QChar('0'));
+      }
     }
     p.setPen(required ? white : grey);
     p.setFont(InterFont(px, QFont::DemiBold));
@@ -969,16 +1105,44 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   const QColor white(0xff, 0xff, 0xff);
   drawBox(p, backRect(), QColor(0x33, 0x33, 0x33), white, QString("BACK"), 70);
   drawBox(p, allOffRect(), QColor(201, 34, 49), white, QString("ALL TESTS OFF"), 60);
-  p.setPen(white);
-  p.setFont(InterFont(80, QFont::Bold));
-  p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));
 
-  if (tests.defs.empty()) {
+  const int n = (int)tests.defs.size();
+  if (queue_pos < 0 || queue_pos >= n) {
+    p.setPen(white);
+    p.setFont(InterFont(80, QFont::Bold));
+    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));
     p.setFont(InterFont(56, QFont::DemiBold));
-    p.drawText(QRect(30, rowTop(0), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
-  }
-  for (int i = 0; i < (int)tests.defs.size(); i++) {
-    drawTest(p, i);
+    p.drawText(QRect(30, rowTop(), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
+  } else {
+    // The queue: PREV / TEST k OF n / NEXT; an end of the queue greyed out, NEXT green once the shown test is done
+    const QColor green(0x17, 0x86, 0x44);
+    const QColor dim_fill(0x1a, 0x1a, 0x1a);
+    const QColor dim_ink(0x55, 0x55, 0x55);
+    const bool finished = tests.done(queue_pos);
+    const bool has_prev = queue_pos > 0;
+    const bool has_next = queue_pos + 1 < n;
+    drawBox(p, prevRect(), has_prev ? QColor(0x33, 0x33, 0x33) : dim_fill, has_prev ? white : dim_ink, QString("< PREV"), 56);
+    drawBox(p, nextRect(), has_next ? (finished ? green : QColor(0x33, 0x33, 0x33)) : dim_fill, has_next ? white : dim_ink,
+            QString("NEXT >"), 56);
+    p.setPen(white);
+    p.setFont(InterFont(48, QFont::Bold));
+    p.drawText(QRect(prevRect().right() + 10, 24, nextRect().left() - prevRect().right() - 20, 150), Qt::AlignCenter,
+               QString("TEST %1 OF %2").arg(queue_pos + 1).arg(n));
+
+    if (finished) {
+      bool all_done = true;
+      for (int i = 0; i < n; i++) {
+        all_done = all_done && tests.done(i);
+      }
+      QString banner = QString("Complete. Tap NEXT to switch to %1").arg(has_next ? tests.defs[queue_pos + 1].title : QString());
+      if (!has_next) {
+        banner = all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test.");
+      }
+      p.setPen(QColor(0x33, 0xcc, 0x66));
+      p.setFont(InterFont(46, QFont::Bold));
+      p.drawText(QRect(30, 184, width() - 60, 66), Qt::AlignCenter, banner);
+    }
+    drawTest(p, queue_pos);
   }
 
   // Definitions that were ignored, and why (at most two lines)

@@ -19,6 +19,69 @@
         ]
       },
       "auto_off": {"at_ignition_off": true}
+    },
+    {
+      "id": "ti_sweep",
+      "title": "Steering sweep 0.3-5 Hz",
+      "description": "Seven small tones one after another on the interceptor command. Runs by itself on straights in each speed band, hands off, no blinker.",
+      "settings": [
+        {"key": "TiSweep", "on": true}
+      ],
+      "progress": {
+        "metric": "step_seconds",
+        "target_seconds": 20,
+        "bin_by": "speed_mph",
+        "bins": [
+          [12, 28, "12-28", true],
+          [31, 45, "31-45", true],
+          [45, 60, "45-60", true],
+          [60, 80, "60-80", true]
+        ],
+        "steps": [7, 7, 7, 7]
+      },
+      "auto_off": {"at_ignition_off": true}
+    },
+    {
+      "id": "ti_ladder",
+      "title": "Steering amplitude ladder",
+      "description": "Slow small wobble at rising sizes to find where the wheel starts to move. Runs by itself on straights, hands off, no blinker.",
+      "settings": [
+        {"key": "TiLadder", "on": true}
+      ],
+      "progress": {
+        "metric": "step_seconds",
+        "target_seconds": 10,
+        "bin_by": "speed_mph",
+        "bins": [
+          [12, 28, "12-28", true],
+          [31, 45, "31-45", true],
+          [45, 60, "45-60", true],
+          [60, 80, "60-80", true]
+        ],
+        "steps": [7, 5, 4, 4]
+      },
+      "auto_off": {"at_ignition_off": true}
+    },
+    {
+      "id": "ti_pulses",
+      "title": "Steering short pulses",
+      "description": "Brief balanced push-pull pulses with short quiet gaps, to time the steering's delay. Runs by itself on straights, hands off, no blinker.",
+      "settings": [
+        {"key": "TiPulses", "on": true}
+      ],
+      "progress": {
+        "metric": "step_seconds",
+        "target_seconds": 40,
+        "bin_by": "speed_mph",
+        "bins": [
+          [12, 28, "12-28", true],
+          [31, 45, "31-45", true],
+          [45, 60, "45-60", true],
+          [60, 80, "60-80", true]
+        ],
+        "steps": [2, 2, 2, 2]
+      },
+      "auto_off": {"at_ignition_off": true}
     }
   ]
 }

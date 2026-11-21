@@ -20,6 +20,7 @@ class CarState(CarStateBase):
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
+    self.lkas_blocked = None    # LKAS_BLOCK of the latest frame (gen1); None until read
     self.lkas_disabled = False
     self.cam_lkas = 0
     self.params = CarControllerParams(CP)
@@ -114,6 +115,7 @@ class CarState(CarStateBase):
 
     # Either due to low speed or hands off
     lkas_blocked = cp.vl["STEER_RATE"]["LKAS_BLOCK"] == 1
+    self.lkas_blocked = bool(lkas_blocked)   # the steering regime, for the identification tests (ti_ident.py)
 
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down
