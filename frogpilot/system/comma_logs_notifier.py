@@ -95,6 +95,7 @@ def on_home_subnet(home, addrs):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
   def redirect_request(self, req, fp, code, msg, headers, newurl):
+    fp.close()  # the redirect reply's connection is not used again
     raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
 
 
@@ -108,9 +109,13 @@ class Http:
   def notify(self, body):
     req = urllib.request.Request(self.base + "/api/notify", data=json.dumps(body).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-    with self.opener.open(req, timeout=self.timeout) as r:
-      r.read(65536)  # drain; the reply's content is not needed
-      return r.status
+    try:
+      with self.opener.open(req, timeout=self.timeout) as r:
+        r.read(65536)  # drain; the reply's content is not needed
+        return r.status
+    except urllib.error.HTTPError as e:
+      e.close()  # a non-2xx reply carries the open connection; close it on every error path
+      raise
 
 
 class Notifier:
@@ -144,6 +149,7 @@ class Notifier:
           self.log(f"comma_logs_notifier: collector notified ({count} segments on the device)")
           return True
       except urllib.error.HTTPError as e:
+        e.close()  # idempotent; Http.notify closes it too, but whichever client raised it, nothing stays open
         if e.code in (401, 403):
           self.log("comma_logs_notifier: collector refused the token; not retrying")
           return False

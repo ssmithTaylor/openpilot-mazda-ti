@@ -137,6 +137,11 @@ def test_settings_and_summary(tmp_path):
   assert cln.segment_summary(str(tmp_path / "missing")) == (0, "")
 
 
+def _stop(srv):
+  srv.shutdown()
+  srv.server_close()  # close the listening socket too, not only the serve loop
+
+
 def _server(handler):
   srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
   threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -163,7 +168,7 @@ def test_http_client_sends_token_and_body():
     assert cln.Http(base, "tok", require_https=False).notify({"device": "comma", "segments": 1, "newest": ""}) == 202
     assert seen == {"auth": "Bearer tok", "body": {"device": "comma", "segments": 1, "newest": ""}}
   finally:
-    srv.shutdown()
+    _stop(srv)
 
 
 def test_redirect_is_refused_and_token_not_forwarded():
@@ -196,8 +201,33 @@ def test_redirect_is_refused_and_token_not_forwarded():
       cln.Http(base, "tok", require_https=False).notify({})
     assert e.value.code == 307 and hits["elsewhere"] == 0
   finally:
-    srv.shutdown()
-    other.shutdown()
+    _stop(srv)
+    _stop(other)
+
+
+def test_error_reply_connection_is_closed():
+  # Run with -W error::ResourceWarning: an HTTPError left open would hold the connection until GC.
+  import gc
+
+  class Fails(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+      pass
+
+    def do_POST(self):
+      self.send_response(500)
+      self.send_header("Content-Length", "2")
+      self.end_headers()
+      self.wfile.write(b"no")
+
+  srv, base = _server(Fails)
+  try:
+    with pytest.raises(urllib.error.HTTPError) as e:
+      cln.Http(base, "tok", require_https=False).notify({})
+    assert e.value.code == 500 and e.value.fp.closed
+    del e
+    gc.collect()
+  finally:
+    _stop(srv)
 
 
 def _gate():
