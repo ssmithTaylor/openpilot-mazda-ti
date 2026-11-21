@@ -71,7 +71,7 @@ SWEEP_LEAD_IN = 50
 # cap run (LADDER_CAPS: TI counts by band label).
 LADDER_FREQ = 0.4
 LADDER_AMPS = (6.0, 11.0, 22.0, 37.0, 55.0, 74.0, 92.0)
-LADDER_CAPS = {"12-28": 92.0, "31-45": 55.0, "45-60": 37.0, "60-80": 37.0}
+LADDER_CAPS = {"12-28": 92.0, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
 LADDER_CHUNK = 500
 LADDER_LEAD_IN = 100
 

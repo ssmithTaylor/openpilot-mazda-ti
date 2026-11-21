@@ -113,7 +113,7 @@ def test_amplitudes_and_their_classes():
 def test_capture_time_per_band_is_short():
   per_band = {k: {b[2]: ti.steps_in_band(k, b[2]) * ti.STEP_SECONDS[k] for b in ti.BANDS} for k in ti.KEYS}
   assert per_band[ti.SWEEP] == {"12-28": 140, "31-45": 140, "45-60": 140, "60-80": 140}
-  assert per_band[ti.LADDER] == {"12-28": 70, "31-45": 50, "45-60": 40, "60-80": 40}
+  assert per_band[ti.LADDER] == {"12-28": 70, "31-45": 40, "45-60": 40, "60-80": 40}
   assert per_band[ti.PULSES] == {"12-28": 80, "31-45": 80, "45-60": 80, "60-80": 80}
   for k in ti.KEYS:      # a step is a whole number of chunks
     for s in range(ti.n_steps(k)):
@@ -136,7 +136,7 @@ def test_shipped_definitions_match_the_generator():
   bad["progress"]["steps"] = [7, 7, 7, 7]
   t, why = tt.validate_test(bad)
   assert t is None and "steps must be" in why
-  bad["progress"]["steps"] = [7, 5, 4]
+  bad["progress"]["steps"] = [7, 4, 4]
   assert tt.validate_test(bad)[1] == "steps must list one count per bin"
   good = doc["tests"][1]
   for change, text in ((dict(target_seconds=30), "target_seconds must be"), (dict(metric="engaged_seconds"),
@@ -352,12 +352,12 @@ def test_progress_per_band_and_step_completion_persistence_and_reset():
   params, mem = FakeParams(), FakeParams()
   acc = _accountant(params, mem)
   g = TiIdent()
-  _drive(acc, g, "31-45", 300 + 100 + 5 * 1000 + 200)
+  _drive(acc, g, "31-45", 300 + 100 + 4 * 1000 + 200)
   acc.publish(1e6, {ti.LADDER: g.reason}, wall=1e9)
   doc = json.loads(mem.store[tt.PROGRESS_KEY])
-  assert doc["ti_ladder"]["31-45"] == {str(s): 10.0 for s in range(5)}
+  assert doc["ti_ladder"]["31-45"] == {str(s): 10.0 for s in range(4)}
   assert doc["_live"]["status"]["ti_ladder"] == tt.REASON_TEXT["band_done"]
-  assert all(acc.remaining(ti.LADDER, "31-45", s) == 0 for s in range(5))
+  assert all(acc.remaining(ti.LADDER, "31-45", s) == 0 for s in range(4))
   assert acc.remaining(ti.LADDER, "12-28", 0) == 10.0
   # completion by the definition (what the UI computes): every required bin has steps x target
   t = next(t for t in acc.tests if t.id == "ti_ladder")
@@ -370,7 +370,7 @@ def test_progress_per_band_and_step_completion_persistence_and_reset():
   acc.publish(1e6 + 100, {}, wall=1e9)
   mem2 = FakeParams()
   acc2 = tt.TestAccountant(acc.tests, params, mem2)
-  assert acc2.remaining(ti.LADDER, "31-45", 4) == 0 and acc2.remaining(ti.LADDER, "45-60", 0) == 10.0
+  assert acc2.remaining(ti.LADDER, "31-45", 3) == 0 and acc2.remaining(ti.LADDER, "45-60", 0) == 10.0
   g2 = TiIdent()
   _drive(acc2, g2, "31-45", 1000, frame0=10**6)
   assert g2.reason == "band_done" and not any(k[0] == "ti_ladder" for k in [])

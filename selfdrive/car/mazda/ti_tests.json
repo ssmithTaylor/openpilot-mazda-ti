@@ -58,7 +58,7 @@
           [45, 60, "45-60", true],
           [60, 80, "60-80", true]
         ],
-        "steps": [7, 5, 4, 4]
+        "steps": [7, 4, 4, 4]
       },
       "auto_off": {"at_ignition_off": true}
     },
