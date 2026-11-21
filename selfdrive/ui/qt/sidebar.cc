@@ -725,6 +725,7 @@ void TiTests::toggleAll() {
 
 // Every allow-listed key to "off", whatever the definitions say (works with a broken file too)
 void TiTests::allOff() {
+  tests_params_memory.putBool("TiPlanOn", false);  // the drive plan runs the tests itself: ALL TESTS OFF ends it too
   for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
     tiTestSwitchOff(tests_params, QString(a.key), a.on);
   }

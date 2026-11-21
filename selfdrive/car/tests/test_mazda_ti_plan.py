@@ -519,3 +519,9 @@ def test_plan_events_let_the_analysis_tell_alternation_time_from_test_time():
   assert plans and {"mode", "why", "seq", "frame"} <= set(plans[0])
   assert [e["seq"] for e in plans] == sorted(e["seq"] for e in plans)
   assert {e["mode"] for e in plans} >= {"hold", "ab", "tests"}
+
+
+def test_all_tests_off_on_the_screen_also_ends_the_drive_plan():
+  text = (ROOT / 'selfdrive/ui/qt/sidebar.cc').read_text(encoding='utf-8')
+  body = text.split('void TiTests::allOff() {', 1)[1].split('}', 1)[0]
+  assert 'putBool("TiPlanOn", false)' in body
