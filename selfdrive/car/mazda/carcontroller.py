@@ -48,6 +48,15 @@ RUN_HISTORY = 5
 TI_DITHER_ACTIVE = ("TiDither",)
 
 
+def ti_hold_log(event):
+  """Why the car controller holds the tests (plan stale, dead, alternation not at A, ...): on every change, in the `ti_ab` channel."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_ab", **event)
+  except Exception:
+    pass
+
+
 def ti_ident_log(event):
   """The identification tests' events (run, chunk, stop, credit, pick) into the log, so the signal can be rebuilt exactly
   (ti_ident.reconstruct) and every run-all choice replayed. A run, chunk or stop per unit or pause (seconds apart); the
@@ -110,7 +119,9 @@ class CarController(CarControllerBase):
     self.ti_plan_on = False            # the drive plan switch (TiPlanOn); with it on the plan's word decides whether the tests may run
     self.ti_plan_allowed = False
     self.ti_plan_seq = None
+    self.ti_plan_nonce = None
     self.ti_plan_ack_key = None
+    self.ti_hold_key = None
     self.ti_ab_on = False              # the A/B alternation switch (TiAbOn, tmpfs, read at 10 Hz): while on, no test runs
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
@@ -226,9 +237,9 @@ class CarController(CarControllerBase):
     """Tell the drive plan whether any test signal is still in progress (ti_plan.make_ack); tmpfs, on change and every 0.5 s."""
     try:
       ident, dither = getattr(self, "ti_ident", None), getattr(self, "ti_dither", None)
-      ack = ti_plan_mod.make_ack(self.ti_plan_seq, bool(ident is not None and ident.running), 0 if ident is None else ident.last,
+      ack = ti_plan_mod.make_ack(self.ti_plan_nonce, self.ti_plan_seq, bool(ident is not None and ident.running), 0 if ident is None else ident.last,
                                  0.0 if dither is None else dither.envelope, time.time())
-      key = (ack["seq"], ack["quiet"])
+      key = (ack["nonce"], ack["seq"], ack["quiet"])
       if key != self.ti_plan_ack_key or self.frame % 50 == 0:
         self.params_memory.put("TiPlanAck", json.dumps(ack))
         self.ti_plan_ack_key = key
@@ -546,9 +557,17 @@ class CarController(CarControllerBase):
         if ti_plan_mod is not None:
           plan_on = bool(self.params_memory.get_bool("TiPlanOn"))
           raw_plan = self.params_memory.get("TiPlan")
-          hold, allowed = ti_plan_mod.tests_gate(plan_on, raw_plan, time.time())
-          self.ti_plan_on, self.ti_plan_allowed, self.ti_plan_seq = plan_on, allowed, ti_plan_mod.plan_seq(raw_plan)
+          hold, allowed, why = ti_plan_mod.tests_gate(plan_on, raw_plan, time.time())
+          self.ti_plan_on, self.ti_plan_allowed = plan_on, allowed
+          self.ti_plan_nonce, self.ti_plan_seq = ti_plan_mod.plan_ident(raw_plan)
+          if not hold and not plan_on and ab_on:
+            why = "A/B switch on"
           ab_on = hold if plan_on else (hold or ab_on)
+          key = (bool(ab_on), why)
+          if key != self.ti_hold_key:                 # every change of the hold decision, and why, into the log
+            self.ti_hold_key = key
+            ti_hold_log({"kind": "tests_hold", "frame": self.frame, "held": bool(ab_on), "why": why, "plan_on": plan_on,
+                         "nonce": self.ti_plan_nonce, "seq": self.ti_plan_seq})
         self.ti_ab_on = ab_on
       except Exception:
         if self.ti_plan_on:                  # an unreadable plan allows no test

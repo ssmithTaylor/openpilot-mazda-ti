@@ -459,6 +459,7 @@ class TiAb:
     self.dead = True
     self.reason_dead = f"{type(exc).__name__}: {exc}"[:120]
     self.ramp.start(0.0, 0)
+    self.wash_left = 0
     self.mode = "off"
     self.block = None
     self.pin = None
@@ -866,6 +867,7 @@ class TiAbRunner:
     fault, controller_ok, mono_ns."""
     try:
       if self.ab.dead:
+        self._publish_plan(dead=self.plan_dead)
         self._publish()
         return toggles
       if self.k % self.ON_EVERY == 0:
@@ -914,13 +916,12 @@ class TiAbRunner:
 
   def _publish_plan(self, dead=False):
     """The plan for the car controller (TiPlan): on every change and every 0.5 s, so a silent controls process is noticed."""
-    po = self.plan_out
-    if po is None and not dead:
-      return
-    key = ("dead",) if dead else (po.mode, po.seq)
+    po = self.plan_out or ti_plan.PlanOut("off", False, "", "", 0)
+    at_a = self.ab.at_a_settled
+    key = ("dead", at_a) if dead else (po.mode, po.seq, at_a)
     if key != self.plan_published or self.k % 50 == 0:
       try:
-        self.memory.put(ti_plan.PARAM_PLAN, ti_plan.encode_plan(po or ti_plan.PlanOut("off", False, "", "", 0), time.time(), dead))
+        self.memory.put(ti_plan.PARAM_PLAN, ti_plan.encode_plan(po, time.time(), dead, self.plan.nonce, at_a))
         self.plan_published = key
       except Exception:
         pass

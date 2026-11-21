@@ -18,6 +18,7 @@ A plan that is stale (not refreshed for STALE_S), unreadable, in error ("dead") 
 Plan events (kind "plan") go in the `ti_ab` log channel: `mode` (off, hold, ab, tests), `why`, `seq`.
 """
 import json
+import os
 from typing import NamedTuple
 
 DT = 0.01
@@ -63,8 +64,9 @@ class PlanOut(NamedTuple):
 
 
 class Plan:
-  def __init__(self, log=None):
+  def __init__(self, log=None, nonce=None):
     self.log = log
+    self.nonce = os.urandom(4).hex() if nonce is None else nonce   # per process: restarts never reuse a (nonce, seq)
     self.mode = "off"
     self.seq = 0
     self.why = ""
@@ -121,7 +123,8 @@ class Plan:
         self._set("ab", why)                          # the tests fade out; the alternation waits for their quiet
     # the acknowledgement of this sequence, fresh and quiet, for QUIET_SETTLE_S
     t_ack = ack.get("t") if isinstance(ack, dict) else None       # (stamps are rounded to 0.1 s: a hair "in the future" is fine)
-    fresh = (isinstance(ack, dict) and ack.get("seq") == self.seq and ack.get("quiet") is True
+    fresh = (isinstance(ack, dict) and ack.get("nonce") == self.nonce and ack.get("seq") == self.seq
+             and ack.get("quiet") is True
              and isinstance(t_ack, (int, float)) and -0.5 <= now - t_ack <= ACK_STALE_S)
     self.quiet = self.quiet + 1 if fresh else 0
     allowed = self.mode == "ab" and self.quiet >= QUIET_SETTLE_S / DT
@@ -133,42 +136,61 @@ class Plan:
     return PlanOut(self.mode, bool(allowed), self.why or why, nxt, self.seq)
 
 
-def encode_plan(out, now, dead=False):
-  return json.dumps({"seq": out.seq, "mode": "dead" if dead else out.mode, "t": round(now, 1)})
+def encode_plan(out, now, dead=False, nonce="", at_a=True):
+  """The plan for the car controller. `nonce`: random per controls process, so an acknowledgement or a plan of an earlier process
+  can never be taken for this one's. `at_a`: the alternation's blend is exactly A and settled (the tests may be allowed)."""
+  return json.dumps({"seq": out.seq, "nonce": nonce, "mode": "dead" if dead else out.mode, "t": round(now, 1), "at_a": bool(at_a)})
 
 
 def tests_gate(plan_on, raw_plan, now):
-  """(hold, allowed) for the car controller. hold: no test may run. allowed: the plan is on and says "tests" (run-all mode is
-  then forced). Anything unreadable, stale or not "tests" holds. A plan in error ("dead") holds whatever the switch says."""
-  try:
-    if isinstance(raw_plan, (bytes, bytearray)):
-      raw_plan = raw_plan.decode("utf-8", "replace")
-    plan = json.loads(raw_plan) if raw_plan else {}
-    if not isinstance(plan, dict):
+  """(hold, allowed, why) for the car controller. hold: no test may run. allowed: the plan is on and says "tests" (run-all mode is
+  then forced). A plan in error ("dead"), a stale or unreadable plan, and an alternation whose blend is not exactly A hold the
+  tests, with the plan on or off; the failure direction is always "neither runs". With the plan off and no plan ever published
+  (no controls-side alternation) the tests are as without any of this."""
+  empty = raw_plan is None or raw_plan == "" or raw_plan == b""
+  plan, bad = {}, False
+  if not empty:
+    try:
+      if isinstance(raw_plan, (bytes, bytearray)):
+        raw_plan = raw_plan.decode("utf-8", "replace")
+      plan = json.loads(raw_plan)
+      bad = not isinstance(plan, dict)
+    except Exception:
+      bad = True
+    if bad:
       plan = {}
-  except Exception:
-    plan = {}
   if plan.get("mode") == "dead":
-    return True, False
-  if not plan_on:
-    return False, False
+    return True, False, "plan dead"
+  if empty:
+    return (True, False, "plan missing") if plan_on else (False, False, "")
+  if bad:
+    return True, False, "plan unreadable"
   t = plan.get("t")
-  ok = (plan.get("mode") == "tests" and isinstance(t, (int, float)) and -0.5 <= now - t <= STALE_S)
-  return (not ok), ok
+  if not isinstance(t, (int, float)) or isinstance(t, bool) or not -0.5 <= now - t <= STALE_S:
+    return True, False, "plan stale"
+  if plan.get("at_a") is not True:
+    return True, False, "alternation not at A"
+  if not plan_on:
+    return False, False, ""
+  if plan.get("mode") != "tests":
+    return True, False, f"plan says {plan.get('mode')}"
+  return False, True, ""
 
 
-def plan_seq(raw_plan):
+def plan_ident(raw_plan):
+  """(nonce, seq) of a published plan, else (None, None)."""
   try:
     if isinstance(raw_plan, (bytes, bytearray)):
       raw_plan = raw_plan.decode("utf-8", "replace")
-    seq = json.loads(raw_plan).get("seq")
-    return seq if isinstance(seq, int) else None
+    plan = json.loads(raw_plan)
+    seq, nonce = plan.get("seq"), plan.get("nonce")
+    return (nonce if isinstance(nonce, str) else None), (seq if isinstance(seq, int) else None)
   except Exception:
-    return None
+    return None, None
 
 
-def make_ack(seq, ident_running, ident_last, dither_envelope, now):
+def make_ack(nonce, seq, ident_running, ident_last, dither_envelope, now):
   """The car controller's acknowledgement: quiet only when no test signal is in progress (fade included) and the last value sent
-  was zero."""
+  was zero. It names the plan it answers by nonce and seq."""
   quiet = (not ident_running) and ident_last == 0 and dither_envelope == 0.0
-  return {"seq": seq, "quiet": bool(quiet), "t": round(now, 1)}
+  return {"nonce": nonce, "seq": seq, "quiet": bool(quiet), "t": round(now, 1)}

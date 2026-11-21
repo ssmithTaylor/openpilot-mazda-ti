@@ -1002,7 +1002,7 @@ def _apply_ti_tuning():
   fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "apply_ti_tuning")
   from openpilot.selfdrive.car.mazda import ti_plan as tp
   import time as _time
-  env = {"ti_ident_mod": ti, "ti_plan_mod": tp, "time": _time}
+  env = {"ti_ident_mod": ti, "ti_plan_mod": tp, "time": _time, "ti_hold_log": lambda e: None}
   exec(compile(ast.Module(body=[fn], type_ignores=[]), "apply_ti_tuning", "exec"), env)
   return env["apply_ti_tuning"]
 
@@ -1012,7 +1012,7 @@ def test_the_car_controller_reads_the_switch_at_10_hz_keeps_the_last_value_on_an
   mem = Mem(TiAbOn=False)
   h = NS(ccp=NS(TI_STEER_DELTA_UP=6, TI_STEER_DELTA_UP_HIGH=6), _ti_limit=lambda *a: 6, frame=0, params_memory=mem,
          ti_steer_threshold=None, ti_dither_enabled=False, ti_ident_on=(), ti_ident_all=False, ti_ab_on=False,
-         ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None)
+         ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None, ti_plan_nonce=None, ti_hold_key=None)
   t = toggles()
   apply(h, t)
   assert h.ti_ab_on is False

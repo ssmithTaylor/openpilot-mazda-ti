@@ -86,7 +86,7 @@ def test_the_range_has_a_mile_of_hysteresis_at_both_ends():
 # ---- the scheduler ---------------------------------------------------------------------------------------------------------
 
 def ack_for(plan, quiet=True, now=100.0):
-  return {"seq": plan.seq, "quiet": quiet, "t": now}
+  return {"nonce": plan.nonce, "seq": plan.seq, "quiet": quiet, "t": now}
 
 
 def run(plan, n, **kw):
@@ -215,36 +215,51 @@ def test_plan_events_carry_mode_why_and_seq():
 
 # ---- the car controller's side ----------------------------------------------------------------------------------------------
 
-def plan_json(mode, seq=1, t=100.0):
-  return json.dumps({"seq": seq, "mode": mode, "t": t})
+def plan_json(mode, seq=1, t=100.0, at_a=True, nonce="n1"):
+  return json.dumps({"seq": seq, "nonce": nonce, "mode": mode, "t": t, "at_a": at_a})
 
 
 def test_tests_gate_allows_only_a_fresh_tests_word_of_a_plan_that_is_on():
-  assert tp.tests_gate(True, plan_json("tests"), 101.0) == (False, True)
+  assert tp.tests_gate(True, plan_json("tests"), 101.0) == (False, True, "")
   for mode in ("ab", "hold", "off"):
-    assert tp.tests_gate(True, plan_json(mode), 101.0) == (True, False)
-  assert tp.tests_gate(True, plan_json("tests"), 110.0) == (True, False)          # stale
-  assert tp.tests_gate(True, plan_json("tests", t=200.0), 101.0) == (True, False)  # from the future
+    assert tp.tests_gate(True, plan_json(mode), 101.0)[:2] == (True, False)
+  assert tp.tests_gate(True, plan_json("tests"), 110.0) == (True, False, "plan stale")
+  assert tp.tests_gate(True, plan_json("tests", t=200.0), 101.0)[:2] == (True, False)   # from the future
   for bad in (None, "", b"\xff", "{", "[1]", json.dumps({"mode": "tests"}), json.dumps({"mode": "tests", "t": "x"})):
-    assert tp.tests_gate(True, bad, 101.0) == (True, False), bad
-  assert tp.tests_gate(False, plan_json("tests"), 101.0) == (False, False)        # plan off: the tests are as without it
-  assert tp.tests_gate(False, None, 101.0) == (False, False)
-  assert tp.tests_gate(False, plan_json("dead"), 101.0) == (True, False)          # a plan in error holds whatever the switch says
+    assert tp.tests_gate(True, bad, 101.0)[:2] == (True, False), bad
+  assert tp.tests_gate(False, plan_json("tests"), 101.0) == (False, False, "")           # plan off: the tests are as without it
+  assert tp.tests_gate(False, None, 101.0) == (False, False, "")                         # ... and with no plan ever published
+  assert tp.tests_gate(False, plan_json("dead"), 101.0) == (True, False, "plan dead")    # a plan in error holds whatever the switch says
+
+
+def test_the_tests_are_held_whatever_the_plan_switch_while_the_alternation_is_not_exactly_at_a_or_the_word_is_stale():
+  for plan_on in (False, True):
+    assert tp.tests_gate(plan_on, plan_json("tests", at_a=False), 101.0)[:2] == (True, False)
+    assert tp.tests_gate(plan_on, plan_json("tests", at_a=False), 101.0)[2] == "alternation not at A"
+    assert tp.tests_gate(plan_on, plan_json("off", t=90.0), 101.0)[2] == "plan stale"        # controls silent: held, fails to "neither"
+    assert tp.tests_gate(plan_on, "{broken", 101.0)[2] == "plan unreadable"
+    assert tp.tests_gate(plan_on, json.dumps({"mode": "tests", "t": 100.0, "at_a": "yes"}), 101.0)[:2] == (True, False)
+  assert tp.tests_gate(False, plan_json("off", at_a=True), 101.0) == (False, False, "")
 
 
 def test_the_acknowledgement_is_quiet_only_when_no_test_signal_is_in_progress():
-  assert tp.make_ack(5, False, 0, 0.0, 1.0)["quiet"] is True
-  assert tp.make_ack(5, True, 0, 0.0, 1.0)["quiet"] is False                       # fading
-  assert tp.make_ack(5, False, 3, 0.0, 1.0)["quiet"] is False
-  assert tp.make_ack(5, False, 0, 0.3, 1.0)["quiet"] is False                      # the dither's envelope
-  assert tp.make_ack(5, False, 0, 0.0, 1.0)["seq"] == 5 and tp.plan_seq(plan_json("tests", seq=9)) == 9 and tp.plan_seq("x") is None
+  assert tp.make_ack("n", 5, False, 0, 0.0, 1.0)["quiet"] is True
+  assert tp.make_ack("n", 5, True, 0, 0.0, 1.0)["quiet"] is False                  # fading
+  assert tp.make_ack("n", 5, False, 3, 0.0, 1.0)["quiet"] is False
+  assert tp.make_ack("n", 5, False, 0, 0.3, 1.0)["quiet"] is False                 # the dither's envelope
+  a = tp.make_ack("n", 5, False, 0, 0.0, 1.0)
+  assert a["seq"] == 5 and a["nonce"] == "n"
+  assert tp.plan_ident(plan_json("tests", seq=9, nonce="zz")) == ("zz", 9) and tp.plan_ident("x") == (None, None)
+
+
+HOLD_LOG = []
 
 
 def _method(name):
   src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
   cls = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "CarController")
   fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
-  env = {"ti_ident_mod": ti, "ti_plan_mod": tp, "time": time, "json": json}
+  env = {"ti_ident_mod": ti, "ti_plan_mod": tp, "time": time, "json": json, "ti_hold_log": HOLD_LOG.append}
   exec(compile(ast.Module(body=[fn], type_ignores=[]), name, "exec"), env)
   return env[name]
 
@@ -252,7 +267,7 @@ def _method(name):
 def cc_host(mem, frame=0):
   return NS(ccp=NS(TI_STEER_DELTA_UP=6, TI_STEER_DELTA_UP_HIGH=6), _ti_limit=lambda *a: 6, frame=frame, params_memory=mem,
             ti_steer_threshold=None, ti_dither_enabled=False, ti_ident_on=(), ti_ident_all=False, ti_ab_on=False,
-            ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None, ti_plan_ack_key=None)
+            ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None, ti_plan_nonce=None, ti_plan_ack_key=None, ti_hold_key=None)
 
 
 def test_the_car_controller_forces_run_all_only_while_the_plan_says_tests_and_holds_otherwise():
@@ -300,10 +315,10 @@ def test_the_car_controller_acknowledges_the_plan_sequence_it_read():
   pub = _method("publish_plan_ack")
   mem = Mem()
   ident = NS(running=False, last=0)
-  h = NS(ti_ident=ident, ti_dither=NS(envelope=0.0), ti_plan_seq=7, params_memory=mem, frame=0, ti_plan_ack_key=None)
+  h = NS(ti_ident=ident, ti_dither=NS(envelope=0.0), ti_plan_seq=7, ti_plan_nonce="nz", params_memory=mem, frame=0, ti_plan_ack_key=None)
   pub(h)
   a = json.loads(mem.d["TiPlanAck"])
-  assert a["seq"] == 7 and a["quiet"] is True
+  assert a["seq"] == 7 and a["nonce"] == "nz" and a["quiet"] is True
   ident.running = True
   h.frame = 1
   pub(h)
@@ -419,7 +434,7 @@ def test_a_scheduler_exception_turns_both_modes_off_and_leaves_the_owners_toggle
     assert rn.step(t, **QUIET) is t
   assert rn.plan_dead and rn.ab.dead
   assert json.loads(mem.d["TiPlan"])["mode"] == "dead"
-  assert tp.tests_gate(True, mem.d["TiPlan"], time.time()) == (True, False) and tp.tests_gate(False, mem.d["TiPlan"], time.time()) == (True, False)
+  assert tp.tests_gate(True, mem.d["TiPlan"], time.time())[:2] == (True, False) and tp.tests_gate(False, mem.d["TiPlan"], time.time())[:2] == (True, False)
   assert json.loads(mem.d["TiAbStatus"])["plan"]["mode"] == "dead"
 
 
@@ -432,7 +447,7 @@ def simulate(seed, seconds=1500, target_min=1.0, block_s=8.0, seg=(4, 25)):
   rn = ab.TiAbRunner(params, mem, block_s=block_s, plan_target_min=target_min)
   gen = TiIdent()
   t = toggles()
-  hold, allowed, seq = True, False, None
+  hold, allowed, seq, nonce = True, False, None, None
   ack_key = None
   state = dict(mph=45.0, curv=0.0003, touch=False, blink=False, engaged=True)
   stats = dict(test_frames=0, ab_frames=0, both=0, modes=set(), complete_at=None, ab_after_complete=0, ident_while_blend=0, switches=0)
@@ -454,8 +469,8 @@ def simulate(seed, seconds=1500, target_min=1.0, block_s=8.0, seg=(4, 25)):
     if k % 10 == 0:
       plan_on = bool(mem.get_bool("TiPlanOn"))
       raw = mem.get("TiPlan")
-      hold, allowed = tp.tests_gate(plan_on, raw, time.time())
-      seq = tp.plan_seq(raw)
+      hold, allowed, _ = tp.tests_gate(plan_on, raw, time.time())
+      nonce, seq = tp.plan_ident(raw)
     armed = ti.SWEEP if (allowed and not hold) else None
     if state["engaged"]:
       out = gen.update(armed, k, v_ego=v_ego, steering_pressed=state["touch"], driver_torque=-1.0, blinker=state["blink"],
@@ -465,10 +480,10 @@ def simulate(seed, seconds=1500, target_min=1.0, block_s=8.0, seg=(4, 25)):
       gen.reset(k)
       out = 0
     if k % 10 == 0 and mem.get_bool("TiPlanOn"):
-      ack = tp.make_ack(seq, gen.running, gen.last, 0.0, time.time())
-      if (ack["seq"], ack["quiet"]) != ack_key or k % 50 == 0:
+      ack = tp.make_ack(nonce, seq, gen.running, gen.last, 0.0, time.time())
+      if (ack["nonce"], ack["seq"], ack["quiet"]) != ack_key or k % 50 == 0:
         mem.put("TiPlanAck", json.dumps(ack))
-        ack_key = (ack["seq"], ack["quiet"])
+        ack_key = (ack["nonce"], ack["seq"], ack["quiet"])
     blend = rn.ab.ramp.s != 0.0 or rn.ab.ramp.moving or rn.ab.ramp.to != 0.0
     stats["modes"].add(rn.plan.mode)
     stats["test_frames"] += out != 0
@@ -525,3 +540,102 @@ def test_all_tests_off_on_the_screen_also_ends_the_drive_plan():
   text = (ROOT / 'selfdrive/ui/qt/sidebar.cc').read_text(encoding='utf-8')
   body = text.split('void TiTests::allOff() {', 1)[1].split('}', 1)[0]
   assert 'putBool("TiPlanOn", false)' in body
+
+
+# ---- the nonce, the blend-at-A word with the plan off, and the car controller's hold log -------------------------------------
+
+def test_an_acknowledgement_counts_only_with_the_current_nonce_and_seq_so_a_restart_never_matches_a_stale_one():
+  old = fresh_plan()
+  run(old, 3, mph=22.0)
+  run(old, 3, mph=22.0)
+  stale_ack = ack_for(old)                                     # the old process's acknowledgement for ITS seq
+  new = tp.Plan()                                              # controls restarted: seq counts from 0 again
+  assert new.nonce != old.nonce
+  new.update(on=False, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=100.0, tests_toggles_on=False)
+  new.dwell = 10 ** 6
+  run(new, 1, mph=45.0)
+  assert new.mode == "ab"
+  new.seq = stale_ack["seq"]                                   # the very same sequence number, delayed write and all
+  assert stale_ack["seq"] == new.seq and stale_ack["nonce"] != new.nonce
+  assert not run(new, 400, mph=45.0, ack=stale_ack).ab_allowed
+  good = dict(stale_ack, nonce=new.nonce)
+  assert run(new, 400, mph=45.0, ack=good).ab_allowed
+  assert tp.Plan(nonce="a").nonce == "a" and len({tp.Plan().nonce for _ in range(50)}) > 40
+
+
+def test_the_runner_publishes_its_nonce_and_whether_the_blend_is_at_a_and_a_new_runner_has_a_new_nonce():
+  rn, mem = make_runner(False)
+  t = toggles()
+  for _ in range(60):
+    rn.step(t, **QUIET)
+  p = json.loads(mem.d["TiPlan"])
+  assert p["nonce"] == rn.plan.nonce and p["at_a"] is True and p["mode"] == "off"
+  rn2, mem2 = make_runner(False)
+  rn2.step(t, **QUIET)
+  assert json.loads(mem2.d["TiPlan"])["nonce"] != p["nonce"]
+
+
+def test_with_the_plan_off_a_test_cannot_start_while_the_alternations_release_ramp_runs():
+  """The plain A/B switch goes off while B is in force: the blend ramps back (up to 2 s); the car controller's hold lasts until the
+  published word says the blend is exactly A, and a silent controls process holds the tests too."""
+  rng = random.Random(5)
+  mem = Mem(TiPlanOn=False, TiAbOn=False)
+  params = Mem(TiAbConfig=json.dumps({"setting": "SteerKP", "b": 0.9, "block_min": 4, "seed": next(s for s in range(60) if ab.arm_for(s, 0) == "B")}))
+  rn = ab.TiAbRunner(params, mem, block_s=30.0)
+  gen = TiIdent()
+  t = toggles()
+  hold = True
+  ack_blend_seen = False
+  switched_off_at = None
+  started_with_blend = 0
+  for k in range(F(120)):
+    if k == 30:
+      mem.d["TiAbOn"] = True
+    if k == F(70):
+      mem.d["TiAbOn"] = False
+      switched_off_at = k
+    rn.step(t, **{**QUIET, "v_ego": v(45.0), "mono_ns": k})
+    if k % 10 == 0:
+      ab_on = bool(mem.get_bool("TiAbOn"))
+      h, allowed, why = tp.tests_gate(False, mem.get("TiPlan"), time.time())
+      hold = h or ab_on
+    armed = None if hold else ti.SWEEP
+    out = gen.update(armed, k, v_ego=v(45.0), steering_pressed=False, driver_torque=-1.0, blinker=False, base_request=40, ti_max=600,
+                     lat_demand=0.1, curvature=0.0003, lkas_blocked=False, room=6)
+    blend = rn.ab.ramp.s != 0.0 or rn.ab.ramp.moving
+    assert not (out != 0 and blend), k
+    assert not (gen.running and blend), k
+    started_with_blend += gen.running and blend
+  assert switched_off_at is not None and any(e["kind"] == "switch" and e["why"] == "release:off" for e in rn.ab.events)
+  assert started_with_blend == 0 and gen.frames.get(ti.SWEEP, 0) > 0        # the tests did run, but only once the blend was A
+
+
+def test_the_car_controller_logs_every_change_of_its_hold_decision_with_the_reason():
+  apply = _method("apply_ti_tuning")
+  del HOLD_LOG[:]
+  now = time.time()
+  mem = Mem(TiPlanOn=False, TiPlan=plan_json("off", 3, now, at_a=False))
+  h = cc_host(mem)
+  apply(h, toggles(ti_sweep=True))
+  assert h.ti_ab_on is True and HOLD_LOG[-1]["held"] is True and HOLD_LOG[-1]["why"] == "alternation not at A"
+  n = len(HOLD_LOG)
+  h.frame = 10
+  apply(h, toggles(ti_sweep=True))
+  assert len(HOLD_LOG) == n                                       # only changes are logged
+  mem.d["TiPlan"] = plan_json("off", 3, now, at_a=True)
+  h.frame = 20
+  apply(h, toggles(ti_sweep=True))
+  assert h.ti_ab_on is False and HOLD_LOG[-1]["held"] is False and HOLD_LOG[-1]["why"] == ""
+  mem.d["TiPlan"] = plan_json("off", 3, now - 30, at_a=True)
+  h.frame = 30
+  apply(h, toggles(ti_sweep=True))
+  assert h.ti_ab_on is True and HOLD_LOG[-1]["why"] == "plan stale"
+  mem.d["TiPlan"] = plan_json("dead", 3, now)
+  h.frame = 40
+  apply(h, toggles(ti_sweep=True))
+  assert HOLD_LOG[-1]["why"] == "plan dead"
+  mem.d.update(TiPlanOn=True, TiPlan=plan_json("ab", 4, now))
+  h.frame = 50
+  apply(h, toggles())
+  assert HOLD_LOG[-1]["why"] == "plan says ab" and HOLD_LOG[-1]["plan_on"] is True and {"kind", "frame", "nonce", "seq"} <= set(HOLD_LOG[-1])
+  assert HOLD_LOG[0]["kind"] == "tests_hold"

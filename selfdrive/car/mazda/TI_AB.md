@@ -72,3 +72,9 @@ time is `mode == "tests"`; `hold` is a hand-over in which neither runs. tmpfs: `
 allows no test), `TiPlanAck` {seq, quiet, t} from the car controller. tests -> A/B: A/B may start only after an acknowledgement of the current seq has been
 quiet for 1 s (no test signal, fade included) and then only through the usual straight-road gate; A/B -> tests: the plan holds, the blend returns to
 A and has been A for its wash-in, then it publishes "tests". An error in the plan ("dead") holds both for the process and the tests stay held.
+
+Plan hardening: `TiPlan` and `TiPlanAck` carry a per-process random `nonce` besides `seq`; an acknowledgement counts only if both match the current plan.
+`TiPlan` also carries `at_a` (the blend is exactly A and settled). With the plan on OR off, the car controller holds every test unless a published plan is fresh
+(3 s) and `at_a` is true; a dead, stale or unreadable plan holds. With no plan ever published and the plan off, the tests are as without any of this. Every change of
+that decision is logged by the car controller as `ti_ab` `tests_hold` {held, why, plan_on, nonce, seq}; `why`: plan dead, plan missing, plan unreadable,
+plan stale, alternation not at A, plan says <mode>, A/B switch on.
