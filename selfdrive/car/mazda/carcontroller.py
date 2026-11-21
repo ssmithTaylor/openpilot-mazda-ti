@@ -44,8 +44,10 @@ TI_DITHER_ACTIVE = ("TiDither",)
 
 
 def ti_ident_log(event):
-  """The identification tests' events (run, chunk, stop) into the log, so the signal can be rebuilt exactly
-  (ti_ident.reconstruct). At most a few per ten seconds while a test runs."""
+  """The identification tests' events (run, chunk, stop, credit, pick) into the log, so the signal can be rebuilt exactly
+  (ti_ident.reconstruct) and every run-all choice replayed. A run, chunk or stop per unit or pause (seconds apart); the
+  speed hysteresis (ti_ident.ZONE_HYSTERESIS_MPH) keeps a car hovering at a boundary from making them in bursts, and
+  pick events are limited to one per ti_ident.PICK_LOG_MIN_S."""
   try:
     from openpilot.common.swaglog import cloudlog
     cloudlog.event("ti_ident", **event)
@@ -574,7 +576,7 @@ class CarController(CarControllerBase):
               if free and self.ti_ident_all and not on:
                 # Run all: the scheduler picks the test for the window the car is in, or the nearest one between
                 # windows (ti_ident.RunAll); a seeded random choice once the window is complete
-                profile = ti_ident_mod.zone_for(CS.out.vEgo).profile
+                profile = ident.advance_zone(CS.out.vEgo).profile      # with the speed hysteresis
                 armed = self.ti_run_all.pick(self.frame, profile, tests.remaining,
                                              lambda k, w: ident.can_run(k, w, tests.remaining))
               else:

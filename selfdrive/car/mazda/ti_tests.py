@@ -111,6 +111,7 @@ REASON_TEXT = {
   "band": "Waiting: speed below 19 or above 80 mph",
   "transition": "Waiting: 28-31 mph, steering mode changing",
   "gap": "Running between windows: logged, not counted",
+  "input": "Off: a steering input is not a valid number",
   "regime": "Waiting: steering mode settling",
   "band_done": "Waiting: this speed window is complete",
   "extra": "Running: window complete, collecting extra",

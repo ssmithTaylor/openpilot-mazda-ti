@@ -1640,6 +1640,17 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     p.drawRect(rect().adjusted(5, 5, -5, -5));
   }
 
+  // Whether the system is engaged, always visible here: this page hides the road view and its engaged border. The same
+  // status the road view colours its border by (UIState::status): green engaged, amber override, grey not engaged.
+  {
+    const UIStatus st = uiState()->status;
+    const bool engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
+    const QRect pill(width() - 520, height() - 84, 490, 64);
+    drawBox(p, pill, engaged ? QColor(0x17, 0x86, 0x44) : st == STATUS_OVERRIDE ? amber : QColor(0x54, 0x54, 0x54),
+            (engaged || st != STATUS_OVERRIDE) ? white : QColor(0, 0, 0),
+            engaged ? QString("● ENGAGED") : st == STATUS_OVERRIDE ? QString("OVERRIDE") : QString("○ NOT ENGAGED"), 40);
+  }
+
   const int n = tests.queueSize();
   const int n_defs = (int)tests.defs.size();
   QString banner;
@@ -1700,7 +1711,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     if (k == 1 && tests.errors.size() > 2) {
       line = QString("... and %1 more ignored definitions (see the log)").arg(tests.errors.size() - 1);
     }
-    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 60, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
+    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
   }
 }
 

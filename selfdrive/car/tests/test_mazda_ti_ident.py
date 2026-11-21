@@ -295,7 +295,7 @@ def test_a_running_test_fades_out_on_entering_the_28_31_region_not_a_cut():
   assert max(abs(b - a) for a, b in zip(out, out[1:])) <= ti.MAX_SLEW + 1
 
 
-@pytest.mark.parametrize('mph,blocked,profile', [(20.0, True, "21-27"), (27.5, True, "21-27"), (33.0, False, "35-41"),
+@pytest.mark.parametrize('mph,blocked,profile', [(20.0, True, "21-27"), (33.0, False, "35-41"),
                                                  (43.0, False, "35-41"), (47.0, False, "49-56"),
                                                  (58.0, False, "49-56"), (62.0, False, "64-80")])
 def test_between_windows_the_test_runs_logged_and_tagged_but_ticks_no_box(mph, blocked, profile):
@@ -616,7 +616,7 @@ def test_picks_are_logged_and_every_random_one_is_recomputed_from_the_log():
   ev = []
   r = ti.RunAll(seed=99, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
   for i in range(200):
-    t = _pick(r, prog, frame=i)
+    t = _pick(r, prog, frame=i * 60)                      # a second apart or so: inside the rate limit
     prog.have[(t, "35-41", 0)] += 5.0
     r.current = t
   picks = [e for e in ev if e["kind"] == "pick"]
@@ -1370,3 +1370,134 @@ def test_the_gate_block_is_published_once_a_second_for_the_screen_and_cleared_af
   n = len(puts)
   fn(h)
   assert len(puts) == n
+
+
+# ---- review fixes: speed hysteresis, pick log rate, non-finite inputs -----------------------------------------------
+
+def _mph_run(g, prog, mph_seq, key=ti.SWEEP, start=0, blocked_for_mph=None):
+  out, reasons = [], []
+  for k, mph in enumerate(mph_seq):
+    blocked = (mph < 28) if blocked_for_mph is None else blocked_for_mph(mph)
+    out.append(g.update(key, start + k, **quiet("35-41", v_ego=mph * MPH, lkas_blocked=blocked), remaining=prog.remaining))
+    prog.add(g.credit)
+    reasons.append(g.reason)
+  return out, reasons
+
+
+@pytest.mark.parametrize('edge,going_off,start,end', [(19.0, "down", 24.0, 18.5), (28.0, "up", 24.0, 28.2),
+                                                      (31.0, "down", 35.0, 30.5), (80.0, "up", 72.0, 80.5)])
+def test_entering_an_off_region_starts_the_fade_at_once(edge, going_off, start, end):
+  g = TiIdent()
+  prog = Progress()
+  _mph_run(g, prog, [start] * (SETTLE + 300))
+  assert g.running and g.env == 1.0
+  _, reasons = _mph_run(g, prog, [end], start=SETTLE + 300)
+  assert g.fading and reasons[-1] in ("band", "transition")         # the very first frame past the edge
+
+
+@pytest.mark.parametrize('edge,low,high', [(19.0, 18.5, 19.9), (80.0, 79.0, 80.5)])
+def test_hovering_at_a_hard_edge_never_delays_off_and_delays_on_only_until_clear(edge, low, high):
+  g = TiIdent()
+  prog = Progress()
+  start = 24.0 if edge == 19.0 else 72.0
+  _mph_run(g, prog, [start] * (SETTLE + 300))
+  seq = ([low] * 3 + [high] * 3) * 200                       # flips every 3 frames across the edge
+  out, reasons = _mph_run(g, prog, seq, start=SETTLE + 300)
+  starts = [e for e in g.events if e["kind"] in ("run", "chunk") and e["frame"] >= SETTLE + 300]
+  assert starts == []                                        # never restarted while hovering
+  assert all(r in ("band", "transition", "switch") or r for r in reasons)
+  assert not any(out[200:])                                  # and quiet: no signal left
+  # all the way clear, it comes back
+  _, reasons = _mph_run(g, prog, [24.0 if edge == 19.0 else 72.0] * (SETTLE + 400), start=SETTLE + 300 + len(seq))
+  assert g.running
+
+
+def test_the_28_31_edges_hold_off_until_one_mph_clear_and_cut_in_at_once():
+  g = TiIdent()
+  prog = Progress()
+  _mph_run(g, prog, [24.0] * (SETTLE + 300))
+  _, r = _mph_run(g, prog, [28.0], start=5000)
+  assert r[-1] == "transition" and g.fading
+  for mph in (27.9, 27.5, 27.1, 28.4, 30.9, 31.0, 31.5, 31.9):      # hovering round both edges: stays off
+    _, r = _mph_run(g, prog, [mph] * 400, start=6000, blocked_for_mph=lambda m: m < 28)
+    assert r[-1] in ("transition", "band", "regime"), (mph, r[-1])
+    assert not g.running
+  _, r = _mph_run(g, prog, [33.0] * (SETTLE + 400), start=9000)
+  assert g.running                                                  # clear of 32: on
+
+
+def _hover_events(mid, hysteresis, monkeypatch):
+  monkeypatch.setattr(ti, "ZONE_HYSTERESIS_MPH", hysteresis)
+  ev = []
+  g = TiIdent(log=ev.append)
+  r = ti.RunAll(seed=3, emit=g.event_for_pick)
+  prog = Progress()
+  _all_complete(prog, "35-41" if mid == 45.0 else "49-56")       # the lower window done, the upper one not
+  for k in range(7000):
+    mph = mid + (0.6 if (k // 7) % 2 else -0.6) if k > 400 else mid - 3.0     # flips every 7 frames, +-0.6 mph
+    zone = g.advance_zone(mph * MPH)
+    armed = r.pick(k, zone.profile, prog.remaining, lambda t, w: g.can_run(t, w, prog.remaining))
+    g.update(armed, k, **quiet("35-41", v_ego=mph * MPH, lkas_blocked=False), remaining=prog.remaining)
+    prog.add(g.credit)
+  return ev, g
+
+
+@pytest.mark.parametrize('mid', [45.0, 60.0])
+def test_a_car_hovering_at_the_45_and_60_mph_profile_midpoints_makes_no_churn_and_no_event_flood(mid, monkeypatch):
+  with_h, _ = _hover_events(mid, 1.0, monkeypatch)
+  without, _ = _hover_events(mid, 0.0, monkeypatch)
+  assert len(with_h) < 30 and len(without) > 3 * len(with_h)         # the same drive without the margin floods the log
+  # clearly past the midpoint it does switch
+  ev, g = _hover_events(mid, 1.0, monkeypatch)
+  for k in range(600):
+    g.update(ti.SWEEP, 8000 + k, **quiet("35-41", v_ego=(mid + 3.0) * MPH, lkas_blocked=False))
+  assert g.zone.profile == ("49-56" if mid == 45.0 else "64-80")
+
+
+def test_the_held_profile_never_crosses_the_steering_regime():
+  g = TiIdent()
+  for mph in (24.0, 27.6, 20.5, 33.0, 38.0, 43.9, 45.4, 47.0, 58.0, 61.5, 70.0):
+    z = g.advance_zone(mph * MPH)
+    g.n += 1
+    if z.profile is not None:
+      assert (z.profile == "21-27") == (mph < 28.0)                  # the 55-count cap profile only below 28 mph
+      assert z.ti_alone == (mph < 28.0)
+
+
+def test_pick_events_are_rate_limited_and_say_how_many_were_held_back():
+  ev = []
+  r = ti.RunAll(seed=5, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
+  prog = Progress()
+  _all_complete(prog)
+  for i in range(1000):                                              # a window flipping every frame: a pick per frame
+    window = "35-41" if i % 2 else "49-56"
+    if window == "49-56":
+      _all_complete(prog, "49-56")
+    r.pick(i, window, prog.remaining)
+  assert 0 < len(ev) <= 1000 * ti.DT / ti.PICK_LOG_MIN_S + 1          # at most one per PICK_LOG_MIN_S
+  assert sum(e.get("skipped", 0) for e in ev) > 100
+  assert ti.verify_picks(ev) == []
+
+
+@pytest.mark.parametrize('field', ['v_ego', 'curvature', 'lat_demand', 'base_request', 'driver_torque'])
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf')])
+@pytest.mark.parametrize('key,step', [(ti.SWEEP, 1), (ti.LADDER, 3)])
+def test_a_non_finite_input_closes_the_gate_and_zeroes_at_once(field, bad, key, step):
+  g, k, prog = _running(key, "35-41", step_to=step)
+  over = {field: bad}
+  assert g.update(key, k, **quiet("35-41", **over), remaining=prog.remaining) == 0 and not g.running
+  assert g.reason == "input"
+  out = [g.update(key, k + 1 + i, **quiet("35-41", **over), remaining=prog.remaining) for i in range(600)]
+  assert not any(out) and g.reason == "input"
+  assert [e for e in g.events if e["kind"] == "run" and e["frame"] > k] == []
+  # and it starts again from nothing once the input is finite
+  out = [g.update(key, k + 700 + i, **quiet("35-41"), remaining=prog.remaining) for i in range(SETTLE + 400)]
+  assert any(out)
+
+
+def test_a_non_finite_input_is_also_a_closed_limit_for_scheduling():
+  g = TiIdent()
+  prog = Progress()
+  g.update(ti.LADDER, 0, **quiet("35-41", curvature=float('nan')), remaining=prog.remaining)
+  assert g.can_run(ti.LADDER, "35-41", prog.remaining) is False
+  assert g.limit_state(ti.LADDER, 3, "35-41", 50, float('nan'), 0.1, 600)[0] == "curve"

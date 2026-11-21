@@ -89,6 +89,13 @@ BANDS = WINDOWS             # the old name
 MIN_TEST_MPH = 19.0         # nothing runs below this (no engaged driving there)
 EPS_LOW_MPH, EPS_HIGH_MPH = 28.0, 31.0   # the EPS starts to allow the stock path here: no test from 28 up to 31 mph
 MAX_TEST_MPH = 80.0
+# Speed hysteresis. The tests are switched OFF at once at every edge of an off-region (below 19, 28-31, above 80 mph);
+# they switch ON again only once the speed is this far clear of it. Between two windows the profile (whose caps and limits
+# apply) changes only once the speed is this far beyond the midpoint of the gap. A car hovering at a boundary so makes no
+# fade-and-switch churn and no flood of log events.
+ZONE_HYSTERESIS_MPH = 1.0
+# At most one "pick" event per this long (the number skipped since the last rides in the next one)
+PICK_LOG_MIN_S = 0.5
 
 
 class Zone(NamedTuple):
@@ -531,11 +538,18 @@ class RunAll:
     self.profile = None
     self.mode = None
     self.blocked = 0
+    self.last_emit = None      # frame of the last pick event
+    self.skipped = 0           # pick events held back since then (rate limit)
 
   def _choose(self, frame, profile, test, mode, totals, **kw):
     if test != self.current or mode != self.mode or profile != self.profile:
       if self.emit is not None and (test != self.current or profile != self.profile):
-        self.emit(frame, "pick", test=test, mode=mode, window=profile, seed=self.seed, totals=totals, **kw)
+        if self.last_emit is None or frame - self.last_emit >= PICK_LOG_MIN_S / DT:
+          extra = {"skipped": self.skipped} if self.skipped else {}
+          self.emit(frame, "pick", test=test, mode=mode, window=profile, seed=self.seed, totals=totals, **extra, **kw)
+          self.last_emit, self.skipped = frame, 0
+        else:
+          self.skipped += 1
     self.current, self.profile, self.mode, self.blocked = test, profile, mode, 0
     return test
 
@@ -655,6 +669,9 @@ class TiIdent:
     self.viol_at = {}            # (test key, step) -> frame a limit last closed that step, and which
     self.inputs = None           # the last frame's limit inputs, for can_run
     self.zone = Zone(None, None, None, "below")
+    self.zone_off = True         # the speed is (or was last) in an off-region and has not cleared it yet
+    self.prof = None             # the profile held between windows (hysteresis)
+    self.zone_n = -1             # the frame count advance_zone last ran for
     self.mph = 0.0
     self._stop()
 
@@ -691,6 +708,37 @@ class TiIdent:
       except Exception:
         pass
 
+  def advance_zone(self, v_ego):
+    """The zone for this frame's speed, with the hysteresis of ZONE_HYSTERESIS_MPH: off at once at an off-region's edge,
+    on again only once clear of it by the margin; between windows the profile changes only when the speed is the margin
+    beyond the midpoint. A non-finite speed is no speed (off). Run once per frame, before `update` (which runs it itself
+    when the caller did not) so run all and the gate see the same zone."""
+    v = float(v_ego) if math.isfinite(v_ego) else 0.0
+    mph = v * MS_TO_MPH
+    raw = zone_for(v)
+    h = ZONE_HYSTERESIS_MPH
+    if raw.profile is None:
+      self.zone_off, self.prof = True, None
+      self.zone = raw
+    else:
+      if self.zone_off:
+        clear = mph >= MIN_TEST_MPH + h and not (EPS_LOW_MPH - h <= mph < EPS_HIGH_MPH + h) and mph < MAX_TEST_MPH - h
+        if not clear:
+          state = "below" if mph < MIN_TEST_MPH + h else "transition" if mph < MAX_TEST_MPH - h else "above"
+          self.zone = Zone(None, None, None, state)
+          self.zone_n = self.n + 1
+          return self.zone
+        self.zone_off, self.prof = False, None
+      prof = raw.profile
+      if raw.window is None and self.prof is not None and self.prof != raw.profile:
+        held = next(w for w in WINDOWS if w[2] == self.prof)
+        if held[3] == raw.ti_alone and (window_distance(mph, self.prof) - window_distance(mph, raw.profile)) <= 2 * h:
+          prof = self.prof               # not yet clearly past the midpoint of the gap
+      self.prof = prof
+      self.zone = Zone(raw.window, prof, raw.ti_alone, raw.state)
+    self.zone_n = self.n + 1
+    return self.zone
+
   def reset(self, frame=None):
     """Lateral control off or TI not in RUN: zero at once."""
     if self.test is not None and frame is not None:
@@ -701,6 +749,7 @@ class TiIdent:
     self.credit = None
     self.emitted = None
     self.gate = None
+    self.zone_off, self.prof = True, None
 
   @property
   def running(self):
@@ -750,7 +799,7 @@ class TiIdent:
     bounds = self.limit_bounds(key, step, profile, ti_max)
     values = {"command": abs(base_request), "curve": abs(curvature), "lat": abs(lat_demand)}
     for reason in GATE_WHAT:
-      if values[reason] > bounds[reason]:
+      if not math.isfinite(values[reason]) or values[reason] > bounds[reason]:   # NaN fails every comparison: closed
         return reason, values[reason], bounds[reason]
     return None, None, None
 
@@ -759,12 +808,16 @@ class TiIdent:
     limit, or is still inside that limit's re-arm dwell (run all passes such a test over after BLOCK_PATIENCE_S)."""
     if self.inputs is None or profile is None:
       return True
+    if not all(math.isfinite(x) for x in self.inputs.values()):
+      return False
     step, _ = self._pick(key, profile, remaining, None, lambda s: self._feasible(key, s, profile))
     return step is not None and self._feasible(key, step, profile)
 
   def _feasible(self, key, step, profile):
     if self.inputs is None:
       return True
+    if not all(math.isfinite(x) for x in self.inputs.values()):
+      return False
     if self.limit_state(key, step, profile, **self.inputs)[0] is not None:
       return False
     return (self.n - self.viol_at.get((key, step), (-10 ** 9, None))[0]) > REARM_S / DT
@@ -814,7 +867,10 @@ class TiIdent:
     self.gate = None
     self.n += 1
     self.stopped_age += 1
-    magnitude = abs(driver_torque)
+    # A non-finite input (NaN or infinity) closes the gate: nothing comparable can be trusted, and a NaN passes every
+    # "greater than the limit" test. Zero at once, like a touch.
+    bad = not all(math.isfinite(x) for x in (v_ego, base_request, curvature, lat_demand, driver_torque, ti_max))
+    magnitude = abs(driver_torque) if math.isfinite(driver_torque) else 0.0
     self.loud = self.loud + 1 if magnitude >= DRIVER_QUIET_COUNTS else 0
     touch = self.touch = bool(steering_pressed or magnitude >= DRIVER_FIRM_COUNTS
                               or self.loud >= self.touch_confirm_frames)
@@ -825,8 +881,10 @@ class TiIdent:
     else:
       self.regime_frames += 1
 
-    zone = self.zone = zone_for(v_ego)
-    self.mph = v_ego * MS_TO_MPH
+    if self.zone_n != self.n:
+      self.advance_zone(v_ego)
+    zone = self.zone
+    self.mph = v_ego * MS_TO_MPH if math.isfinite(v_ego) else 0.0
     band, ti_alone = zone.profile, zone.ti_alone      # the window whose caps, limits and needs apply
     self.inputs = dict(base_request=base_request, curvature=curvature, lat_demand=lat_demand, ti_max=ti_max)
 
@@ -868,6 +926,8 @@ class TiIdent:
     # Why not (display), and the gate, in the dither's order of precedence
     if key is None:
       reason = "off"
+    elif bad:
+      reason = "input"
     elif touch:
       reason = "touch"
     elif room is not None and not rate_room_ok(room, key, step if step is not None else 0):
@@ -923,7 +983,7 @@ class TiIdent:
       slot = (key, zone.window or ("gap" if band is not None else "none"), reason)
       self.counts[slot] = self.counts.get(slot, 0) + 1
 
-    if self.test is not None and (touch or (key is not None and reason == "rate")):
+    if self.test is not None and (touch or bad or (key is not None and reason == "rate")):
       self._event(frame, "stop", mode="zero", why=reason, step=self.step)   # a touch or too little rate room
       self._stop()
     if self.test is not None and not self.fading and (not open_ or key != self.test):
