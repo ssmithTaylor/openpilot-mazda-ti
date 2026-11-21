@@ -38,6 +38,7 @@ from pathlib import Path
 DEFINITIONS_PATH = Path(__file__).with_name("ti_tests.json")
 PROGRESS_KEY = "TiTestProgress"
 LIVE_KEY = "_live"
+TABLE_KEY = "_table"   # in a step_seconds test's entry: ti_ident.SIGNAL_HASH of the signal its seconds were collected with
 RESET_KEY = "_reset"
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
@@ -378,7 +379,9 @@ def parse_progress(raw):
       continue
     clean = {}
     for k, v in entry.items():
-      if _number(v) and v >= 0:
+      if k == TABLE_KEY and isinstance(v, str):
+        clean[k] = v                  # the signal table a step_seconds entry was collected with
+      elif _number(v) and v >= 0:
         clean[k] = float(v)
       elif isinstance(v, dict):
         clean[k] = {b: float(x) for b, x in v.items() if _number(x) and x >= 0}
@@ -488,14 +491,42 @@ class TestAccountant:
   def wants_reasons(self):
     return bool(self.seen_interval) and not self.failed
 
+  def _signal(self, t):
+    try:
+      from openpilot.selfdrive.car.mazda import ti_ident
+      return ti_ident.SIGNAL_HASH[next(iter(t.keys))]
+    except Exception:
+      return None
+
+  def _migrate(self, doc):
+    """A step_seconds entry collected with another signal table (or before tables were recorded, as on fd05555) is
+    kept under "<id>~<its table or 'old'>" and the test starts again from zero under its id; seconds collected with
+    another waveform never count toward the current needs."""
+    for t in self.tests:
+      if t.metric != "step_seconds":
+        continue
+      table = self._signal(t)
+      entry = doc.get(t.id)
+      if not isinstance(entry, dict) or table is None or entry.get(TABLE_KEY) == table:
+        continue
+      if any(k != TABLE_KEY for k in entry):
+        old = f"{t.id}~{entry.get(TABLE_KEY) or 'old'}"
+        n = 2
+        while old in doc:
+          old = f"{t.id}~{entry.get(TABLE_KEY) or 'old'}{n}"
+          n += 1
+        doc[old] = entry
+      doc[t.id] = {TABLE_KEY: table}
+    return doc
+
   def _base(self):
     """(progress, resets): the tmpfs copy and the UI's reset requests in it, else the flash copy and none."""
     raw = self.params_memory.get(PROGRESS_KEY, encoding="utf8")
     doc = parse_progress(raw)
     if doc is not None:
-      return doc, parse_resets(raw)
+      return self._migrate(doc), parse_resets(raw)
     doc = parse_progress(self.params.get(PROGRESS_KEY, encoding="utf8"))
-    return (doc if doc is not None else {}), {}
+    return self._migrate(doc if doc is not None else {}), {}
 
   def _status(self, on, reasons, notes=None):
     status = {}
@@ -538,6 +569,9 @@ class TestAccountant:
           into[b] = round((prev if _number(prev) else 0.0) + n * DT, 2)
       for tid, counted in self.pending_steps.items():
         entry = doc.setdefault(tid, {})
+        t = next((x for x in self.tests if x.id == tid), None)
+        if t is not None and self._signal(t) is not None:
+          entry[TABLE_KEY] = self._signal(t)
         for (b, step), secs in counted.items():
           into = entry.get(b)
           if not isinstance(into, dict):

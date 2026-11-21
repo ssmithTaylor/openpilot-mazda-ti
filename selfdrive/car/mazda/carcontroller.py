@@ -531,8 +531,11 @@ class CarController(CarControllerBase):
           # keep the undithered path.
           dither = getattr(self, "ti_dither", None)
           if dither is not None:
+            # One signal at a time: switched on while an identification test is still sending (fading included),
+            # the dither waits until that signal has ended. Without a running test this is the toggle as before.
+            ident_now = getattr(self, "ti_ident", None)
             ti_dither = dither.update(
-              self.ti_dither_enabled, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
+              self.ti_dither_enabled and not (ident_now is not None and ident_now.running), self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
               driver_torque=CS.out.steeringTorque,
               blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
               base_request=ti_new_steer, ti_max=self.ccp.TI_STEER_MAX,

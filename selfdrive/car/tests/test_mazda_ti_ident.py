@@ -414,7 +414,7 @@ def test_a_band_change_mid_unit_is_not_credited():
 def test_the_ladder_runs_only_the_steps_under_the_bands_cap():
   for band in ("19-28", "60-80"):
     g = TiIdent()
-    out, prog = drive(g, ti.LADDER, band, band_frames(ti.LADDER, band) + 5000)
+    out, prog = drive(g, ti.LADDER, band, band_frames(ti.LADDER, band) + 20000)
     assert max(abs(v) for v in out) <= ti.LADDER_CAPS[band]
     assert {s for (_, _, s) in prog.have} == set(range(ti.steps_in_band(ti.LADDER, band)))
     assert prog.band_done(ti.LADDER, band) and g.reason == "extra"
@@ -854,3 +854,108 @@ def test_every_pause_reason_has_its_own_screen_text_and_stop_events_name_it():
   whys = [e.get("why") for e in logged if e["kind"] == "stop"]
   assert {"blinker", "curve", "lat", "command", "band", "touch"} <= set(whys)
   assert all("step" in e for e in logged if e["kind"] == "stop")
+
+
+# ---- review round 2 ---------------------------------------------------------------------------------------------
+
+def test_run_all_completion_is_per_step_not_per_band_total():
+  # The fd05555 progress pattern: 20 s on every sweep step, the now-optional 0.3 Hz step included, is 140 s against
+  # 67.3 s required at 31-45 mph, yet the 0.6 Hz step (26.56 s needed) is short.
+  prog = Progress()
+  for s_ in range(7):
+    prog.have[(ti.SWEEP, "31-45", s_)] = 20.0
+  assert ti.band_share(ti.SWEEP, "31-45", prog.remaining, clip=False) > 1.0
+  assert ti.band_share(ti.SWEEP, "31-45", prog.remaining) < 1.0
+  assert ti.schedule(None, None, "31-45", prog.remaining) == ti.SWEEP
+  assert ti.schedule(ti.SWEEP, "31-45", "31-45", prog.remaining) == ti.SWEEP
+  # and the generator goes to the short step
+  g = TiIdent()
+  drive(g, ti.SWEEP, "31-45", SETTLE + 5, prog=prog)
+  assert g.step == 1 and not g.extra
+
+
+def test_progress_from_another_signal_table_is_kept_aside_and_does_not_count():
+  mem, flash = FakeParams(), FakeParams()
+  old = {"ti_sweep": {"31-45": {str(k): 20.0 for k in range(7)}, "45-60": {str(k): 20.0 for k in range(7)}},
+         "ti_dither": {"43-50": 120.0}}
+  flash.store[tt.PROGRESS_KEY] = json.dumps(old)              # what fd05555 left (no table recorded)
+  acc = _accountant(flash, mem)
+  assert acc.remaining(ti.SWEEP, "31-45", 1) == ti.required_seconds(ti.SWEEP, "31-45", 1)   # starts from zero
+  acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("31-45"), True, (),
+             credit=(ti.SWEEP, "31-45", 1, 3.32))
+  acc.publish(1.0, {}, wall=1e9)
+  doc = json.loads(mem.store[tt.PROGRESS_KEY])
+  assert doc["ti_sweep~old"] == old["ti_sweep"]                # kept, under its own key
+  assert doc["ti_sweep"]["_table"] == ti.SIGNAL_HASH[ti.SWEEP] and doc["ti_sweep"]["31-45"] == {"1": 3.32}
+  assert doc["ti_dither"] == {"43-50": 120.0}                  # the dither's record is untouched
+  # a later table change moves this one aside too, under its hash
+  doc["ti_sweep"]["_table"] = "0123456789ab"
+  mem.store[tt.PROGRESS_KEY] = json.dumps(doc)
+  acc2 = tt.TestAccountant(acc.tests, flash, mem)
+  assert acc2.remaining(ti.SWEEP, "31-45", 1) == ti.required_seconds(ti.SWEEP, "31-45", 1)
+  acc2.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("31-45"), True, ())
+  acc2.publish(2.0, {}, wall=1e9)
+  doc2 = json.loads(mem.store[tt.PROGRESS_KEY])
+  assert doc2["ti_sweep~0123456789ab"]["31-45"] == {"1": 3.32} and doc2["ti_sweep~old"] == old["ti_sweep"]
+  # the same table survives a reboot as it is
+  flash.store[tt.PROGRESS_KEY] = json.dumps({k: v for k, v in doc.items() if not k.startswith("_")})
+  flash_doc = json.loads(flash.store[tt.PROGRESS_KEY])
+  flash_doc["ti_sweep"]["_table"] = ti.SIGNAL_HASH[ti.SWEEP]
+  flash.store[tt.PROGRESS_KEY] = json.dumps(flash_doc)
+  acc3 = tt.TestAccountant(acc.tests, flash, FakeParams())
+  assert acc3.remaining(ti.SWEEP, "31-45", 1) == pytest.approx(ti.required_seconds(ti.SWEEP, "31-45", 1) - 3.32)
+
+
+def _transition_sums(key, band):
+  """Counts and heading (running sum) of the signal over pairs of step transitions in a long extra run."""
+  prog = Progress()
+  for k_ in ti.KEYS:
+    complete(prog, k_, band)
+  g = TiIdent(log=None)
+  logged = []
+  g.log = logged.append
+  out, _ = drive(g, key, band, 120000, prog=prog)
+  return np.array(out, dtype=float), logged
+
+
+@pytest.mark.parametrize('band', ["31-45", "19-28"])
+@pytest.mark.parametrize('key', [ti.SWEEP, ti.LADDER])
+def test_extra_mode_long_run_mean_and_heading_stay_near_zero(key, band):
+  out, logged = _transition_sums(key, band)
+  runs = [e["frame"] for e in logged if e["kind"] == "run"]
+  assert len(runs) > 10                                        # many transitions in extra mode
+  run_out = out[SETTLE:]
+  assert abs(run_out.mean()) < 0.02                            # no constant bias (review: -0.36 / -1.14 before)
+  heading = np.cumsum(run_out)
+  # bounded by one unit's own heading swing plus one transition, not growing with the length of the run (a bias of
+  # 0.36 counts would reach 43000 count-frames here)
+  assert np.max(np.abs(heading)) < 4000
+  assert abs(heading[-1]) < 4000
+
+
+def test_extra_dwells_several_units_per_step():
+  _, logged = _transition_sums(ti.SWEEP, "45-60")
+  per_run = []
+  units = 0
+  for e in logged:
+    if e["kind"] == "run":
+      if units:
+        per_run.append(units)
+      units = 1
+    elif e["kind"] == "chunk":
+      units += 1
+  assert per_run and min(per_run) >= ti.EXTRA_DWELL_UNITS
+
+
+def test_the_dither_waits_for_a_running_test_to_end():
+  h = host((ti.SWEEP,))
+  for _ in range(M.frames(5)):
+    step(h, 0.05)
+  assert h.ti_ident.running
+  h.ti_dither_enabled = True                                   # the dither switched on mid-test
+  rows = [step(h, 0.05) for _ in range(M.frames(5))]
+  both = [r for r in rows if r['dither'] != 0 and (r['ident'] != 0 or r['emitted'])]
+  assert not both                                              # never both in one frame
+  first_dither = next(i for i, r in enumerate(rows) if r['dither'] != 0)
+  last_test = max(i for i, r in enumerate(rows) if r['emitted'])
+  assert first_dither > last_test                              # the dither starts only after the test has ended

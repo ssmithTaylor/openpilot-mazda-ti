@@ -27,8 +27,10 @@ the next one starts.
 Heading. Each sweep and ladder tone starts at the phase (PHASES) that makes the heading it produces zero-mean over a
 unit, its lead-in included, so the car does not drift sideways (a sine from zero gives a one-sided heading and a
 steady drift); each period has an even number of frames, so a unit still sums to exactly zero. Units of a step that
-follow each other start where the last one ended (whole periods), so every unit has the same zero-mean heading.
-Pulse doublets alternate sign, so each pair leaves no heading.
+follow each other start where the last one ended (whole periods), so every unit has the same zero-mean heading. A
+fade-out and the next lead-in leave a few hundred count-frames each; every fresh run takes the tone sign whose
+lead-in pulls the running net of all counts sent back toward zero, and extra collection dwells EXTRA_DWELL_UNITS
+units per step, so there is no long-run bias. Pulse doublets alternate sign, so each pair leaves no heading.
 
 Gate. A driver touch (steeringPressed, |driver torque| >= 6 counts, or >= 4 counts for 3 frames) or too little rate
 room cut the signal to zero AT ONCE. Everything else that closes the gate FADES the signal out: blinker or lane
@@ -58,7 +60,7 @@ from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_
                                                      MAX_BASE_FRACTION, MAX_LAT_DEMAND_MPS2, RATE_ROOM_FACTOR,
                                                      TOUCH_CONFIRM_FRAMES)
 
-VERSION = 4
+VERSION = 5
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
@@ -160,6 +162,7 @@ def band_required(key, band):
 RUN_ALL_ORDER = (SWEEP, PULSES, LADDER)
 SWITCH_QUIET_S = 0.5        # quiet between one test's complete fade-out and the next test's start
 EXTRA_HYSTERESIS = 0.25     # extra collection: leave the current test once it leads the least-collected by this share
+EXTRA_DWELL_UNITS = 4       # extra collection: units on one step before moving to the next (fewer fade transitions)
 
 
 def unit_periods(p):
@@ -177,6 +180,17 @@ def _table(key):
 
 TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), {b: REQUIRED_S[b][k] for b in REQUIRED_S}, BANDS, MAX_SLEW],
                                          sort_keys=True).encode()).hexdigest()[:12] for k in KEYS}
+
+
+def _signal(key):
+  """What a credited second of this test means: the waveform of every step (not the needs, caps or gates)."""
+  t = dict(_table(key))
+  t.pop("caps", None)
+  return ["zero-heading phase, sign alternating per run", t]
+
+
+# Progress is kept per SIGNAL_HASH (ti_tests.py): seconds collected with another waveform do not count toward these.
+SIGNAL_HASH = {k: hashlib.sha1(json.dumps(_signal(k), sort_keys=True).encode()).hexdigest()[:12] for k in KEYS}
 
 
 def n_steps(key):
@@ -273,13 +287,15 @@ PHASES = {(k, s): _zero_heading_phase(k, s) for k in (SWEEP, LADDER) for s in ra
 
 
 def unit(key, step, ph, sign=1):
-  """The full-amplitude signal (float counts) of a step at unit phase `ph` (frames; negative: lead-in). Sweep and
-  ladder: a tone at the phase PHASES gives it (zero-mean heading); pulses: the doublet, then quiet."""
+  """The full-amplitude signal (float counts) of a step at unit phase `ph` (frames; negative: lead-in), times `sign`.
+  Sweep and ladder: a tone at the phase PHASES gives it (zero-mean heading); its sign alternates from one run (lead-in)
+  to the next, so the fade-out and lead-in at successive transitions cancel in pairs. Pulses: the doublet, its sign
+  alternating pulse by pulse, then quiet."""
   p, a, _, _ = step_params(key, step)
   if p is None:
     shape = _DOUBLETS[a]
     return sign * shape[ph] if 0 <= ph < len(shape) else 0.0
-  return _tone(p, a, PHASES[(key, step)], ph)
+  return sign * _tone(p, a, PHASES[(key, step)], ph)
 
 
 def value(key, step, ph, env, sign=1):
@@ -302,6 +318,12 @@ def _step_slew(key, step):
 
 
 STEP_SLEW = {(k, s): _step_slew(k, s) for k in KEYS for s in range(n_steps(k))}
+
+# Net counts of a step's lead-in at sign +1 (the raised-cosine ramp into the tone): the generator picks each new run's
+# sign so that the lead-in pulls the running net of everything sent so far back toward zero.
+LEAD_SUM = {(k, s): sum(value(k, s, ph, (ph + step_params(k, s)[3]) / step_params(k, s)[3])
+                        for ph in range(-step_params(k, s)[3], 0))
+            for k in (SWEEP, LADDER) for s in range(n_steps(k))}
 
 
 def band_for(v_ego, lkas_blocked=None):
@@ -351,8 +373,9 @@ def check_definition(key, bins, steps, target, needs=None):
   return None
 
 
-def band_share(key, band, remaining):
-  """Collected / required for one test in one band, extra included (> 1 when it has extra); None when unknown."""
+def band_share(key, band, remaining, clip=True):
+  """Collected / required for one test in one band; None when unknown. clip: each step counts at most its own need, so
+  the share reaches 1 only when every step is complete (completion). Not clipped: extra included (choosing extra)."""
   required, collected = 0.0, 0.0
   for s in range(steps_in_band(key, band)):
     left = remaining(key, band, s)
@@ -360,8 +383,10 @@ def band_share(key, band, remaining):
       return None
     need = required_seconds(key, band, s)
     required += need
-    collected += need - left
-  return collected / required if required > 0 else 1.0 + collected
+    collected += min(need, need - left) if clip else need - left
+  if required <= 0:
+    return 1.0 if clip else 1.0 + collected
+  return collected / required
 
 
 def schedule(current, current_band, band, remaining):
@@ -369,18 +394,19 @@ def schedule(current, current_band, band, remaining):
   `band`: the band now (None: keep the current test; its own gate pauses it). None when progress is unknown."""
   if band is None:
     return current
-  shares = {}
+  shares, totals = {}, {}
   for k in RUN_ALL_ORDER:
     shares[k] = band_share(k, band, remaining)
-    if shares[k] is None:
+    totals[k] = band_share(k, band, remaining, clip=False)
+    if shares[k] is None or totals[k] is None:
       return None
   if current in shares and band == current_band and shares[current] < 1.0 - 1e-9:
-    return current                       # stay until its requirement for this band is complete
+    return current                       # stay until every step of it is complete in this band
   for k in RUN_ALL_ORDER:
     if shares[k] < 1.0 - 1e-9:
       return k                           # the first test not complete in this band
-  least = min(RUN_ALL_ORDER, key=lambda k: (shares[k], RUN_ALL_ORDER.index(k)))
-  if current in shares and band == current_band and shares[current] - shares[least] < EXTRA_HYSTERESIS:
+  least = min(RUN_ALL_ORDER, key=lambda k: (totals[k], RUN_ALL_ORDER.index(k)))
+  if current in totals and band == current_band and totals[current] - totals[least] < EXTRA_HYSTERESIS:
     return current                       # extra: keep going until it leads by the hysteresis
   return least
 
@@ -433,6 +459,9 @@ class TiIdent:
     self.emitted = None          # the test whose waveform produced this frame's output (even if it rounded to 0)
     self.prev_test = None        # the test that ran last, and frames since it stopped (the quiet between tests)
     self.stopped_age = 10 ** 6
+    self.tone_sign = -1          # sweep and ladder: the sign of the current run's tone
+    self.net = 0                 # running sum of every count sent (the heading the test has left); kept near zero
+    self.units_on_step = 0       # units started on the current step in this run (extra dwell)
     self._stop()
 
   def _stop(self):
@@ -495,9 +524,19 @@ class TiIdent:
     return best, True
 
   def _start_chunk(self, frame, key, band, step, lead_in, extra):
-    _, a, _, lead = step_params(key, step)
+    p, a, _, lead = step_params(key, step)
     if key == PULSES and self.test == key:
       self.sign = -self.sign
+    elif p is not None and lead_in:
+      # Each fresh run's sign: the one whose lead-in pulls the running net back toward zero (a fade-out and the next
+      # lead-in leave a few hundred count-frames each); with nothing to correct, alternate.
+      lead_net = LEAD_SUM[(key, step)]
+      if self.net != 0 and lead_net != 0:
+        self.tone_sign = -1 if (self.net > 0) == (lead_net > 0) else 1
+      else:
+        self.tone_sign = -self.tone_sign
+      self.sign = self.tone_sign
+    self.units_on_step = self.units_on_step + 1 if (not lead_in and self.test == key and self.step == step) else 1
     self.test, self.step, self.band, self.fading, self.extra = key, step, band, False, extra
     self.ph = -lead if lead_in else 0
     self.env = 0.0 if lead_in and lead else 1.0
@@ -598,6 +637,9 @@ class TiIdent:
     elif not self.fading:
       if self.ph >= step_params(self.test, self.step)[2]:
         nxt, nxt_extra = self._pick(key, band, remaining, self.credit)
+        if (nxt_extra and self.extra and nxt != self.step and self.units_on_step < EXTRA_DWELL_UNITS
+            and self.step < steps_in_band(key, band) and band == self.band):
+          nxt = self.step                 # extra: a few units on one step before moving on (fewer transitions)
         if nxt == self.step or self.test == PULSES:
           self._start_chunk(frame, key, band, nxt, lead_in=False, extra=nxt_extra)   # straight on: continuous
         else:
@@ -613,6 +655,7 @@ class TiIdent:
     st = self.__dict__
     _wrap(st)
     self.last = value(self.test, self.step, self.ph, self.env, self.sign)
+    self.net += self.last
     if self.last != 0:
       self.frames[self.test] = self.frames.get(self.test, 0) + 1
     _advance(st)
