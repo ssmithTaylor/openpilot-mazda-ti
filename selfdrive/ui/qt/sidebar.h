@@ -190,6 +190,8 @@ private:
   // A/B page (ti_ab_logic.h): a page of this window beside the test pages, under the same lock
   bool ab_page = false;
   bool ab_on = false;                       // TiAbOn (tmpfs)
+  bool ab_plan_on = false;                  // TiPlanOn (tmpfs): the drive plan, A/B then the tests
+  void drawPlanLine(QPainter &p);
   bool ab_fresh = false;                    // the car side's status is recent
   bool ab_a_known = false;
   double ab_a = 0;                          // the owner's stored value of the shown setting

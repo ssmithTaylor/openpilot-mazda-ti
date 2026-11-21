@@ -52,6 +52,7 @@ import time
 from typing import NamedTuple, Optional
 
 from openpilot.selfdrive.car.mazda import ti_ident as ti
+from openpilot.selfdrive.car.mazda import ti_plan
 from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_QUIET_COUNTS, HOLDOFF_S,
                                                      TOUCH_CONFIRM_FRAMES)
 
@@ -318,6 +319,9 @@ class TiAb:
     self.log = log
     self.block_s_override = None if block_s is None else float(block_s)   # (unit tests only: shorter blocks)
     self.block_len = 0.0
+    self.speed_off_high, self.speed_on_high = SPEED_OFF_HIGH, SPEED_ON_HIGH
+    self.target_s = None         # drive plan: scored seconds per side that complete the alternation (None: never completes)
+    self.cfg_valid = False
     self.last_release = None
     self._refused = None
     self.events = []
@@ -368,6 +372,9 @@ class TiAb:
     self.skipped = 0
     self.switches = 0
     self.voided_idx = None
+    self.committed = {"A": 0.0, "B": 0.0}   # scored seconds of non-voided blocks, per arm
+    self.block_scored = 0                   # scored frames of the running block
+    self.complete = False
 
   def _event(self, kind, **kw):
     e = {"frame": self.n, "kind": kind, **kw}
@@ -419,9 +426,14 @@ class TiAb:
     self._event("block_end", idx=idx, arm=arm, engaged_s=engaged_s, reason=reason, voided=voided)
     if not voided:
       self.idx = idx + 1
+      self.committed[arm] += self.block_scored * DT
     else:
       self.voided_idx = idx
-    self.block, self.block_frames = None, 0
+    self.block, self.block_frames, self.block_scored = None, 0, 0
+    if (self.target_s is not None and not self.complete and self.committed["A"] >= self.target_s
+        and self.committed["B"] >= self.target_s):
+      self.complete = True
+      self._event("complete", committed={a: round(v, 1) for a, v in self.committed.items()}, target_s=self.target_s)
     self.pending_since, self.wait_hist, self.wait_logged = None, {}, False
 
   def _end_wait(self, outcome):
@@ -502,9 +514,9 @@ class TiAb:
     mph = v_ego * MS_TO_MPH if finite else 0.0
     self.mph = mph
     if finite:
-      if mph < SPEED_OFF_LOW or mph >= SPEED_OFF_HIGH:
+      if mph < SPEED_OFF_LOW or mph >= self.speed_off_high:
         self.speed_ok = False
-      elif SPEED_ON_LOW <= mph < SPEED_ON_HIGH:
+      elif SPEED_ON_LOW <= mph < self.speed_on_high:
         self.speed_ok = True
     else:
       self.speed_ok = False
@@ -514,6 +526,7 @@ class TiAb:
     cfg, msg = (None, "")
     if on and self.seen_off:
       cfg, msg = self._config(config, stored)
+    self.cfg_valid = cfg is not None
     hard, immediate = None, False
     if not on:
       hard = "off"
@@ -535,6 +548,9 @@ class TiAb:
         self.seen_off = False          # a changed configuration needs the switch off and on again
         self.restart_msg = "the A/B configuration changed: switch A/B off and on again"
         self.message = self.restart_msg
+      elif self.complete:
+        hard = "complete"
+        self.message = "A/B complete: your own value A stays for the rest of the drive"
       elif tests_active:
         hard = "tests"
         self.message = "tests are on: A/B stays off while any test is on"
@@ -552,7 +568,7 @@ class TiAb:
         self.message = "bad inputs"
       elif not self.speed_ok:
         hard = "speed"
-        self.message = "speed outside 35-70 mph"
+        self.message = f"speed outside 35-{self.speed_off_high:g} mph"
       else:
         self.message = ""
 
@@ -564,7 +580,7 @@ class TiAb:
         if self.spec is not None and not self.ramp.moving and self.ramp.s == 0.0:
           self.cfg_key, self.cfg, self.spec = None, None, None       # back at A and finished: forget the activation
       else:
-        self.mode = "idle"
+        self.mode = "complete" if hard == "complete" else "idle"
       return self._out()
     self.last_release = None
 
@@ -633,6 +649,8 @@ class TiAb:
     acts = ACTS_ABOVE_LAT.get(self.spec.name)
     if self.wash_left == 0 and not self.ramp.moving and (acts is None or v_ego * v_ego * abs(curvature) >= acts):
       self.progress[self.arm_in_force][self.window] += DT
+      if self.block is not None and self.pin is None:
+        self.block_scored += 1
     if self.n - self.hb_at >= HB_S / DT:
       self.hb_at = self.n
       self._event("hb", s=self.ramp.s, arm=self.arm_in_force, wash_left=self.wash_left, idx=self.idx,
@@ -727,6 +745,19 @@ class TiAb:
       over["ab_weights"] = {spec.attr: out.weight}
     return over
 
+  def set_plan_limits(self, ceiling_mph, target_s):
+    """The drive plan's first-trial limits: the alternation's upper speed and the scored seconds per side that complete it."""
+    self.speed_off_high, self.speed_on_high = float(ceiling_mph), float(ceiling_mph) - H
+    self.target_s = None if target_s is None else float(target_s)
+
+  def clear_plan_limits(self):
+    self.speed_off_high, self.speed_on_high, self.target_s = SPEED_OFF_HIGH, SPEED_ON_HIGH, None
+
+  @property
+  def at_a_settled(self):
+    """The blend is exactly A, not moving, and has been for the wash-in time."""
+    return self.ramp.s == 0.0 and not self.ramp.moving and self.ramp.to == 0.0 and self.wash_left == 0
+
   def status(self, now=None):
     """The block the A/B page reads (param TiAbStatus)."""
     block = None
@@ -749,6 +780,7 @@ class TiAb:
             "value": value, "arm": self.arm_in_force if spec is not None else None, "blend": round(self.ramp.s, 3),
             "pin": self.pin, "block": block, "wait": wait, "wash_in": self.wash_left > 0, "seed": self.seed if spec else None,
             "idx": self.idx, "skipped": self.skipped, "mph": round(self.mph, 1),
+            "scored": {a: round(v, 1) for a, v in self.committed.items()}, "target_s": self.target_s, "complete": self.complete,
             "progress": {a: {w: round(t, 1) for w, t in d.items()} for a, d in self.progress.items()}}
 
 
@@ -792,9 +824,14 @@ class TiAbRunner:
   AbToggles view. Never raises; after an error it returns the owner's toggles for the rest of the process."""
   ON_EVERY, CONFIG_EVERY, STATUS_EVERY = 10, 100, 50     # cycles
 
-  def __init__(self, params, params_memory, log=None, block_s=None):
+  def __init__(self, params, params_memory, log=None, block_s=None, plan_target_min=None):
     self.params, self.memory = params, params_memory
     self.ab = TiAb(log=log, block_s=block_s)
+    self.plan = ti_plan.Plan(log=lambda kind, **kw: self.ab._event(kind, **kw))
+    self.plan_on, self.plan_ack, self.plan_dead = False, None, False
+    self.plan_out = None
+    self.plan_target_s = 60.0 * (ti_plan.TARGET_MIN_PER_SIDE if plan_target_min is None else plan_target_min)
+    self.plan_published = None
     self.k = 0
     self.on, self.pin, self.config = False, None, None
     self.read_error = ""
@@ -808,9 +845,15 @@ class TiAbRunner:
       if isinstance(raw_pin, (bytes, bytearray)):
         raw_pin = raw_pin.decode("utf-8", "replace")
       self.pin = None if raw_pin in (None, "") else raw_pin
+      self.plan_on = bool(self.memory.get_bool(ti_plan.PARAM_PLAN_ON))
+      raw_ack = self.memory.get(ti_plan.PARAM_PLAN_ACK)
+      try:
+        self.plan_ack = json.loads(raw_ack) if raw_ack else None
+      except Exception:
+        self.plan_ack = None
       self.read_error = ""
     except Exception as exc:
-      self.on, self.pin = False, None
+      self.on, self.pin, self.plan_on = False, None, False
       self.read_error = f"A/B switch unreadable: {type(exc).__name__}"
     if self.k % self.CONFIG_EVERY == 0 or self.config is None:
       try:
@@ -831,9 +874,33 @@ class TiAbRunner:
       specs = [SETTINGS[n] for n in ALLOWED]
       stored = {s.name: stored_value(s, toggles) for s in specs}
       tests = any(getattr(toggles, t, False) is True for t in TEST_TOGGLES)
-      out = self.ab.update(on=self.on, pin=self.pin, config=self.config, stored=stored, tests_active=tests, **inputs)
+      on, paused = self.on, tests
+      try:
+        v = inputs["v_ego"]
+        mph = v * MS_TO_MPH if isinstance(v, (int, float)) and math.isfinite(v) else 0.0
+        if self.plan_on:
+          self.ab.set_plan_limits(ti_plan.PLAN_ALT_MAX_MPH, self.plan_target_s)
+        else:
+          self.ab.clear_plan_limits()
+        po = self.plan.update(on=self.plan_on, cfg_valid=self.ab.cfg_valid, complete=self.ab.complete, mph=mph,
+                              ab_at_a=self.ab.at_a_settled, ack=self.plan_ack, now=time.time(), tests_toggles_on=tests,
+                              ceiling=ti_plan.PLAN_ALT_MAX_MPH)
+        self.plan_out = po
+        if self.plan_on:
+          on, paused = True, tests or not po.ab_allowed
+      except Exception as exc:
+        # the plan is off and both modes are off for the rest of the process: the controller stays on the owner's settings
+        self.plan_dead = True
+        self.ab._fail(exc)
+        self._publish_plan(dead=True)
+        self._publish()
+        return toggles
+      out = self.ab.update(on=on, pin=self.pin, config=self.config, stored=stored, tests_active=paused, **inputs)
+      if self.plan_on and paused and not tests and self.ab.message.startswith("tests are on"):
+        self.ab.message = "A/B paused: the drive plan is running " + ("the tests" if po.mode == "tests" else "a hand-over")
       if self.read_error and not self.ab.message:
         self.ab.message = self.read_error
+      self._publish_plan()
       self._publish()
       if not out.active:
         return toggles
@@ -845,9 +912,27 @@ class TiAbRunner:
         pass
       return toggles
 
+  def _publish_plan(self, dead=False):
+    """The plan for the car controller (TiPlan): on every change and every 0.5 s, so a silent controls process is noticed."""
+    po = self.plan_out
+    if po is None and not dead:
+      return
+    key = ("dead",) if dead else (po.mode, po.seq)
+    if key != self.plan_published or self.k % 50 == 0:
+      try:
+        self.memory.put(ti_plan.PARAM_PLAN, ti_plan.encode_plan(po or ti_plan.PlanOut("off", False, "", "", 0), time.time(), dead))
+        self.plan_published = key
+      except Exception:
+        pass
+
   def _publish(self):
     st = self.ab.status()
-    key = (st["state"], st["msg"], st["arm"], st["pin"], st["block"] and st["block"]["idx"], st["wait"] and st["wait"]["reason"])
+    po = self.plan_out
+    st["plan"] = None if (po is None or not self.plan_on) and not self.plan_dead else {
+      "on": self.plan_on, "mode": "dead" if self.plan_dead else po.mode, "why": "" if po is None else po.why,
+      "next": "" if po is None else po.next, "target_min": self.plan_target_s / 60.0}
+    key = (st["state"], st["msg"], st["arm"], st["pin"], st["block"] and st["block"]["idx"], st["wait"] and st["wait"]["reason"],
+           st["plan"] and st["plan"]["mode"], st["complete"])
     if key != self.published or self.k - self.published_k >= (self.STATUS_EVERY if st["state"] != "off" else 4 * self.STATUS_EVERY):
       try:
         self.memory.put(PARAM_STATUS, json.dumps(st))

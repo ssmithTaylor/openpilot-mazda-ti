@@ -600,6 +600,9 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiAbOn", CLEAR_ON_MANAGER_START},      // tmpfs: the A/B alternation switch; off at every boot
     {"TiAbPin", CLEAR_ON_MANAGER_START},     // tmpfs: "A" or "B" pins the value, empty alternates
     {"TiAbStatus", CLEAR_ON_MANAGER_START},  // tmpfs: what the A/B page shows (controlsd, 2 Hz)
+    {"TiPlanOn", CLEAR_ON_MANAGER_START},    // tmpfs: the drive plan switch (A/B alternation, then the tests); off at every boot
+    {"TiPlan", CLEAR_ON_MANAGER_START},      // tmpfs: which of the two the plan allows now (controlsd -> car controller)
+    {"TiPlanAck", CLEAR_ON_MANAGER_START},   // tmpfs: the car controller's acknowledgement that the tests are quiet
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

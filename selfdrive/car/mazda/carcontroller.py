@@ -20,6 +20,11 @@ try:
   from openpilot.selfdrive.car.mazda import ti_ident as ti_ident_mod
 except Exception:
   ti_ident_mod = None
+try:
+  # Drive plan (ti_plan.py): sequences the A/B alternation and the tests. Optional: without it nothing here changes.
+  from openpilot.selfdrive.car.mazda import ti_plan as ti_plan_mod
+except Exception:
+  ti_plan_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -102,6 +107,10 @@ class CarController(CarControllerBase):
     # The run-all scheduler: seeded, every pick logged as a "pick" ti_ident event (ti_ident.RunAll, verify_picks)
     self.ti_run_all = (ti_ident_mod.RunAll(emit=self.ti_ident.event_for_pick)
                        if self.ti_ident is not None else None)
+    self.ti_plan_on = False            # the drive plan switch (TiPlanOn); with it on the plan's word decides whether the tests may run
+    self.ti_plan_allowed = False
+    self.ti_plan_seq = None
+    self.ti_plan_ack_key = None
     self.ti_ab_on = False              # the A/B alternation switch (TiAbOn, tmpfs, read at 10 Hz): while on, no test runs
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
@@ -212,6 +221,19 @@ class CarController(CarControllerBase):
       tests.publish(time.monotonic(), reasons, notes=notes, run_all=run_all)
       return
     tests.publish(time.monotonic(), reasons)
+
+  def publish_plan_ack(self):
+    """Tell the drive plan whether any test signal is still in progress (ti_plan.make_ack); tmpfs, on change and every 0.5 s."""
+    try:
+      ident, dither = getattr(self, "ti_ident", None), getattr(self, "ti_dither", None)
+      ack = ti_plan_mod.make_ack(self.ti_plan_seq, bool(ident is not None and ident.running), 0 if ident is None else ident.last,
+                                 0.0 if dither is None else dither.envelope, time.time())
+      key = (ack["seq"], ack["quiet"])
+      if key != self.ti_plan_ack_key or self.frame % 50 == 0:
+        self.params_memory.put("TiPlanAck", json.dumps(ack))
+        self.ti_plan_ack_key = key
+    except Exception:
+      pass
 
   def publish_ti_gate(self):
     """What closes the armed identification test's gate right now, once a second, for the Tests screen: {t, test, reason,
@@ -520,13 +542,23 @@ class CarController(CarControllerBase):
       # A/B alternation (ti_ab.py) and the tests exclude each other: the switch is tmpfs, off at every boot. An unreadable
       # switch keeps the last value read; the A/B side independently refuses to run while any test toggle is on.
       try:
-        self.ti_ab_on = bool(self.params_memory.get_bool("TiAbOn"))
+        ab_on = bool(self.params_memory.get_bool("TiAbOn"))
+        if ti_plan_mod is not None:
+          plan_on = bool(self.params_memory.get_bool("TiPlanOn"))
+          raw_plan = self.params_memory.get("TiPlan")
+          hold, allowed = ti_plan_mod.tests_gate(plan_on, raw_plan, time.time())
+          self.ti_plan_on, self.ti_plan_allowed, self.ti_plan_seq = plan_on, allowed, ti_plan_mod.plan_seq(raw_plan)
+          ab_on = hold if plan_on else (hold or ab_on)
+        self.ti_ab_on = ab_on
       except Exception:
-        pass
+        if self.ti_plan_on:                  # an unreadable plan allows no test
+          self.ti_ab_on, self.ti_plan_allowed = True, False
     if ti_ident_mod is not None:
       self.ti_ident_on = tuple(k for k in ti_ident_mod.KEYS
                                if getattr(frogpilot_toggles, ti_ident_mod.TOGGLES[k], False) is True)
       self.ti_ident_all = getattr(frogpilot_toggles, ti_ident_mod.RUN_ALL_TOGGLE, False) is True
+      if self.ti_plan_allowed:
+        self.ti_ident_all, self.ti_ident_on = True, ()    # the plan runs the tests in run-all mode, under all their own gates
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
@@ -808,6 +840,8 @@ class CarController(CarControllerBase):
         self.publish_ti_tests(CS, CC, ti_new_steer - ti_dither - ti_ident)
       if self.frame % 100 == 0:
         self.publish_ti_gate()
+      if self.frame % 10 == 0 and self.ti_plan_on and ti_plan_mod is not None:
+        self.publish_plan_ack()
 
     self.frame += 1
     Timer.tick()

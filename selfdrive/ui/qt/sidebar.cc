@@ -675,6 +675,7 @@ void TiTests::toggle(int i) {
   }
   const bool on = !views[i].requested;
   if (on) {
+    tests_params_memory.putBool("TiPlanOn", false); // the drive plan runs the tests itself: a single test ends it
     tests_params_memory.putBool("TiAbOn", false);   // one injection at a time: A/B and the tests exclude each other
     tests_params_memory.remove("TiAbPin");
   }
@@ -697,6 +698,7 @@ void TiTests::setAll(bool on) {
 // The run-all mode on, written as toggle() writes a test's settings: one injection at a time, so the single
 // identification tests go off (the dither stays as it is and, while on, holds everything else)
 void TiTests::startAll() {
+  tests_params_memory.putBool("TiPlanOn", false);
   tests_params_memory.putBool("TiAbOn", false);     // A/B and the tests exclude each other
   tests_params_memory.remove("TiAbPin");
   setAll(true);
@@ -1084,9 +1086,7 @@ void TestsWindow::refresh() {
   have_speed = sm.rcv_frame("carState") > 0;
   speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
   tests.poll(frogpilotUIState()->frogpilot_toggles);
-  if (ab_page) {
-    abPoll();
-  }
+  abPoll();                  // the plan line is on both pages
   // The queue is read when the page opens; after that only PREV / NEXT move the shown test
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     queue_pos = tests.queued();
@@ -1297,6 +1297,7 @@ const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
 const char *const TI_AB_ON_KEY = "TiAbOn";
 const char *const TI_AB_PIN_KEY = "TiAbPin";
 const char *const TI_AB_STATUS_KEY = "TiAbStatus";
+const char *const TI_PLAN_ON_KEY = "TiPlanOn";
 }  // namespace
 
 // The owner's value of setting i as the controller reads it (frogpilot_toggles); false when absent or unreadable
@@ -1366,6 +1367,7 @@ void TestsWindow::abSave() {
 // What the car side says now, and the switch and pin as they are in tmpfs
 void TestsWindow::abPoll() {
   ab_on = ab_memory.getBool(TI_AB_ON_KEY);
+  ab_plan_on = ab_memory.getBool(TI_PLAN_ON_KEY);
   const std::string pin = ab_memory.get(TI_AB_PIN_KEY);
   ab_pin = pin == "A" ? ti_ab::Pin::A : (pin == "B" ? ti_ab::Pin::B : ti_ab::Pin::None);
   ab_status = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(TI_AB_STATUS_KEY))).object();
@@ -1394,6 +1396,7 @@ QRect TestsWindow::abBox(int id) const {
     case 36: return QRect(abBox(35).right() + 1 + 16 + 200, row2, 100, 120);
     case 37: return QRect(abBox(36).right() + 1 + 40, row2, 100, 120);
     case 38: return QRect(abBox(37).right() + 1 + 16 + 200, row2, 100, 120);
+    case 39: return QRect(1250, row2 + 160, 640, 110);
   }
   return QRect();
 }
@@ -1402,7 +1405,7 @@ int TestsWindow::abControlAt(const QPoint &pos) const {
   if (runAllRect().contains(pos)) {
     return 9;
   }
-  for (int id = 30; id <= 38; id++) {
+  for (int id = 30; id <= 39; id++) {
     if (abBox(id).contains(pos)) {
       return id;
     }
@@ -1411,6 +1414,7 @@ int TestsWindow::abControlAt(const QPoint &pos) const {
 }
 
 void TestsWindow::abSetOn(bool on) {
+  ab_memory.putBool(TI_PLAN_ON_KEY, false);   // the plain A/B switch and the drive plan exclude each other
   if (on) {
     tests.allOff();                          // one injection at a time: the tests go off before A/B starts
     abSave();
@@ -1432,6 +1436,16 @@ void TestsWindow::abAct(int control) {
     ab_page = false;
   } else if (control == 2 || control == 30) {   // A/B OFF (the red box), or the on/off box
     abSetOn(control == 30 && !ab_on);
+  } else if (control == 39) {                    // the drive plan: A/B until complete or out of its speeds, then the tests
+    if (ab_plan_on) {
+      ab_memory.putBool(TI_PLAN_ON_KEY, false);
+    } else {
+      tests.allOff();                            // the single tests off first; the plan runs the tests itself
+      abSave();
+      ab_memory.putBool(TI_AB_ON_KEY, false);
+      ab_memory.remove(TI_AB_PIN_KEY);
+      ab_memory.putBool(TI_PLAN_ON_KEY, true);
+    }
   } else if (control == 31 || control == 32) {
     if (ab_on) {                                // a pin means nothing while A/B is off
       const ti_ab::Pin next = ti_ab::tapPin(ab_pin, control == 31 ? ti_ab::Pin::A : ti_ab::Pin::B);
@@ -1464,6 +1478,19 @@ void TestsWindow::abAct(int control) {
 
 static QString abValueText(const ti_ab::Setting &s, double v) {
   return s.is_bool ? (v != 0.0 ? QString("ON") : QString("OFF")) : QString::number(v, 'f', 2);
+}
+
+// One line at the bottom of both pages: what the drive plan runs now, what is next, the alternation's minutes against target
+void TestsWindow::drawPlanLine(QPainter &p) {
+  const QJsonObject plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
+  const QString mode = (ab_plan_on && !plan.isEmpty()) ? plan.value("mode").toString() : QString("off");
+  const QJsonObject scored = ab_status.value("scored").toObject();
+  const std::string line = ti_ab::planLine(mode.toStdString().c_str(), scored.value("A").toDouble(), scored.value("B").toDouble(),
+                                           plan.value("target_min").toDouble(ti_ab::PLAN_TARGET_MIN_DEFAULT),
+                                           ab_status.value("complete").toBool());
+  p.setPen(QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(34));
+  p.drawText(QRect(30, height() - 84, width() - 580, 64), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(line));
 }
 
 // Draws the A/B page below the shared header; returns the banner line
@@ -1536,7 +1563,7 @@ QString TestsWindow::drawAb(QPainter &p) {
   }
 
   // the configuration: only while A/B is off
-  const bool edit = ti_ab::canEdit(ab_on);
+  const bool edit = ti_ab::canEdit(ab_on || ab_plan_on);
   const QColor box = edit ? grey : dim_fill;
   const QColor ink = edit ? white : dim_ink;
   drawBox(p, abBox(33), box, ink, QString("<"), 56);
@@ -1555,6 +1582,9 @@ QString TestsWindow::drawAb(QPainter &p) {
              QString("B\n") + abValueText(s, ab_b));
   p.drawText(QRect(abBox(37).right() + 8, abBox(37).top(), abBox(38).left() - abBox(37).right() - 16, 120), Qt::AlignCenter,
              QString("Block\n%1 min").arg((int)ab_block_min));
+
+  drawBox(p, abBox(39), ab_plan_on ? QColor(0x17, 0x86, 0x44) : QColor(0x46, 0x5B, 0xEA), white,
+          ab_plan_on ? QString("DRIVE PLAN ON\ntap to stop") : QString("DRIVE PLAN\nA/B, then the tests"), 40);
 
   // engaged minutes per side and per speed window (the wash-in after each switch is not counted)
   const int table_top = abBox(33).bottom() + 40;
@@ -1988,6 +2018,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
             engaged ? QString("● ENGAGED") : st == STATUS_OVERRIDE ? QString("OVERRIDE") : QString("○ NOT ENGAGED"), 40);
   }
 
+  drawPlanLine(p);
   const int n = tests.queueSize();
   const int n_defs = (int)tests.defs.size();
   QString banner;

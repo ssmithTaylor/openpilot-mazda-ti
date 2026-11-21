@@ -61,3 +61,11 @@ def test_the_header_compiles_and_its_own_tests_pass():
              f'/Fo:"{os.path.join(d, "t.obj")}" >nul && "{exe}"')
       run = subprocess.run('cmd /s /c "' + cmd + '"', shell=True, capture_output=True, text=True)
     assert run.stdout.strip().endswith("ok"), run.stdout + run.stderr
+
+
+def test_the_header_mirrors_the_drive_plan_constants():
+  from openpilot.selfdrive.car.mazda import ti_plan as tp
+  for name, value in (("PLAN_TARGET_MIN_DEFAULT", tp.TARGET_MIN_PER_SIDE), ("PLAN_ALT_MIN_MPH", tp.PLAN_ALT_MIN_MPH),
+                      ("PLAN_ALT_MAX_MPH", tp.PLAN_ALT_MAX_MPH)):
+    assert float(re.search(rf"constexpr double {name} = ([\d.]+);", HEADER).group(1)) == value
+  assert "35-56 mph" in HEADER

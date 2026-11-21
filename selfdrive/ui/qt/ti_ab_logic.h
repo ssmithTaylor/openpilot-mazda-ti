@@ -8,7 +8,9 @@
 //   - the texts for the reasons a switch waits (ti_ab.MESSAGE) and the states
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace ti_ab {
 
@@ -143,6 +145,37 @@ inline const char *reasonText(const char *name) {
     }
   }
   return "waiting";
+}
+
+// The drive plan's line, on both pages (selfdrive/car/mazda/ti_plan.py): what the plan is running now, what is next, and the
+// alternation's scored minutes per side against its target. mode: off, hold, ab, tests, dead.
+constexpr double PLAN_TARGET_MIN_DEFAULT = 20.0;
+constexpr double PLAN_ALT_MIN_MPH = 35.0;
+constexpr double PLAN_ALT_MAX_MPH = 56.0;
+
+inline std::string planLine(const char *mode, double a_s, double b_s, double target_min, bool complete) {
+  char buf[220];
+  const char *now = "off";
+  const char *next = "";
+  if (std::strcmp(mode, "ab") == 0) {
+    now = "A/B alternation";
+    next = "tests when the speed leaves 35-56 mph or A/B completes";
+  } else if (std::strcmp(mode, "tests") == 0) {
+    now = "identification tests";
+    next = complete ? "tests only: A/B is complete" : "A/B when it is set up and the speed is 35-56 mph";
+  } else if (std::strcmp(mode, "hold") == 0) {
+    now = "handing over";
+    next = "waiting for a quiet moment";
+  } else if (std::strcmp(mode, "dead") == 0) {
+    now = "stopped after an error";
+    next = "nothing runs";
+  }
+  if (std::strcmp(mode, "off") == 0) {
+    return std::string("Drive plan off");
+  }
+  std::snprintf(buf, sizeof(buf), "PLAN: %s | next: %s | A %.1f / B %.1f of %.0f min%s", now, next, a_s / 60.0, b_s / 60.0, target_min,
+                complete ? " COMPLETE" : "");
+  return std::string(buf);
 }
 
 inline bool statusFresh(double now, double t) {

@@ -754,7 +754,7 @@ def test_the_runner_never_writes_the_owners_param_and_publishes_a_status():
   for _ in range(FRAMES(40.0)):
     rn.step(toggles(), **INPUTS)
   assert set(params.d) == {"TiAbConfig"}                                # nothing written to the persistent store
-  assert set(mem.d) <= {"TiAbOn", "TiAbStatus"}
+  assert set(mem.d) <= {"TiAbOn", "TiAbStatus", "TiPlan"}
   st = json.loads(mem.d["TiAbStatus"])
   assert st["setting"] == "SteerKP" and st["a"] == 0.8 and st["b"] == 0.9 and st["state"] == "running"
 
@@ -1000,7 +1000,9 @@ def _apply_ti_tuning():
   src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
   cls = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "CarController")
   fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "apply_ti_tuning")
-  env = {"ti_ident_mod": ti}
+  from openpilot.selfdrive.car.mazda import ti_plan as tp
+  import time as _time
+  env = {"ti_ident_mod": ti, "ti_plan_mod": tp, "time": _time}
   exec(compile(ast.Module(body=[fn], type_ignores=[]), "apply_ti_tuning", "exec"), env)
   return env["apply_ti_tuning"]
 
@@ -1009,7 +1011,8 @@ def test_the_car_controller_reads_the_switch_at_10_hz_keeps_the_last_value_on_an
   apply = _apply_ti_tuning()
   mem = Mem(TiAbOn=False)
   h = NS(ccp=NS(TI_STEER_DELTA_UP=6, TI_STEER_DELTA_UP_HIGH=6), _ti_limit=lambda *a: 6, frame=0, params_memory=mem,
-         ti_steer_threshold=None, ti_dither_enabled=False, ti_ident_on=(), ti_ident_all=False, ti_ab_on=False)
+         ti_steer_threshold=None, ti_dither_enabled=False, ti_ident_on=(), ti_ident_all=False, ti_ab_on=False,
+         ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None)
   t = toggles()
   apply(h, t)
   assert h.ti_ab_on is False
@@ -1065,7 +1068,7 @@ def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it
   assert 'TI_AB_ON_KEY = "TiAbOn"' in ui and 'TI_AB_PIN_KEY = "TiAbPin"' in ui and 'TI_AB_CONFIG_KEY = "TiAbConfig"' in ui
   # the page writes no tuning setting: its only writes are the three keys
   writes = set(__import__("re").findall(r"ab_(?:memory|params)\.(?:put|putBool|remove)\((\w+)", ui))
-  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY"}, writes
+  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY", "TI_PLAN_ON_KEY"}, writes
   # the lock is the Tests page's own (the A/B page is a page of the same window)
   assert "class TestsWindow" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
   assert "bool abStoredValue" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")

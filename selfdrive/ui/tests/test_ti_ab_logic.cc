@@ -79,7 +79,20 @@ static void texts() {
   CHECK(!statusFresh(NAN, 1.0) && !statusFresh(1.0, NAN));
 }
 
+static void plan() {
+  const std::string a = planLine("ab", 150.0, 90.0, 20.0, false);
+  CHECK(a.find("A/B alternation") != std::string::npos && a.find("A 2.5 / B 1.5 of 20 min") != std::string::npos);
+  CHECK(a.find("next: tests") != std::string::npos && a.find("COMPLETE") == std::string::npos);
+  const std::string t = planLine("tests", 1200.0, 1200.0, 20.0, true);
+  CHECK(t.find("identification tests") != std::string::npos && t.find("COMPLETE") != std::string::npos && t.find("A/B is complete") != std::string::npos);
+  CHECK(planLine("hold", 0, 0, 20.0, false).find("handing over") != std::string::npos);
+  CHECK(planLine("dead", 0, 0, 20.0, false).find("stopped after an error") != std::string::npos);
+  CHECK(planLine("off", 0, 0, 20.0, false) == "Drive plan off");
+  CHECK(PLAN_TARGET_MIN_DEFAULT == 20.0 && PLAN_ALT_MIN_MPH == 35.0 && PLAN_ALT_MAX_MPH == 56.0);
+}
+
 int main() {
+  plan();
   table();
   steps();
   blocks();

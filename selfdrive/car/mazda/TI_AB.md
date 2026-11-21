@@ -57,3 +57,18 @@ marked wash-in. The value in force is `A + s (B - A)` (a boolean: weight `(1-s)A
 and the sample is not wash-in; everything else (ramping, `wash_in`) is excluded. Also exclude samples where lateral control was not active
 (the module is at A then). SteerKP reaches the PID one control cycle after `s`. `verify_schedule(events)` recomputes every block's arm from the seed.
 Samples marked `gap` in `hb.progress` are driven between the four speed windows (21-27, 35-41, 49-56, 64-80 mph; only 35-70 mph is driven by this mode): used for scoring but not counted for coverage.
+
+## Drive plan (ti_plan.py)
+
+`TiPlanOn` (tmpfs, off at every boot, set by the page's DRIVE PLAN box) sequences the alternation and the tests; with it off nothing here acts.
+The alternation runs where it is configured, incomplete and the speed is 35-56 mph (`PLAN_ALT_MAX_MPH`, 56 because replay evidence covers 35-56 mph only;
+a mile of hysteresis, and `MIN_DWELL_S` = 10 s between speed-driven changes); everywhere else, and everywhere once it is complete, the tests run in run-all
+mode under all their own gates. Complete = `TARGET_MIN_PER_SIDE` (20) scored minutes on each side, counted at the end of each non-voided block from
+scored (non-wash-in, not ramping, not pinned; for LatCommitSetpoint only in bends) time. On completion: `complete` event, the value returns to A by its
+ramp and stays A for the rest of the drive (`state` "complete", notice on the page), the tests take over.
+
+`plan` events (`mode` off/hold/ab/tests, `why`, `seq`): alternation time is `mode == "ab"` after the `ab_allowed` start (the first `block_start`), test
+time is `mode == "tests"`; `hold` is a hand-over in which neither runs. tmpfs: `TiPlan` {seq, mode, t} from controls (0.5 s heartbeat; stale after 3 s
+allows no test), `TiPlanAck` {seq, quiet, t} from the car controller. tests -> A/B: A/B may start only after an acknowledgement of the current seq has been
+quiet for 1 s (no test signal, fade included) and then only through the usual straight-road gate; A/B -> tests: the plan holds, the blend returns to
+A and has been A for its wash-in, then it publishes "tests". An error in the plan ("dead") holds both for the process and the tests stay held.
