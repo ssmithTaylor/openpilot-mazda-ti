@@ -47,7 +47,7 @@ class Progress:
     self.have = {}
 
   def remaining(self, key, band, step):
-    return ti.STEP_SECONDS[key] - self.have.get((key, band, step), 0.0)
+    return ti.required_seconds(key, band, step) - self.have.get((key, band, step), 0.0)
 
   def add(self, credit):
     if credit is not None:
@@ -56,6 +56,15 @@ class Progress:
 
   def band_done(self, key, band):
     return all(self.remaining(key, band, s) <= 1e-6 for s in range(ti.steps_in_band(key, band)))
+
+
+def complete(prog, key, band, steps=None):
+  for s_ in (steps if steps is not None else range(ti.steps_in_band(key, band))):
+    prog.have[(key, band, s_)] = ti.required_seconds(key, band, s_)
+
+
+def first_required(key, band):
+  return next(s_ for s_ in range(ti.steps_in_band(key, band)) if ti.required_seconds(key, band, s_) > 0)
 
 
 def drive(g, key, band, n, frame0=0, prog=None, **over):
@@ -72,7 +81,9 @@ def band_frames(key, band):
   total = SETTLE + 2
   for s in range(ti.steps_in_band(key, band)):
     _, _, n, lead = ti.step_params(key, s)
-    total += lead + n * ti.units_per_step(key, s) + ti.fade_frames(key, s) + 2
+    need = ti.required_seconds(key, band, s)
+    if need > 0:
+      total += lead + n * math.ceil(need / (n * ti.DT) - 1e-9) + ti.fade_frames(key, s) + 2
   return total
 
 
@@ -131,15 +142,26 @@ def test_amplitudes_and_their_classes():
   assert [ti.small(ti.PULSES, s) for s in range(2)] == [True, False]
 
 
-def test_capture_time_per_band():
-  per_band = {k: {b[2]: ti.steps_in_band(k, b[2]) * ti.STEP_SECONDS[k] for b in ti.BANDS} for k in ti.KEYS}
-  assert per_band[ti.SWEEP] == {"19-28": 140, "31-45": 140, "45-60": 140, "60-80": 140}
-  assert per_band[ti.LADDER] == {"19-28": 50, "31-45": 40, "45-60": 40, "60-80": 40}
-  assert per_band[ti.PULSES] == {"19-28": 80, "31-45": 80, "45-60": 80, "60-80": 80}
-  for k in ti.KEYS:      # a step's units add up to about its nominal time
-    for s in range(ti.n_steps(k)):
-      n = ti.step_params(k, s)[2]
-      assert abs(n * ti.DT * ti.units_per_step(k, s) - ti.STEP_SECONDS[k]) <= 0.5 * n * ti.DT + 1e-9
+def test_capture_time_per_band_follows_what_each_step_needs():
+  per_band = {k: {b[2]: round(ti.band_required(k, b[2]), 2) for b in ti.BANDS} for k in ti.KEYS}
+  assert per_band[ti.SWEEP] == {"19-28": 190.5, "31-45": 67.26, "45-60": 56.68, "60-80": 40.92}
+  assert per_band[ti.LADDER] == {"19-28": 60.0, "31-45": 100.0, "45-60": 85.0, "60-80": 75.0}
+  assert per_band[ti.PULSES] == {"19-28": 54.0, "31-45": 80.0, "45-60": 72.0, "60-80": 74.0}
+  for b in ti.BANDS:
+    assert sum(ti.band_required(k, b[2]) for k in ti.KEYS) <= 6 * 60        # no band needs an inordinate time
+    for k in ti.KEYS:
+      assert len(ti.REQUIRED_S[b[2]][k]) == ti.steps_in_band(k, b[2])
+      for s in range(ti.steps_in_band(k, b[2])):
+        need = ti.required_seconds(k, b[2], s)
+        n = ti.step_params(k, s)[2] * ti.DT
+        assert 0 <= need <= ti.STEP_CAP_S
+        assert abs(need / n - round(need / n)) < 1e-6                    # whole units
+  # the optional (extra only) steps: the 0.3 Hz tone, the ladder's two smallest steps, and below 28 mph the 22- and
+  # 37-count ladder steps and the small pulse
+  for b in ti.BANDS:
+    assert ti.required_seconds(ti.SWEEP, b[2], 0) == 0
+    assert ti.required_seconds(ti.LADDER, b[2], 0) == ti.required_seconds(ti.LADDER, b[2], 1) == 0
+  assert ti.required_seconds(ti.PULSES, "19-28", 0) == 0 and ti.required_seconds(ti.LADDER, "19-28", 3) == 0
 
 
 def test_shipped_definitions_match_the_generator():
@@ -148,16 +170,20 @@ def test_shipped_definitions_match_the_generator():
   by_key = {t.settings[0][0]: t for t in tests}
   for k in ti.KEYS:
     t = by_key[k]
-    assert t.metric == "step_seconds" and t.at_ignition_off and t.target_seconds == ti.STEP_SECONDS[k]
+    assert t.metric == "step_seconds" and t.at_ignition_off and t.target_seconds == ti.STEP_CAP_S
+    assert t.needs == tuple(ti.REQUIRED_S[b[2]][k] for b in ti.BANDS)
     assert [b[2] for b in t.bins] == [b[2] for b in ti.BANDS]
     assert t.steps == tuple(ti.steps_in_band(k, b[2]) for b in ti.BANDS)
   doc = json.loads(tt.DEFINITIONS_PATH.read_text(encoding='utf-8'))
   bad = doc["tests"][2]
   bad["progress"]["steps"] = [7, 7, 7, 7]
   t, why = tt.validate_test(bad)
-  assert t is None and "steps must be" in why
+  assert t is None and ("steps must be" in why or "needs must" in why)
   bad["progress"]["steps"] = [5, 4, 4]
   assert tt.validate_test(bad)[1] == "steps must list one count per bin"
+  bad["progress"]["steps"] = [5, 4, 4, 4]
+  bad["progress"]["needs"][1][2] = 30.0
+  assert "needs must be" in tt.validate_test(bad)[1]                     # the needs must be the code's
   good = doc["tests"][1]
   for change, text in ((dict(target_seconds=30), "target_seconds must be"), (dict(metric="engaged_seconds"),
                        "steps go with step_seconds")):
@@ -250,8 +276,7 @@ def _running(key=ti.SWEEP, band="31-45", prog=None, step_to=None):
   g = TiIdent()
   prog = prog if prog is not None else Progress()
   if step_to is not None:                                  # earlier steps already complete
-    for s in range(step_to):
-      prog.have[(key, band, s)] = ti.STEP_SECONDS[key]
+    complete(prog, key, band, range(step_to))
   drive(g, key, band, SETTLE + 150, prog=prog)
   assert g.running and g.env == 1.0 and g.reason == "ok"
   return g, SETTLE + 150, prog
@@ -313,9 +338,10 @@ def test_small_steps_keep_running_where_only_the_strict_limits_close(key, step, 
 
 
 def test_rate_room_is_judged_on_the_steps_own_slew():
-  g, k, prog = _running()                                 # 0.3 Hz, 12 counts: slew ~0.3 count/frame
-  assert ti.STEP_SLEW[(ti.SWEEP, 0)] < 1.0
-  assert g.update(ti.SWEEP, k, **quiet(room=2), remaining=prog.remaining) != 0 or g.running
+  g, k, prog = _running()                                 # 0.6 Hz, 22 counts: slew ~1.6 counts/frame
+  room = math.ceil(ti.RATE_ROOM_FACTOR * ti.STEP_SLEW[(ti.SWEEP, g.step)])
+  assert room < 5
+  assert g.update(ti.SWEEP, k, **quiet(room=room), remaining=prog.remaining) != 0 or g.running
   assert g.reason == "ok"
   g, k, prog = _running(step_to=6)                        # 5 Hz, 9 counts: slew ~2.9
   assert g.update(ti.SWEEP, k, **quiet(room=5), remaining=prog.remaining) == 0 and not g.running
@@ -338,14 +364,15 @@ def test_a_band_completes_with_no_dead_time_and_keeps_collecting_extra():
     longest = max(longest, quiet_run)
   assert longest < 40                                     # it keeps moving: no dead time beyond the fades
   assert g.reason == "extra" and g.running and any(out[-500:])
-  extra = {s: prog.have[(ti.SWEEP, "31-45", s)] - 20.0 for s in range(7)}
+  extra = {s: prog.have.get((ti.SWEEP, "31-45", s), 0.0) - ti.required_seconds(ti.SWEEP, "31-45", s)
+           for s in range(7)}
   assert sum(extra.values()) > 0                           # extra is counted
 
 
 def test_extra_goes_to_the_least_collected_step_first():
   prog = Progress()
   for s in range(4):
-    prog.have[(ti.LADDER, "31-45", s)] = 10.0 + (5.0 if s != 2 else 0.0)
+    prog.have[(ti.LADDER, "31-45", s)] = ti.required_seconds(ti.LADDER, "31-45", s) + (5.0 if s != 2 else 0.0)
   g = TiIdent()
   drive(g, ti.LADDER, "31-45", SETTLE + 5, prog=prog)
   assert g.running and g.step == 2 and g.extra
@@ -353,18 +380,19 @@ def test_extra_goes_to_the_least_collected_step_first():
 
 def test_a_pause_loses_only_the_unit_in_progress_and_the_step_resumes():
   g = TiIdent()
-  n = ti.step_params(ti.SWEEP, 0)[2]
+  s0 = first_required(ti.SWEEP, "31-45")
+  n = ti.step_params(ti.SWEEP, s0)[2]
   lead = ti.SWEEP_LEAD_IN
   _, prog = drive(g, ti.SWEEP, "31-45", SETTLE + lead + n + n // 2)   # one unit done, half of the next
-  assert prog.have == {(ti.SWEEP, "31-45", 0): ti.unit_credit(ti.SWEEP, 0)}
+  assert prog.have == {(ti.SWEEP, "31-45", s0): ti.unit_credit(ti.SWEEP, s0)}
   for i in range(30):
     g.update(ti.SWEEP, 5000 + i, **quiet(blinker=True), remaining=prog.remaining)
   assert not g.running
   out, _ = drive(g, ti.SWEEP, "31-45", int(ti.BLINKER_HOLDOFF_S / ti.DT) + lead + n + 10, frame0=6000, prog=prog)
-  assert prog.have[(ti.SWEEP, "31-45", 0)] == pytest.approx(2 * ti.unit_credit(ti.SWEEP, 0))   # kept, then one more
+  assert prog.have[(ti.SWEEP, "31-45", s0)] == pytest.approx(2 * ti.unit_credit(ti.SWEEP, s0))   # kept, one more
   first = next(i for i, v in enumerate(out) if v != 0)
   assert first <= int(ti.BLINKER_HOLDOFF_S / ti.DT) + 20
-  assert g.step == 0                                       # the same step resumed
+  assert g.step == s0                                      # the same step resumed
 
 
 def test_a_step_counts_in_whatever_band_the_car_is_in():
@@ -378,8 +406,9 @@ def test_a_step_counts_in_whatever_band_the_car_is_in():
 def test_a_band_change_mid_unit_is_not_credited():
   g = TiIdent()
   _, prog = drive(g, ti.SWEEP, "45-60", SETTLE + 50 + 300)
-  drive(g, ti.SWEEP, "60-80", ti.step_params(ti.SWEEP, 0)[2] - 300, frame0=1000, prog=prog)
-  assert (ti.SWEEP, "45-60", 0) not in prog.have and (ti.SWEEP, "60-80", 0) not in prog.have
+  s0 = first_required(ti.SWEEP, "45-60")
+  drive(g, ti.SWEEP, "60-80", ti.step_params(ti.SWEEP, s0)[2] - 300, frame0=1000, prog=prog)
+  assert (ti.SWEEP, "45-60", s0) not in prog.have and (ti.SWEEP, "60-80", s0) not in prog.have
 
 
 def test_the_ladder_runs_only_the_steps_under_the_bands_cap():
@@ -417,16 +446,13 @@ def test_schedule_order_stickiness_band_change_and_extra():
   assert ti.schedule(ti.PULSES, "31-45", "31-45", r) == ti.PULSES      # stays on an incomplete test
   assert ti.schedule(ti.PULSES, "19-28", "31-45", r) == ti.SWEEP       # band change: the first incomplete one
   assert ti.schedule(ti.SWEEP, "31-45", None, r) == ti.SWEEP           # no band: keep
-  for s in range(7):
-    prog.have[(ti.SWEEP, "31-45", s)] = 20.0
+  complete(prog, ti.SWEEP, "31-45")
   assert ti.schedule(ti.SWEEP, "31-45", "31-45", r) == ti.PULSES       # complete: the next in order
-  for s in range(2):
-    prog.have[(ti.PULSES, "31-45", s)] = 40.0
-  for s in range(4):
-    prog.have[(ti.LADDER, "31-45", s)] = 10.0
+  complete(prog, ti.PULSES, "31-45")
+  complete(prog, ti.LADDER, "31-45")
   # all complete: extra, least collected first, with hysteresis
   assert ti.schedule(ti.LADDER, "31-45", "31-45", r) == ti.LADDER
-  prog.have[(ti.LADDER, "31-45", 0)] = 10.0 + 0.3 * 40
+  prog.have[(ti.LADDER, "31-45", 2)] += 0.3 * ti.band_required(ti.LADDER, "31-45")
   assert ti.schedule(ti.LADDER, "31-45", "31-45", r) == ti.SWEEP
   assert ti.schedule(None, None, "31-45", lambda k, b, s: None) is None
 
@@ -495,10 +521,9 @@ def _random_rows(seed, n):
 def test_run_all_over_a_random_drive_is_one_signal_at_a_time_and_exactly_reconstructed(seed):
   rows = _random_rows(seed, 60000)
   prog = Progress()                                        # some tests already complete in some bands
-  for s_ in range(7):
-    prog.have[(ti.SWEEP, "31-45", s_)] = prog.have[(ti.SWEEP, "45-60", s_)] = 20.0
-  for s_ in range(2):
-    prog.have[(ti.PULSES, "45-60", s_)] = 40.0
+  complete(prog, ti.SWEEP, "31-45")
+  complete(prog, ti.SWEEP, "45-60")
+  complete(prog, ti.PULSES, "45-60")
   g, out, keys, logged, prog = _run_all(len(rows), rows=rows, prog=prog)
   assert len({k_ for k_ in keys if k_}) >= 2 and sum(1 for v in out if v) > 5000
   assert ti.reconstruct(logged, len(out)) == out
@@ -586,19 +611,19 @@ def test_progress_per_band_and_step_completion_extra_persistence_and_reset():
   acc.publish(1e6, {ti.LADDER: g.reason}, wall=1e9)
   doc = json.loads(mem.store[tt.PROGRESS_KEY])
   entry = doc["ti_ladder"]["31-45"]
-  assert all(entry[str(s)] >= 10.0 for s in range(4)) and sum(entry.values()) > 40.0     # extra counted
+  assert entry["2"] >= 60.0 and entry["3"] >= 40.0 and sum(entry.values()) > 100.0      # extra counted
   assert doc["_live"]["status"]["ti_ladder"] == tt.REASON_TEXT["extra"]
   assert all(acc.remaining(ti.LADDER, "31-45", s) <= 0 for s in range(4))
-  assert acc.remaining(ti.LADDER, "19-28", 0) == 10.0
+  assert acc.remaining(ti.LADDER, "19-28", 4) == 60.0 and acc.remaining(ti.LADDER, "19-28", 0) == 0.0
   # a reboot: the flash copy carries it
   acc.publish(1e6 + 100, {}, wall=1e9)
   acc2 = tt.TestAccountant(acc.tests, params, FakeParams())
-  assert acc2.remaining(ti.LADDER, "31-45", 3) <= 0 and acc2.remaining(ti.LADDER, "45-60", 0) == 10.0
+  assert acc2.remaining(ti.LADDER, "31-45", 3) <= 0 and acc2.remaining(ti.LADDER, "45-60", 2) == 60.0
   # reset (what the UI writes)
   acc2.params_memory.store[tt.PROGRESS_KEY] = json.dumps({tt.RESET_KEY: {"ti_ladder": 7}})
   acc2.update(TOGGLES, v_for("31-45"), True, ())          # the test is on, so the next publish runs
   acc2.publish(2e6, {}, wall=1e9)
-  assert acc2.remaining(ti.LADDER, "31-45", 0) == 10.0
+  assert acc2.remaining(ti.LADDER, "31-45", 2) == 60.0
   # a broken accountant: unknown progress, so nothing runs
   acc2.failed = True
   assert acc2.remaining(ti.LADDER, "31-45", 0) is None
@@ -743,8 +768,7 @@ def test_the_dither_and_a_test_never_run_together():
 def test_armed_tests_stay_inside_the_limits_and_are_recoverable_from_logged_fields(kw, seed):
   h = host(**kw)
   if kw.get('run_all'):                                    # sweep already complete at 31-45 mph: the scheduler moves on
-    for s_ in range(7):
-      h.ti_tests.prog.have[(ti.SWEEP, "31-45", s_)] = 20.0
+    complete(h.ti_tests.prog, ti.SWEEP, "31-45")
   saw, keys = 0, set()
   for row in _rows(seed, M.frames(240)):
     prev, shadow = h.ti_apply_steer_last, h.ti_reported_last

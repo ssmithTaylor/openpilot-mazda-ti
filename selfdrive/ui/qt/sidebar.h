@@ -25,7 +25,8 @@ struct TiTestBin {
   double high = 0;
   QString label;
   bool required = false;
-  int steps = 0;                               // step_seconds: steps in this bin, each needs target_seconds; else 0
+  int steps = 0;                               // step_seconds: steps run in this bin; else 0
+  std::vector<double> needs;                   // step_seconds: seconds each step needs (0: optional, extra only)
 };
 
 struct TiTestDef {

@@ -73,7 +73,7 @@ const QStringList TI_TEST_FILE_KEYS = {"version", "tests"};
 const QStringList TI_TEST_TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"};
 const QStringList TI_TEST_TEST_REQUIRED = {"id", "title", "description", "settings", "progress"};
 const QStringList TI_TEST_SETTING_KEYS = {"key", "on"};
-const QStringList TI_TEST_PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps"};
+const QStringList TI_TEST_PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps", "needs"};
 const QStringList TI_TEST_PROGRESS_REQUIRED = {"metric", "target_seconds"};
 const QStringList TI_TEST_AUTO_OFF_KEYS = {"at_ignition_off"};
 const QStringList TI_TEST_ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"};
@@ -165,8 +165,9 @@ QString tiTestSettings(const QJsonValue &raw, Params &params, std::vector<QPair<
   return out.empty() ? count : QString();
 }
 
-// `steps` (step_seconds only; undefined otherwise): one count per bin, in the order the bins are written
-QString tiTestBins(const QJsonValue &raw, const QJsonValue &steps, std::vector<TiTestBin> &out) {
+// `steps` and `needs` (step_seconds only; undefined otherwise): per bin, in the order the bins are written, the
+// count of steps and the seconds each step needs (0: optional, collected only as extra)
+QString tiTestBins(const QJsonValue &raw, const QJsonValue &steps, const QJsonValue &needs, std::vector<TiTestBin> &out) {
   out.clear();
   const QString count = QString("bins must list 1-%1 bins").arg(TI_TEST_MAX_BINS);
   if (!raw.isArray()) {
@@ -217,6 +218,23 @@ QString tiTestBins(const QJsonValue &raw, const QJsonValue &steps, std::vector<T
         return QString("steps must be whole numbers 1-%1").arg(TI_TEST_MAX_STEPS);
       }
       out[k].steps = int(n);
+    }
+    const QJsonArray per_bin = needs.toArray();
+    if (!needs.isArray() || per_bin.size() != (int)out.size()) {
+      return QString("needs must list each bin's seconds per step");
+    }
+    for (int k = 0; k < per_bin.size(); k++) {
+      const QJsonArray secs = per_bin.at(k).toArray();
+      if (!per_bin.at(k).isArray() || secs.size() != out[k].steps) {
+        return QString("needs must list each bin's seconds per step");
+      }
+      out[k].needs.clear();
+      for (const QJsonValue &x : secs) {
+        if (!x.isDouble() || !(x.toDouble() >= 0 && x.toDouble() <= TI_TEST_MAX_TARGET_S)) {
+          return QString("needs must list each bin's seconds per step");
+        }
+        out[k].needs.push_back(x.toDouble());
+      }
     }
   }
   std::sort(out.begin(), out.end(), [](const TiTestBin &x, const TiTestBin &y) { return x.low < y.low; });
@@ -321,17 +339,17 @@ QString tiTestValidate(const QJsonValue &raw, Params &params, TiTestDef &def) {
   if (p.contains("bins") != p.contains("bin_by")) {
     return QString("bins and bin_by go together");
   }
-  if (p.contains("steps") && def.metric != "step_seconds") {
+  if ((p.contains("steps") || p.contains("needs")) && def.metric != "step_seconds") {
     return QString("steps go with step_seconds");
   }
-  if (def.metric == "step_seconds" && !(p.contains("bins") && p.contains("steps"))) {
-    return QString("step_seconds needs bins and steps");
+  if (def.metric == "step_seconds" && !(p.contains("bins") && p.contains("steps") && p.contains("needs"))) {
+    return QString("step_seconds needs bins, steps and needs");
   }
   if (p.contains("bins")) {
     if (!TI_TEST_BIN_BY.contains(p.value("bin_by").toString())) {
       return QString("unknown bin_by");
     }
-    why = tiTestBins(p.value("bins"), p.value("steps"), def.bins);
+    why = tiTestBins(p.value("bins"), p.value("steps"), p.value("needs"), def.bins);
     if (!why.isEmpty()) {
       return why;
     }
@@ -577,7 +595,7 @@ void TiTests::poll(const QJsonObject &toggles) {
         view.seconds.insert(key, entry.value(key).toDouble());
       }
     }
-    // A step_seconds bin is {step index: seconds}; it counts its steps 0..steps-1, each up to target_seconds
+    // A step_seconds bin is {step index: seconds}; it counts its steps 0..steps-1, each up to what it needs
     view.step_seconds.clear();
     view.step_extra.clear();
     if (def.metric == "step_seconds") {
@@ -587,9 +605,10 @@ void TiTests::poll(const QJsonObject &toggles) {
         double extra = 0;
         for (int k = 0; k < bin.steps; k++) {
           const QJsonValue v = steps.value(QString::number(k));
+          const double step_need = k < (int)bin.needs.size() ? bin.needs[k] : def.target;
           if (v.isDouble()) {
-            sum += std::min(v.toDouble(), def.target);
-            extra += std::max(0.0, v.toDouble() - def.target);
+            sum += std::min(v.toDouble(), step_need);
+            extra += std::max(0.0, v.toDouble() - step_need);
           }
         }
         view.step_seconds.insert(bin.label, sum);
@@ -780,7 +799,7 @@ bool TiTests::done(int i) const {
   return true;
 }
 
-// Seconds a bin has (step_seconds: its steps' clipped sum) and needs (step_seconds: steps x target_seconds)
+// Seconds a bin has (step_seconds: its steps' clipped sum) and needs (step_seconds: the sum of its steps' needs)
 double TiTests::have(int i, const TiTestBin &bin) const {
   if (i < 0 || i >= (int)defs.size() || i >= (int)views.size()) {
     return 0.0;
@@ -789,6 +808,13 @@ double TiTests::have(int i, const TiTestBin &bin) const {
 }
 
 double TiTests::need(const TiTestDef &def, const TiTestBin &bin) {
+  if (!bin.needs.empty()) {
+    double sum = 0;
+    for (double x : bin.needs) {
+      sum += x;
+    }
+    return sum;
+  }
   return bin.steps > 0 ? bin.steps * def.target : def.target;
 }
 

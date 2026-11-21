@@ -58,7 +58,7 @@ from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_
                                                      MAX_BASE_FRACTION, MAX_LAT_DEMAND_MPS2, RATE_ROOM_FACTOR,
                                                      TOUCH_CONFIRM_FRAMES)
 
-VERSION = 3
+VERSION = 4
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
@@ -104,9 +104,9 @@ UNIT_MIN_PERIODS = 2
 UNIT_MIN_S = 2.0
 
 # Sweep: one tone per step, (period in frames, even; peak TI counts): 0.30, 0.60, 1.0, 1.6, 2.4, 3.6 and 5.0 Hz.
-# Amplitudes in the dither's class (its preset 1 peaks at 22 counts, 12 at its 1.1 Hz tone); the high tones are
-# reduced so the slew stays under MAX_SLEW.
-SWEEP_TONES = ((334, 12.0), (166, 12.0), (100, 16.0), (62, 16.0), (42, 16.0), (28, 12.0), (20, 9.0))
+# Amplitudes at the dither's peak (22 counts) where the slew allows it, so the slow tones, which the natural steering
+# noise hides most, need as little time as possible; the high tones are reduced so the slew stays under MAX_SLEW.
+SWEEP_TONES = ((334, 22.0), (166, 22.0), (100, 22.0), (62, 22.0), (42, 16.0), (28, 12.0), (20, 9.0))
 SWEEP_LEAD_IN = 50
 
 # Ladder: one frequency (0.4 Hz, a 250-frame period), stepped amplitudes (TI counts; 1 count ~ 0.0544 EPS sensor
@@ -128,7 +128,33 @@ PULSE_PERIOD = 200
 PULSE_RAMP = 2.75
 PULSE_FLAT = 10
 
-STEP_SECONDS = {SWEEP: 20.0, LADDER: 10.0, PULSES: 40.0}
+# ---- what each band needs -----------------------------------------------------------------------------------------
+# Clean seconds per step and band for a usable estimate of the EPS sensor response (z = 5) against the natural
+# steering noise of 150 released segments (E:\openpilot-mazda-ti-data\ident-analysis-20261120\noise_needs.json),
+# at the amplitudes above: time = 10-20 s x (noise / response)^2, rounded up to whole units, at least 2 units (pulses:
+# 10), at most STEP_CAP_S (z then 3.4-5). A step that would need more than OPTIONAL_ABOVE_S is OPTIONAL (0 here): it
+# runs only as extra once the band is complete. Optional: sweep 0.3 Hz in every band (148-776 s needed even at 22
+# counts; the ladder's 0.4 Hz steps give the low-frequency point instead), ladder 6 and 11 counts everywhere
+# (214-4861 s) and 22 and 37 counts below 28 mph (362 and 128 s), the 22-count pulse below 28 mph (211 s).
+STEP_CAP_S = 60.0
+OPTIONAL_ABOVE_S = 130.0
+REQUIRED_S = {
+  "19-28": {SWEEP: (0.0, 59.76, 48.0, 32.24, 27.3, 11.2, 12.0), LADDER: (0.0, 0.0, 0.0, 0.0, 60.0), PULSES: (0.0, 54.0)},
+  "31-45": {SWEEP: (0.0, 26.56, 14.0, 9.92, 6.3, 4.48, 6.0), LADDER: (0.0, 0.0, 60.0, 40.0), PULSES: (60.0, 20.0)},
+  "45-60": {SWEEP: (0.0, 26.56, 10.0, 7.44, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 60.0, 25.0), PULSES: (52.0, 20.0)},
+  "60-80": {SWEEP: (0.0, 13.28, 10.0, 4.96, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 55.0, 20.0), PULSES: (54.0, 20.0)},
+}
+# Nominal per-step figure kept in ti_tests.json as target_seconds (the cap); the screen uses the per-step "needs".
+STEP_SECONDS = {SWEEP: STEP_CAP_S, LADDER: STEP_CAP_S, PULSES: STEP_CAP_S}
+
+
+def required_seconds(key, band, step):
+  """Clean seconds the step needs in the band (0: optional, extra only)."""
+  return REQUIRED_S[band][key][step]
+
+
+def band_required(key, band):
+  return sum(REQUIRED_S[band][key])
 
 # Run all
 RUN_ALL_ORDER = (SWEEP, PULSES, LADDER)
@@ -149,7 +175,7 @@ def _table(key):
   return {"amps": PULSE_AMPS, "period": PULSE_PERIOD, "ramp": PULSE_RAMP, "flat": PULSE_FLAT}
 
 
-TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), STEP_SECONDS[k], BANDS, MAX_SLEW],
+TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), {b: REQUIRED_S[b][k] for b in REQUIRED_S}, BANDS, MAX_SLEW],
                                          sort_keys=True).encode()).hexdigest()[:12] for k in KEYS}
 
 
@@ -174,13 +200,9 @@ def step_params(key, step):
   return None, PULSE_AMPS[step], PULSE_PERIOD, 0
 
 
-def units_per_step(key, step):
-  """Units that make up one step's STEP_SECONDS (each credited as its nominal share)."""
-  return max(1, int(round(STEP_SECONDS[key] / (step_params(key, step)[2] * DT))))
-
-
 def unit_credit(key, step):
-  return STEP_SECONDS[key] / units_per_step(key, step)
+  """Seconds a clean unit is credited: its length."""
+  return round(step_params(key, step)[2] * DT, 2)
 
 
 def small(key, step):
@@ -314,7 +336,7 @@ def rate_room_ok(room, key=None, step=None):
   return room >= RATE_ROOM_FACTOR * need
 
 
-def check_definition(key, bins, steps, target):
+def check_definition(key, bins, steps, target, needs=None):
   """None when a step_seconds definition for `key` matches this module, else the reason (ti_tests validation)."""
   if key not in KEYS:
     return f"setting {key} does not report steps"
@@ -324,6 +346,8 @@ def check_definition(key, bins, steps, target):
     return f"steps must be {[steps_in_band(key, b[2]) for b in BANDS]}"
   if target != STEP_SECONDS[key]:
     return f"target_seconds must be {STEP_SECONDS[key]:g}"
+  if needs is not None and tuple(tuple(float(x) for x in n) for n in needs) != tuple(REQUIRED_S[b[2]][key] for b in BANDS):
+    return f"needs must be {[list(REQUIRED_S[b[2]][key]) for b in BANDS]}"
   return None
 
 
@@ -334,9 +358,10 @@ def band_share(key, band, remaining):
     left = remaining(key, band, s)
     if left is None:
       return None
-    required += STEP_SECONDS[key]
-    collected += STEP_SECONDS[key] - left
-  return collected / required
+    need = required_seconds(key, band, s)
+    required += need
+    collected += need - left
+  return collected / required if required > 0 else 1.0 + collected
 
 
 def schedule(current, current_band, band, remaining):
@@ -495,7 +520,7 @@ class TiIdent:
     `remaining(key, band, step)`: seconds still to capture for that step in that band, negative when it has extra
     (the accountant's progress; None from it: unknown, nothing runs; None here: nothing captured yet)."""
     if remaining is None:
-      remaining = lambda k, b, s: STEP_SECONDS[k]
+      remaining = lambda k, b, s: required_seconds(k, b, s)
     self.credit = None
     self.stopped_age += 1
     magnitude = abs(driver_torque)

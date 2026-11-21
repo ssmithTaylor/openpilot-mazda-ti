@@ -63,7 +63,7 @@ FILE_KEYS = {"version", "tests"}
 TEST_KEYS = {"id", "title", "description", "settings", "progress", "auto_off", "alternate"}
 TEST_REQUIRED = {"id", "title", "description", "settings", "progress"}
 SETTING_KEYS = {"key", "on"}
-PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps"}
+PROGRESS_KEYS = {"metric", "target_seconds", "bin_by", "bins", "steps", "needs"}
 PROGRESS_REQUIRED = {"metric", "target_seconds"}
 AUTO_OFF_KEYS = {"at_ignition_off"}
 ALTERNATE_KEYS = {"arms", "min_dwell_s", "switch_when"}
@@ -117,7 +117,8 @@ REASON_TEXT = {
 
 
 class TestDef:
-  def __init__(self, id, title, description, settings, metric, target_seconds, bins, at_ignition_off, steps=()):
+  def __init__(self, id, title, description, settings, metric, target_seconds, bins, at_ignition_off, steps=(),
+               needs=()):
     self.id = id
     self.title = title
     self.description = description
@@ -129,6 +130,7 @@ class TestDef:
     self.bins = bins                         # ((low mph, high mph, label, required), ...) sorted by low, or ()
     self.at_ignition_off = at_ignition_off
     self.steps = steps                       # step_seconds: steps to capture per bin, in the order of `bins`
+    self.needs = needs                       # step_seconds: seconds each step needs per bin (0: optional, extra only)
 
   def enabled(self, toggles):
     """Every setting at its "on" value in the live toggles (what the car applies, after the tuning-level gate)."""
@@ -175,7 +177,7 @@ def _settings(raw):
   return tuple(pairs), None
 
 
-def _bins(raw, steps=None):
+def _bins(raw, steps=None, needs=None):
   """(((low, high, label, required), ...), None) or (None, reason); with `steps` (step_seconds), ((bins, steps),
   None), the step counts paired with the bins as written and kept in the sorted order."""
   if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_BINS:
@@ -185,6 +187,10 @@ def _bins(raw, steps=None):
       return None, "steps must list one count per bin"
     if not all(_number(n) and n == int(n) and 1 <= n <= MAX_STEPS for n in steps):
       return None, f"steps must be whole numbers 1-{MAX_STEPS}"
+    if (not isinstance(needs, list) or len(needs) != len(raw) or
+        any(not isinstance(n, list) or len(n) != int(k) or not all(_number(x) and 0 <= x <= MAX_TARGET_S for x in n)
+            for n, k in zip(needs, steps))):
+      return None, "needs must list each bin's seconds per step"
   out = []
   for i, b in enumerate(raw):
     if not isinstance(b, list) or len(b) != 4:
@@ -196,7 +202,8 @@ def _bins(raw, steps=None):
       return None, f"bin {label}: need 0 <= low < high <= {MAX_SPEED_MPH}"
     if not isinstance(required, bool):
       return None, f"bin {label}: required must be true or false"
-    out.append((float(low), float(high), label, required, int(steps[i]) if steps is not None else 0))
+    out.append((float(low), float(high), label, required, int(steps[i]) if steps is not None else 0,
+                tuple(float(x) for x in needs[i]) if steps is not None else ()))
   out.sort(key=lambda x: x[0])
   for a, c in zip(out, out[1:]):
     if c[0] < a[1]:
@@ -206,7 +213,7 @@ def _bins(raw, steps=None):
   if not any(x[3] for x in out):
     return None, "at least one bin must be required"
   if steps is not None:
-    return (tuple(x[:4] for x in out), tuple(x[4] for x in out)), None
+    return (tuple(x[:4] for x in out), tuple(x[4] for x in out), tuple(x[5] for x in out)), None
   return tuple(x[:4] for x in out), None
 
 
@@ -234,12 +241,12 @@ def _alternate(a):
   return None
 
 
-def _ident_check(key, bins, steps, target):
+def _ident_check(key, bins, steps, target, needs):
   try:
     from openpilot.selfdrive.car.mazda import ti_ident
   except Exception:
     return "identification tests not available"
-  return ti_ident.check_definition(key, bins, steps, target)
+  return ti_ident.check_definition(key, bins, steps, target, needs)
 
 
 def validate_test(t):
@@ -279,20 +286,20 @@ def validate_test(t):
     return None, "active_seconds needs a setting that reports applied time"
   if not (_number(p["target_seconds"]) and MIN_TARGET_S <= p["target_seconds"] <= MAX_TARGET_S):
     return None, f"target_seconds must be {MIN_TARGET_S}-{MAX_TARGET_S}"
-  bins, steps = (), ()
+  bins, steps, needs = (), (), ()
   if ("bins" in p) != ("bin_by" in p):
     return None, "bins and bin_by go together"
-  if "steps" in p and p["metric"] != "step_seconds":
+  if ("steps" in p or "needs" in p) and p["metric"] != "step_seconds":
     return None, "steps go with step_seconds"
-  if p["metric"] == "step_seconds" and not ("bins" in p and "steps" in p):
-    return None, "step_seconds needs bins and steps"
+  if p["metric"] == "step_seconds" and not ("bins" in p and "steps" in p and "needs" in p):
+    return None, "step_seconds needs bins, steps and needs"
   if "bins" in p:
     if p["bin_by"] not in BIN_BY:
       return None, "unknown bin_by"
     if p["metric"] == "step_seconds":
-      got, why = _bins(p["bins"], p["steps"])
+      got, why = _bins(p["bins"], p["steps"], p["needs"])
       if why is None:
-        bins, steps = got
+        bins, steps, needs = got
     else:
       bins, why = _bins(p["bins"])
     if why is not None:
@@ -302,7 +309,7 @@ def validate_test(t):
     # time per step), so the screen shows what the car really collects.
     if len(settings) != 1:
       return None, "step_seconds needs exactly one setting"
-    why = _ident_check(settings[0][0], bins, steps, float(p["target_seconds"]))
+    why = _ident_check(settings[0][0], bins, steps, float(p["target_seconds"]), needs)
     if why is not None:
       return None, why
 
@@ -318,7 +325,7 @@ def validate_test(t):
     return None, why if why is not None else UNSUPPORTED
 
   return TestDef(t["id"], t["title"], t["description"], settings, p["metric"], float(p["target_seconds"]), bins,
-                 at_off, steps), None
+                 at_off, steps, needs), None
 
 
 def validate_document(doc):
@@ -472,7 +479,8 @@ class TestAccountant:
       entry = self.doc.get(t.id, {}).get(band, {})
       have = entry.get(str(step), 0.0) if isinstance(entry, dict) else 0.0
       have = (have if _number(have) else 0.0) + self.pending_steps.get(t.id, {}).get((band, step), 0.0)
-      return t.target_seconds - have
+      k = next(i for i, b in enumerate(t.bins) if b[2] == band)
+      return t.needs[k][step] - have
     except Exception:
       self._fail("remaining")
       return None
