@@ -155,6 +155,16 @@ class CarController(CarControllerBase):
                         for k in sorted(seen)}
     return cfg
 
+  def ti_ident_failed(self):
+    """The identification tests raised: off for the rest of this process (the drive), logged once."""
+    self.ti_ident = None
+    self.ti_ident_armed = None
+    try:
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.exception("ti_ident disabled")
+    except Exception:
+      pass
+
   def publish_ti_tests(self, CS, CC, ti_request):
     """Test progress, at the stats cadence. `ti_request` is this frame's undithered TI request. The dither's gate
     reason is display only (ti_dither.gate_reason) and computed only while a test is on."""
@@ -519,15 +529,20 @@ class CarController(CarControllerBase):
             armed = on[0] if (len(on) == 1 and tests is not None and not self.ti_dither_enabled
                               and (dither is None or dither.envelope == 0.0)) else None
             self.ti_ident_armed = armed
-            ti_ident = ident.update(
-              armed, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
-              driver_torque=CS.out.steeringTorque,
-              blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
-              base_request=ti_new_steer - ti_dither, ti_max=self.ccp.TI_STEER_MAX,
-              lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, curvature=CC.actuators.curvature,
-              lkas_blocked=getattr(CS, "lkas_blocked", None),
-              room=ti_ident_mod.rate_room(self.ccp, armed) if armed is not None else None,
-              remaining=tests.remaining if tests is not None else None)
+            try:
+              ti_ident = int(ident.update(
+                armed, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
+                driver_torque=CS.out.steeringTorque,
+                blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
+                base_request=ti_new_steer - ti_dither, ti_max=self.ccp.TI_STEER_MAX,
+                lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, curvature=CC.actuators.curvature,
+                lkas_blocked=getattr(CS, "lkas_blocked", None),
+                room=ti_ident_mod.rate_room(self.ccp, armed) if armed is not None else None,
+                remaining=tests.remaining if tests is not None else None))
+            except Exception:
+              # Never take the controller down: no signal from this frame on, tests off for the rest of the drive
+              ti_ident, ident = 0, None
+              self.ti_ident_failed()
             ti_new_steer += ti_ident
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
                                                     CS.out.steeringTorque, self.ccp)
@@ -559,7 +574,10 @@ class CarController(CarControllerBase):
       if ident is not None:
         self.ti_ident_seen |= set(self.ti_ident_on)
         if not (CC.latActive and CS.ti_lkas_allowed):
-          ident.reset(self.frame)   # the same for the identification tests
+          try:
+            ident.reset(self.frame)   # the same for the identification tests
+          except Exception:
+            self.ti_ident_failed()
 
     if self.CP.flags & MazdaFlags.GEN1:
       if CC.cruiseControl.cancel:
