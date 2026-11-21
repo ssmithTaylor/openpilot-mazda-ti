@@ -406,7 +406,7 @@ def test_disengaging_returns_to_a_at_once_and_a_short_block_is_voided_and_repeat
 def test_a_long_block_cut_short_is_kept_and_the_next_block_follows(monkeypatch):
   monkeypatch.setattr(ab, "MIN_SCORED_KEEP_S", 3.0)
   r = running_b()
-  r.secs(10.0)                                                  # scored time after the wash-in
+  r.secs(3.5)                                                   # scored time after the 6 s wash-in, inside the 10 s block (running_b has used 6 s of it)
   r.step(engaged=False)
   assert not r.kinds("block_end")[-1]["voided"] and r.ab.idx == 1
 
