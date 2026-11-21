@@ -122,6 +122,7 @@ class CarController(CarControllerBase):
     self.ti_plan_nonce = None
     self.ti_plan_ack_key = None
     self.ti_hold_key = None
+    self.ti_hold_published = None
     self.ti_ab_on = False              # the A/B alternation switch (TiAbOn, tmpfs, read at 10 Hz): while on, no test runs
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
@@ -568,6 +569,12 @@ class CarController(CarControllerBase):
             self.ti_hold_key = key
             ti_hold_log({"kind": "tests_hold", "frame": self.frame, "held": bool(ab_on), "why": why, "plan_on": plan_on,
                          "nonce": self.ti_plan_nonce, "seq": self.ti_plan_seq})
+          if key != self.ti_hold_published or self.frame % 100 == 0:   # the same reason for the screens, on change and every second
+            try:
+              self.params_memory.put("TiTestHold", json.dumps({"held": bool(ab_on), "why": why, "t": round(time.time(), 1)}))
+              self.ti_hold_published = key
+            except Exception:
+              pass
         self.ti_ab_on = ab_on
       except Exception:
         if self.ti_plan_on:                  # an unreadable plan allows no test

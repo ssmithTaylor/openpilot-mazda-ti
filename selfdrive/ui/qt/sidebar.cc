@@ -1088,6 +1088,14 @@ void TestsWindow::refresh() {
   speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
   tests.poll(frogpilotUIState()->frogpilot_toggles);
   abPoll();                  // the plan line is on both pages
+  if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
+    // the tests are held for a reason of the plan or the alternation: say it, not "another test is on"
+    const QString text = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
+    for (TiTestView &view : tests.views) {
+      view.status = text;
+    }
+    tests.all_view.status = text;
+  }
   // The queue is read when the page opens; after that only PREV / NEXT move the shown test
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     queue_pos = tests.queued();
@@ -1299,6 +1307,7 @@ const char *const TI_AB_ON_KEY = "TiAbOn";
 const char *const TI_AB_PIN_KEY = "TiAbPin";
 const char *const TI_AB_STATUS_KEY = "TiAbStatus";
 const char *const TI_PLAN_ON_KEY = "TiPlanOn";
+const char *const TI_HOLD_KEY = "TiTestHold";
 }  // namespace
 
 // The owner's value of setting i as the controller reads it (frogpilot_toggles); false when absent or unreadable
@@ -1369,6 +1378,9 @@ void TestsWindow::abSave() {
 void TestsWindow::abPoll() {
   ab_on = ab_memory.getBool(TI_AB_ON_KEY);
   ab_plan_on = ab_memory.getBool(TI_PLAN_ON_KEY);
+  const QJsonObject hold = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(TI_HOLD_KEY))).object();
+  ab_hold_fresh = ti_ab::statusFresh(QDateTime::currentMSecsSinceEpoch() / 1000.0, hold.value("t").toDouble(-1e9));
+  ab_hold_why = (ab_hold_fresh && hold.value("held").toBool()) ? hold.value("why").toString() : QString();
   const std::string pin = ab_memory.get(TI_AB_PIN_KEY);
   ab_pin = pin == "A" ? ti_ab::Pin::A : (pin == "B" ? ti_ab::Pin::B : ti_ab::Pin::None);
   ab_status = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(TI_AB_STATUS_KEY))).object();
@@ -1492,6 +1504,11 @@ void TestsWindow::drawPlanLine(QPainter &p) {
   p.setPen(QColor(0xc9, 0xc9, 0xc9));
   p.setFont(InterFont(34));
   p.drawText(QRect(30, height() - 84, width() - 580, 64), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(line));
+  if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
+    p.setPen(QColor(218, 202, 37));                         // why the tests are not running now, on both pages
+    p.drawText(QRect(30, height() - 134, width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter,
+               QString(ti_ab::holdText(ab_hold_why.toStdString().c_str())));
+  }
 }
 
 // Draws the A/B page below the shared header; returns the banner line

@@ -91,7 +91,22 @@ static void plan() {
   CHECK(PLAN_TARGET_MIN_DEFAULT == 20.0 && PLAN_ALT_MIN_MPH == 35.0 && PLAN_ALT_MAX_MPH == 56.0);
 }
 
+static void holds() {
+  const char *whys[] = {"plan dead", "plan missing", "plan unreadable", "plan stale", "alternation not at A", "plan says ab",
+                        "plan says hold", "plan says off", "A/B switch on"};
+  for (const char *w : whys) {
+    CHECK(holdText(w)[0] != 0);
+    CHECK(std::strstr(holdText(w), "another test") == nullptr);
+  }
+  CHECK(std::strcmp(holdText("plan dead"), "Held: drive plan stopped after an error; restart needed") == 0);
+  CHECK(std::strcmp(holdText("plan stale"), "Held: controls not reporting (stale)") == 0);
+  CHECK(std::strcmp(holdText("alternation not at A"), "Waiting: A/B alternation returning to your setting") == 0);
+  CHECK(std::strcmp(holdText("plan says ab"), "Waiting: drive plan is running A/B") == 0);
+  CHECK(holdText("")[0] == 0 && holdText("something else")[0] == 0);
+}
+
 int main() {
+  holds();
   plan();
   table();
   steps();

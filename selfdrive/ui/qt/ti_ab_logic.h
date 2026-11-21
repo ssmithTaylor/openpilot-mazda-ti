@@ -178,6 +178,32 @@ inline std::string planLine(const char *mode, double a_s, double b_s, double tar
   return std::string(buf);
 }
 
+// Why the tests are held, in plain words (the car controller's `tests_hold` reasons, selfdrive/car/mazda/ti_plan.HOLD_WHYS); "" for
+// a reason that is not a hold. Shown on the Tests page in place of the generic status and on the A/B page.
+inline const char *holdText(const char *why) {
+  struct Hold {
+    const char *why;
+    const char *text;
+  };
+  static const Hold HOLDS[] = {
+    {"plan dead", "Held: drive plan stopped after an error; restart needed"},
+    {"plan missing", "Held: drive plan not reporting from controls"},
+    {"plan unreadable", "Held: drive plan unreadable"},
+    {"plan stale", "Held: controls not reporting (stale)"},
+    {"alternation not at A", "Waiting: A/B alternation returning to your setting"},
+    {"plan says ab", "Waiting: drive plan is running A/B"},
+    {"plan says hold", "Waiting: drive plan is handing over"},
+    {"plan says off", "Waiting: drive plan is starting"},
+    {"A/B switch on", "Waiting: A/B alternation is on"},
+  };
+  for (const Hold &h : HOLDS) {
+    if (std::strcmp(h.why, why) == 0) {
+      return h.text;
+    }
+  }
+  return "";
+}
+
 inline bool statusFresh(double now, double t) {
   return std::isfinite(now) && std::isfinite(t) && now - t >= -1.0 && now - t <= STATUS_STALE_S;
 }

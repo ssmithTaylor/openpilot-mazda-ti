@@ -267,7 +267,7 @@ def _method(name):
 def cc_host(mem, frame=0):
   return NS(ccp=NS(TI_STEER_DELTA_UP=6, TI_STEER_DELTA_UP_HIGH=6), _ti_limit=lambda *a: 6, frame=frame, params_memory=mem,
             ti_steer_threshold=None, ti_dither_enabled=False, ti_ident_on=(), ti_ident_all=False, ti_ab_on=False,
-            ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None, ti_plan_nonce=None, ti_plan_ack_key=None, ti_hold_key=None)
+            ti_plan_on=False, ti_plan_allowed=False, ti_plan_seq=None, ti_plan_nonce=None, ti_plan_ack_key=None, ti_hold_key=None, ti_hold_published=None)
 
 
 def test_the_car_controller_forces_run_all_only_while_the_plan_says_tests_and_holds_otherwise():
@@ -639,3 +639,47 @@ def test_the_car_controller_logs_every_change_of_its_hold_decision_with_the_reas
   apply(h, toggles())
   assert HOLD_LOG[-1]["why"] == "plan says ab" and HOLD_LOG[-1]["plan_on"] is True and {"kind", "frame", "nonce", "seq"} <= set(HOLD_LOG[-1])
   assert HOLD_LOG[0]["kind"] == "tests_hold"
+
+
+# ---- the reason the tests are held, for the screens ---------------------------------------------------------------------------
+
+def test_every_hold_reason_the_gate_can_give_is_in_the_published_list():
+  seen = set()
+  for plan_on in (False, True):
+    for raw in (plan_json("dead"), plan_json("tests", t=50.0), "{", None, plan_json("tests", at_a=False), plan_json("ab"),
+                plan_json("hold"), plan_json("off")):
+      hold, allowed, why = tp.tests_gate(plan_on, raw, 101.0)
+      if hold:
+        seen.add(why.replace("plan says ", "plan says ") if why else why)
+        assert why in tp.HOLD_WHYS, why
+  assert seen >= {"plan dead", "plan stale", "plan unreadable", "plan missing", "alternation not at A", "plan says ab", "plan says hold"}
+
+
+def test_the_car_controller_publishes_the_hold_reason_on_change_and_each_second_for_the_screens():
+  apply = _method("apply_ti_tuning")
+  now = time.time()
+  mem = Mem(TiPlanOn=False, TiPlan=plan_json("off", 3, now, at_a=False))
+  h = cc_host(mem)
+  h.ti_hold_published = None
+  apply(h, toggles())
+  msg = json.loads(mem.d["TiTestHold"])
+  assert msg["held"] is True and msg["why"] == "alternation not at A" and abs(msg["t"] - now) < 5
+  mem.d["TiTestHold"] = "sentinel"
+  h.frame = 10
+  apply(h, toggles())
+  assert mem.d["TiTestHold"] == "sentinel"                       # unchanged: not rewritten
+  h.frame = 100
+  apply(h, toggles())
+  assert mem.d["TiTestHold"] != "sentinel"                       # heartbeat
+  mem.d["TiPlan"] = plan_json("off", 3, now, at_a=True)
+  h.frame = 110
+  apply(h, toggles())
+  assert json.loads(mem.d["TiTestHold"]) == dict(json.loads(mem.d["TiTestHold"]), held=False, why="")
+
+
+def test_the_new_hold_param_is_registered_and_the_screens_do_not_say_another_test_is_on_for_a_plan_hold():
+  cc = (ROOT / "common/params.cc").read_text(encoding="utf-8")
+  py = (ROOT / "frogpilot/common/frogpilot_variables.py").read_text(encoding="utf-8")
+  assert '{"TiTestHold", CLEAR_ON_MANAGER_START}' in cc and '("TiTestHold", ' in py and tp.PARAM_HOLD == "TiTestHold"
+  ui = (ROOT / "selfdrive/ui/qt/sidebar.cc").read_text(encoding="utf-8")
+  assert "ti_ab::holdText(" in ui and "view.status = text" in ui and "tests.all_view.status = text" in ui

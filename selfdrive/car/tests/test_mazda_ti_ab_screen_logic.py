@@ -69,3 +69,11 @@ def test_the_header_mirrors_the_drive_plan_constants():
                       ("PLAN_ALT_MAX_MPH", tp.PLAN_ALT_MAX_MPH)):
     assert float(re.search(rf"constexpr double {name} = ([\d.]+);", HEADER).group(1)) == value
   assert "35-56 mph" in HEADER
+
+
+def test_the_header_words_every_hold_reason_and_none_says_another_test_is_on():
+  from openpilot.selfdrive.car.mazda import ti_plan as tp
+  block = HEADER[HEADER.index("inline const char *holdText"):]
+  pairs = dict(re.findall(r'\{"([^"]+)", "([^"]+)"\}', block[:block.index("return \"\";")]))
+  assert set(pairs) == set(tp.HOLD_WHYS)
+  assert all(text and "another test" not in text for text in pairs.values())

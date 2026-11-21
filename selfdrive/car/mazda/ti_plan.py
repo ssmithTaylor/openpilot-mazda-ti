@@ -31,6 +31,10 @@ QUIET_SETTLE_S = 1.0                 # the tests' signal has been zero this long
 STALE_S = 3.0                        # a plan not refreshed for this long allows no test
 ACK_STALE_S = 2.5
 PARAM_PLAN_ON, PARAM_PLAN, PARAM_PLAN_ACK = "TiPlanOn", "TiPlan", "TiPlanAck"
+PARAM_HOLD = "TiTestHold"            # tmpfs, car controller: {"held", "why", "t"}: why the tests are held now (the screens' wording is in ti_ab_logic.h)
+# every reason `tests_gate` or the car controller can give for a hold (the screens map each to plain words)
+HOLD_WHYS = ("plan dead", "plan missing", "plan unreadable", "plan stale", "alternation not at A", "plan says ab", "plan says hold",
+             "plan says off", "A/B switch on")
 MODES = ("off", "hold", "ab", "tests")
 
 
