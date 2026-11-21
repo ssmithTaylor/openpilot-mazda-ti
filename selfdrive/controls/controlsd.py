@@ -30,6 +30,12 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.car.mazda.lateral_diagnostics import record_inputs
+try:
+  # On-car A/B alternation of one tuning setting (selfdrive/car/mazda/ti_ab.py): optional; without the module, or with the
+  # mode off, the lateral controller is handed the owner's own toggles object, exactly as before.
+  from openpilot.selfdrive.car.mazda.ti_ab import TiAbRunner
+except Exception:
+  TiAbRunner = None
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
 from openpilot.frogpilot.tinygrad_modeld.tinygrad_modeld import LAT_SMOOTH_SECONDS
@@ -40,6 +46,14 @@ from openpilot.frogpilot.common.frogpilot_variables import get_frogpilot_toggles
 from openpilot.frogpilot.controls.lib.neural_network_feedforward import LatControlNNFF
 
 SOFT_DISABLE_TIME = 3  # seconds
+
+
+def ti_ab_log(event):
+  """The A/B alternation's events (config, block_start, block_end, switch, ...) into the log: see selfdrive/car/mazda/TI_AB.md."""
+  try:
+    cloudlog.event("ti_ab", **event)
+  except Exception:
+    pass
 LDW_MIN_SPEED = 31 * CV.MPH_TO_MS
 LANE_DEPARTURE_THRESHOLD = 0.1
 CAMERA_OFFSET = 0.04
@@ -215,6 +229,13 @@ class Controls:
 
     self.frogpilot_toggles = get_frogpilot_toggles()
 
+    # A/B alternation: the toggles the lateral controller reads. The owner's own object unless a blend toward value B is in
+    # force; ti_ab.py never writes the owner's stored value.
+    self.ab_toggles = self.frogpilot_toggles
+    self.ab_last_steer = 0.0
+    self.ab_last_saturated = False
+    self.ti_ab = TiAbRunner(self.params, params_memory, log=ti_ab_log) if TiAbRunner is not None and self.CP.carName == "mazda" else None
+
     # Both lateral controllers are built here; self.LaC only points at one of them, so which one is
     # driving can change while the car is moving. Comparing them across separate drives has misled
     # this project twice already -- a "night" effect that was an 8 km/h speed difference, and a
@@ -227,6 +248,24 @@ class Controls:
     # an angle-steering car never builds one even when its lateralTuning happens to be torque.
     self.LaC_nnff = LatControlNNFF(self.CP, self.CI, DT_CTRL) if isinstance(self.LaC, LatControlTorque) else None
     self.select_lat_control(handover=False)
+
+  def ab_step(self, CS, CC, model_v2, fp_car_state):
+    """The toggles the lateral controller reads this cycle (ti_ab.TiAbRunner); never raises."""
+    if self.ti_ab is None:
+      return self.frogpilot_toggles
+    try:
+      boot = getattr(time, "CLOCK_BOOTTIME", None)
+      return self.ti_ab.step(
+        self.frogpilot_toggles, engaged=bool(CC.latActive), v_ego=CS.vEgo, curvature=self.desired_curvature,
+        steer=self.ab_last_steer, saturated=self.ab_last_saturated, steering_pressed=bool(CS.steeringPressed),
+        driver_torque=CS.steeringTorque, lane_change=bool(model_v2.meta.laneChangeState != LaneChangeState.off),
+        blinker=bool(CS.leftBlinker or CS.rightBlinker),
+        ti_ok=bool(fp_car_state is not None and fp_car_state.tiActive),
+        fault=bool(CS.steerFaultTemporary or CS.steerFaultPermanent),
+        controller_ok=bool(isinstance(self.LaC, LatControlTorque) and self.LaC.plant is not None),
+        mono_ns=time.clock_gettime_ns(boot) if boot is not None else time.monotonic_ns())
+    except Exception:
+      return self.frogpilot_toggles
 
   def select_lat_control(self, handover=True):
     """Point self.LaC at whichever lateral controller the toggles are asking for.
@@ -753,13 +792,16 @@ class Controls:
       if isinstance(self.LaC, LatControlTorque):
         self.LaC.update_model_context(model_v2, self.sm.logMonoTime['modelV2'],
                                       self.sm.all_checks(['modelV2']), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+      self.ab_toggles = self.ab_step(CS, CC, model_v2, fp_car_state)
       steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                          self.steer_limited_by_safety, self.desired_curvature,
                                                          curvature_limited, lat_delay,
                                                          self.sm['liveLocationKalman'],
                                                          self.sm['modelV2'],
-                                                         self.frogpilot_toggles,
+                                                         self.ab_toggles,
                                                          fp_car_state)
+      self.ab_last_steer = float(steer)
+      self.ab_last_saturated = bool(getattr(lac_log, "saturated", False))
       if isinstance(self.LaC, LatControlTorque) and self.LaC.plant is not None:
         record_inputs(lac_log.mazdaDiagnostics, self.sm, self.car_state_event, self.car_state_updated)
       actuators.steer = float(steer)
@@ -851,7 +893,7 @@ class Controls:
       # The slider is clipped around the car's kp, which on a TI car is the plant branch's
       # reduced value. A controller that needs a different baseline declares kp_scale so the
       # slider still trims it proportionally instead of overwriting its tuning every frame.
-      kp = self.frogpilot_toggles.steerKp
+      kp = self.ab_toggles.steerKp
       scale = getattr(self.LaC, "kp_scale", 1.0)
       if scale != 1.0 and isinstance(kp, (list, tuple)) and len(kp) == 2:
         kp = [list(kp[0]), [v * scale for v in kp[1]]]

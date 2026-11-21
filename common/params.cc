@@ -596,6 +596,10 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiTestQueue", PERSISTENT},
     {"TiTestGate", CLEAR_ON_MANAGER_START},  // tmpfs: what closes the armed test's gate now (car side, 1 Hz)
     {"TiTestLock", CLEAR_ON_MANAGER_START},  // tmpfs: the Tests page lock (UI); gone at reboot
+    {"TiAbConfig", PERSISTENT},              // A/B alternation: which setting, value B, block minutes, optional seed (JSON)
+    {"TiAbOn", CLEAR_ON_MANAGER_START},      // tmpfs: the A/B alternation switch; off at every boot
+    {"TiAbPin", CLEAR_ON_MANAGER_START},     // tmpfs: "A" or "B" pins the value, empty alternates
+    {"TiAbStatus", CLEAR_ON_MANAGER_START},  // tmpfs: what the A/B page shows (controlsd, 2 Hz)
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

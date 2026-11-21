@@ -172,6 +172,13 @@ COMMIT_BLEND_RAMP = 0.5    # s, so the gate's motion and the mid-drive toggle ne
 COMMIT_FLAG = 1024         # added to plantState while the commitment is blended in
 
 
+def ab_weight(frogpilot_toggles, attr):
+  """The A/B alternation's blend weight toward "on" for one boolean toggle (selfdrive/car/mazda/ti_ab.py), or None when
+  no blend is in force for it: then the controller reads the plain toggle exactly as it always did."""
+  weights = getattr(frogpilot_toggles, "ab_weights", None)
+  return None if weights is None else weights.get(attr)
+
+
 class CommitFilter:
   """The asymmetric ratchet: fast toward a deeper (or opposite-signed) ask, slow easing off,
   never more than COMMIT_MAX_EXTRA beyond the live ask. Pure, so it can be replayed and tested."""
@@ -379,8 +386,11 @@ class LatControlTorque(LatControl):
     # Damping, see DAMP_KD above. Deadzoned so rest is exactly untouched; gated by the toggle so
     # the A/B is clean. With the toggle off the error_rate input is zero and the D term is inert,
     # bit-identical to the pre-damping controller.
-    damp_on = bool(getattr(frogpilot_toggles, "lat_damping", False))
+    damp_w = ab_weight(frogpilot_toggles, "lat_damping")
+    damp_on = bool(getattr(frogpilot_toggles, "lat_damping", False)) if damp_w is None else damp_w > 0.0
     damp_rate = apply_center_deadzone(measurement_rate, DAMP_RATE_DEADZONE) if damp_on else 0.0
+    if damp_w is not None:
+      damp_rate *= damp_w            # A/B blend: the term fades in or out instead of stepping
 
     freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
     integral_before = self.pid.i
@@ -399,7 +409,9 @@ class LatControlTorque(LatControl):
     # the integrator both have less to make up.
     gate_la = self.fric_gate_filter.update(output_lataccel)
     fric_comp = 0.0
-    if bool(getattr(frogpilot_toggles, "lat_friction_comp", False)) and la_max > FRIC_COMP_MIN_AUTHORITY:
+    fric_w = ab_weight(frogpilot_toggles, "lat_friction_comp")
+    fric_on = bool(getattr(frogpilot_toggles, "lat_friction_comp", False)) if fric_w is None else fric_w > 0.0
+    if fric_on and la_max > FRIC_COMP_MIN_AUTHORITY:
       comp_mag = min(FRIC_COMP_BASE + FRIC_COMP_LOAD * abs(command), FRIC_COMP_MAX)
       comp_mag = min(comp_mag, max(0.0, FRIC_COMP_KEEPOUT * u_max - abs(command)))
       over = max(abs(gate_la) - FRIC_COMP_LA_DEAD, 0.0)
@@ -407,6 +419,8 @@ class LatControlTorque(LatControl):
       fric_comp = self.friction_release.update(
         fric_comp, future_lateral_accel, desired_curvature * CS.vEgo ** 2, measurement,
         self.lane_release.permitted, self.lane_release.elapsed[0], CS.steeringRateDeg, self.dt)
+      if fric_w is not None:
+        fric_comp *= fric_w              # A/B blend
       command = float(np.clip(command + fric_comp, -u_max, u_max))
     else:
       self.friction_release.reset()
@@ -417,10 +431,13 @@ class LatControlTorque(LatControl):
     # in play there is nothing to break away, so send nothing rather than a standing offset that
     # would step onto the wheel the moment an actuator comes back.
     friction_torque = 0.0
-    relay_off = bool(getattr(frogpilot_toggles, "lat_no_friction_relay", False))
+    relay_w = ab_weight(frogpilot_toggles, "lat_no_friction_relay")      # weight of "relay off"
+    relay_off = bool(getattr(frogpilot_toggles, "lat_no_friction_relay", False)) if relay_w is None else relay_w >= 1.0
     if la_max > 0.0 and not relay_off:
       friction_torque = self.friction_torque * u_max * float(np.clip(
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
+      if relay_w is not None:
+        friction_torque *= 1.0 - relay_w  # A/B blend
     command = float(np.clip(command + friction_torque, -u_max, u_max))
 
     # Preserve the empirical high-column-load stand-down threshold. Column load does not by itself

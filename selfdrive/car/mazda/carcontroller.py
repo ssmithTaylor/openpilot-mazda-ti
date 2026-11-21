@@ -102,6 +102,7 @@ class CarController(CarControllerBase):
     # The run-all scheduler: seeded, every pick logged as a "pick" ti_ident event (ti_ident.RunAll, verify_picks)
     self.ti_run_all = (ti_ident_mod.RunAll(emit=self.ti_ident.event_for_pick)
                        if self.ti_ident is not None else None)
+    self.ti_ab_on = False              # the A/B alternation switch (TiAbOn, tmpfs, read at 10 Hz): while on, no test runs
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
     self.reset_ti_stats()
@@ -515,6 +516,13 @@ class CarController(CarControllerBase):
     self.ti_steer_threshold = getattr(frogpilot_toggles, "ti_steer_threshold", None)
     # Absent (older toggles JSON) reads as off.
     self.ti_dither_enabled = bool(getattr(frogpilot_toggles, "ti_dither", False))
+    if self.frame % 10 == 0:
+      # A/B alternation (ti_ab.py) and the tests exclude each other: the switch is tmpfs, off at every boot. An unreadable
+      # switch keeps the last value read; the A/B side independently refuses to run while any test toggle is on.
+      try:
+        self.ti_ab_on = bool(self.params_memory.get_bool("TiAbOn"))
+      except Exception:
+        pass
     if ti_ident_mod is not None:
       self.ti_ident_on = tuple(k for k in ti_ident_mod.KEYS
                                if getattr(frogpilot_toggles, ti_ident_mod.TOGGLES[k], False) is True)
@@ -559,7 +567,7 @@ class CarController(CarControllerBase):
             # the dither waits until that signal has ended. Without a running test this is the toggle as before.
             ident_now = getattr(self, "ti_ident", None)
             ti_dither = dither.update(
-              self.ti_dither_enabled and not (ident_now is not None and ident_now.running), self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
+              self.ti_dither_enabled and not getattr(self, "ti_ab_on", False) and not (ident_now is not None and ident_now.running), self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
               driver_torque=CS.out.steeringTorque,
               blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
               base_request=ti_new_steer, ti_max=self.ccp.TI_STEER_MAX,
@@ -571,7 +579,8 @@ class CarController(CarControllerBase):
           if ident is not None:
             tests = getattr(self, "ti_tests", None)
             on = self.ti_ident_on
-            free = tests is not None and not self.ti_dither_enabled and (dither is None or dither.envelope == 0.0)
+            free = (tests is not None and not self.ti_dither_enabled and (dither is None or dither.envelope == 0.0)
+                    and not getattr(self, "ti_ab_on", False))
             try:
               if free and self.ti_ident_all and not on:
                 # Run all: the scheduler picks the test for the window the car is in, or the nearest one between

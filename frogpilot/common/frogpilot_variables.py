@@ -111,7 +111,7 @@ EXCLUDED_KEYS = {
   "AvailableModels", "AvailableModelNames", "CalibratedLateralAcceleration", "CalibrationProgress", "CarParamsPersistent",
   "CurvatureData", "ExperimentalLongitudinalEnabled", "KonikMinutes", "MapBoxRequests", "ModelDrivesAndScores", "ModelVersions",
   "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches",
-  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "CommaLogsUrl"
+  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "TiAbConfig", "TiAbOn", "TiAbPin", "TiAbStatus", "CommaLogsUrl"
 }
 
 TINYGRAD_FILES = [
@@ -488,6 +488,10 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TiTestQueue", "", 3, ""),
   ("TiTestGate", "", 3, ""),
   ("TiTestLock", "", 3, ""),
+  ("TiAbConfig", "", 3, ""),
+  ("TiAbOn", "0", 3, "0"),
+  ("TiAbPin", "", 3, ""),
+  ("TiAbStatus", "", 3, ""),
   ("AutoScreenRefresh", "1", 0, "1"),
   ("LastScreenRefresh", "0", 0, "0"),
   ("ScreenRefreshRemaining", "0", 0, "0"),
