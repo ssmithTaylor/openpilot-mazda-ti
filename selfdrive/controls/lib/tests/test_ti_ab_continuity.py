@@ -11,7 +11,6 @@ Three things are proved with the real `LatControlTorque` plant branch on identic
 """
 import importlib.util
 import math
-import random
 import subprocess
 import sys
 from pathlib import Path

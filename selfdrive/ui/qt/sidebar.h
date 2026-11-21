@@ -11,6 +11,9 @@
 #include <QTimer>
 #include <QWidget>
 
+#include <QJsonObject>
+
+#include "selfdrive/ui/qt/ti_ab_logic.h"
 #include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/ui.h"
 
@@ -155,6 +158,17 @@ private:
   QRect bannerRect() const;
   QRect toggleRect() const;
   QRect resetRect() const;
+  QRect abRect() const;
+  QRect abBox(int id) const;
+  int abControlAt(const QPoint &pos) const;
+  void abAct(int control);
+  void abOpen();
+  void abFixB(bool keep);
+  void abSave();
+  void abPoll();
+  void abSetOn(bool on);
+  bool abStoredValue(int i, double &value) const;
+  QString drawAb(QPainter &p);
   int controlAt(const QPoint &pos) const;
   void drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const;
   void drawToggle(QPainter &p, const TiTestView &view, bool off_at_ignition_off) const;
@@ -173,6 +187,19 @@ private:
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row
   ti_logic::LockReopen reopen;
+  // A/B page (ti_ab_logic.h): a page of this window beside the test pages, under the same lock
+  bool ab_page = false;
+  bool ab_on = false;                       // TiAbOn (tmpfs)
+  bool ab_fresh = false;                    // the car side's status is recent
+  bool ab_a_known = false;
+  double ab_a = 0;                          // the owner's stored value of the shown setting
+  double ab_b = 0;
+  double ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
+  int ab_setting = 0;
+  ti_ab::Pin ab_pin = ti_ab::Pin::None;
+  QJsonObject ab_status;
+  Params ab_params;
+  Params ab_memory{"/dev/shm/params"};
   int tick_count = 0;
   bool is_metric = false;
   bool have_speed = false;

@@ -6,10 +6,13 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMouseEvent>
 #include <QPainter>
 
 #include "common/util.h"
+#include "selfdrive/ui/qt/ti_ab_logic.h"
 #include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/widgets/input.h"
@@ -671,6 +674,10 @@ void TiTests::toggle(int i) {
     return;
   }
   const bool on = !views[i].requested;
+  if (on) {
+    tests_params_memory.putBool("TiAbOn", false);   // one injection at a time: A/B and the tests exclude each other
+    tests_params_memory.remove("TiAbPin");
+  }
   setTest(i, on);
   views[i].mismatch_ticks = 0;
   if (on && all_view.requested) {
@@ -690,6 +697,8 @@ void TiTests::setAll(bool on) {
 // The run-all mode on, written as toggle() writes a test's settings: one injection at a time, so the single
 // identification tests go off (the dither stays as it is and, while on, holds everything else)
 void TiTests::startAll() {
+  tests_params_memory.putBool("TiAbOn", false);     // A/B and the tests exclude each other
+  tests_params_memory.remove("TiAbPin");
   setAll(true);
   all_view.mismatch_ticks = 0;
   for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
@@ -1075,6 +1084,9 @@ void TestsWindow::refresh() {
   have_speed = sm.rcv_frame("carState") > 0;
   speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
   tests.poll(frogpilotUIState()->frogpilot_toggles);
+  if (ab_page) {
+    abPoll();
+  }
   // The queue is read when the page opens; after that only PREV / NEXT move the shown test
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     queue_pos = tests.queued();
@@ -1126,7 +1138,8 @@ QRect TestsWindow::lockRect() const {
 }
 
 QRect TestsWindow::bannerRect() const {
-  return QRect(runAllRect().right() + 20, 184, lockRect().left() - runAllRect().right() - 40, 66);
+  const int right = ab_page ? lockRect().left() : abRect().left();
+  return QRect(runAllRect().right() + 20, 184, right - runAllRect().right() - 40, 66);
 }
 
 QRect TestsWindow::toggleRect() const {
@@ -1138,8 +1151,9 @@ QRect TestsWindow::resetRect() const {
 }
 
 // Controls: 1 BACK (ignored while locked), 2 ALL TESTS OFF, 3 PREV, 4 NEXT (none at the ends of the queue), 5 LOCK,
-// 6 RUN ALL (opens the overview), 7 TEST PAGES (leaves it), 10 + i the on/off box of the shown test i (the overview:
-// i = defs.size(), run-all mode), 20 + i its Reset progress; 0 none
+// 6 RUN ALL (opens the overview), 7 TEST PAGES (leaves it), 8 A/B (opens the A/B page), 9 TEST PAGES (leaves the A/B page),
+// 10 + i the on/off box of the shown test i (the overview: i = defs.size(), run-all mode), 20 + i its Reset progress,
+// 30-38 the A/B page's boxes (abBox); 0 none
 int TestsWindow::controlAt(const QPoint &pos) const {
   if (backRect().contains(pos)) {
     return 1;
@@ -1149,6 +1163,12 @@ int TestsWindow::controlAt(const QPoint &pos) const {
   }
   if (lockRect().contains(pos)) {
     return 5;
+  }
+  if (ab_page) {
+    return abControlAt(pos);
+  }
+  if (abRect().contains(pos)) {
+    return 8;
   }
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     return 0;
@@ -1199,8 +1219,14 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
 
   if (control == 1) {
     if (ti_logic::backAllowed(locked)) {  // locked: unlock first (the LOCK button), so a stray tap cannot dismiss the page
+      ab_page = false;                    // the next opening from the sidebar card starts on the test pages
       leave();
     }
+    return;
+  }
+  if (control == 8 || control == 9 || control >= 30 || (control == 2 && ab_page)) {
+    abAct(control);       // the A/B page: its red box turns A/B off, not the tests
+    refresh();
     return;
   }
   if (control == 2) {
@@ -1259,6 +1285,303 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
   idle.start();
   opened.start();  // the dialog's own taps end here: no stray input right after it closes
   refresh();
+}
+
+// ---- the A/B page (selfdrive/car/mazda/ti_ab.py; logic in ti_ab_logic.h) -----------------------------------------------
+// A page of the same window, beside the test pages and under the same page lock. It writes the configuration (TiAbConfig,
+// persistent) and the switch and pin (TiAbOn, TiAbPin: tmpfs, off at every boot) and reads what the car side publishes
+// (TiAbStatus, tmpfs). It never writes a tuning setting.
+
+namespace {
+const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
+const char *const TI_AB_ON_KEY = "TiAbOn";
+const char *const TI_AB_PIN_KEY = "TiAbPin";
+const char *const TI_AB_STATUS_KEY = "TiAbStatus";
+}  // namespace
+
+// The owner's value of setting i as the controller reads it (frogpilot_toggles); false when absent or unreadable
+bool TestsWindow::abStoredValue(int i, double &value) const {
+  const QJsonObject &toggles = frogpilotUIState()->frogpilot_toggles;
+  const ti_ab::Setting &s = ti_ab::SETTINGS[i];
+  const QJsonValue v = toggles.value(s.toggle);
+  if (s.is_bool) {
+    if (!v.isBool()) {
+      return false;
+    }
+    value = v.toBool() ? 1.0 : 0.0;
+    return true;
+  }
+  const QJsonArray kp = v.toArray();
+  if (kp.size() != 2 || kp[0].toArray().size() != 1 || kp[1].toArray().size() != 1 || !kp[1].toArray()[0].isDouble()) {
+    return false;
+  }
+  value = kp[1].toArray()[0].toDouble();
+  return true;
+}
+
+// Read the saved configuration (the setting, B and the block length) and fix B to something the car side accepts
+void TestsWindow::abOpen() {
+  ab_setting = 0;
+  ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
+  bool have_b = false;
+  const QJsonObject cfg = QJsonDocument::fromJson(QByteArray::fromStdString(ab_params.get(TI_AB_CONFIG_KEY))).object();
+  const int i = ti_ab::settingIndex(cfg.value("setting").toString().toStdString().c_str());
+  if (i >= 0) {
+    ab_setting = i;
+    const QJsonValue b = cfg.value("b");
+    ab_b = b.isBool() ? (b.toBool() ? 1.0 : 0.0) : b.toDouble(0.0);
+    have_b = b.isBool() || b.isDouble();
+  }
+  const double minutes = cfg.value("block_min").toDouble(ti_ab::DEFAULT_BLOCK_MIN);
+  ab_block_min = std::min(ti_ab::MAX_BLOCK_MIN, std::max(ti_ab::MIN_BLOCK_MIN, std::round(minutes)));
+  abFixB(have_b);
+  abPoll();
+}
+
+// B for the shown setting: kept when the car side would accept it with the owner's stored value, else the first offer
+void TestsWindow::abFixB(bool keep) {
+  ab_a_known = abStoredValue(ab_setting, ab_a);
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  if (!ab_a_known) {
+    return;
+  }
+  if (!(keep && ti_ab::bAllowed(s, ab_a, ab_b))) {
+    ab_b = ti_ab::defaultB(s, ab_a);
+  }
+}
+
+void TestsWindow::abSave() {
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  QJsonObject cfg;
+  cfg["setting"] = QString(s.name);
+  if (s.is_bool) {
+    cfg["b"] = ab_b != 0.0;
+  } else {
+    cfg["b"] = ab_b;
+  }
+  cfg["block_min"] = ab_block_min;
+  ab_params.put(TI_AB_CONFIG_KEY, QJsonDocument(cfg).toJson(QJsonDocument::Compact).toStdString());
+}
+
+// What the car side says now, and the switch and pin as they are in tmpfs
+void TestsWindow::abPoll() {
+  ab_on = ab_memory.getBool(TI_AB_ON_KEY);
+  const std::string pin = ab_memory.get(TI_AB_PIN_KEY);
+  ab_pin = pin == "A" ? ti_ab::Pin::A : (pin == "B" ? ti_ab::Pin::B : ti_ab::Pin::None);
+  ab_status = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(TI_AB_STATUS_KEY))).object();
+  ab_fresh = ti_ab::statusFresh(QDateTime::currentMSecsSinceEpoch() / 1000.0, ab_status.value("t").toDouble(-1e9));
+  if (!ab_on) {
+    ab_a_known = abStoredValue(ab_setting, ab_a);   // follows what he stores while the page is open and A/B is off
+  }
+}
+
+QRect TestsWindow::abRect() const {
+  return QRect(lockRect().left() - 250, 184, 230, 66);
+}
+
+// Boxes of the A/B page by control id: 30 on/off, 31 pin A, 32 pin B, 33 / 34 previous / next setting, 35 / 36 B - / B +,
+// 37 / 38 block - / +
+QRect TestsWindow::abBox(int id) const {
+  const int top = rowTop() + 10;
+  const int row2 = top + 210;
+  switch (id) {
+    case 30: return QRect(30, top, 560, 190);
+    case 31: return QRect(620, top, 330, 190);
+    case 32: return QRect(980, top, 330, 190);
+    case 33: return QRect(30, row2, 100, 120);
+    case 34: return QRect(30 + 100 + 560 + 16, row2, 100, 120);
+    case 35: return QRect(30 + 100 + 560 + 16 + 100 + 30 + 250 + 20, row2, 100, 120);
+    case 36: return QRect(abBox(35).right() + 1 + 16 + 200, row2, 100, 120);
+    case 37: return QRect(abBox(36).right() + 1 + 40, row2, 100, 120);
+    case 38: return QRect(abBox(37).right() + 1 + 16 + 200, row2, 100, 120);
+  }
+  return QRect();
+}
+
+int TestsWindow::abControlAt(const QPoint &pos) const {
+  if (runAllRect().contains(pos)) {
+    return 9;
+  }
+  for (int id = 30; id <= 38; id++) {
+    if (abBox(id).contains(pos)) {
+      return id;
+    }
+  }
+  return 0;
+}
+
+void TestsWindow::abSetOn(bool on) {
+  if (on) {
+    tests.allOff();                          // one injection at a time: the tests go off before A/B starts
+    abSave();
+    ab_memory.remove(TI_AB_PIN_KEY);
+  }
+  ab_memory.putBool(TI_AB_ON_KEY, on);
+  if (!on) {
+    ab_memory.remove(TI_AB_PIN_KEY);
+  }
+  abPoll();
+}
+
+void TestsWindow::abAct(int control) {
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  if (control == 8) {
+    abOpen();
+    ab_page = true;
+  } else if (control == 9) {
+    ab_page = false;
+  } else if (control == 2 || control == 30) {   // A/B OFF (the red box), or the on/off box
+    abSetOn(control == 30 && !ab_on);
+  } else if (control == 31 || control == 32) {
+    if (ab_on) {                                // a pin means nothing while A/B is off
+      const ti_ab::Pin next = ti_ab::tapPin(ab_pin, control == 31 ? ti_ab::Pin::A : ti_ab::Pin::B);
+      if (next == ti_ab::Pin::None) {
+        ab_memory.remove(TI_AB_PIN_KEY);
+      } else {
+        ab_memory.put(TI_AB_PIN_KEY, ti_ab::pinText(next));
+      }
+    }
+  } else if (ti_ab::canEdit(ab_on) && control >= 33 && control <= 38) {
+    if (control == 33 || control == 34) {
+      ab_setting = ti_ab::cycleSetting(ab_setting, control == 34 ? 1 : -1);
+      abFixB(false);
+    } else if (control == 35 || control == 36) {
+      if (ab_a_known) {
+        ab_b = ti_ab::stepB(s, ab_a, ab_b, control == 36 ? 1 : -1);
+      }
+    } else {
+      ab_block_min = ti_ab::stepBlock(ab_block_min, control == 38 ? 1 : -1);
+    }
+    abSave();
+  }
+  abPoll();
+}
+
+static QString abValueText(const ti_ab::Setting &s, double v) {
+  return s.is_bool ? (v != 0.0 ? QString("ON") : QString("OFF")) : QString::number(v, 'f', 2);
+}
+
+// Draws the A/B page below the shared header; returns the banner line
+QString TestsWindow::drawAb(QPainter &p) {
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor dim_fill(0x1a, 0x1a, 0x1a);
+  const QColor dim_ink(0x55, 0x55, 0x55);
+  const QColor amber(218, 202, 37);
+  const QColor blue(0x46, 0x5B, 0xEA);
+  const QColor grey(0x33, 0x33, 0x33);
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  const QString state = ab_fresh ? ab_status.value("state").toString() : QString("off");
+  const bool running = ab_on && ab_fresh && (state == "running" || state == "pinned");
+  const QString arm = ab_status.value("arm").toString();
+
+  // the switch and the pins
+  drawBox(p, abBox(30), ab_on ? QColor(0x17, 0x86, 0x44) : QColor(201, 34, 49), white,
+          ab_on ? QString("A/B ON\ntap to stop") : QString("A/B OFF\ntap to start"), 52);
+  drawBox(p, abBox(31), ab_pin == ti_ab::Pin::A ? blue : (ab_on ? grey : dim_fill), ab_on ? white : dim_ink,
+          ab_pin == ti_ab::Pin::A ? QString("A PINNED\ntap to release") : QString("PIN A"), 44);
+  drawBox(p, abBox(32), ab_pin == ti_ab::Pin::B ? amber : (ab_on ? grey : dim_fill),
+          ab_pin == ti_ab::Pin::B ? QColor(0, 0, 0) : (ab_on ? white : dim_ink),
+          ab_pin == ti_ab::Pin::B ? QString("B PINNED\ntap to release") : QString("PIN B"), 44);
+
+  // which value is in force, and its number
+  const QRect panel(1340, rowTop() + 10, width() - 1340 - 30, 190);
+  p.setPen(Qt::NoPen);
+  p.setBrush(QColor(0x11, 0x11, 0x11));
+  p.drawRoundedRect(panel, 24, 24);
+  if (running && (arm == "A" || arm == "B")) {
+    p.setPen(arm == "B" ? amber : blue);
+    p.setFont(InterFont(130, QFont::Bold));
+    p.drawText(QRect(panel.left() + 20, panel.top(), 150, panel.height()), Qt::AlignCenter, arm);
+    p.setPen(white);
+    p.setFont(InterFont(70, QFont::Bold));
+    const QJsonValue value = ab_status.value("value");
+    const QString number = value.isBool() ? (value.toBool() ? QString("ON") : QString("OFF")) : QString::number(value.toDouble(), 'f', 2);
+    const double blend = ab_status.value("blend").toDouble();
+    p.drawText(QRect(panel.left() + 180, panel.top() + 10, panel.width() - 190, 90), Qt::AlignLeft | Qt::AlignVCenter,
+               number + (blend > 0.001 && blend < 0.999 ? QString("  (blending)") : QString()));
+    p.setFont(InterFont(34));
+    const QJsonObject block = ab_status.value("block").toObject();
+    QString line;
+    if (state == "pinned") {
+      line = QString("Pinned: no alternation");
+    } else if (!block.isEmpty()) {
+      const int left = (int)std::ceil(block.value("left_s").toDouble());
+      line = QString("Block %1: %2:%3 left").arg(block.value("idx").toInt() + 1).arg(left / 60).arg(left % 60, 2, 10, QChar('0'));
+    } else {
+      const QJsonObject wait = ab_status.value("wait").toObject();
+      line = wait.isEmpty() ? QString("Starting the next block")
+                            : QString("Switch to %1 waiting: %2 (%3 s of %4 s)").arg(wait.value("arm").toString())
+                                  .arg(QString(ti_ab::reasonText(wait.value("reason").toString().toStdString().c_str())))
+                                  .arg((int)wait.value("s").toDouble()).arg((int)wait.value("max_s").toDouble());
+    }
+    if (ab_status.value("wash_in").toBool()) {
+      line += QString("   settling after a switch");
+    }
+    p.setPen(amber);
+    p.drawText(QRect(panel.left() + 180, panel.top() + 100, panel.width() - 190, 80), Qt::AlignLeft | Qt::AlignVCenter, line);
+  } else {
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(44, QFont::DemiBold));
+    const QString msg = ab_status.value("msg").toString();
+    p.drawText(panel.adjusted(20, 0, -20, 0), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap,
+               !ab_on ? QString("A/B is off: your own value is in force")
+                      : (msg.isEmpty() ? QString("Waiting for engagement") : msg));
+  }
+
+  // the configuration: only while A/B is off
+  const bool edit = ti_ab::canEdit(ab_on);
+  const QColor box = edit ? grey : dim_fill;
+  const QColor ink = edit ? white : dim_ink;
+  drawBox(p, abBox(33), box, ink, QString("<"), 56);
+  drawBox(p, abBox(34), box, ink, QString(">"), 56);
+  drawBox(p, abBox(35), (edit && ab_a_known && !s.is_bool) ? grey : dim_fill, (edit && ab_a_known && !s.is_bool) ? white : dim_ink, QString("-"), 56);
+  drawBox(p, abBox(36), (edit && ab_a_known && !s.is_bool) ? grey : dim_fill, (edit && ab_a_known && !s.is_bool) ? white : dim_ink, QString("+"), 56);
+  drawBox(p, abBox(37), box, ink, QString("-"), 56);
+  drawBox(p, abBox(38), box, ink, QString("+"), 56);
+  p.setPen(white);
+  p.setFont(InterFont(46, QFont::Bold));
+  p.drawText(QRect(abBox(33).right() + 8, abBox(33).top(), abBox(34).left() - abBox(33).right() - 16, 120), Qt::AlignCenter, QString(s.name));
+  p.setFont(InterFont(40));
+  p.drawText(QRect(abBox(34).right() + 30, abBox(34).top(), 250, 120), Qt::AlignCenter,
+             QString("A (yours)\n") + (ab_a_known ? abValueText(s, ab_a) : QString("unreadable")));
+  p.drawText(QRect(abBox(35).right() + 8, abBox(35).top(), abBox(36).left() - abBox(35).right() - 16, 120), Qt::AlignCenter,
+             QString("B\n") + abValueText(s, ab_b));
+  p.drawText(QRect(abBox(37).right() + 8, abBox(37).top(), abBox(38).left() - abBox(37).right() - 16, 120), Qt::AlignCenter,
+             QString("Block\n%1 min").arg((int)ab_block_min));
+
+  // engaged minutes per side and per speed window (the wash-in after each switch is not counted)
+  const int table_top = abBox(33).bottom() + 40;
+  const int row_h = std::max(36, std::min(60, (height() - 110 - table_top) / 6));
+  p.setFont(InterFont(std::min(38, row_h * 7 / 10), QFont::Bold));
+  p.setPen(white);
+  p.drawText(QRect(30, table_top, 600, row_h), Qt::AlignLeft | Qt::AlignVCenter, QString("Engaged minutes"));
+  p.setPen(blue);
+  p.drawText(QRect(640, table_top, 220, row_h), Qt::AlignRight | Qt::AlignVCenter, QString("A"));
+  p.setPen(amber);
+  p.drawText(QRect(900, table_top, 220, row_h), Qt::AlignRight | Qt::AlignVCenter, QString("B"));
+  const QJsonObject progress = ab_status.value("progress").toObject();
+  p.setFont(InterFont(std::min(38, row_h * 7 / 10)));
+  for (int k = 0; k <= ti_logic::N_WINDOWS; k++) {
+    const QString label = k < ti_logic::N_WINDOWS ? QString(ti_logic::WINDOWS[k].label) : QString("gap");
+    const int y = table_top + (k + 1) * row_h;
+    p.setPen(white);
+    p.drawText(QRect(30, y, 600, row_h), Qt::AlignLeft | Qt::AlignVCenter,
+               k < ti_logic::N_WINDOWS ? label + QString(" mph") : QString("between windows"));
+    for (int j = 0; j < 2; j++) {
+      const double secs = progress.value(j == 0 ? "A" : "B").toObject().value(label).toDouble(0.0);
+      p.setPen(j == 0 ? blue : amber);
+      p.drawText(QRect(j == 0 ? 640 : 900, y, 220, row_h), Qt::AlignRight | Qt::AlignVCenter, QString::number(secs / 60.0, 'f', 1));
+    }
+  }
+
+  // refusals and advice
+  if (!ab_on && !ab_a_known) {
+    return QString("Your stored value of %1 cannot be read: A/B cannot start").arg(s.name);
+  }
+  if (ab_on && ab_status.value("msg").toString().size() > 0 && ab_fresh) {
+    return ab_status.value("msg").toString();
+  }
+  return edit ? QString("Changes apply when you start A/B") : QString();
 }
 
 void TestsWindow::drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const {
@@ -1628,7 +1951,11 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   const QColor dim_ink(0x55, 0x55, 0x55);
   const QColor amber(218, 202, 37);
   drawBox(p, backRect(), locked ? dim_fill : QColor(0x33, 0x33, 0x33), locked ? dim_ink : white, QString("BACK"), 70);
-  drawBox(p, allOffRect(), QColor(201, 34, 49), white, QString("ALL TESTS OFF"), 60);
+  drawBox(p, allOffRect(), QColor(201, 34, 49), white, ab_page ? QString("A/B OFF") : QString("ALL TESTS OFF"), 60);
+  if (!ab_page) {
+    drawBox(p, abRect(), ab_memory.getBool("TiAbOn") ? QColor(0x17, 0x86, 0x44) : QColor(0x33, 0x33, 0x33), white,
+            ab_memory.getBool("TiAbOn") ? QString("A/B ON >") : QString("A/B >"), 40);
+  }
   // The lock, always visible: amber and solid when locked (the page stays until it is unlocked), plain when not
   drawBox(p, lockRect(), locked ? amber : QColor(0x33, 0x33, 0x33), locked ? QColor(0, 0, 0) : white,
           locked ? QString("LOCKED · tap to unlock") : QString("LOCK PAGE"), 36);
@@ -1655,7 +1982,14 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   const int n_defs = (int)tests.defs.size();
   QString banner;
   QColor banner_color(0x33, 0xcc, 0x66);
-  if (queue_pos < 0 || queue_pos >= n) {
+  if (ab_page) {
+    drawBox(p, runAllRect(), QColor(0x33, 0x33, 0x33), white, QString("< TEST PAGES"), 40);
+    p.setPen(white);
+    p.setFont(InterFont(56, QFont::Bold));
+    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("A/B ALTERNATION"));
+    banner = drawAb(p);
+    banner_color = QColor(218, 202, 37);
+  } else if (queue_pos < 0 || queue_pos >= n) {
     p.setPen(white);
     p.setFont(InterFont(80, QFont::Bold));
     p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));

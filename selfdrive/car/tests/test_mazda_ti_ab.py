@@ -3,7 +3,6 @@ reproduction from the log, the switch gates, waiting and skipping, pins, fail-sa
 and the exact reconstruction of the value in force from the logged events."""
 import ast
 import json
-import math
 import random
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -931,3 +930,62 @@ def test_the_car_controller_reads_the_switch_at_10_hz_keeps_the_last_value_on_an
   h.frame = 30
   apply(h, t)
   assert h.ti_ab_on is False
+
+
+def test_the_format_note_names_every_event_and_every_allowed_and_excluded_setting():
+  note = (ROOT / "selfdrive/car/mazda/TI_AB.md").read_text(encoding="utf-8")
+  for name in list(ab.SETTINGS) + list(ab.EXCLUDED):
+    assert name in note, name
+  for kind in ("config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "unpin", "release",
+               "refuse", "error", "hb"):
+    assert f"`{kind}`" in note, kind
+  r = Rig(config=cfg(seed=first_b_seed()), block_s=6.0)
+  r.secs(60.0, pin=None)
+  r.secs(5.0, pin="B")
+  r.secs(5.0, engaged=False)
+  r.secs(1.0, config=cfg(setting="SteerKP", b=9.0))
+  for e in r.events:
+    assert e["kind"] in {"config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "unpin",
+                         "release", "refuse", "error", "hb"}, e["kind"]
+
+
+def test_the_toggles_view_passes_everything_else_through_and_defaults_work():
+  base = toggles()
+  view = ab.AbToggles(base, {"lat_damping": True, "ab_weights": {"lat_damping": 0.4}})
+  assert view.lat_damping is True and view.lat_commit_setpoint is True and view.ti_steer_max == 600
+  assert getattr(view, "missing_thing", "d") == "d" and getattr(base, "ab_weights", None) is None
+  assert view.ab_weights == {"lat_damping": 0.4}
+
+
+def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it_off():
+  ui = (ROOT / "selfdrive/ui/qt/sidebar.cc").read_text(encoding="utf-8")
+  assert ui.count('tests_params_memory.putBool("TiAbOn", false)') == 2                   # TiTests::toggle (on) and startAll
+  start = ui.index("void TestsWindow::abSetOn(bool on)")
+  body = ui[start:ui.index("void TestsWindow::abAct", start)]
+  assert body.index("tests.allOff()") < body.index("putBool(TI_AB_ON_KEY, on)")
+  assert 'TI_AB_ON_KEY = "TiAbOn"' in ui and 'TI_AB_PIN_KEY = "TiAbPin"' in ui and 'TI_AB_CONFIG_KEY = "TiAbConfig"' in ui
+  # the page writes no tuning setting: its only writes are the three keys
+  writes = set(__import__("re").findall(r"ab_(?:memory|params)\.(?:put|putBool|remove)\((\w+)", ui))
+  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY"}, writes
+  # the lock is the Tests page's own (the A/B page is a page of the same window)
+  assert "class TestsWindow" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
+  assert "bool abStoredValue" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
+
+
+def test_a_cycle_of_the_runner_is_cheap_enough_for_the_100_hz_thread():
+  import time
+  mem = Mem(TiAbOn=True)
+  rn, _ = runner(mem, cfg(setting="SteerKP", b=0.95, seed=first_b_seed()))
+  t = toggles()
+  rn.step(t, **INPUTS)
+  mem.d["TiAbOn"] = False
+  rn.step(t, **INPUTS)
+  for _ in range(20):
+    rn.step(t, **INPUTS)
+  mem.d["TiAbOn"] = True
+  t0 = time.perf_counter()
+  n = 20000
+  for _ in range(n):
+    rn.step(t, **INPUTS)
+  per = (time.perf_counter() - t0) / n
+  assert per < 400e-6, per                       # on a PC; the device is several times slower: see the report for the figure

@@ -1,0 +1,139 @@
+#pragma once
+
+// Mazda TI A/B page: the logic that does not need Qt, so it can be compiled and tested on its own
+// (selfdrive/ui/tests/test_ti_ab_logic.cc, run by selfdrive/car/tests/test_mazda_ti_ab_screen_logic.py).
+//   - the allow-listed settings with their hard ranges and largest A-to-B steps, mirroring selfdrive/car/mazda/ti_ab.py
+//     (SETTINGS): the page only ever offers values the car side accepts, and the car side refuses anything else with a message
+//   - how B and the block length are stepped, what a tap on PIN A / PIN B asks for, what may be edited while A/B is on
+//   - the texts for the reasons a switch waits (ti_ab.MESSAGE) and the states
+
+#include <cmath>
+#include <cstring>
+
+namespace ti_ab {
+
+struct Setting {
+  const char *name;   // the param (one of the 15 tuning settings)
+  const char *toggle; // the frogpilot_toggles key that holds the owner's value as the controller reads it (steerKp: [[0], [value]])
+  bool is_bool;       // on/off; B is then always the opposite of A
+  double lo;          // hard range
+  double hi;
+  double max_step;    // largest |A - B|
+  double step;        // what one tap on B - / B + moves
+};
+
+constexpr int N_SETTINGS = 6;
+constexpr Setting SETTINGS[N_SETTINGS] = {
+  {"SteerKP", "steerKp", false, 0.50, 1.10, 0.25, 0.05},
+  {"LatCommitSetpoint", "lat_commit_setpoint", true, 0, 1, 1, 1},
+  {"LatDamping", "lat_damping", true, 0, 1, 1, 1},
+  {"LatFrictionComp", "lat_friction_comp", true, 0, 1, 1, 1},
+  {"LatOutputFilter", "lat_output_filter", true, 0, 1, 1, 1},
+  {"LatNoFrictionRelay", "lat_no_friction_relay", true, 0, 1, 1, 1},
+};
+constexpr double MIN_BLOCK_MIN = 2.0;
+constexpr double MAX_BLOCK_MIN = 10.0;
+constexpr double DEFAULT_BLOCK_MIN = 4.0;
+constexpr double BLOCK_STEP_MIN = 1.0;
+constexpr double STATUS_STALE_S = 4.0;   // the car side writes the status at 2 Hz while on, and every few seconds while off
+
+inline int settingIndex(const char *name) {
+  for (int i = 0; i < N_SETTINGS; i++) {
+    if (std::strcmp(SETTINGS[i].name, name) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// the setting after / before i in the list, wrapping
+inline int cycleSetting(int i, int dir) {
+  return ((i + (dir > 0 ? 1 : -1)) % N_SETTINGS + N_SETTINGS) % N_SETTINGS;
+}
+
+inline double roundTo(double v, double step) {
+  return std::round(v / step) * step;
+}
+
+// B acceptable for the owner's stored value A (the car side's rule): inside the range, within max_step of A, and not A itself
+inline bool bAllowed(const Setting &s, double a, double b) {
+  if (!std::isfinite(a) || !std::isfinite(b) || a < s.lo - 1e-9 || a > s.hi + 1e-9) {
+    return false;
+  }
+  if (s.is_bool) {
+    return (a != 0.0) != (b != 0.0) && (b == 0.0 || b == 1.0);
+  }
+  return b >= s.lo - 1e-9 && b <= s.hi + 1e-9 && std::fabs(b - a) <= s.max_step + 1e-9 && std::fabs(b - a) >= s.step / 2.0;
+}
+
+// The B to offer first: a bool's opposite of A; a number one step above A (below at the top of the range)
+inline double defaultB(const Setting &s, double a) {
+  if (s.is_bool) {
+    return a != 0.0 ? 0.0 : 1.0;
+  }
+  const double up = roundTo(a + s.step, s.step);
+  return up <= s.hi + 1e-9 ? up : roundTo(a - s.step, s.step);
+}
+
+// B after a tap on B - (dir < 0) or B + (dir > 0): one step, never outside what bAllowed accepts (an end stays), and it
+// jumps over A itself. A bool does not move: its B is the opposite of A.
+inline double stepB(const Setting &s, double a, double b, int dir) {
+  if (s.is_bool) {
+    return defaultB(s, a);
+  }
+  double next = roundTo(b + (dir > 0 ? s.step : -s.step), s.step);
+  if (std::fabs(next - a) < s.step / 2.0) {
+    next = roundTo(next + (dir > 0 ? s.step : -s.step), s.step);
+  }
+  return bAllowed(s, a, next) ? next : b;
+}
+
+inline double stepBlock(double minutes, int dir) {
+  const double next = minutes + (dir > 0 ? BLOCK_STEP_MIN : -BLOCK_STEP_MIN);
+  return next < MIN_BLOCK_MIN ? MIN_BLOCK_MIN : (next > MAX_BLOCK_MIN ? MAX_BLOCK_MIN : next);
+}
+
+// The setting, B and the block length can be changed only while A/B is off (the car side takes a changed configuration as a
+// reason to stop and wants the switch cycled)
+inline bool canEdit(bool on) {
+  return !on;
+}
+
+enum class Pin { None, A, B };
+
+// What a tap on PIN A or PIN B asks for: the other arm pinned, or alternation again when the tapped arm is already pinned
+inline Pin tapPin(Pin current, Pin tapped) {
+  return current == tapped ? Pin::None : tapped;
+}
+
+inline const char *pinText(Pin p) {
+  return p == Pin::A ? "A" : (p == Pin::B ? "B" : "");
+}
+
+// The words for why a switch is waiting: the reason names of ti_ab.PRIORITY
+struct Reason {
+  const char *name;
+  const char *text;
+};
+constexpr int N_REASONS = 11;
+constexpr Reason REASONS[N_REASONS] = {
+  {"input", "bad inputs"}, {"touch", "hands on the wheel"}, {"lane_change", "lane change"},
+  {"holdoff", "after a touch or blinker"}, {"speed", "speed outside 20-79 mph"}, {"eps", "near 28-31 mph"},
+  {"curve", "road bends"}, {"lat", "lateral demand"}, {"request", "steering request large"},
+  {"saturated", "steering saturated"}, {"settle", "settling"},
+};
+
+inline const char *reasonText(const char *name) {
+  for (const Reason &r : REASONS) {
+    if (std::strcmp(r.name, name) == 0) {
+      return r.text;
+    }
+  }
+  return "waiting";
+}
+
+inline bool statusFresh(double now, double t) {
+  return std::isfinite(now) && std::isfinite(t) && now - t >= -1.0 && now - t <= STATUS_STALE_S;
+}
+
+}  // namespace ti_ab
