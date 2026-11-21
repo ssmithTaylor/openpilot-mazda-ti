@@ -46,7 +46,11 @@ MS_TO_MPH = 1.0 / 0.44704
 # actually applies, the value that means "on"). Each is a plain boolean, exposed in Settings and read live by the car
 # controller. Mirrored in selfdrive/ui/qt/sidebar.cc (TI_TEST_ALLOWED); test_mazda_ti_tests.py checks the two agree.
 ALLOWED_SETTINGS = {"TiDither": ("ti_dither", True), "TiSweep": ("ti_sweep", True), "TiLadder": ("ti_ladder", True),
-                    "TiPulses": ("ti_pulses", True)}
+                    "TiPulses": ("ti_pulses", True), "TiIdentAll": ("ti_ident_all", True)}
+# The run-all switch of the identification tests (ti_ident.py): allow-listed so ALL TESTS OFF and the screen can switch
+# it, but no definition may use it; while it is on, every step_seconds test counts as switched on.
+RUN_ALL_SETTING = "TiIdentAll"
+RUN_ALL_TOGGLE = "ti_ident_all"
 # Settings that report "applied on this frame" to the accountant (metric active_seconds).
 ACTIVE_SOURCES = ("TiDither",)
 
@@ -104,8 +108,10 @@ REASON_TEXT = {
   # the identification tests (ti_ident.TiIdent.reason)
   "other": "Waiting: another test is on",
   "band": "Waiting: speed outside the test bands",
-  "regime": "Waiting: steering mode settling (28-31 mph or a change)",
+  "regime": "Waiting: steering mode settling",
   "band_done": "Waiting: this speed band is complete",
+  "extra": "Running: band complete, collecting extra",
+  "switch": "Switching to the next test",
 }
 
 
@@ -158,7 +164,7 @@ def _settings(raw):
     if not isinstance(s, dict) or set(s) != SETTING_KEYS:
       return None, "each setting is exactly {key, on}"
     key, on = s["key"], s["on"]
-    if not isinstance(key, str) or key not in ALLOWED_SETTINGS:
+    if not isinstance(key, str) or key not in ALLOWED_SETTINGS or key == RUN_ALL_SETTING:
       return None, f"setting {key!r} is not allowed"
     if not isinstance(on, bool) or on != ALLOWED_SETTINGS[key][1]:
       return None, f"setting {key}: on must be {str(ALLOWED_SETTINGS[key][1]).lower()}"
@@ -412,6 +418,8 @@ class TestAccountant:
     self.pending_steps = {}      # test id -> {(band, step): seconds} credited since the last publish (step_seconds)
     self.doc = None              # the progress as of the last publish (step_seconds bookkeeping); None: not read yet
     self.step_tests = {k: t for t in self.tests if t.metric == "step_seconds" for k in t.keys}
+    self.active_interval = set()  # step_seconds tests that ran clean at any frame since the last publish
+    self.all_seen = False        # run all was on at any frame since the last publish
     self.failed = False
 
   def _fail(self, where):
@@ -425,12 +433,17 @@ class TestAccountant:
     if self.failed:
       return
     try:
+      run_all = getattr(toggles, RUN_ALL_TOGGLE, None) is True
+      self.all_seen = self.all_seen or run_all
       for t in self.tests:
-        if not t.enabled(toggles):
+        if not (t.enabled(toggles) or (run_all and t.metric == "step_seconds")):
           continue
         self.seen_interval.add(t.id)
         self.run_seen.add(t.id)
         if t.metric == "step_seconds":
+          # "active" for the screen while it runs clean, not only on the frames a unit is credited
+          if not t.keys.isdisjoint(active_keys):
+            self.active_interval.add(t.id)
           if credit is not None and credit[0] in t.keys:
             slot = (credit[1], credit[2])
             counted = self.pending_steps.setdefault(t.id, {})
@@ -446,21 +459,22 @@ class TestAccountant:
       self._fail("update")
 
   def remaining(self, key, band, step):
-    """Seconds still to capture for a step of the identification test switched by `key` in `band` (0 when complete or
-    unknown, so nothing runs on a broken accountant). Reads params once per process at most; never raises."""
+    """Seconds still to capture for a step of the identification test switched by `key` in `band`: negative when it
+    has extra; None when unknown (no such test, or a broken accountant), so nothing runs. Reads params once per process
+    at most; never raises."""
     t = self.step_tests.get(key)
     if t is None or self.failed:
-      return 0.0
+      return None
     try:
       if self.doc is None:
         self.doc = self._base()[0]
       entry = self.doc.get(t.id, {}).get(band, {})
       have = entry.get(str(step), 0.0) if isinstance(entry, dict) else 0.0
-      have += self.pending_steps.get(t.id, {}).get((band, step), 0.0)
-      return max(0.0, t.target_seconds - have)
+      have = (have if _number(have) else 0.0) + self.pending_steps.get(t.id, {}).get((band, step), 0.0)
+      return t.target_seconds - have
     except Exception:
       self._fail("remaining")
-      return 0.0
+      return None
 
   def wants_reasons(self):
     return bool(self.seen_interval) and not self.failed
@@ -474,24 +488,26 @@ class TestAccountant:
     doc = parse_progress(self.params.get(PROGRESS_KEY, encoding="utf8"))
     return (doc if doc is not None else {}), {}
 
-  def _status(self, on, reasons):
+  def _status(self, on, reasons, notes=None):
     status = {}
     for t in self.tests:
       if t.id in on:
         for key in sorted(t.keys):
           text = REASON_TEXT.get((reasons or {}).get(key))
           if text is not None:
-            status[t.id] = text
+            status[t.id] = (text + (notes or {}).get(key, ""))[:80]
             break
     return status
 
-  def publish(self, now, reasons=None, wall=None):
+  def publish(self, now, reasons=None, wall=None, notes=None, run_all=None):
     """`now`: a monotonic clock in seconds. `reasons`: {setting key: ti_dither.gate_reason code}. `wall`: the wall
     clock for the live block's "t" (default time.time()); the UI compares it with its own clock to tell a live block
-    from one left over by an earlier drive. Writes the tmpfs copy when a test was on, something is unsaved or the last
+    from one left over by an earlier drive. `notes`: {setting key: text appended to its status line}. `run_all`:
+    (setting key of the test running now or None, reason code) while run all is on, shown as the live block's "all"
+    {on, test, status}. Writes the tmpfs copy when a test was on, something is unsaved or the last
     live block still lists a test as on, and the flash copy at the rate in the module docstring."""
     if self.failed or not (self.pending or self.pending_steps or self.seen_interval or self.unsaved or
-                           self.live_shown):
+                           self.live_shown or self.all_seen):
       return
     try:
       doc, resets = self._base()
@@ -519,12 +535,23 @@ class TestAccountant:
             into = entry[b] = {}
           prev = into.get(str(step))
           into[str(step)] = round((prev if _number(prev) else 0.0) + secs, 2)
-      on, active = sorted(self.seen_interval), sorted(set(self.pending) | set(self.pending_steps))
-      self.pending, self.pending_steps, self.seen_interval = {}, {}, set()
+      on = sorted(self.seen_interval)
+      active = sorted(set(self.pending) | set(self.pending_steps) | self.active_interval)
+      all_block = None
+      if self.all_seen:
+        key, code = run_all if run_all is not None else (None, None)
+        t = self.step_tests.get(key)
+        text = REASON_TEXT.get(code, "")
+        all_block = {"on": True, "test": t.id if t is not None else "",
+                     "status": ((t.title + ": " if t is not None else "") + text + (notes or {}).get(key, ""))[:80]}
+      self.pending, self.pending_steps, self.seen_interval, self.active_interval = {}, {}, set(), set()
+      self.all_seen = False
       self.doc = doc
       self.seq += 1
       live = {"seq": self.seq, "t": round(time.time() if wall is None else wall, 1), "on": on, "active": active,
-              "status": self._status(on, reasons), "reset_done": dict(self.reset_done)}
+              "status": self._status(on, reasons, notes), "reset_done": dict(self.reset_done)}
+      if all_block is not None:
+        live["all"] = all_block
       self.params_memory.put(PROGRESS_KEY, json.dumps({**doc, LIVE_KEY: live}))
       self.live_shown = bool(on)
       self.unsaved = self.unsaved or changed
