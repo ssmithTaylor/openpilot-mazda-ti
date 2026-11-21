@@ -643,8 +643,13 @@ void TiTests::toggle(int i) {
   if (i < 0 || i >= (int)defs.size() || i >= (int)views.size()) {
     return;
   }
-  setTest(i, !views[i].requested);
+  const bool on = !views[i].requested;
+  setTest(i, on);
   views[i].mismatch_ticks = 0;
+  if (on && all_view.requested) {
+    setAll(false);  // one injection at a time: a single test switched on ends run all
+    all_view.mismatch_ticks = 0;
+  }
   updateFrogPilotToggles();
 }
 
@@ -657,8 +662,19 @@ void TiTests::setAll(bool on) {
 
 // The run-all mode on or off, written as toggle() writes a test's settings
 void TiTests::toggleAll() {
-  setAll(!all_view.requested);
+  const bool on = !all_view.requested;
+  setAll(on);
   all_view.mismatch_ticks = 0;
+  if (on) {
+    // one injection at a time: run all switches the single identification tests off (the dither stays as it is and,
+    // while on, holds everything else)
+    for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
+      if (defs[i].metric == "step_seconds" && views[i].any_on) {
+        setTest((int)i, false);
+        views[i].mismatch_ticks = 0;
+      }
+    }
+  }
   updateFrogPilotToggles();
 }
 
@@ -823,7 +839,7 @@ int TiTests::countOn() const {
   for (const TiTestView &view : views) {
     n += view.any_on ? 1 : 0;
   }
-  return n;
+  return n + (all_view.any_on ? 1 : 0);
 }
 
 // Collected share of the required time of the tests that are on, 0-100; -1 when none is on
@@ -1688,6 +1704,10 @@ void Sidebar::updateTestStatus() {
     active = active || view.state == "ON · ACTIVE";
     waiting = waiting || view.any_on;
   }
+  // ... and the run-all mode, which injects with every single test off
+  not_applied = not_applied || tiTests.all_view.state == "NOT APPLIED";
+  active = active || tiTests.all_view.state == "ON · ACTIVE";
+  waiting = waiting || tiTests.all_view.any_on;
 
   ItemStatus testStatus = {{tr("TESTS"), tr("ALL OFF")}, QColor(0x54, 0x54, 0x54)};
   if (tiTests.defs.empty()) {
