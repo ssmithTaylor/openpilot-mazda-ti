@@ -9,8 +9,9 @@ only in memory. Off at every boot, off by default, off while any identification 
 | key | where | meaning |
 |---|---|---|
 | `TiAbConfig` | persistent (written by SET UP A/B; absent = no alternation set up, START then runs the tests alone) | JSON `{"setting": "SteerKP", "b": 0.95, "block_min": 4, "seed": 123}`. `a` may be given but must equal the stored value. `block_min` 4-10 (default 4). `seed` optional (drawn and logged when absent). Refused with a message on the A/B page outside the ranges below. |
-| `TiAbOn` | tmpfs, cleared at manager start | the switch (the A/B page's box). A configuration change while on stops the run: switch off and on again. |
+| `TiAbOn` | tmpfs, cleared at manager start AND whenever controls (re)starts (`TiAbRunner.__init__`), as `TiPlanOn` and `TiAbPin` are; the UI clears them at the end of a drive | the switch (the A/B page's box). A configuration change while on stops the run: switch off and on again. |
 | `TiAbPin` | tmpfs | `A` or `B`: alternation stops, the value ramps to that arm; empty: alternate. |
+| `TiAbProgress` | persistent | JSON `{v, key, setting, a, b, committed {A, B} seconds, progress {A|B: {window: seconds}}}`, written at each block end. `key` = [table hash, setting, A, B]: restored when the same experiment is set up (completion is judged on the restored total), cleared when the experiment changes, removed by RESET PROGRESS on the set-up page; an unreadable record reads as zero. Restoring only fills counters of an activation that is already allowed: it can never start the mode. |
 | `TiAbStatus` | tmpfs, 2 Hz while on | what the page shows (state, arm, value, block, wait reason, progress) |
 
 First-trial limits (named constants in `ti_ab.py`, changed later only on evidence): alternation is active only between 35 and 70 mph (released
@@ -42,7 +43,8 @@ cloudlog event `ti_ab` (rlog `logMessage`, JSON), the same style as `ti_ident`. 
 - `config`: `setting a b block_s seed seed_given ramp_s wash_in_s weighted version table`. Starts one activation (blocks count from 0).
 - `block_start`: `idx arm first switched waited_s block_s repeat`. `arm` = `arm_for(seed, idx)`: pair `idx // 2` is (A, B) if `first` is "A" else (B, A);
   `first` = "A" when `sha256(f"{seed}:{pair}")[:6]/2**48 < 0.5`. `repeat`: a voided block run again.
-- `block_end`: `idx arm engaged_s reason voided`. `reason` done, pinned, or a release reason. A block cut short under 60 s is voided and its idx runs again.
+- `block_end`: `idx arm engaged_s scored_s reason voided`. `reason` done, pinned, or a release reason. `scored_s` is the block's scored time (wash-in, ramps, pinned time excluded). A block that ends early (speed, hand-over, disengagement, switch off) with `scored_s` of at least `MIN_SCORED_KEEP_S` (30 s) is KEPT: its scored seconds are committed and the next idx follows; below that it is voided and its idx runs again (before this revision the limit was 60 s of engaged time). Analysis pairs by time in force from the `switch` events (see below), never by block label, so partial blocks are usable as they are.
+- A block starts only when the speed is `MARGIN_MPH` (3 mph) inside either edge of the range and has been for `MARGIN_HOLD_S` (3 s): gate reason `margin` (in `PRIORITY` after `eps`). A block already running still ends at the old edges (35 mph and the ceiling).
 - `wait_start` / `wait_end`: a switch is pending and unsafe. `wait_end`: `outcome` switched, not_needed, pinned or release:*, `waited_s`, `reasons` {gate: seconds}.
 - `skip`: the wait hit 60 s; the value stays, `kept` is the arm in force, the next idx is tried. `reasons` as above.
 - `switch`: EVERY change of the value in force: `why` (block, pin, release:*), `s_from s_to ramp_frames wash_frames a b arm immediate`.

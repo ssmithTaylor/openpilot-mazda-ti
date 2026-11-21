@@ -641,6 +641,9 @@ void TiTests::poll(const QJsonObject &toggles) {
   all_test = live_all.value("test").toString().left(TI_TEST_MAX_ID);
   all_view.status = live_all.value("status").toString().left(TI_TEST_MAX_STATUS);
   all_view.active = live_all.value("on") == QJsonValue(true) && !all_test.isEmpty();
+  live_fresh = fresh;
+  live_all_on = fresh && live_all.value("on") == QJsonValue(true);
+  live_tests_on = fresh && !live.value("on").toArray().isEmpty();
   tiTestState(all_view);
 
   // The limit that closes the armed test's gate right now (command, bend, lateral demand), written by the car side once a
@@ -973,6 +976,11 @@ ti_logic::Target TiTests::target(const std::vector<int> &scope, double mph) cons
 // At the end of a drive (onroad -> offroad): switch off the tests that ask for it and the run-all mode, and copy the
 // live progress to flash so the last minute of counting survives a power-down before the next drive
 void TiTests::driveEnded() {
+  // The comma stays powered across a stop: the drive plan, the alternation and its pin go OFF with the drive, as the run-all mode does
+  // (and as controls does when it restarts), so the screens never show ON for a mode that is not running
+  tests_params_memory.putBool(ti_pages::KEY_PLAN_ON, false);
+  tests_params_memory.putBool(ti_pages::KEY_AB_ON, false);
+  tests_params_memory.remove(ti_pages::KEY_AB_PIN);
   bool changed = tiTestSwitchOff(tests_params, QString(TESTS_ALL_KEY), true);
   for (const TiTestDef &def : defs) {
     if (!def.off_at_ignition_off) {
@@ -1343,9 +1351,10 @@ void TestsWindow::homeAct(int control) {
     abPoll();
   } else if (control == CTL_START) {
     abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
-    const Run run = ab_plan_on ? Run::Plan : (ab_on ? Run::AbPlain : (tests.all_view.requested ? Run::All : (tests.singleTestOn() ? Run::Single : Run::Stopped)));
-    if (!startLook(ab_configured, run).enabled) {
-      return;                   // it is running what the label says already
+    TiHomeStrings keep;
+    const HomeState hs = homeState(keep);
+    if (!startLook(ab_configured, hs.run, carRunning(hs)).enabled) {
+      return;                   // the car side reports it is running what the label says already
     }
     ab_pin_b_armed = -1.0;
     tests.runOps(startOps(ab_configured), [this]() { abSave(); });
@@ -1730,11 +1739,6 @@ static QColor toneQColor(ti_pages::Tone t) {
   return QColor(c.r, c.g, c.b);
 }
 
-// The strings a HomeState points into
-struct TiHomeStrings {
-  std::string mode, why, state, arm, reason, gate;
-};
-
 // What the first page is told: from the params, the car side's status and the tests' own progress (nothing computed here that
 // the Tests page does not already show)
 ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
@@ -1768,6 +1772,10 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.ab_wait_s = wait.value("s").toDouble();
   h.ab_wait_max_s = wait.value("max_s").toDouble();
   h.ab_complete = ab_fresh && ab_status.value("complete").toBool();
+  h.car_plan_on = ab_fresh && ab_status.value("plan").toObject().value("on").toBool();
+  h.live_fresh = tests.live_fresh;
+  h.live_all_on = tests.live_all_on;
+  h.live_tests_on = tests.live_tests_on;
 
   std::vector<int> scope;
   for (int i = 0; i < (int)tests.defs.size(); i++) {
@@ -1840,7 +1848,7 @@ void TestsWindow::drawHome(QPainter &p) {
              QString::fromStdString(experimentLine(ab_configured ? ab_setting : -1, a_known, ab_a, ab_b)));
 
   // START (what it will run, and what it replaces), STOP
-  const StartLook look = startLook(ab_configured, hs.run);
+  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs));
   drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : QColor(0x0f, 0x4d, 0x28), white,
            QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
   const bool any = hs.run != Run::Stopped;

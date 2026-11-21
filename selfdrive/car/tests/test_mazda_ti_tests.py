@@ -733,3 +733,24 @@ def test_under_the_plan_the_generators_step_choice_and_the_stored_progress_evolv
   by_plan.publish(1.0)
   strip = lambda a: {k: v for k, v in json.loads(a.params_memory.store[tt.PROGRESS_KEY]).items() if k != tt.LIVE_KEY}
   assert strip(by_plan) == strip(by_toggle)
+
+
+def test_the_tests_tally_survives_a_restart_of_the_process_that_counts_it():
+  defs, errors = tt.load_definitions()
+  assert errors == []
+  steps = [t for t in defs if t.metric == "step_seconds"]
+  toggles = NS(ti_dither=False, ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False)
+  flash, tmpfs = FakeParams(), FakeParams()
+  first = tt.TestAccountant(defs, flash, tmpfs)
+  t = steps[0]
+  key, band = next(iter(t.keys)), t.bins[0][2]
+  for _ in range(3):
+    first.update(toggles, 24 * MPH, True, (), credit=(key, band, 0, 4.0), run_all_forced=True)
+  first.publish(1000.0)
+  left = first.remaining(key, band, 0)
+  assert left == t.needs[0][0] - 12.0
+  # the process restarts with the tmpfs copy still there (the comma stayed powered), or with only the flash copy
+  with_tmpfs = tt.TestAccountant(defs, flash, tmpfs)
+  assert with_tmpfs.remaining(key, band, 0) == left
+  only_flash = tt.TestAccountant(defs, flash, FakeParams())
+  assert only_flash.remaining(key, band, 0) == left

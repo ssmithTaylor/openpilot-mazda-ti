@@ -116,6 +116,9 @@ public:
   TiTestView all_view;  // the run-all mode (TiIdentAll): state and the car side's _live.all status; no seconds
   QString all_test;     // the test the run-all mode is running now (_live.all.test); empty: none or stale
   TiTestGate gate;      // the limit closing the armed test's gate now
+  bool live_fresh = false;      // the car side's live block is recent
+  bool live_all_on = false;     // ... and says run-all is on (what the car controller is doing, whoever switched it)
+  bool live_tests_on = false;   // ... and lists a test as on
   QStringList errors;
 
 private:
@@ -134,7 +137,10 @@ private:
 // screen, and it comes back by itself, locked, once no alert has shown for a moment. A page of MainWindow's stack,
 // the way SettingsWindow is (window.cc). Painted and hit-tested like the sidebar; no signals or slots of its own, so
 // no Q_OBJECT (as ScreenRefreshOverlay, frogpilot/ui/qt/offroad/screen_refresh.h).
-struct TiHomeStrings;
+// The strings a ti_pages::HomeState points into
+struct TiHomeStrings {
+  std::string mode, why, state, arm, reason, gate;
+};
 
 class TestsWindow : public QWidget {
 public:
@@ -177,7 +183,7 @@ private:
   void drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill);
   std::vector<int> stepScope() const;
   bool running() const;
-  ti_pages::HomeState homeState(struct TiHomeStrings &keep);
+  ti_pages::HomeState homeState(TiHomeStrings &keep);
   void drawHome(QPainter &p);
   void drawSetup(QPainter &p);
   void drawTitle(QPainter &p, const QRect &r, const QString &text, int px);

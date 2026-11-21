@@ -732,57 +732,48 @@ def _two_process_rig():
 
 
 @pytest.mark.parametrize("mph,expect", [(45.0, "ab"), (25.0, "tests")])
-def test_a_plan_left_on_when_controls_restarts_resumes_by_itself_once_the_car_is_engaged(mph, expect):
+def test_controls_restarting_with_the_plan_on_leaves_everything_off_and_start_works_first_time(mph, expect):
   mem, params, car = _two_process_rig()
   t = toggles()
   first = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
   car.run(first, t, 1.0)
   mem.d["TiPlanOn"] = True
+  mem.d["TiAbPin"] = "A"
   car.run(first, t, 40.0, mph=mph)
-  assert first.plan.mode == expect and first.plan.nonce
-  # controls restarts (a new process, a new nonce); TiPlanOn, the old TiPlan and TiPlanAck stay in tmpfs, the car controller runs on
+  assert first.plan.mode == expect
+  # controls restarts (a new process, a new nonce); the comma stays powered, so tmpfs still holds the last drive's switches and
+  # the car controller keeps running. The new controls process clears them: every switch reads OFF, nothing runs.
   second = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
-  assert second.plan.nonce != first.plan.nonce and mem.d["TiPlanOn"] is True
-  car.run(second, t, 1.5, mph=mph)
-  assert second.plan.mode == "hold" and not second.plan.resumed          # not before the car has been engaged for a few seconds
-  assert car.hold or not car.allowed
-  car.run(second, t, 2.5, mph=mph)
-  assert second.plan.resumed and second.plan.mode == expect               # resumed with no action from the driver
+  assert second.plan.nonce != first.plan.nonce
+  assert mem.get_bool("TiPlanOn") is False and mem.get_bool("TiAbOn") is False and mem.get("TiAbPin") is None
+  car.run(second, t, 30.0, mph=mph)
+  assert second.plan.mode == "off" and second.ab.block is None and second.ab.mode == "off" and not car.gen.running
+  assert car.hold is False or json.loads(mem.d["TiPlan"])["mode"] == "off"      # the tests are not held by the plan either
+  assert not second.plan_on
+  # START (what the screen writes: the plan switch on) works the first time, with no cycling of anything
+  mem.d["TiPlanOn"] = True
   car.run(second, t, 20.0, mph=mph)
-  if expect == "tests":
-    assert car.allowed and not car.hold and car.gen.running or car.gen.last != 0 or car.allowed
+  assert second.plan.mode == expect and not second.plan_dead
+  if expect == "ab":
+    assert second.ab.block is not None or second.ab.ramp.to == 1.0
   else:
-    assert second.ab.block is not None or second.ab.ramp.to == 1.0 or second.ab.mode == "running"
-  assert [e for e in second.ab.events if e["kind"] == "plan_resume"]
+    assert car.allowed and not car.hold
 
 
-def test_a_plan_left_on_stays_held_while_the_car_is_not_engaged_and_the_old_nonce_never_counts():
+def test_the_alternations_tally_survives_a_controls_restart_mid_drive():
   mem, params, car = _two_process_rig()
   t = toggles()
-  first = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  first = ab.TiAbRunner(params, mem, block_s=20.0, plan_target_min=50.0)
   car.run(first, t, 1.0)
   mem.d["TiPlanOn"] = True
-  car.run(first, t, 30.0, mph=45.0)
-  old_nonce = first.plan.nonce
-  second = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
-  car.run(second, t, 30.0, mph=45.0, engaged=False)
-  assert second.plan.mode == "hold" and not second.plan.resumed and second.ab.block is None and car.hold
-  assert json.loads(mem.d["TiPlan"])["nonce"] == second.plan.nonce != old_nonce
-  # a driver cycling the switch still works exactly as before
-  mem.d["TiPlanOn"] = False
-  car.run(second, t, 1.0, mph=45.0)
+  car.run(first, t, 400.0, mph=45.0)
+  before = dict(first.ab.committed)
+  assert before["A"] + before["B"] > 100.0 and ab.parse_progress(params.d.get("TiAbProgress")) is not None
+  stored = ab.parse_progress(params.d["TiAbProgress"])["committed"]
+  assert abs((before["A"] + before["B"]) - (stored["A"] + stored["B"])) <= 20.0          # at most the block in progress is not in the record
+  second = ab.TiAbRunner(params, mem, block_s=20.0, plan_target_min=50.0)
+  car.run(second, t, 1.0)
   mem.d["TiPlanOn"] = True
-  car.run(second, t, 10.0, mph=45.0)
-  assert second.plan.mode == "ab" and not second.plan.resumed
-
-
-def test_the_plan_unit_still_holds_without_an_engaged_input_and_logs_the_resume():
-  plan = tp.Plan(nonce="x")
-  logged = []
-  plan.log = lambda kind, **kw: logged.append(kind)
-  for _ in range(F(20)):
-    plan.update(on=True, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=time.time(), tests_toggles_on=False)
-  assert plan.mode == "hold" and not plan.resumed                         # engaged never reported: nothing changes
-  for _ in range(F(tp.RESUME_ENGAGED_S) + 2):
-    plan.update(on=True, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=time.time(), tests_toggles_on=False, engaged=True)
-  assert plan.resumed and plan.mode == "ab" and "plan_resume" in logged
+  car.run(second, t, 40.0, mph=45.0)
+  after = second.ab.committed
+  assert after["A"] >= stored["A"] - 1e-6 and after["B"] >= stored["B"] - 1e-6 and after["A"] + after["B"] > stored["A"] + stored["B"] - 1.0

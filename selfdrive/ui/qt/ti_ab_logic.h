@@ -130,10 +130,11 @@ struct Reason {
   const char *name;
   const char *text;
 };
-constexpr int N_REASONS = 11;
+constexpr int N_REASONS = 12;
 constexpr Reason REASONS[N_REASONS] = {
   {"input", "bad inputs"}, {"touch", "hands on the wheel"}, {"lane_change", "lane change"},
   {"holdoff", "after a touch or blinker"}, {"speed", "speed outside 36-69 mph"}, {"eps", "near 28-31 mph"},
+  {"margin", "speed not yet well inside the range"},
   {"curve", "road bends"}, {"lat", "lateral demand"}, {"request", "steering request large"},
   {"saturated", "steering saturated"}, {"settle", "settling"},
 };

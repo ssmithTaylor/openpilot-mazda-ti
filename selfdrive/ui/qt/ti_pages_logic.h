@@ -312,11 +312,44 @@ struct HomeState {
   double target_secs = 0;
   bool tests_active = false;               // the car side counted a test in its last interval
   const char *gate_reason = "";            // command curve lat when the armed test's gate is closed
+  // What the car controller itself reports (the only basis of "running"): the switches only say what was asked
+  bool car_plan_on = false;                // TiAbStatus.plan.on: controls sees the plan switch on
+  bool live_fresh = false;                 // the test accountant's live block (TiTestProgress._live) is recent
+  bool live_all_on = false;                // ... and says run-all is on (the plan forces it): what the car controller is doing
+  bool live_tests_on = false;              // ... and lists a test as on
   bool ab_stored_known = false;            // the persistent record is for the alternation set up now
   double ab_stored_a_s = 0;                // ... scored seconds per side, kept across ignition cycles
   double ab_stored_b_s = 0;
   double target_min = 20.0;                // scored minutes per side that complete the alternation
 };
+
+// True when the car side's own published state confirms what the switches ask for. A switch alone never counts: a stored ON
+// while controls had restarted, or while its report has stopped arriving, is "on but not running".
+inline bool carRunning(const HomeState &s) {
+  switch (s.run) {
+    case Run::Stopped:
+      return false;
+    case Run::Plan: {
+      const std::string mode = s.plan_mode;
+      if (mode == "dead") {
+        return s.ab_fresh;                       // reporting its error
+      }
+      if (mode == "tests") {
+        return s.live_fresh && s.live_all_on;    // the plan is running the tests: the accountant must say run-all is on
+      }
+      return (mode == "ab" || mode == "hold") && s.ab_fresh && s.car_plan_on;
+    }
+    case Run::AbPlain: {
+      const std::string st = s.ab_state;
+      return s.ab_fresh && !st.empty() && st != "off" && st != "error";
+    }
+    case Run::All:
+      return s.live_fresh && s.live_all_on;
+    case Run::Single:
+      return s.live_fresh && s.live_tests_on;
+  }
+  return false;
+}
 
 struct Line {
   std::string text;
@@ -350,7 +383,7 @@ inline std::string waitShort(const char *name, bool metric) {
   }
   static const ShortText TABLE[] = {
     {"input", "WAITING: CHECK INPUTS"}, {"touch", "WAITING: HANDS OFF"}, {"lane_change", "WAITING: LANE CHANGE"},
-    {"holdoff", "WAITING: QUIET MOMENT"}, {"curve", "WAITING: STRAIGHT ROAD"}, {"lat", "WAITING: STRAIGHT ROAD"},
+    {"holdoff", "WAITING: QUIET MOMENT"}, {"margin", "WAITING: STEADY SPEED"}, {"curve", "WAITING: STRAIGHT ROAD"}, {"lat", "WAITING: STRAIGHT ROAD"},
     {"request", "WAITING: EASE STEERING"}, {"saturated", "WAITING: EASE STEERING"}, {"settle", "WAITING: SETTLING"},
   };
   for (const ShortText &t : TABLE) {
@@ -555,6 +588,12 @@ inline HomeLines home(const HomeState &s) {
     h.second = s.configured ? stoppedSecond(s.ab_stored_known, s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) : std::string("Nothing is running");
     return h;
   }
+  if (!carRunning(s)) {
+    // asked for, not confirmed by the car side (restarted, silent, or never started): said plainly, never "running"
+    h.primary = line("ON BUT NOT RUNNING", Tone::Held);
+    h.second = "No report from the car: tap START";
+    return h;
+  }
   if (!s.engaged) {
     h.primary = line("WAITING: ENGAGE", Tone::Waiting);
     h.second = "Engage the comma to begin";
@@ -733,9 +772,16 @@ struct StartLook {
 };
 
 // What the primary control says and whether a tap does anything. Running already: it says RUNNING and a tap does nothing.
-inline StartLook startLook(bool configured, Run run) {
+inline StartLook startLook(bool configured, Run run, bool confirmed = true) {
   StartLook k;
   const std::string what = configured ? "tests + A/B relay" : "tests";
+  if (!confirmed && run != Run::Stopped) {      // the switch says on, the car is not running it: START starts it cleanly
+    k.label = "START: " + what;
+    k.sub = "The switch shows on but nothing is running";
+    k.enabled = true;
+    k.tone = Tone::Done;
+    return k;
+  }
   const bool same = run == Run::Plan || (run == Run::All && !configured);
   if (same) {
     k.label = "RUNNING: " + what;

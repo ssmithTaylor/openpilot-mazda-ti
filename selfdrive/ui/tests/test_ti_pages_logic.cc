@@ -122,6 +122,17 @@ static void fontsFit() {
   CHECK(PRIMARY_PX > SECOND_PX && SECOND_PX > EXPERIMENT_PX);
 }
 
+// The car side reports what the switches ask for (the states below test the wording, not the confirmation)
+static void confirm(HomeState &s) {
+  s.car_plan_on = true;
+  s.live_fresh = s.live_all_on = s.live_tests_on = true;
+}
+
+static HomeLines H(HomeState s) {
+  confirm(s);
+  return home(s);
+}
+
 static void checkLines(const HomeState &s, int &count) {
   const HomeLines h = home(s);
   count++;
@@ -156,6 +167,7 @@ static void everyStateFits() {
                         s.run = (Run)run; s.configured = conf; s.engaged = eng; s.have_speed = have; s.mph = mph; s.metric = metric;
                         s.plan_mode = pm; s.hold_why = hw; s.target = w >= 0; s.target_window = w; s.target_secs = 7200;
                         s.tests_active = active; s.gate_reason = g;
+                        confirm(s); s.ab_fresh = true; s.ab_state = "running";
                         checkLines(s, count);
                       }
   // the alternation side
@@ -176,6 +188,7 @@ static void everyStateFits() {
                       s.run = (Run)run; s.engaged = true; s.have_speed = true; s.mph = 45; s.metric = metric; s.plan_mode = pm;
                       s.ab_fresh = fresh; s.ab_state = st; s.ab_arm = arm; s.ab_block = block; s.ab_block_left_s = 599;
                       s.ab_wait = wait; s.ab_wait_reason = r; s.ab_wait_s = 59; s.ab_wait_max_s = 60; s.ab_complete = complete;
+                      confirm(s);
                       checkLines(s, count);
                     }
   CHECK(count > 100000);
@@ -185,42 +198,86 @@ static void sampleStates() {
   HomeState s;
   s.run = Run::Plan; s.engaged = true; s.have_speed = true; s.mph = 24; s.plan_mode = "tests"; s.target = true; s.target_window = 0;
   s.target_secs = 100; s.tests_active = true; s.configured = true;
-  CHECK(home(s).primary.text == "TESTING: HOLD 24 MPH" && home(s).primary.tone == Tone::Running && home(s).second == "1:40 to go here");
+  CHECK(H(s).primary.text == "TESTING: HOLD 24 MPH" && H(s).primary.tone == Tone::Running && H(s).second == "1:40 to go here");
   s.mph = 38;                                    // inside another window: it counts, but not the one asked for
-  CHECK(home(s).primary.text == "HOLD 24 MPH" && home(s).primary.tone == Tone::Waiting && home(s).second == "Now 38 mph");
+  CHECK(H(s).primary.text == "HOLD 24 MPH" && H(s).primary.tone == Tone::Waiting && H(s).second == "Now 38 mph");
   s.mph = 30;                                    // where nothing counts: said plainly, with the nearest speeds that do
-  CHECK(home(s).primary.text == "NO COUNT AT 30 MPH" && home(s).primary.tone == Tone::Waiting && home(s).second == "Hold 24 or 38 mph");
+  CHECK(H(s).primary.text == "NO COUNT AT 30 MPH" && H(s).primary.tone == Tone::Waiting && H(s).second == "Hold 24 or 38 mph");
   s.mph = 45;
-  CHECK(home(s).primary.text == "NO COUNT AT 45 MPH" && home(s).second == "Hold 38 or 52 mph");
+  CHECK(H(s).primary.text == "NO COUNT AT 45 MPH" && H(s).second == "Hold 38 or 52 mph");
   s.mph = 17;
-  CHECK(home(s).primary.text == "NO COUNT AT 17 MPH" && home(s).second == "Hold 24 mph");
+  CHECK(H(s).primary.text == "NO COUNT AT 17 MPH" && H(s).second == "Hold 24 mph");
   s.mph = 85;
-  CHECK(home(s).primary.text == "NO COUNT AT 85 MPH" && home(s).second == "Hold 72 mph");
+  CHECK(H(s).primary.text == "NO COUNT AT 85 MPH" && H(s).second == "Hold 72 mph");
   s.mph = 24;
   s.mph = 24; s.tests_active = false; s.gate_reason = "curve";
-  CHECK(home(s).primary.text == "WAITING: STRAIGHT ROAD");
+  CHECK(H(s).primary.text == "WAITING: STRAIGHT ROAD");
   s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "ab"; s.ab_fresh = true; s.ab_state = "running"; s.ab_arm = "B";
   s.ab_block = true; s.ab_block_left_s = 252;
-  CHECK(home(s).primary.text == "A/B RUNNING: B" && home(s).second == "4:12 left in block");
+  CHECK(H(s).primary.text == "A/B RUNNING: B" && H(s).second == "4:12 left in block");
   s.ab_block = false; s.ab_complete = true;
-  CHECK(home(s).primary.text == "DONE: A/B COMPLETE" && home(s).primary.tone == Tone::Done);
+  CHECK(H(s).primary.text == "DONE: A/B COMPLETE" && H(s).primary.tone == Tone::Done);
   s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "tests"; s.have_speed = true; s.mph = 45; s.configured = true;
-  CHECK(home(s).primary.text == "WAITING: A/B STARTING");
+  CHECK(H(s).primary.text == "WAITING: A/B STARTING");
   s.mph = 25;
-  CHECK(home(s).primary.text == "A/B: HOLD 38 MPH");
+  CHECK(H(s).primary.text == "A/B: HOLD 38 MPH");
   s.ab_complete = true;
-  CHECK(home(s).primary.text == "DONE: ALL COMPLETE");
+  CHECK(H(s).primary.text == "DONE: ALL COMPLETE");
   s = HomeState();
-  CHECK(home(s).primary.text == "STOPPED: TAP START" && home(s).second == "Nothing is running");
+  CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "Nothing is running");
   s.configured = true; s.ab_stored_known = true; s.ab_stored_a_s = 14.7 * 60; s.ab_stored_b_s = 13.2 * 60;
-  CHECK(home(s).primary.text == "STOPPED: TAP START" && home(s).second == "A/B 13 of 20 min each side done");
+  CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "A/B 13 of 20 min each side done");
   s.ab_stored_known = false;
-  CHECK(home(s).second == "Nothing is running");
+  CHECK(H(s).second == "Nothing is running");
   s.run = Run::All;
-  CHECK(home(s).primary.text == "WAITING: ENGAGE");
+  CHECK(H(s).primary.text == "WAITING: ENGAGE");
   // km/h on a metric device
   s = HomeState(); s.run = Run::All; s.engaged = true; s.have_speed = true; s.mph = 72; s.metric = true; s.target = true; s.target_window = 3;
-  CHECK(home(s).primary.text == "TESTING: HOLD 116 KM/H" || home(s).primary.text == "WAITING: HOLD 116 KM/H");
+  CHECK(H(s).primary.text == "TESTING: HOLD 116 KM/H" || H(s).primary.text == "WAITING: HOLD 116 KM/H");
+}
+
+static void carReportRules() {
+  // Whatever the switches say, "running" appears only when the car side reports it. Every combination of the switch state and the
+  // car's own reports: the page never shows a running tone (or a RUNNING label) unless carRunning, and a switch that the car does
+  // not confirm reads "ON BUT NOT RUNNING"; nothing asked for reads STOPPED.
+  const char *plan_modes[] = {"", "off", "hold", "ab", "tests", "dead"};
+  const char *states[] = {"", "off", "idle", "running", "pinned", "complete", "error"};
+  int combos = 0, confirmed = 0, shown_running = 0;
+  for (int run = 0; run < 5; run++)
+    for (const char *pm : plan_modes)
+      for (const char *st : states)
+        for (int bits = 0; bits < 64; bits++) {
+          HomeState s;
+          s.run = (Run)run; s.plan_mode = pm; s.ab_state = st; s.ab_arm = "B";
+          s.ab_fresh = bits & 1; s.car_plan_on = bits & 2; s.live_fresh = bits & 4; s.live_all_on = bits & 8; s.live_tests_on = bits & 16;
+          s.engaged = true; s.have_speed = true; s.mph = 24; s.configured = true; s.target = true; s.target_window = 0; s.target_secs = 60;
+          s.tests_active = bits & 32; s.ab_block = true; s.ab_block_left_s = 100;
+          const HomeLines h = home(s);
+          const StartLook k = startLook(true, s.run, carRunning(s));
+          combos++;
+          confirmed += carRunning(s);
+          if (h.primary.tone == Tone::Running) {
+            shown_running++;
+            CHECK(carRunning(s));
+          }
+          if (k.label.rfind("RUNNING", 0) == 0) {
+            CHECK(carRunning(s));
+          }
+          if (s.run == Run::Stopped) {
+            CHECK(h.primary.text == "STOPPED: TAP START" && !carRunning(s));
+          } else if (!carRunning(s)) {
+            CHECK(h.primary.text == "ON BUT NOT RUNNING" && h.primary.tone == Tone::Held && k.enabled);
+          }
+        }
+  CHECK(combos > 5000 && confirmed > 100 && shown_running > 50);
+  // a stored ON with the car side silent (controls restarted, or its report stopped): never running
+  HomeState s;
+  s.run = Run::Plan; s.plan_mode = "ab"; s.engaged = true;
+  CHECK(home(s).primary.text == "ON BUT NOT RUNNING" && startLook(true, Run::Plan, false).label == "START: tests + A/B relay" && startLook(true, Run::Plan, false).enabled);
+  s.ab_fresh = true; s.car_plan_on = false;                       // controls reports the plan switch OFF: the screen's switch is stale
+  CHECK(home(s).primary.text == "ON BUT NOT RUNNING");
+  s.car_plan_on = true;
+  CHECK(home(s).primary.tone != Tone::Held);
 }
 
 static void wordsCoverTheCarSide() {
@@ -416,6 +473,7 @@ int main() {
   fontsFit();
   everyStateFits();
   sampleStates();
+  carReportRules();
   wordsCoverTheCarSide();
   experimentWords();
   writes();

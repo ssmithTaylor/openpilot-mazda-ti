@@ -285,7 +285,7 @@ def test_a_switch_waits_while_each_gate_is_violated_and_goes_ahead_once_it_clear
     return
   w = r.ab.status()["wait"]
   assert w is not None and w["reason"] == name and w["arm"] == "B", w
-  assert r.kinds("wait_start") and r.kinds("wait_start")[0]["why"] == name
+  assert r.kinds("wait_start") and r.kinds("wait_start")[0]["why"] in ("margin", name)       # the first 3 s: the speed margin
   r.secs(10.0)
   assert r.ab.block is not None and r.ab.block[1] == "B" and r.outs[-1].arm == "B"
   assert r.kinds("wait_end")[-1]["outcome"] == "switched" and name in r.kinds("wait_end")[-1]["reasons"]
@@ -305,7 +305,7 @@ def test_the_wait_is_logged_and_the_switch_is_skipped_after_the_bound_then_the_n
 
 def test_the_gates_have_hysteresis_and_a_condition_that_closes_resets_the_settle_time():
   r = r_pending()
-  r.secs(0.5)
+  r.secs(2.8)                                           # (the speed has been well inside the range for MARGIN_HOLD_S only from 3.0 s)
   r.step(curvature=0.003)                               # one bad frame
   r.secs(0.9)                                           # not yet settled for SETTLE_S again
   assert r.ab.block is None
@@ -314,7 +314,7 @@ def test_the_gates_have_hysteresis_and_a_condition_that_closes_resets_the_settle
   # lateral demand v^2 |k|: open at 0.4, close at 0.5 m/s^2 (at 40 mph: k 0.00125 and 0.00156)
   fast = dict(v_ego=v_mph(40.0))
   r2 = r_pending()
-  r2.secs(3.0, curvature=0.0014, **fast)                # between open and close: was never closed, so open
+  r2.secs(4.2, curvature=0.0014, **fast)                # between open and close: was never closed, so open (after the margin hold and the settle)
   assert r2.ab.block is not None
   r3 = r_pending()
   r3.step(curvature=0.003, **fast)                      # closes
@@ -404,8 +404,9 @@ def test_disengaging_returns_to_a_at_once_and_a_short_block_is_voided_and_repeat
 
 
 def test_a_long_block_cut_short_is_kept_and_the_next_block_follows(monkeypatch):
-  monkeypatch.setattr(ab, "MIN_BLOCK_KEEP_S", 3.0)
+  monkeypatch.setattr(ab, "MIN_SCORED_KEEP_S", 3.0)
   r = running_b()
+  r.secs(10.0)                                                  # scored time after the wash-in
   r.step(engaged=False)
   assert not r.kinds("block_end")[-1]["voided"] and r.ab.idx == 1
 
@@ -552,7 +553,7 @@ def test_a_touch_or_blinker_during_a_ramp_toward_b_turns_it_back_but_a_ramp_towa
 
 def test_a_pin_to_b_with_the_touch_during_its_ramp_reverses_and_waits_again():
   r = r_pending()
-  r.secs(1.2, pin="B")
+  r.secs(4.2, pin="B")                                  # the pin waits for the gates, the speed margin included
   r.secs(0.3, pin="B")
   assert 0 < r.outs[-1].s < 1
   r.secs(0.2, pin="B", steering_pressed=True)
@@ -754,7 +755,7 @@ def test_the_runner_never_writes_the_owners_param_and_publishes_a_status():
   for _ in range(FRAMES(40.0)):
     rn.step(toggles(), **INPUTS)
   assert set(params.d) <= {"TiAbConfig", "TiAbProgress"}                # the persistent store: the set-up and the experiment's progress only
-  assert set(mem.d) <= {"TiAbOn", "TiAbStatus", "TiPlan"}
+  assert set(mem.d) <= {"TiAbOn", "TiAbStatus", "TiPlan", "TiPlanOn"}
   st = json.loads(mem.d["TiAbStatus"])
   assert st["setting"] == "SteerKP" and st["a"] == 0.8 and st["b"] == 0.9 and st["state"] == "running"
 
@@ -1185,3 +1186,75 @@ def test_the_progress_param_is_registered_persistent_and_the_runner_reads_and_wr
   assert par.d["TiAbProgress"] == "x"
   rn._save_progress(None)
   assert "TiAbProgress" not in par.d
+
+
+# ---- fewer wasted blocks: a start well inside the range, partial blocks kept by their scored time ---------------------------
+
+def _started_within(mph, seconds=8.0, plan_ceiling=None):
+  r = r_pending()
+  if plan_ceiling is not None:
+    r.ab.set_plan_limits(plan_ceiling, 1200.0)
+  r.secs(seconds, v_ego=v_mph(mph))
+  return r
+
+
+def test_a_block_starts_only_when_the_speed_is_well_inside_either_edge_for_a_few_seconds():
+  assert "margin" in ab.PRIORITY and ab.MARGIN_MPH == 3.0 and ab.MARGIN_HOLD_S == 3.0
+  for mph in (36.0, 37.0, 37.9):                                  # ready for the plain gate (from 36 mph) but at the edge: no block
+    r = _started_within(mph)
+    assert r.ab.block is None and r.ab.status()["wait"]["reason"] == "margin", mph
+  assert _started_within(38.0).ab.block is not None and _started_within(45.0).ab.block is not None
+  for mph in (67.5, 68.5):                                        # the plain range ends at 70
+    assert _started_within(mph).ab.block is None
+  assert _started_within(66.0).ab.block is not None
+  for mph in (53.5, 54.5):                                        # under the drive plan the range ends at 56
+    assert _started_within(mph, plan_ceiling=56.0).ab.block is None, mph
+  assert _started_within(52.0, plan_ceiling=56.0).ab.block is not None
+  # held for the few seconds: not at once
+  r = r_pending()
+  r.secs(3.5, v_ego=v_mph(45.0))                                  # MARGIN_HOLD_S, then the usual SETTLE_S
+  assert r.ab.block is None and r.ab.status()["wait"]["reason"] in ("margin", "settle")
+  r.secs(1.0, v_ego=v_mph(45.0))
+  assert r.ab.block is not None
+  # leaving the comfortable band for a moment (still in range) restarts the hold
+  r = r_pending()
+  r.secs(2.0, v_ego=v_mph(45.0))
+  r.secs(0.5, v_ego=v_mph(36.5))
+  r.secs(2.0, v_ego=v_mph(45.0))
+  assert r.ab.block is None
+  r.secs(2.5, v_ego=v_mph(45.0))
+  assert r.ab.block is not None
+
+
+def test_the_margin_loosens_nothing_a_block_already_running_still_ends_at_the_old_edges():
+  r = r_pending()
+  r.secs(8.0, v_ego=v_mph(45.0))
+  assert r.ab.block is not None
+  r.secs(1.0, v_ego=v_mph(36.5))                                  # near the edge, still inside: the running block goes on
+  assert r.ab.block is not None
+  r.secs(1.0, v_ego=v_mph(34.0))                                  # below 35: released as before
+  assert r.outs[-1].s < 1.0 and r.kinds("block_end")[-1]["reason"] == "speed"
+
+
+def test_a_partial_block_keeps_its_scored_time_when_it_reached_the_minimum_and_is_voided_below_it(monkeypatch):
+  assert ab.MIN_SCORED_KEEP_S == 30.0 and not hasattr(ab, "MIN_BLOCK_KEEP_S")
+  r = running_b(block_s=240.0)
+  r.secs(20.0)                                                    # after the wash-in: about 20 s scored
+  r.secs(1.0, v_ego=v_mph(34.0))                                  # the speed leaves the range
+  e = r.kinds("block_end")[-1]
+  assert e["reason"] == "speed" and e["voided"] and 10.0 < e["scored_s"] < 30.0 and r.ab.committed["B"] == 0.0 and r.ab.idx == 0
+  r2 = running_b(block_s=240.0)
+  r2.secs(45.0)
+  r2.secs(1.0, v_ego=v_mph(34.0))
+  e2 = r2.kinds("block_end")[-1]
+  assert e2["reason"] == "speed" and not e2["voided"] and e2["scored_s"] >= 30.0
+  assert abs(r2.ab.committed["B"] - e2["scored_s"]) < 0.02 and r2.ab.idx == 1       # kept, and the next block follows
+  # the same for a disengagement and a hand-over (the plan's tests flag)
+  for kw in (dict(engaged=False), dict(tests_active=True)):
+    r3 = running_b(block_s=240.0)
+    r3.secs(45.0)
+    r3.secs(1.0, **kw)
+    e3 = r3.kinds("block_end")[-1]
+    assert not e3["voided"] and e3["scored_s"] >= 30.0 and r3.ab.committed["B"] >= 30.0
+  # events carry what the analysis needs: the time in force comes from the switch events, not the block label
+  assert {"idx", "arm", "engaged_s", "scored_s", "reason", "voided"} <= set(e2)

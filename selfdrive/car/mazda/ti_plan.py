@@ -27,7 +27,6 @@ PLAN_ALT_MIN_MPH = 35.0
 PLAN_ALT_MAX_MPH = 56.0              # first trial: replay evidence covers 35-56 mph only
 TARGET_MIN_PER_SIDE = 20.0           # engaged, scored minutes per side before the alternation is complete
 MIN_DWELL_S = 10.0                   # a speed-driven change of mode waits this long after the last change
-RESUME_ENGAGED_S = 3.0               # a plan found ON when controls starts resumes by itself once the car has been engaged this long
 QUIET_SETTLE_S = 1.0                 # the tests' signal has been zero this long before the alternation may start
 STALE_S = 3.0                        # a plan not refreshed for this long allows no test
 ACK_STALE_S = 2.5
@@ -78,8 +77,6 @@ class Plan:
     self.dwell = 10 ** 6
     self.in_range = False
     self.seen_off = False
-    self.resumed = False                 # a plan left on across a controls restart was taken up (not an off-and-on by the driver)
-    self.engaged_frames = 0
     self.quiet = 0
     self.n = 0
 
@@ -96,7 +93,7 @@ class Plan:
     else:
       self.why = why
 
-  def update(self, *, on, cfg_valid, complete, mph, ab_at_a, ack, now, tests_toggles_on, ceiling=PLAN_ALT_MAX_MPH, engaged=False):
+  def update(self, *, on, cfg_valid, complete, mph, ab_at_a, ack, now, tests_toggles_on, ceiling=PLAN_ALT_MAX_MPH):
     """One control cycle. `ab_at_a`: the alternation's blend is exactly A and has been for its wash-in time. `ack`: the car
     controller's acknowledgement dict (or None); `now`: wall seconds."""
     self.n += 1
@@ -106,21 +103,9 @@ class Plan:
       self._set("off", "plan off")
       return self._out(False, "")
     self.in_range = in_range(self.in_range, mph, ceiling)
-    self.engaged_frames = self.engaged_frames + 1 if engaged else 0
     if not self.seen_off:
-      if self.engaged_frames >= RESUME_ENGAGED_S / DT:
-        # the plan was left on when controls (re)started: the owner's intent stands. Resumes after the car has been engaged for a
-        # few seconds, never before, and then through every gate as ever (nothing was loosened).
-        self.seen_off = self.resumed = True
-        if self.log is not None:
-          try:
-            self.log("plan_resume", seq=self.seq)
-          except Exception:
-            pass
-        return self._out(False, "")      # this cycle's alternation state is still the stale one: decide on the next, with fresh inputs
-      else:
-        self._set("hold", "the plan was on when controls started: it resumes once the car is engaged")
-        return self._out(False, "")
+      self._set("hold", "the plan was on when controls started: switch it off and on again")
+      return self._out(False, "")
     if tests_toggles_on:
       self._set("hold", "single tests are on: the plan waits")
       return self._out(False, "")

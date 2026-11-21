@@ -23,7 +23,8 @@ error (immediate), the return is a ramp (RAMP, see below) so the steering reques
 Blocks. Block k has arm A or B: pair p = k // 2 is (A, B) or (B, A) by the seeded draw `first_of_pair(seed, p)` (a hash of
 "seed:p", recomputable from the log without our random module), so every pair holds one block of each and time-of-drive
 trends cancel. A block is block_s long (default 4 min, 2-10 min) counted in ENGAGED running time. A block that ends early
-for any reason except its own end and lasted under MIN_BLOCK_KEEP_S is voided: the same k is run again. A change of value
+for any reason except its own end and scored under MIN_SCORED_KEEP_S (scored seconds: wash-in and ramps excluded) is voided: the same k
+is run again; at or above it the scored seconds are kept (partial blocks count by their time in force). A change of value
 at a block start waits until it is safe (gates below, held for SETTLE_S); after MAX_WAIT_S (60 s) the switch is skipped,
 the value stays, and the next block is tried. Pinning A or B from the screen stops alternation until released; a pin
 ramps in at once (no gate except the hard ones above).
@@ -130,7 +131,9 @@ assert set(SETTINGS) | set(EXCLUDED) == {
 DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN = 4.0, 4.0, 10.0
 MAX_WAIT_S = 60.0           # a pending switch waits this long, then is skipped
 SETTLE_S = 1.0              # every gate open this long before a switch
-MIN_BLOCK_KEEP_S = 60.0     # a block cut short under this is voided and run again
+MIN_SCORED_KEEP_S = 30.0    # a block cut short with less SCORED time than this is voided and run again; with this much or more its scored time is kept
+MARGIN_MPH = 3.0            # a block starts only when the speed is this far inside either edge of the range ...
+MARGIN_HOLD_S = 3.0         # ... and has been for this long (a block started at the edge ends within seconds, for speed)
 HB_S = 10.0
 H = ti.ZONE_HYSTERESIS_MPH
 SPEED_OFF_LOW, SPEED_ON_LOW = ALT_MIN_MPH, ALT_MIN_MPH + H                   # released below 35, ready from 36 mph
@@ -141,15 +144,15 @@ GATES = {"curve": (0.002, 0.0025),       # 1/m, desired curvature
          "lat": (0.4, 0.5),              # m/s^2, v^2 |curvature|
          "request": (0.25, 0.30)}        # |actuators.steer| (share of the TI maximum), the last cycle's
 WINDOW_LABELS = tuple(w[2] for w in ti.WINDOWS) + ("gap",)
-PRIORITY = ("input", "touch", "lane_change", "holdoff", "speed", "eps", "curve", "lat", "request", "saturated", "settle")
+PRIORITY = ("input", "touch", "lane_change", "holdoff", "speed", "eps", "margin", "curve", "lat", "request", "saturated", "settle")
 MESSAGE = {"input": "bad inputs", "touch": "hands on the wheel", "lane_change": "lane change", "holdoff": "after a touch or blinker",
-           "speed": "speed outside 36-69 mph", "eps": "near 28-31 mph", "curve": "road bends", "lat": "lateral demand",
+           "speed": "speed outside 36-69 mph", "eps": "near 28-31 mph", "margin": "speed not yet well inside the range", "curve": "road bends", "lat": "lateral demand",
            "request": "steering request large", "saturated": "steering saturated", "settle": "settling"}
 
 
 def _table_hash():
   spec = [[tuple(s) for s in SETTINGS.values()], DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN, MAX_WAIT_S, SETTLE_S,
-          MIN_BLOCK_KEEP_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
+          MIN_SCORED_KEEP_S, MARGIN_MPH, MARGIN_HOLD_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
   return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -383,6 +386,7 @@ class TiAb:
     self.blink_age = 10 ** 6
     self.gate_closed = {k: False for k in GATES}
     self.ok_frames = 0
+    self.margin_frames = 0       # consecutive cycles with the speed well inside the range (MARGIN_MPH from either edge)
     self.speed_ok = False
     self.last_reason = None
     self.mph = 0.0
@@ -498,8 +502,9 @@ class TiAb:
       return
     idx, arm = self.block
     engaged_s = round(self.block_frames * DT, 2)
-    voided = reason != "done" and engaged_s < MIN_BLOCK_KEEP_S
-    self._event("block_end", idx=idx, arm=arm, engaged_s=engaged_s, reason=reason, voided=voided)
+    scored_s = round(self.block_scored * DT, 2)
+    voided = reason != "done" and scored_s < MIN_SCORED_KEEP_S
+    self._event("block_end", idx=idx, arm=arm, engaged_s=engaged_s, scored_s=scored_s, reason=reason, voided=voided)
     if not voided:
       self.idx = idx + 1
       self.committed[arm] += self.block_scored * DT
@@ -654,6 +659,7 @@ class TiAb:
         self.message = ""
 
     if hard is not None:
+      self.margin_frames = 0            # the speed must be well inside the range again, for MARGIN_HOLD_S, before a block starts
       if self.spec is not None:
         self._release(hard, immediate=immediate)
       if hard in ("off", "config", "config_changed", "restart"):
@@ -750,10 +756,14 @@ class TiAb:
       reasons.append("lane_change")
     elif self.touch_age < HOLDOFF_S / DT or self.blink_age < HOLDOFF_S / DT:
       reasons.append("holdoff")
+    comfy = finite and self.speed_ok and SPEED_OFF_LOW + MARGIN_MPH - 1e-6 <= mph < self.speed_off_high - MARGIN_MPH
+    self.margin_frames = self.margin_frames + 1 if comfy else 0
     if not self.speed_ok:
       reasons.append("speed")
     elif EPS_KEEPOUT[0] <= mph < EPS_KEEPOUT[1]:
       reasons.append("eps")
+    elif self.margin_frames < MARGIN_HOLD_S / DT:
+      reasons.append("margin")
     if finite:
       vals = {"curve": abs(curvature), "lat": v_ego * v_ego * abs(curvature), "request": abs(steer)}
       for g, v in vals.items():
@@ -911,9 +921,9 @@ class TiAbRunner:
     self.ab = TiAb(log=log, block_s=block_s)
     self.ab.save_fn = self._save_progress
     self._written = None
+    self._clear_switches()
     self.plan = ti_plan.Plan(log=lambda kind, **kw: self.ab._event(kind, **kw))
     self.plan_on, self.plan_ack, self.plan_dead = False, None, False
-    self.plan_resumed_ab = False
     self.plan_out = None
     self.plan_target_s = 60.0 * (ti_plan.TARGET_MIN_PER_SIDE if plan_target_min is None else plan_target_min)
     self.plan_published = None
@@ -922,6 +932,25 @@ class TiAbRunner:
     self.read_error = ""
     self.published = None
     self.published_k = -10 ** 9
+
+  def _clear_switches(self):
+    """Controls (re)started: the plan switch, the alternation switch and its pin are OFF, whatever tmpfs still holds (the comma stays
+    powered across a fuel stop, so the tmpfs state of the last drive survives a restart of this process). The screens show the
+    switches, so a switch that said ON while nothing could run was the defect; now what they show after a restart is OFF, and
+    START works first time. Never raises."""
+    for key in (PARAM_ON, ti_plan.PARAM_PLAN_ON):
+      try:
+        put = getattr(self.memory, "put_bool", None)
+        if put is not None:
+          put(key, False)
+        else:
+          self.memory.put(key, False)
+      except Exception:
+        pass
+    try:
+      self.memory.remove(PARAM_PIN)
+    except Exception:
+      pass
 
   def _save_progress(self, raw):
     """Write the experiment's progress (persistent), or clear it (None)."""
@@ -987,10 +1016,7 @@ class TiAbRunner:
           self.ab.clear_plan_limits()
         po = self.plan.update(on=self.plan_on, cfg_valid=self.ab.cfg_valid, complete=self.ab.complete, mph=mph,
                               ab_at_a=self.ab.at_a_settled, ack=self.plan_ack, now=time.time(), tests_toggles_on=tests,
-                              ceiling=ti_plan.PLAN_ALT_MAX_MPH, engaged=bool(inputs.get("engaged")))
-        if self.plan.resumed and not self.plan_resumed_ab and self.plan_on:
-          self.plan_resumed_ab = True
-          self.ab.seen_off = True       # the alternation takes the same resumed plan (no cycling of the switch)
+                              ceiling=ti_plan.PLAN_ALT_MAX_MPH)
         self.plan_out = po
         if self.plan_on:
           on, paused = True, tests or not po.ab_allowed
