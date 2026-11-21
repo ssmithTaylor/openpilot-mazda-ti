@@ -150,7 +150,7 @@ inline const char *reasonText(const char *name) {
 
 // The drive plan's line, on both pages (selfdrive/car/mazda/ti_plan.py): what the plan is running now, what is next, and the
 // alternation's scored minutes per side against its target. mode: off, hold, ab, tests, dead.
-constexpr double PLAN_TARGET_MIN_DEFAULT = 20.0;
+constexpr double PLAN_TARGET_MIN_DEFAULT = 10.0;
 constexpr double PLAN_ALT_MIN_MPH = 35.0;
 constexpr double PLAN_ALT_MAX_MPH = 56.0;
 

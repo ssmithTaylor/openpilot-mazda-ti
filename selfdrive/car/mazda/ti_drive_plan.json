@@ -2,17 +2,56 @@
   "name": "Next drive: identification tests + friction relay A/B",
   "date": "2026-11-23",
   "tests": {
-    "ids": ["ti_sweep", "ti_pulses", "ti_ladder"],
-    "windows": ["21-27", "35-41", "49-56", "64-80"]
+    "ids": [
+      "ti_sweep",
+      "ti_pulses",
+      "ti_ladder"
+    ],
+    "windows": [
+      {
+        "window": "21-27",
+        "amount": "pulses 54 s, ladder 60 s, sweep about 80 s (credited seconds)",
+        "reason": "Pulses and ladder are kept in full: neither has usable data in this window yet. The sweep is cut from 190 s to about 80 s: two earlier drives already cover the sweep in the lowest band, and the wheel's response to the sweep is below the angle sensor's resolution, so more sweep time here adds little. The data-needs register lists all six sweep steps as short, so none is singled out: every step keeps its share, scaled to about 80 s.",
+        "minimum": "Pulses 54 s and ladder 60 s are the whole requirement there; the sweep's 80 s is a cap, not a measured need.",
+        "buffer": "None added: the amounts are what each step needs, rounded up to whole units by the generator."
+      },
+      {
+        "window": "35-41",
+        "amount": "sweep 67 s, pulses 80 s, ladder 100 s",
+        "reason": "As reviewed earlier; not changed this round.",
+        "minimum": "As in ti_tests.json.",
+        "buffer": "None added."
+      },
+      {
+        "window": "49-56",
+        "amount": "sweep 57 s, pulses 72 s, ladder 85 s",
+        "reason": "As reviewed earlier; not changed this round.",
+        "minimum": "As in ti_tests.json.",
+        "buffer": "None added."
+      },
+      {
+        "window": "64-80",
+        "amount": "sweep 41 s, pulses 74 s, ladder 75 s",
+        "reason": "As reviewed earlier; not changed this round.",
+        "minimum": "As in ti_tests.json.",
+        "buffer": "None added."
+      }
+    ]
   },
   "alternation": {
     "setting": "LatNoFrictionRelay",
     "a": "stored",
     "b": "other",
     "block_min": 4,
-    "target_min_per_side": 20,
+    "target_min_per_side": 10,
     "min_mph": 35,
-    "max_mph": 56
+    "max_mph": 56,
+    "reason": "The question is whether removing the friction relay reduces steering oscillation (direction reversals per second) at 36-55 mph. Pass-to-pass variation is about 0.12 per second per pass of about 86 s; the one earlier comparison showed a drop of about 0.23 per second, about 1.9 times that variation.",
+    "minimum": "About 4-5 passes per side (about 6-7 minutes per side) give 80 percent power for an effect of that size. It cannot show an effect as small as closed-loop replay predicted (about 0.05 per second): that would need well over an hour per side and is out of reach of any single drive.",
+    "buffer": "10 minutes per side is that minimum plus about half again, so a second drive is unlikely to be needed."
   },
-  "priority": ["the alternation has 35-56 mph until it is complete", "the tests run everywhere else, and everywhere once it is complete"]
+  "priority": [
+    "the alternation has 35-56 mph until it is complete, except that a test window there gets its time when its tests are behind the alternation",
+    "the tests run everywhere else, and everywhere once it is complete"
+  ]
 }

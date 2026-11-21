@@ -144,7 +144,7 @@ def test_amplitudes_and_their_classes():
 
 def test_capture_time_per_band_follows_what_each_step_needs():
   per_band = {k: {b[2]: round(ti.band_required(k, b[2]), 2) for b in ti.BANDS} for k in ti.KEYS}
-  assert per_band[ti.SWEEP] == {"21-27": 190.5, "35-41": 67.26, "49-56": 56.68, "64-80": 40.92}
+  assert per_band[ti.SWEEP] == {"21-27": 80.04, "35-41": 67.26, "49-56": 56.68, "64-80": 40.92}   # 21-27: cut to about 80 s by the plan (ti_drive_plan.json)
   assert per_band[ti.LADDER] == {"21-27": 60.0, "35-41": 100.0, "49-56": 85.0, "64-80": 75.0}
   assert per_band[ti.PULSES] == {"21-27": 54.0, "35-41": 80.0, "49-56": 72.0, "64-80": 74.0}
   for b in ti.BANDS:

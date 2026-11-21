@@ -11,8 +11,17 @@ WINDOWS = ("21-27", "35-41", "49-56", "64-80")
 BOOL_SETTINGS = ("LatNoFrictionRelay", "LatFrictionComp", "LatDamping", "LatOutputFilter", "LatCommitSetpoint")
 NUMBER_SETTINGS = ("SteerKP",)
 BLOCK_MIN_RANGE = (4, 10)
-TARGET_MIN = 20          # = ti_plan.TARGET_MIN_PER_SIDE
+TARGET_MIN = 10          # = ti_plan.TARGET_MIN_PER_SIDE
 RANGE_MPH = (35, 56)     # = ti_plan.PLAN_ALT_MIN_MPH, PLAN_ALT_MAX_MPH
+
+
+def _reasons_ok(window_entries, alt):
+  """Every amount carries its reason, its minimum and its buffer (a non-empty sentence each)."""
+  for e in list(window_entries) + ([alt] if alt is not None else []):
+    for key in ("reason", "minimum", "buffer"):
+      if not isinstance(e, dict) or not isinstance(e.get(key), str) or not e[key].strip():
+        return False
+  return True
 
 
 def problem(plan):
@@ -23,11 +32,12 @@ def problem(plan):
     tests = plan.get("tests")
     if not isinstance(tests, dict) or tuple(tests.get("ids", ())) != STEP_TESTS:
       return "tests must be sweep, pulses, ladder"
-    if tuple(tests.get("windows", ())) != WINDOWS:
+    entries = tests.get("windows", ())
+    if tuple(e.get("window") if isinstance(e, dict) else e for e in entries) != WINDOWS:
       return "tests must cover all four windows"
     alt = plan.get("alternation")
     if alt is None:
-      return ""
+      return "" if _reasons_ok(entries, None) else "an amount has no reason"
     if not isinstance(alt, dict) or alt.get("setting") not in BOOL_SETTINGS + NUMBER_SETTINGS:
       return "setting is not allowed"
     if alt.get("a") != "stored":
@@ -42,10 +52,10 @@ def problem(plan):
     if isinstance(block, bool) or not isinstance(block, (int, float)) or not BLOCK_MIN_RANGE[0] <= block <= BLOCK_MIN_RANGE[1]:
       return "block length outside 4-10 min"
     if alt.get("target_min_per_side") != TARGET_MIN:
-      return "target must be 20 min per side"
+      return "target must be 10 min per side"
     if (alt.get("min_mph"), alt.get("max_mph")) != RANGE_MPH:
       return "speed range must be 35-56 mph"
-    return ""
+    return "" if _reasons_ok(entries, alt) else "an amount has no reason"
   except Exception:
     return "plan unreadable"
 

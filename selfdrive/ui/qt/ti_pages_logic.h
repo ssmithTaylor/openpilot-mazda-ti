@@ -39,7 +39,8 @@ constexpr int CHOSEN_PX = 52;      // the chosen experiment on the first page, i
 constexpr int START_PX = 72;       // START label (its second line: START_SUB_PX)
 constexpr int START_SUB_PX = 40;
 constexpr int STOP_PX = 110;       // STOP
-constexpr int BAND_PX = 64;        // a band still needed: "24 mph  6 min"
+constexpr int BAND_PX = 56;        // a band still needed: "24 mph  6 min"
+constexpr int PLAN_NOTE_PX = 28;   // the reasons on the plan details page
 constexpr int NAV_PX = 44;         // navigation, LOCK
 constexpr int ACTION_PX = 56;      // other large controls (set-up page, pins, the switch)
 constexpr int DETAIL_PX = 36;      // the detail line (not needed while driving)
@@ -311,6 +312,7 @@ struct HomeState {
   bool live_fresh = false;                 // the test accountant's live block (TiTestProgress._live) is recent
   bool live_all_on = false;                // ... and says run-all is on (the plan forces it): what the car controller is doing
   bool live_tests_on = false;              // ... and lists a test as on
+  double tests_left_s[ti_logic::N_WINDOWS] = {0, 0, 0, 0};   // required test seconds still to collect per window (step tests)
   bool ab_stored_known = false;            // the persistent record is for the alternation set up now
   double ab_stored_a_s = 0;                // ... scored seconds per side, kept across ignition cycles
   double ab_stored_b_s = 0;
@@ -548,30 +550,134 @@ inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double
   return out + t + (has_ab ? std::string("; ") + ab : std::string());
 }
 
-// The speeds that count, nearest first below and above `mph` (the middle of the nearest windows), "Hold 24 or 38 mph"
-inline bool countsNothingAt(double mph) {
-  return ti_logic::zoneFor(mph).state != ti_logic::ZoneState::Inside;
+// ---- the bands still needed, ONE model for the list and the status line ------------------------------------------------------------
+// A band is a range of speeds with the engaged minutes still needed there. What the tests and the alternation each need is merged into
+// one figure per band. While the alternation is open the range 35-56 mph is ONE band (alternation blocks and the tests' 35-41 and 49-56
+// windows interleave there, ti_plan.tests_behind); once it is complete the bands are the test windows themselves (38 and 52 mph) and
+// the gap between them counts nothing. Both the list and the primary line are computed from these bands and from what the car reports
+// is counting, so they cannot disagree. Overheads (fades, hand-overs, wash-in, voided time, gate waits) are estimates, named here.
+constexpr double OVERHEAD_TESTS = 1.3;   // engaged minutes per minute of credited test signal (assumption: the plan never credited on the last drive)
+constexpr double OVERHEAD_ALT = 1.35;    // engaged minutes per scored minute of alternation (wash-in about 11 s per switch, margin and settle waits, partial blocks)
+constexpr int MAX_BANDS = 4;
+
+struct Band {
+  int target_mph = 0;          // the one speed to hold
+  int lo = 0, hi = 0;          // where time counts: lo <= mph < hi
+  int show_lo = 0, show_hi = 0;// the range in small type
+  double minutes = 0;          // engaged minutes still needed (rounded up)
+  bool done = false;
+};
+
+inline bool altOpen(const HomeState &s) {
+  return s.configured && !s.ab_complete && abMinutesLeft(s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) > 0.0;
 }
 
-inline std::string nearestCounting(double mph, bool metric) {
-  int lower = -1, upper = -1;
+// The bands for the state; returns how many (3 while the alternation is open, else 4)
+inline int bandsFromState(const HomeState &s, Band out[MAX_BANDS]) {
+  double t[ti_logic::N_WINDOWS];
   for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
-    if (ti_logic::WINDOWS[w].high <= mph) {
-      lower = w;
+    t[w] = s.tests_left_s[w] * OVERHEAD_TESTS / 60.0;
+  }
+  int n = 0;
+  auto win = [&](int w, int target, double minutes) {
+    out[n++] = Band{target, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, minutes, false};
+  };
+  win(0, ti_logic::windowTargetMph(0), t[0]);
+  if (altOpen(s)) {
+    const double alt = abMinutesLeft(s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) * OVERHEAD_ALT;
+    out[n++] = Band{45, (int)ti_ab::PLAN_ALT_MIN_MPH, (int)ti_ab::PLAN_ALT_MAX_MPH, (int)ti_ab::PLAN_ALT_MIN_MPH + 1, (int)ti_ab::PLAN_ALT_MAX_MPH - 1,
+                    alt + t[1] + t[2], false};
+  } else {
+    win(1, ti_logic::windowTargetMph(1), t[1]);
+    win(2, ti_logic::windowTargetMph(2), t[2]);
+  }
+  win(3, ti_logic::windowTargetMph(3), t[3]);
+  for (int i = 0; i < n; i++) {
+    out[i].minutes = std::ceil(out[i].minutes - 1e-9);
+    out[i].done = out[i].minutes <= 0.0;
+  }
+  return n;
+}
+
+inline double bandsTotalMinutes(const Band *b, int n) {
+  double sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += b[i].minutes;
+  }
+  return sum;
+}
+
+// The still-needed band that contains `mph` (time counts there), else -1
+inline int bandIndexAt(const Band *b, int n, double mph) {
+  for (int i = 0; i < n; i++) {
+    if (!b[i].done && mph >= b[i].lo && mph < b[i].hi) {
+      return i;
     }
-    if (ti_logic::WINDOWS[w].low > mph && upper < 0) {
-      upper = w;
+  }
+  return -1;
+}
+
+// The band in which time is COUNTING right now, from what the car reports (a running alternation block, or a test counted in its
+// last interval), else -1. Never from the speed alone.
+inline int countingBand(const HomeState &s, const Band *b, int n) {
+  if (!s.have_speed || !carRunning(s)) {
+    return -1;
+  }
+  const std::string mode = s.plan_mode;
+  const bool ab_side = ((s.run == Run::Plan && mode == "ab") || s.run == Run::AbPlain) && s.ab_fresh && s.ab_block && altOpen(s);
+  const bool tests_side = s.tests_active && ((s.run == Run::Plan && mode == "tests") || s.run == Run::All || s.run == Run::Single);
+  return (ab_side || tests_side) ? bandIndexAt(b, n, s.mph) : -1;
+}
+
+// "24 mph  6 min" / "24 mph  done"
+inline std::string bandText(const Band &b, bool metric) {
+  char buf[64];
+  if (b.done) {
+    std::snprintf(buf, sizeof(buf), "%d %s  done", speedValue(b.target_mph, metric), metric ? "km/h" : "mph");
+  } else {
+    std::snprintf(buf, sizeof(buf), "%d %s  %d min", speedValue(b.target_mph, metric), metric ? "km/h" : "mph", (int)b.minutes);
+  }
+  return buf;
+}
+
+inline std::string bandRange(const Band &b, bool metric) {
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%d-%d %s", speedValue(b.show_lo, metric), speedValue(b.show_hi, metric), metric ? "km/h" : "mph");
+  return buf;
+}
+
+// Where nothing counts: the nearest still-needed bands below and above, "Hold 24 or 38 mph"
+inline std::string nearestBands(const Band *b, int n, double mph, bool metric) {
+  int lower = -1, upper = -1;
+  for (int i = 0; i < n; i++) {
+    if (b[i].done) {
+      continue;
+    }
+    if (b[i].hi <= mph) {
+      lower = i;
+    } else if (b[i].lo > mph && upper < 0) {
+      upper = i;
     }
   }
   char buf[64];
   const char *unit = metric ? "km/h" : "mph";
   if (lower >= 0 && upper >= 0) {
-    std::snprintf(buf, sizeof(buf), "Hold %d or %d %s", speedValue(ti_logic::windowTargetMph(lower), metric), speedValue(ti_logic::windowTargetMph(upper), metric), unit);
+    std::snprintf(buf, sizeof(buf), "Hold %d or %d %s", speedValue(b[lower].target_mph, metric), speedValue(b[upper].target_mph, metric), unit);
+  } else if (lower >= 0 || upper >= 0) {
+    std::snprintf(buf, sizeof(buf), "Hold %d %s", speedValue(b[lower >= 0 ? lower : upper].target_mph, metric), unit);
   } else {
-    const int w = lower >= 0 ? lower : upper;
-    std::snprintf(buf, sizeof(buf), "Hold %d %s", speedValue(ti_logic::windowTargetMph(w), metric), unit);
+    return "Nothing left to collect";
   }
   return buf;
+}
+
+// The stopped page: what the whole plan needs of one drive, "PLAN NEEDS ABOUT 76 MIN: 24 mph 7, 45 mph 64, 72 mph 5"
+inline std::string budgetLine(const Band *b, int n, bool metric) {
+  std::string out = "PLAN NEEDS ABOUT " + std::to_string((int)bandsTotalMinutes(b, n)) + " MIN:";
+  for (int i = 0; i < n; i++) {
+    out += (i ? ", " : " ") + std::to_string(speedValue(b[i].target_mph, metric)) + (metric ? " km/h " : " mph ") + std::to_string((int)b[i].minutes);
+  }
+  return out;
 }
 
 // The primary line and the second line of the first page.
@@ -648,44 +754,40 @@ inline HomeLines home(const HomeState &s) {
     h.second = "Waiting for the car";
     return h;
   }
-  if (!s.target) {
-    if (plan && s.configured && !s.ab_complete) {
-      const bool inside = s.mph >= ti_ab::PLAN_ALT_MIN_MPH && s.mph <= ti_ab::PLAN_ALT_MAX_MPH;
-      if (inside) {
-        h.primary = line("WAITING: A/B STARTING", Tone::Waiting);
-        h.second = "Waiting for a quiet moment";
-      } else {
-        h.primary = line("A/B: " + holdSpeed(altTargetWindow(s.mph), s.metric), Tone::Waiting);
-        h.second = nowSpeed(s.mph, s.metric);
-      }
-      return h;
-    }
+  Band bands[MAX_BANDS];
+  const int n = bandsFromState(s, bands);
+  if (bandsTotalMinutes(bands, n) <= 0.0) {
     h.primary = line(plan && s.configured ? "DONE: ALL COMPLETE" : "DONE: TESTS COMPLETE", Tone::Done);
     h.second = "Extra data still helps";
     return h;
   }
-  const ti_logic::Zone zone = ti_logic::zoneFor(s.mph);
-  const bool inside = zone.state == ti_logic::ZoneState::Inside && zone.window == s.target_window;
-  if (countsNothingAt(s.mph)) {
+  const int here = bandIndexAt(bands, n, s.mph);
+  if (here < 0) {
+    // no band that still needs time contains this speed: nothing counts here, and the list shows the bands that do
     char buf[48];
     std::snprintf(buf, sizeof(buf), "NO COUNT AT %d %s", speedValue(s.mph, s.metric), speedUnit(s.metric));
     h.primary = line(buf, Tone::Waiting);
-    h.second = nearestCounting(s.mph, s.metric);
-  } else if (!inside) {
-    h.primary = line(holdSpeed(s.target_window, s.metric), Tone::Waiting);
-    h.second = nowSpeed(s.mph, s.metric);
-  } else if (s.tests_active) {
-    h.primary = line("TESTING: " + holdSpeed(s.target_window, s.metric), Tone::Running);
-    h.second = mmss(s.target_secs) + " to go here";
+    h.second = nearestBands(bands, n, s.mph, s.metric);
+    return h;
+  }
+  const Band &bd = bands[here];
+  char hold_text[48];
+  std::snprintf(hold_text, sizeof(hold_text), "HOLD %d %s", speedValue(bd.target_mph, s.metric), speedUnit(s.metric));
+  const std::string left = std::to_string((int)bd.minutes) + " min left here";
+  if (countingBand(s, bands, n) == here) {
+    h.primary = line(std::string("TESTING: ") + hold_text, Tone::Running);
+    h.second = left;
   } else {
-    std::string t = "WAITING: " + holdSpeed(s.target_window, s.metric);
-    if (std::strcmp(s.gate_reason, "curve") == 0 || std::strcmp(s.gate_reason, "lat") == 0) {
+    std::string t = std::string("WAITING: ") + hold_text;
+    if (altOpen(s) && bd.lo == (int)ti_ab::PLAN_ALT_MIN_MPH) {
+      t = "WAITING: A/B STARTING";             // the alternation's band: the plan is handing over to it
+    } else if (std::strcmp(s.gate_reason, "curve") == 0 || std::strcmp(s.gate_reason, "lat") == 0) {
       t = "WAITING: STRAIGHT ROAD";
     } else if (std::strcmp(s.gate_reason, "command") == 0) {
       t = "WAITING: EASE STEERING";
     }
     h.primary = line(t, Tone::Waiting);
-    h.second = mmss(s.target_secs) + " to go here";
+    h.second = left;
   }
   return h;
 }
@@ -822,6 +924,7 @@ inline std::string detailScored(double a_s, double b_s, double target_min, bool 
 // rules as ti_drive_plan.py (test_mazda_ti_pages_logic.py compares the reasons). The driver never picks an experiment on the screen.
 struct PlanFields {
   bool named = false;
+  bool reasons_ok = false;               // every amount carries its reason, minimum and buffer
   std::vector<std::string> test_ids, windows;
   bool has_alt = false;
   std::string setting, a, b_text;       // b_text: "other", or "number" when b is a number
@@ -841,7 +944,7 @@ inline std::string planProblem(const PlanFields &p) {
     return "tests must cover all four windows";
   }
   if (!p.has_alt) {
-    return "";
+    return p.reasons_ok ? "" : "an amount has no reason";
   }
   const int idx = ti_ab::settingIndex(p.setting.c_str());
   if (idx < 0) {
@@ -862,12 +965,12 @@ inline std::string planProblem(const PlanFields &p) {
     return "block length outside 4-10 min";
   }
   if (p.target_min != ti_ab::PLAN_TARGET_MIN_DEFAULT) {
-    return "target must be 20 min per side";
+    return "target must be 10 min per side";
   }
   if (p.min_mph != ti_ab::PLAN_ALT_MIN_MPH || p.max_mph != ti_ab::PLAN_ALT_MAX_MPH) {
     return "speed range must be 35-56 mph";
   }
-  return "";
+  return p.reasons_ok ? "" : "an amount has no reason";
 }
 
 // The plan in large plain words, or why it cannot run. has_alt with its setting: "PLAN: tests + friction relay A/B"
@@ -879,76 +982,6 @@ inline std::string planLine(bool ok, const std::string &problem, bool has_alt, c
     return "PLAN: tests";
   }
   return std::string("PLAN: tests + ") + plainName(setting) + " A/B";
-}
-
-// ---- the bands still needed, one number each -----------------------------------------------------------------------------------
-// The first page's list while the plan runs: a speed to hold and the engaged minutes still needed there. What the tests and the
-// alternation each need is merged into one figure per band, so the driver does not have to know which one is using the time.
-// Scheduling rule (the one the car side applies; not changed here): inside 35-56 mph the ALTERNATION has the time until it is complete
-// (that is how the plan hands over: tests everywhere else, and everywhere once it is complete), so the 35-41 and 49-56 mph test windows
-// are served after it; the one 36-55 mph figure is therefore alternation minutes plus those two windows' minutes. Outside it the tests
-// run in their own windows. Overheads (fades, hand-overs, wash-in, voided time, gate waits) are estimates, named below.
-constexpr double OVERHEAD_TESTS = 1.3;   // engaged minutes per minute of credited test signal (assumption: the plan never credited on the last drive)
-constexpr double OVERHEAD_ALT = 1.35;    // engaged minutes per scored minute of alternation (wash-in about 11 s per switch, margin and settle waits, partial blocks)
-constexpr int N_BANDS = 3;
-
-struct Band {
-  int target_mph = 0;          // the one speed to hold
-  int lo = 0, hi = 0;          // the range, in small type
-  double minutes = 0;          // engaged minutes still needed, rounded up for display
-  bool done = false;
-  bool here = false;           // the car is inside this band now
-};
-
-// tests_left_s: required seconds still to collect per window (step tests); alt_a_s, alt_b_s: scored seconds so far per side;
-// alt_open: an alternation is part of the plan and not complete
-inline void bandsFor(const double tests_left_s[ti_logic::N_WINDOWS], bool alt_open, double alt_a_s, double alt_b_s, double target_min, double mph,
-                     bool have_speed, Band out[N_BANDS]) {
-  const double t[ti_logic::N_WINDOWS] = {tests_left_s[0] * OVERHEAD_TESTS / 60.0, tests_left_s[1] * OVERHEAD_TESTS / 60.0,
-                                         tests_left_s[2] * OVERHEAD_TESTS / 60.0, tests_left_s[3] * OVERHEAD_TESTS / 60.0};
-  const double alt = alt_open ? abMinutesLeft(alt_a_s, alt_b_s, target_min) * OVERHEAD_ALT : 0.0;
-  out[0] = Band{ti_logic::windowTargetMph(0), (int)ti_logic::WINDOWS[0].low, (int)ti_logic::WINDOWS[0].high, t[0], false, false};
-  out[1] = Band{ti_logic::windowTargetMph(1) + 7, (int)ti_ab::PLAN_ALT_MIN_MPH + 1, (int)ti_ab::PLAN_ALT_MAX_MPH - 1, alt + t[1] + t[2], false, false};
-  out[2] = Band{ti_logic::windowTargetMph(3), (int)ti_logic::WINDOWS[3].low, (int)ti_logic::WINDOWS[3].high, t[3], false, false};
-  for (int i = 0; i < N_BANDS; i++) {
-    out[i].minutes = std::ceil(out[i].minutes - 1e-9);
-    out[i].done = out[i].minutes <= 0.0;
-    out[i].here = have_speed && mph >= out[i].lo && mph < out[i].hi + 1;
-  }
-}
-
-inline double bandsTotalMinutes(const Band b[N_BANDS]) {
-  double sum = 0;
-  for (int i = 0; i < N_BANDS; i++) {
-    sum += b[i].minutes;
-  }
-  return sum;
-}
-
-// "24 mph  6 min" / "done"
-inline std::string bandText(const Band &b, bool metric) {
-  char buf[64];
-  if (b.done) {
-    std::snprintf(buf, sizeof(buf), "%d %s  done", speedValue(b.target_mph, metric), metric ? "km/h" : "mph");
-  } else {
-    std::snprintf(buf, sizeof(buf), "%d %s  %d min", speedValue(b.target_mph, metric), metric ? "km/h" : "mph", (int)b.minutes);
-  }
-  return buf;
-}
-
-inline std::string bandRange(const Band &b, bool metric) {
-  char buf[48];
-  std::snprintf(buf, sizeof(buf), "%d-%d %s", speedValue(b.lo, metric), speedValue(b.hi, metric), metric ? "km/h" : "mph");
-  return buf;
-}
-
-// The stopped page: what the whole plan needs in one drive, "PLAN NEEDS ABOUT 75 MIN: 24 mph 7, 45 mph 54, 70 mph 5"
-inline std::string budgetLine(const Band b[N_BANDS], bool metric) {
-  char buf[128];
-  std::snprintf(buf, sizeof(buf), "PLAN NEEDS ABOUT %d MIN: %d %s %d, %d %s %d, %d %s %d", (int)bandsTotalMinutes(b), speedValue(b[0].target_mph, metric),
-                metric ? "km/h" : "mph", (int)b[0].minutes, speedValue(b[1].target_mph, metric), metric ? "km/h" : "mph", (int)b[1].minutes,
-                speedValue(b[2].target_mph, metric), metric ? "km/h" : "mph", (int)b[2].minutes);
-  return buf;
 }
 
 // ---- the set-up page ------------------------------------------------------------------------------------------------

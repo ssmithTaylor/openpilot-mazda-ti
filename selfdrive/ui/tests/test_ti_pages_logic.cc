@@ -165,7 +165,8 @@ static void everyStateFits() {
                       for (const char *g : gates) {
                         HomeState s;
                         s.run = (Run)run; s.configured = conf; s.engaged = eng; s.have_speed = have; s.mph = mph; s.metric = metric;
-                        s.plan_mode = pm; s.hold_why = hw; s.target = w >= 0; s.target_window = w; s.target_secs = 7200;
+                        s.plan_mode = pm; s.hold_why = hw;
+                        if (w >= 0) s.tests_left_s[w] = 7200; else s.ab_stored_a_s = s.ab_stored_b_s = 100;
                         s.tests_active = active; s.gate_reason = g;
                         confirm(s); s.ab_fresh = true; s.ab_state = "running";
                         checkLines(s, count);
@@ -196,20 +197,28 @@ static void everyStateFits() {
 
 static void sampleStates() {
   HomeState s;
-  s.run = Run::Plan; s.engaged = true; s.have_speed = true; s.mph = 24; s.plan_mode = "tests"; s.target = true; s.target_window = 0;
-  s.target_secs = 100; s.tests_active = true; s.configured = true;
-  CHECK(H(s).primary.text == "TESTING: HOLD 24 MPH" && H(s).primary.tone == Tone::Running && H(s).second == "1:40 to go here");
-  s.mph = 38;                                    // inside another window: it counts, but not the one asked for
-  CHECK(H(s).primary.text == "HOLD 24 MPH" && H(s).primary.tone == Tone::Waiting && H(s).second == "Now 38 mph");
-  s.mph = 30;                                    // where nothing counts: said plainly, with the nearest speeds that do
-  CHECK(H(s).primary.text == "NO COUNT AT 30 MPH" && H(s).primary.tone == Tone::Waiting && H(s).second == "Hold 24 or 38 mph");
-  s.mph = 45;
-  CHECK(H(s).primary.text == "NO COUNT AT 45 MPH" && H(s).second == "Hold 38 or 52 mph");
+  s.run = Run::Plan; s.engaged = true; s.have_speed = true; s.mph = 24; s.plan_mode = "tests"; s.tests_active = true; s.configured = false;
+  s.tests_left_s[0] = 100.0 * 60 / 1.3 / 60.0 * 1.0; s.tests_left_s[3] = 120;
+  // 100 s * 1.3 / 60 = 2.2 -> 3 min left in the 24 mph band
+  s.tests_left_s[0] = 100;
+  CHECK(H(s).primary.text == "TESTING: HOLD 24 MPH" && H(s).primary.tone == Tone::Running && H(s).second == "3 min left here");
+  s.mph = 72;                                     // another band that still needs time: it counts there too
+  CHECK(H(s).primary.text == "TESTING: HOLD 72 MPH" && H(s).second == "3 min left here");
+  s.tests_active = false;
+  CHECK(H(s).primary.text == "WAITING: HOLD 72 MPH" && H(s).primary.tone == Tone::Waiting);
+  s.tests_active = true;
+  s.mph = 30;                                     // where nothing counts: said plainly, with the nearest bands that still need time
+  CHECK(H(s).primary.text == "NO COUNT AT 30 MPH" && H(s).primary.tone == Tone::Waiting && H(s).second == "Hold 24 or 72 mph");
   s.mph = 17;
   CHECK(H(s).primary.text == "NO COUNT AT 17 MPH" && H(s).second == "Hold 24 mph");
   s.mph = 85;
   CHECK(H(s).primary.text == "NO COUNT AT 85 MPH" && H(s).second == "Hold 72 mph");
-  s.mph = 24;
+  s.tests_left_s[3] = 0;
+  s.mph = 85;
+  CHECK(H(s).second == "Hold 24 mph");                                    // 72 mph needs nothing now: only the 24 mph band is listed as needed
+  s.tests_left_s[1] = s.tests_left_s[2] = 60;      // the windows 35-41 and 49-56 still need time, the alternation is not part of the plan
+  s.mph = 45;                                     // the gap between them: nothing counts, and the list shows 38 and 52
+  CHECK(H(s).primary.text == "NO COUNT AT 45 MPH" && H(s).second == "Hold 38 or 52 mph");
   s.mph = 24; s.tests_active = false; s.gate_reason = "curve";
   CHECK(H(s).primary.text == "WAITING: STRAIGHT ROAD");
   s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "ab"; s.ab_fresh = true; s.ab_state = "running"; s.ab_arm = "B";
@@ -218,10 +227,12 @@ static void sampleStates() {
   s.ab_block = false; s.ab_complete = true;
   CHECK(H(s).primary.text == "DONE: A/B COMPLETE" && H(s).primary.tone == Tone::Done);
   s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "tests"; s.have_speed = true; s.mph = 45; s.configured = true;
+  s.target_min = 20; s.ab_stored_a_s = s.ab_stored_b_s = 600;        // the alternation is open: 36-55 mph is one band, 45 mph is inside it
   CHECK(H(s).primary.text == "WAITING: A/B STARTING");
-  s.mph = 25;
-  CHECK(H(s).primary.text == "A/B: HOLD 38 MPH");
-  s.ab_complete = true;
+  s.mph = 25;                                                       // 25 mph: only the 24 mph band, which needs nothing: nothing counts
+  s.tests_left_s[0] = 60;
+  CHECK(H(s).primary.text == "TESTING: HOLD 24 MPH" || H(s).primary.text == "WAITING: HOLD 24 MPH");
+  s.ab_stored_a_s = s.ab_stored_b_s = 1200; s.tests_left_s[0] = 0;
   CHECK(H(s).primary.text == "DONE: ALL COMPLETE");
   s = HomeState();
   CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "Nothing is running");
@@ -232,7 +243,7 @@ static void sampleStates() {
   s.run = Run::All;
   CHECK(H(s).primary.text == "WAITING: ENGAGE");
   // km/h on a metric device
-  s = HomeState(); s.run = Run::All; s.engaged = true; s.have_speed = true; s.mph = 72; s.metric = true; s.target = true; s.target_window = 3;
+  s = HomeState(); s.run = Run::All; s.engaged = true; s.have_speed = true; s.mph = 72; s.metric = true; s.tests_left_s[3] = 120;
   CHECK(H(s).primary.text == "TESTING: HOLD 116 KM/H" || H(s).primary.text == "WAITING: HOLD 116 KM/H");
 }
 
@@ -250,7 +261,7 @@ static void carReportRules() {
           HomeState s;
           s.run = (Run)run; s.plan_mode = pm; s.ab_state = st; s.ab_arm = "B";
           s.ab_fresh = bits & 1; s.car_plan_on = bits & 2; s.live_fresh = bits & 4; s.live_all_on = bits & 8; s.live_tests_on = bits & 16;
-          s.engaged = true; s.have_speed = true; s.mph = 24; s.configured = true; s.target = true; s.target_window = 0; s.target_secs = 60;
+          s.engaged = true; s.have_speed = true; s.mph = 24; s.configured = true; s.tests_left_s[0] = 60; s.ab_stored_a_s = s.ab_stored_b_s = 300;
           s.tests_active = bits & 32; s.ab_block = true; s.ab_block_left_s = 100;
           const HomeLines h = home(s);
           const StartLook k = startLook(true, s.run, carRunning(s));
@@ -426,8 +437,6 @@ static void progressTexts() {
       CHECK((int)thisDriveLine(some, 12345, 54321, ab, m).size() <= MAX_DETAIL_CHARS);
     }
   }
-  CHECK(countsNothingAt(30) && countsNothingAt(33) && countsNothingAt(17) && countsNothingAt(80) && !countsNothingAt(24) && !countsNothingAt(70));
-  CHECK(nearestCounting(30, false) == "Hold 24 or 38 mph");
 }
 
 static void setupOrderAndChoice() {
@@ -462,11 +471,11 @@ static void setupOrderAndChoice() {
 
 static PlanFields goodPlan() {
   PlanFields p;
-  p.named = true;
+  p.named = true; p.reasons_ok = true;
   p.test_ids = {"ti_sweep", "ti_pulses", "ti_ladder"};
   p.windows = {"21-27", "35-41", "49-56", "64-80"};
   p.has_alt = true; p.setting = "LatNoFrictionRelay"; p.a = "stored"; p.b_text = "other";
-  p.block_min = 4; p.target_min = 20; p.min_mph = 35; p.max_mph = 56;
+  p.block_min = 4; p.target_min = 10; p.min_mph = 35; p.max_mph = 56;
   return p;
 }
 
@@ -479,7 +488,8 @@ static void planAndBands() {
     {"A must be your stored value", [](PlanFields &x) { x.a = "0.8"; }},
     {"B must be the other value", [](PlanFields &x) { x.b_text = "1"; }},
     {"block length outside 4-10 min", [](PlanFields &x) { x.block_min = 3; }},
-    {"target must be 20 min per side", [](PlanFields &x) { x.target_min = 30; }},
+    {"target must be 10 min per side", [](PlanFields &x) { x.target_min = 30; }},
+    {"an amount has no reason", [](PlanFields &x) { x.reasons_ok = false; }},
     {"speed range must be 35-56 mph", [](PlanFields &x) { x.max_mph = 70; }},
     {"tests must cover all four windows", [](PlanFields &x) { x.windows = {"21-27"}; }},
     {"tests must be sweep, pulses, ladder", [](PlanFields &x) { x.test_ids = {"ti_dither"}; }},
@@ -507,30 +517,96 @@ static void planAndBands() {
   CHECK(startLook(true, Run::Stopped, true, true).enabled);
 
   // the bands: one figure each, the alternation and the tests merged
-  const double left[4] = {6.0 * 60 / 1.3, 4.0 * 60 / 1.3, 3.0 * 60 / 1.3, 4.0 * 60 / 1.3};
-  Band b[N_BANDS];
-  bandsFor(left, true, 0, 0, 20, 45.0, true, b);
-  CHECK(b[0].target_mph == 24 && b[2].target_mph == 72 && b[1].target_mph == 45 && b[0].minutes == 6 && b[2].minutes == 4);
+  HomeState hs;
+  hs.configured = true; hs.target_min = 20; hs.ab_stored_a_s = hs.ab_stored_b_s = 0;
+  hs.tests_left_s[0] = 6.0 * 60 / 1.3; hs.tests_left_s[1] = 4.0 * 60 / 1.3; hs.tests_left_s[2] = 3.0 * 60 / 1.3; hs.tests_left_s[3] = 4.0 * 60 / 1.3;
+  Band b[MAX_BANDS];
+  int n = bandsFromState(hs, b);
+  CHECK(n == 3 && b[0].target_mph == 24 && b[2].target_mph == 72 && b[1].target_mph == 45 && b[0].minutes == 6 && b[2].minutes == 4);
   CHECK(b[1].minutes == std::ceil(40 * OVERHEAD_ALT + 7.0 - 1e-9));        // alternation 40 min, both sides still open, plus the two windows
-  CHECK(!b[0].here && b[1].here && !b[2].here && !b[1].done);
-  bandsFor(left, false, 0, 0, 20, 24.0, true, b);
-  CHECK(b[1].minutes == 7 && b[0].here);
-  const double none[4] = {0, 0, 0, 0};
-  bandsFor(none, true, 1200, 1200, 20, 0, false, b);
-  CHECK(b[0].done && b[1].done && b[2].done && bandsTotalMinutes(b) == 0 && !b[0].here);
-  CHECK(bandText(b[0], false) == "24 mph  done");
-  bandsFor(left, true, 600, 300, 20, 70, true, b);
-  CHECK(b[2].here && bandText(b[2], false) == "72 mph  4 min" && bandRange(b[2], false) == "64-80 mph");
+  CHECK(b[1].lo == 35 && b[1].hi == 56 && bandRange(b[1], false) == "36-55 mph" && bandIndexAt(b, n, 35.5) == 1 && bandIndexAt(b, n, 45.0) == 1);
+  hs.configured = false;                                                   // no alternation: the bands are the test windows
+  n = bandsFromState(hs, b);
+  CHECK(n == 4 && b[1].target_mph == 38 && b[2].target_mph == 52 && b[1].minutes == 4 && b[2].minutes == 3 && bandIndexAt(b, n, 45.0) == -1);
+  hs.configured = true; hs.ab_stored_a_s = hs.ab_stored_b_s = 1200;       // the alternation complete: 36-55 is not a band any more, 38 and 52 are
+  n = bandsFromState(hs, b);
+  CHECK(n == 4 && b[1].target_mph == 38 && b[2].target_mph == 52 && bandIndexAt(b, n, 45.0) == -1 && bandIndexAt(b, n, 38.0) == 1);
+  HomeState none;
+  none.configured = true; none.target_min = 20; none.ab_stored_a_s = none.ab_stored_b_s = 1200;
+  n = bandsFromState(none, b);
+  CHECK(bandsTotalMinutes(b, n) == 0 && b[0].done && bandText(b[0], false) == "24 mph  done" && bandIndexAt(b, n, 24.0) == -1);
+  n = bandsFromState(hs, b);
+  CHECK(bandText(b[3], false) == "72 mph  4 min" && bandRange(b[3], false) == "64-80 mph");
   for (int m = 0; m < 2; m++) {
-    for (int i = 0; i < N_BANDS; i++) {
+    HomeState big;
+    big.configured = true; big.target_min = 20;
+    for (int w = 0; w < 4; w++) big.tests_left_s[w] = 9e4;
+    n = bandsFromState(big, b);
+    for (int i = 0; i < n; i++) {
       CHECK((int)bandText(b[i], m).size() <= 24 && (int)bandRange(b[i], m).size() <= 24);
     }
-    const double big[4] = {9e4, 9e4, 9e4, 9e4};
-    bandsFor(big, true, 0, 0, 20, 45, true, b);
-    CHECK((int)budgetLine(b, m).size() <= 128 && (int)bandText(b[1], m).size() <= 24);
+    CHECK((int)budgetLine(b, n, m).size() <= 128);
   }
-  bandsFor(left, true, 0, 0, 20, 45, true, b);
-  CHECK(budgetLine(b, false).rfind("PLAN NEEDS ABOUT ", 0) == 0);
+  hs.ab_stored_a_s = hs.ab_stored_b_s = 0;
+  n = bandsFromState(hs, b);
+  CHECK(budgetLine(b, n, false).rfind("PLAN NEEDS ABOUT ", 0) == 0);
+}
+
+// One model for the list and the status line, over every state: what is highlighted is a band where time is counting, "NO COUNT" never
+// shows while a listed band contains the speed, and the minutes of a band are exactly what completing it needs at that moment.
+static void listAndStatusAgree() {
+  const char *plan_modes[] = {"", "off", "hold", "ab", "tests"};
+  const double speeds[] = {0, 10, 20, 22, 25, 29, 33, 35, 35.5, 36, 38, 41, 45, 49, 52, 55, 55.9, 56, 60, 66, 72, 79, 80, 90};
+  const double amounts[] = {0, 40, 400};
+  int states = 0, highlighted = 0, nocount = 0;
+  for (int run = 0; run < 5; run++)
+    for (int conf = 0; conf < 2; conf++)
+      for (const char *pm : plan_modes)
+        for (double mph : speeds)
+          for (double a : {0.0, 700.0, 1200.0})
+            for (double t0 : amounts)
+              for (double t1 : amounts)
+                for (double t3 : amounts)
+                  for (int active = 0; active < 2; active++)
+                    for (int block = 0; block < 2; block++) {
+                      HomeState s;
+                      s.run = (Run)run; s.configured = conf; s.plan_mode = pm; s.engaged = true; s.have_speed = true; s.mph = mph;
+                      s.target_min = 20; s.ab_stored_a_s = a; s.ab_stored_b_s = a; s.tests_left_s[0] = t0; s.tests_left_s[1] = t1;
+                      s.tests_left_s[2] = t1; s.tests_left_s[3] = t3; s.tests_active = active; s.ab_block = block; s.ab_arm = "B";
+                      s.ab_state = "running"; s.ab_fresh = true;
+                      confirm(s);
+                      Band b[MAX_BANDS];
+                      const int n = bandsFromState(s, b);
+                      const int counting = countingBand(s, b, n);
+                      const HomeLines h = home(s);
+                      states++;
+                      // the highlighted band is one that contains the speed, still needs time, and the car reports counting
+                      if (counting >= 0) {
+                        highlighted++;
+                        CHECK(!b[counting].done && mph >= b[counting].lo && mph < b[counting].hi && carRunning(s) && (active || block));
+                      }
+                      // "NO COUNT" never while a still-needed band contains the speed (and then nothing is highlighted)
+                      if (h.primary.text.rfind("NO COUNT", 0) == 0) {
+                        nocount++;
+                        CHECK(bandIndexAt(b, n, mph) < 0 && counting < 0);
+                      }
+                      // a running status that counts down a band is in a listed band
+                      if (h.primary.text.rfind("TESTING", 0) == 0) {
+                        CHECK(bandIndexAt(b, n, mph) >= 0 && counting == bandIndexAt(b, n, mph));
+                      }
+                      // the minutes of a band: exactly what completing it requires now (recomputed here from the inputs)
+                      const bool alt_open = conf && std::fmax(0.0, 1200.0 - a) + std::fmax(0.0, 1200.0 - a) > 0.0;
+                      const double alt_min = alt_open ? (2 * std::fmax(0.0, 1200.0 - a) / 60.0) * OVERHEAD_ALT : 0.0;
+                      const double w0 = t0 * OVERHEAD_TESTS / 60.0, w1 = t1 * OVERHEAD_TESTS / 60.0, w3 = t3 * OVERHEAD_TESTS / 60.0;
+                      CHECK(b[0].minutes == std::ceil(w0 - 1e-9) && b[n - 1].minutes == std::ceil(w3 - 1e-9));
+                      if (alt_open) {
+                        CHECK(n == 3 && b[1].minutes == std::ceil(alt_min + 2 * w1 - 1e-9));
+                      } else {
+                        CHECK(n == 4 && b[1].minutes == std::ceil(w1 - 1e-9) && b[2].minutes == std::ceil(w1 - 1e-9));
+                      }
+                      CHECK(bandsTotalMinutes(b, n) >= 0);
+                    }
+  CHECK(states > 100000 && highlighted > 1000 && nocount > 1000);
 }
 
 static void setup() {
@@ -554,6 +630,7 @@ int main() {
   progressTexts();
   setupOrderAndChoice();
   planAndBands();
+  listAndStatusAgree();
   setup();
   if (failures == 0) {
     std::printf("ok\n");

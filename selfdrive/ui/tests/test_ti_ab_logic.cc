@@ -88,7 +88,7 @@ static void plan() {
   CHECK(planLine("hold", 0, 0, 20.0, false).find("handing over") != std::string::npos);
   CHECK(planLine("dead", 0, 0, 20.0, false).find("stopped after an error") != std::string::npos);
   CHECK(planLine("off", 0, 0, 20.0, false) == "Drive plan off");
-  CHECK(PLAN_TARGET_MIN_DEFAULT == 20.0 && PLAN_ALT_MIN_MPH == 35.0 && PLAN_ALT_MAX_MPH == 56.0);
+  CHECK(PLAN_TARGET_MIN_DEFAULT == 10.0 && PLAN_ALT_MIN_MPH == 35.0 && PLAN_ALT_MAX_MPH == 56.0);
 }
 
 static void holds() {

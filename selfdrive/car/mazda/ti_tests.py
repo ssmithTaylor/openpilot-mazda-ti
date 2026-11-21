@@ -364,6 +364,30 @@ def load_definitions(path=DEFINITIONS_PATH):
   return validate_document(doc)
 
 
+def window_share(doc, defs, band):
+  """(have, need): required seconds of the step tests in window `band`, as collected (each step clipped to its need) and in all.
+  `doc`: the parsed progress mapping. Never raises; (0, 0) when unknown."""
+  have_sum, need_sum = 0.0, 0.0
+  try:
+    for t in defs:
+      if t.metric != "step_seconds":
+        continue
+      for k, b in enumerate(t.bins):
+        if b[2] != band:
+          continue
+        entry = doc.get(t.id, {}).get(band, {}) if isinstance(doc, dict) else {}
+        for step, need in enumerate(t.needs[k]):
+          if need <= 0:
+            continue
+          got = entry.get(str(step), 0.0) if isinstance(entry, dict) else 0.0
+          got = got if isinstance(got, (int, float)) and not isinstance(got, bool) and got == got else 0.0
+          have_sum += min(max(got, 0.0), need)
+          need_sum += need
+  except Exception:
+    return 0.0, 0.0
+  return have_sum, need_sum
+
+
 def parse_progress(raw):
   """The progress mapping, cleaned, or None when absent or unusable. Entries of tests that are no longer defined are
   kept (they keep their numbers until reset); bad values are dropped; top-level keys starting with "_" (the live

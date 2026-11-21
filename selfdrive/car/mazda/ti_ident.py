@@ -203,7 +203,9 @@ PULSE_FLAT = 10
 STEP_CAP_S = 60.0
 OPTIONAL_ABOVE_S = 130.0
 REQUIRED_S = {
-  "21-27": {SWEEP: (0.0, 59.76, 48.0, 32.24, 27.3, 11.2, 12.0), LADDER: (0.0, 0.0, 0.0, 0.0, 60.0), PULSES: (0.0, 54.0)},
+  # 21-27 sweep: the noise-derived needs (190.5 s) cut to about 80 s (whole units per step, the first six units' shares kept roughly in proportion) by the owner's plan (ti_drive_plan.json gives the reason: two earlier drives cover the
+  # sweep in the lowest band and the wheel's response to it is below the angle sensor's resolution); pulses and ladder are in full
+  "21-27": {SWEEP: (0.0, 26.56, 18.0, 12.4, 12.6, 4.48, 6.0), LADDER: (0.0, 0.0, 0.0, 0.0, 60.0), PULSES: (0.0, 54.0)},
   "35-41": {SWEEP: (0.0, 26.56, 14.0, 9.92, 6.3, 4.48, 6.0), LADDER: (0.0, 0.0, 60.0, 40.0), PULSES: (60.0, 20.0)},
   "49-56": {SWEEP: (0.0, 26.56, 10.0, 7.44, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 60.0, 25.0), PULSES: (52.0, 20.0)},
   "64-80": {SWEEP: (0.0, 13.28, 10.0, 4.96, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 55.0, 20.0), PULSES: (54.0, 20.0)},

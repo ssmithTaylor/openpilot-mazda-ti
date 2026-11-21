@@ -85,6 +85,10 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   s.name = name;
   s.title = title;
   s.locked = locked;
+  hs.target_min = 20; hs.ab_stored_known = hs.configured; hs.ab_stored_a_s = 14.2 * 60; hs.ab_stored_b_s = 12.9 * 60;
+  const bool alt_done = hs.ab_complete || name == "home-gap-alternation-done";
+  if (alt_done) hs.ab_stored_a_s = hs.ab_stored_b_s = 1200;
+  hs.tests_left_s[0] = 6.0 * 60 / 1.3; hs.tests_left_s[1] = 4.0 * 60 / 1.3; hs.tests_left_s[2] = 3.0 * 60 / 1.3; hs.tests_left_s[3] = 4.0 * 60 / 1.3;
   const HomeLines h = home(hs);
   const ToneColor tc = toneColor(h.primary.tone);
   const int fill[3] = {tc.r, tc.g, tc.b};
@@ -100,25 +104,28 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
           planLine(true, "", hs.configured, "LatNoFrictionRelay"), CHOSEN_PX);
   const StartLook look = startLook(hs.configured, hs.run, carRunning(hs));
   const int dark_green[3] = {0x0f, 0x4d, 0x28};
-  const double left[4] = {6.0 * 60 / 1.3, 4.0 * 60 / 1.3, 3.0 * 60 / 1.3, 4.0 * 60 / 1.3};
-  Band bands[N_BANDS];
-  bandsFor(left, hs.configured, 14.2 * 60, 12.9 * 60, 20, hs.mph, hs.have_speed, bands);
+  Band bands[MAX_BANDS];
+  const int n_bands = bandsFromState(hs, bands);
+  const int counting = countingBand(hs, bands, n_bands);
   if (carRunning(hs)) {
     Rect area{};
     rectOf(Page::Home, CTL_START, 0, area);
-    for (int i = 0; i < N_BANDS; i++) {
-      const bool here = bands[i].here && !bands[i].done;
-      const Rect row{area.x, area.y + i * 92, area.w, 84};
-      s.items.push_back({row, here ? 0x17 : 0x22, here ? 0x86 : 0x22, here ? 0x44 : 0x22, 255, 255, 255, "", 0, "", 0, "center", "band", ""});
-      textBox(s, Rect{row.x + 24, row.y, row.w - 420, row.h}, WHITE, bandText(bands[i], false), BAND_PX);
+    for (int i = 0; i < n_bands; i++) {
+      const bool inside = bandIndexAt(bands, n_bands, hs.mph) == i && hs.have_speed;
+      const Rect row{area.x, area.y + i * 70, area.w, 66};
+      const int fr = i == counting ? 0x17 : (inside ? 0x6b : (bands[i].done ? 0x1f : 0x22));
+      const int fg = i == counting ? 0x86 : (inside ? 0x5e : (bands[i].done ? 0x3a : 0x22));
+      const int fb = i == counting ? 0x44 : (inside ? 0x10 : (bands[i].done ? 0x2a : 0x22));
+      s.items.push_back({row, fr, fg, fb, 255, 255, 255, "", 0, "", 0, "center", "band", ""});
+      textBox(s, Rect{row.x + 24, row.y, row.w - 420, row.h}, WHITE, (bands[i].done ? "✓ " : "") + bandText(bands[i], false), BAND_PX);
       s.items.back().sub = "bold";
       textBox(s, Rect{row.x, row.y, row.w - 24, row.h}, grey_ink, bandRange(bands[i], false), DETAIL_PX, "right");
     }
-    textBox(s, Rect{area.x, area.y + N_BANDS * 92 + 4, area.w, 44}, grey_ink, "About " + std::to_string((int)bandsTotalMinutes(bands)) + " min of driving left in all", DETAIL_PX);
+    textBox(s, Rect{area.x, area.y + n_bands * 70 + 4, area.w, 44}, grey_ink, "About " + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all", DETAIL_PX);
   } else {
     box(s, Page::Home, CTL_START, look.enabled ? BLUE : dark_green, WHITE, look.label, START_PX, look.sub, START_SUB_PX);
   }
-  const std::string budget = hs.run == Run::Stopped ? budgetLine(bands, false) : "";
+  const std::string budget = hs.run == Run::Stopped ? budgetLine(bands, n_bands, false) : "";
   const bool any = hs.run != Run::Stopped;
   const int dark_red[3] = {0x6b, 0x1d, 0x25};
   box(s, Page::Home, CTL_STOP, any ? RED : dark_red, any ? WHITE : grey_ink, "STOP", STOP_PX, "stops every test and the A/B relay", START_SUB_PX);
@@ -127,8 +134,8 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   box(s, Page::Home, CTL_NAV_PROGRESS, GREY, WHITE, "PROGRESS >", NAV_PX);
   lockAndEngaged(s, Page::Home, hs.engaged);
   const double drive[4] = {95, 0, 40, 0};
-  textBox(s, HOME_DETAIL, grey_ink, hs.run != Run::Stopped ? thisDriveLine(drive, 4.0 * 60, 3.5 * 60, hs.configured, false) : budget, DETAIL_PX);
-  textBox(s, HOME_DETAIL2, grey_ink, hs.configured ? detailScored(14.2 * 60, 12.9 * 60, 20, false) : "", DETAIL_PX);
+  textBox(s, HOME_DETAIL, grey_ink, hs.run != Run::Stopped ? thisDriveLine(drive, 4.0 * 60, 3.5 * 60, hs.configured && !alt_done, false) : budget, DETAIL_PX);
+  textBox(s, HOME_DETAIL2, grey_ink, hs.configured ? detailScored(hs.ab_stored_a_s, hs.ab_stored_b_s, 20, alt_done) : "", DETAIL_PX);
   return s;
 }
 
@@ -144,10 +151,30 @@ static Scene setupScene() {
   const int grey_ink[3] = {0xc9, 0xc9, 0xc9};
   const char *lines[] = {"Next drive: identification tests + friction relay A/B", "Date 2026-11-23. Read from the build; nothing here is chosen on the screen.",
                          "Tests: sweep, pulses, ladder in the windows 21-27, 35-41, 49-56, 64-80 mph",
-                         "A/B: friction relay, yours (off) against on", "Blocks of 4 min, 20 min per side to finish, at 36-55 mph (35-56 mph range)",
-                         "A 14 / 20 min, B 13 / 20 min  (kept across restarts)"};
+                         "A/B: friction relay, yours (off) against on", "Blocks of 4 min, 10 min per side to finish, at 36-55 mph (35-56 mph range)",
+                         "A 6 / 10 min, B 5 / 10 min  (kept across restarts)"};
   for (int i = 0; i < 6; i++) {
-    textBox(s, Rect{480, 230 + i * 80, 1660, 70}, i == 0 ? WHITE : grey_ink, lines[i], EXPERIMENT_PX);
+    textBox(s, Rect{480, 215 + i * 56, 1660, 52}, i == 0 ? WHITE : grey_ink, lines[i], EXPERIMENT_PX);
+  }
+  // the reasons, as the plan file gives them (wrapped here the way the device wraps them)
+  const std::string notes =
+      "Alternation, 10 min per side: The question is whether removing the friction relay reduces steering oscillation (direction reversals per second) at 36-55 mph. Pass-to-pass variation is about 0.12 per second per pass of about 86 s; the one earlier comparison showed a drop of about 0.23 per second, about 1.9 times that variation. "
+      "Minimum: About 4-5 passes per side (about 6-7 minutes per side) give 80 percent power for an effect of that size. It cannot show an effect as small as closed-loop replay predicted (about 0.05 per second): that would need well over an hour per side and is out of reach of any single drive. "
+      "Buffer: 10 minutes per side is that minimum plus about half again, so a second drive is unlikely to be needed.   "
+      "Tests at 21-27 mph (pulses 54 s, ladder 60 s, sweep about 80 s): Pulses and ladder are kept in full: neither has usable data in this window yet. The sweep is cut from 190 s to about 80 s: two earlier drives already cover the sweep in the lowest band, and the wheel's response to the sweep is below the angle sensor's resolution, so more sweep time here adds little. "
+      "Minimum: pulses 54 s and ladder 60 s are the whole requirement there; the sweep's 80 s is a cap, not a measured need. Buffer: none added.";
+  int y = 215 + 6 * 56 + 8;
+  std::string line;
+  size_t pos = 0;
+  while (pos < notes.size() && y < SCREEN_H - 20) {
+    size_t end = std::min(notes.size(), pos + 105);
+    if (end < notes.size()) {
+      const size_t sp = notes.rfind(' ', end);
+      if (sp != std::string::npos && sp > pos) end = sp;
+    }
+    textBox(s, Rect{480, y, 1660, 34}, grey_ink, notes.substr(pos, end - pos), PLAN_NOTE_PX);
+    y += 34;
+    pos = end + 1;
   }
   return s;
 }
@@ -283,9 +310,10 @@ int main() {
 
   HomeState waiting = testing;
   waiting.tests_active = false; waiting.gate_reason = "curve";
-  HomeState bandsRun = testing;
-  bandsRun.mph = 45; bandsRun.plan_mode = "tests"; bandsRun.tests_active = false;
-  scenes.push_back(homeScene("home-bands-in-ab-range", "First page: bands still needed, the car is in the 36-55 mph band", bandsRun));
+  HomeState gap = testing;                               // the alternation complete: the bands are the windows, 41-49 mph counts nothing
+  gap.mph = 45; gap.tests_active = false;
+  gap.configured = true;
+  scenes.push_back(homeScene("home-gap-alternation-done", "First page: alternation done, 45 mph is between the windows, nothing counts", gap));
   scenes.push_back(homeScene("home-waiting-straight", "First page: waiting for a straight road", waiting));
 
   HomeState ab;

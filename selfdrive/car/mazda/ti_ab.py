@@ -922,6 +922,13 @@ class TiAbRunner:
     self.ab.save_fn = self._save_progress
     self._written = None
     self._clear_switches()
+    self.tests_defs, self.tests_doc, self.tests_behind = None, None, False
+    try:
+      from openpilot.selfdrive.car.mazda import ti_tests
+      self.ti_tests = ti_tests
+      self.tests_defs = ti_tests.load_definitions()[0]
+    except Exception:
+      self.ti_tests = None            # no test definitions here: the tests never get a visit inside the range (the plan as before)
     self.plan = ti_plan.Plan(log=lambda kind, **kw: self.ab._event(kind, **kw))
     self.plan_on, self.plan_ack, self.plan_dead = False, None, False
     self.plan_out = None
@@ -952,6 +959,40 @@ class TiAbRunner:
     except Exception:
       pass
 
+  def _read_tests_progress(self):
+    """The tests' progress as the accountant publishes it (tmpfs copy first, else the flash copy); None when unreadable."""
+    self.tests_doc = None
+    if self.ti_tests is None:
+      return
+    try:
+      for store in (self.memory, self.params):
+        raw = store.get(self.ti_tests.PROGRESS_KEY)
+        if isinstance(raw, (bytes, bytearray)):
+          raw = raw.decode("utf-8", "replace")
+        doc = self.ti_tests.parse_progress(raw) if raw else None
+        if doc is not None:
+          self.tests_doc = doc
+          return
+    except Exception:
+      self.tests_doc = None
+
+  def _tests_behind(self, v_ego):
+    """Are the tests of the test window the car is in behind the alternation in share of completion (ti_plan.tests_behind)? False on any doubt."""
+    try:
+      window = ti.zone_for(v_ego).window
+      if self.ti_tests is None or self.tests_defs is None or window not in ti_plan.INTERLEAVE_WINDOWS:
+        self.tests_behind = False
+        return False
+      have, need = self.ti_tests.window_share(self.tests_doc or {}, self.tests_defs, window)
+      tests_share = have / need if need > 0 else 1.0
+      target = self.ab.target_s
+      alt_share = None if not target else min(1.0, min(self.ab.committed["A"], self.ab.committed["B"]) / target)
+      self.tests_behind = ti_plan.tests_behind(window, tests_share, alt_share, self.tests_behind)
+      return self.tests_behind
+    except Exception:
+      self.tests_behind = False
+      return False
+
   def _save_progress(self, raw):
     """Write the experiment's progress (persistent), or clear it (None)."""
     self._written = (raw, time.time())
@@ -979,6 +1020,7 @@ class TiAbRunner:
       self.on, self.pin, self.plan_on = False, None, False
       self.read_error = f"A/B switch unreadable: {type(exc).__name__}"
     if self.k % self.CONFIG_EVERY == 0 or self.config is None:
+      self._read_tests_progress()
       try:
         self.config = self.params.get(PARAM_CONFIG)
       except Exception:
@@ -1016,7 +1058,8 @@ class TiAbRunner:
           self.ab.clear_plan_limits()
         po = self.plan.update(on=self.plan_on, cfg_valid=self.ab.cfg_valid, complete=self.ab.complete, mph=mph,
                               ab_at_a=self.ab.at_a_settled, ack=self.plan_ack, now=time.time(), tests_toggles_on=tests,
-                              ceiling=ti_plan.PLAN_ALT_MAX_MPH)
+                              ceiling=ti_plan.PLAN_ALT_MAX_MPH,
+                              tests_behind_here=self.plan_on and self._tests_behind(v))
         self.plan_out = po
         if self.plan_on:
           on, paused = True, tests or not po.ab_allowed

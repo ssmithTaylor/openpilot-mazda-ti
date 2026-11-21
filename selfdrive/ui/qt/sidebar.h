@@ -225,6 +225,7 @@ private:
   QString plan_problem_text;
   QString plan_name;
   QString plan_date;
+  QStringList plan_reasons;      // the reason, minimum and buffer of each amount, as the plan file gives them
   ti_pages::PlanFields plan;
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row

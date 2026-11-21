@@ -25,7 +25,7 @@ DT = 0.01
 H = 1.0                              # mph of hysteresis, as ti_ab's own speed gate
 PLAN_ALT_MIN_MPH = 35.0
 PLAN_ALT_MAX_MPH = 56.0              # first trial: replay evidence covers 35-56 mph only
-TARGET_MIN_PER_SIDE = 20.0           # engaged, scored minutes per side before the alternation is complete
+TARGET_MIN_PER_SIDE = 10.0           # engaged, scored minutes per side before the alternation is complete (the owner's plan file gives the reason)
 MIN_DWELL_S = 10.0                   # a speed-driven change of mode waits this long after the last change
 QUIET_SETTLE_S = 1.0                 # the tests' signal has been zero this long before the alternation may start
 STALE_S = 3.0                        # a plan not refreshed for this long allows no test
@@ -48,7 +48,22 @@ def in_range(prev, mph, ceiling=PLAN_ALT_MAX_MPH):
   return prev
 
 
-def decide(cfg_valid, complete, speed_in_range):
+INTERLEAVE_MARGIN = 0.02             # the tests must be this far behind the alternation (share of completion) to be given a visit
+INTERLEAVE_WINDOWS = ("35-41", "49-56")   # the test windows inside the alternation's speed range
+
+
+def tests_behind(window, tests_share, alt_share, was_behind):
+  """Interleaving inside the alternation's range: the alternation blocks go on until their target, but when the car is inside one of the
+  test windows there and that window's tests are behind the alternation in share of completion, they get the time (and keep it until
+  they have caught up). Pure; every hand-over rule of the plan applies to the visit as to any other change. False when unknown."""
+  if window not in INTERLEAVE_WINDOWS or tests_share is None or alt_share is None:
+    return False
+  if was_behind:
+    return tests_share < alt_share
+  return tests_share + INTERLEAVE_MARGIN < alt_share
+
+
+def decide(cfg_valid, complete, speed_in_range, tests_behind_here=False):
   """(mode, why) the plan wants: a pure function of state."""
   if complete:
     return "tests", "A/B complete"
@@ -56,6 +71,8 @@ def decide(cfg_valid, complete, speed_in_range):
     return "tests", "A/B not configured"
   if not speed_in_range:
     return "tests", "speed outside the A/B range"
+  if tests_behind_here:
+    return "tests", "the tests in this window are behind the alternation"
   return "ab", "A/B in its range"
 
 
@@ -93,7 +110,7 @@ class Plan:
     else:
       self.why = why
 
-  def update(self, *, on, cfg_valid, complete, mph, ab_at_a, ack, now, tests_toggles_on, ceiling=PLAN_ALT_MAX_MPH):
+  def update(self, *, on, cfg_valid, complete, mph, ab_at_a, ack, now, tests_toggles_on, ceiling=PLAN_ALT_MAX_MPH, tests_behind_here=False):
     """One control cycle. `ab_at_a`: the alternation's blend is exactly A and has been for its wash-in time. `ack`: the car
     controller's acknowledgement dict (or None); `now`: wall seconds."""
     self.n += 1
@@ -109,7 +126,7 @@ class Plan:
     if tests_toggles_on:
       self._set("hold", "single tests are on: the plan waits")
       return self._out(False, "")
-    want, why = decide(cfg_valid, complete, self.in_range)
+    want, why = decide(cfg_valid, complete, self.in_range, tests_behind_here)
     forced = complete or not cfg_valid
     cur = self.mode
     if want == "tests":

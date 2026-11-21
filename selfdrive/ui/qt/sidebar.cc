@@ -1535,8 +1535,25 @@ void TestsWindow::loadPlan() {
   for (const QJsonValue &v : o.value("tests").toObject().value("ids").toArray()) {
     plan.test_ids.push_back(v.toString().toStdString());
   }
+  plan.reasons_ok = true;
+  plan_reasons = QStringList();
+  const auto note = [&](const QString &what, const QJsonObject &e) {
+    for (const char *key : {"reason", "minimum", "buffer"}) {
+      if (!e.value(key).isString() || e.value(key).toString().trimmed().isEmpty()) {
+        plan.reasons_ok = false;
+      }
+    }
+    plan_reasons << QString("%1: %2 Minimum: %3 Buffer: %4").arg(what, e.value("reason").toString(), e.value("minimum").toString(), e.value("buffer").toString());
+  };
   for (const QJsonValue &v : o.value("tests").toObject().value("windows").toArray()) {
-    plan.windows.push_back(v.toString().toStdString());
+    const QJsonObject e = v.toObject();
+    plan.windows.push_back(e.value("window").toString().toStdString());
+    if (e.value("reason").toString() != QString("As reviewed earlier; not changed this round.")) {
+      note(QString("Tests at %1 mph (%2)").arg(e.value("window").toString(), e.value("amount").toString()), e);
+    } else {
+      note(QString("Tests at %1 mph").arg(e.value("window").toString()), e);
+      plan_reasons.removeLast();      // unchanged windows are one line below, not a paragraph each
+    }
   }
   const QJsonValue alt = o.value("alternation");
   if (alt.isObject()) {
@@ -1549,6 +1566,7 @@ void TestsWindow::loadPlan() {
     plan.b_text = a.value("b").toString().toStdString();
     plan.block_min = a.value("block_min").toDouble();
     plan.target_min = a.value("target_min_per_side").toDouble();
+    note(QString("Alternation, %1 min per side").arg((int)a.value("target_min_per_side").toDouble()), a);
     plan.min_mph = a.value("min_mph").toDouble();
     plan.max_mph = a.value("max_mph").toDouble();
   }
@@ -1805,6 +1823,10 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.tests_active = active;
   keep.gate = tests.gate.valid ? tests.gate.reason.toStdString() : std::string();
   h.gate_reason = keep.gate.c_str();
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    int done_n = 0, total_n = 0;
+    tests.windowShare(scope, w, done_n, total_n, h.tests_left_s[w]);
+  }
   bool known = false;
   abDisplay(h.ab_stored_a_s, h.ab_stored_b_s, known, h.target_min);
   h.ab_stored_known = known;
@@ -1855,27 +1877,20 @@ void TestsWindow::drawHome(QPainter &p) {
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
              QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "")));
 
-  // The bands still needed: one speed and the minutes left, the tests and the alternation merged into one figure each
-  const std::vector<int> band_scope = stepScope();
-  double left_s[ti_logic::N_WINDOWS];
-  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
-    int done_n = 0, total_n = 0;
-    tests.windowShare(band_scope, w, done_n, total_n, left_s[w]);
-  }
-  double ab_a_s = 0, ab_b_s = 0, ab_target = 0;
-  bool ab_known = false;
-  abDisplay(ab_a_s, ab_b_s, ab_known, ab_target);
-  Band bands[N_BANDS];
-  bandsFor(left_s, ab_configured && abMinutesLeft(ab_a_s, ab_b_s, ab_target) > 0.0, ab_a_s, ab_b_s, ab_target, speed_mph, have_speed, bands);
+  // The bands still needed: one speed and the minutes left, tests and alternation merged. The same model as the status line above.
+  Band bands[MAX_BANDS];
+  const int n_bands = bandsFromState(hs, bands);
+  const int counting = countingBand(hs, bands, n_bands);
   const bool show_bands = carRunning(hs);
   if (show_bands) {
     const QRect area = ctlRect(CTL_START);
-    for (int i = 0; i < N_BANDS; i++) {
-      const QRect row(area.x(), area.y() + i * 92, area.width(), 84);
-      const bool here = bands[i].here && !bands[i].done;
+    for (int i = 0; i < n_bands; i++) {
+      const QRect row(area.x(), area.y() + i * 70, area.width(), 66);
+      const bool inside = bandIndexAt(bands, n_bands, hs.mph) == i && hs.have_speed;
       p.setPen(Qt::NoPen);
-      p.setBrush(here ? QColor(0x17, 0x86, 0x44) : (bands[i].done ? QColor(0x1f, 0x3a, 0x2a) : QColor(0x22, 0x22, 0x22)));
-      p.drawRoundedRect(row, 20, 20);
+      // green: time is counting in this band now; amber: the car is in it but nothing counts yet; dim green: done
+      p.setBrush(i == counting ? QColor(0x17, 0x86, 0x44) : (inside ? QColor(0x6b, 0x5e, 0x10) : (bands[i].done ? QColor(0x1f, 0x3a, 0x2a) : QColor(0x22, 0x22, 0x22))));
+      p.drawRoundedRect(row, 18, 18);
       p.setPen(white);
       p.setFont(InterFont(BAND_PX, QFont::Bold));
       p.drawText(row.adjusted(24, 0, -420, 0), Qt::AlignLeft | Qt::AlignVCenter,
@@ -1886,8 +1901,8 @@ void TestsWindow::drawHome(QPainter &p) {
     }
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(DETAIL_PX));
-    p.drawText(QRect(area.x(), area.y() + N_BANDS * 92 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
-               QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands)) + " min of driving left in all"));
+    p.drawText(QRect(area.x(), area.y() + n_bands * 70 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
+               QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all"));
   }
 
   // START (what it will run, and what it replaces), STOP
@@ -1910,7 +1925,7 @@ void TestsWindow::drawHome(QPainter &p) {
   // alternation's minutes against its target.
   QString detail1;
   if (hs.run == Run::Stopped && plan_ok) {
-    detail1 = QString::fromStdString(budgetLine(bands, is_metric));          // what the whole plan needs of one drive
+    detail1 = QString::fromStdString(budgetLine(bands, n_bands, is_metric));          // what the whole plan needs of one drive
   }
   if (drive_base_set && hs.run != Run::Stopped) {
     const std::vector<int> scope = stepScope();
@@ -1979,8 +1994,13 @@ void TestsWindow::drawSetup(QPainter &p) {
   p.setFont(InterFont(EXPERIMENT_PX));
   for (int i = 0; i < lines.size(); i++) {
     p.setPen(i == 0 ? (plan_ok ? white : QColor(218, 202, 37)) : dim);
-    p.drawText(QRect(480, 230 + i * 80, 1660, 70), Qt::AlignLeft | Qt::AlignVCenter, lines[i]);
+    p.drawText(QRect(480, 215 + i * 56, 1660, 52), Qt::AlignLeft | Qt::AlignVCenter, lines[i]);
   }
+  // why each amount is what it is: reason, minimum, buffer (from the plan file), in plain words
+  p.setPen(dim);
+  p.setFont(InterFont(PLAN_NOTE_PX));
+  p.drawText(QRect(480, 215 + lines.size() * 56 + 8, 1660, SCREEN_H - (215 + lines.size() * 56 + 8) - 10), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+             plan_reasons.join(QString("\n\n")));
 }
 
 void TestsWindow::drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill) {

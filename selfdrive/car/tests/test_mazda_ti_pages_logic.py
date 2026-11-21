@@ -150,9 +150,10 @@ def test_an_invalid_plan_is_refused_with_a_reason_and_the_header_agrees():
     "A must be your stored value": lambda p: p["alternation"].update(a=0.8),
     "B must be the other value": lambda p: p["alternation"].update(b=1),
     "block length outside 4-10 min": lambda p: p["alternation"].update(block_min=3),
-    "target must be 20 min per side": lambda p: p["alternation"].update(target_min_per_side=30),
+    "target must be 10 min per side": lambda p: p["alternation"].update(target_min_per_side=30),
+    "an amount has no reason": lambda p: p["alternation"].update(reason=""),
     "speed range must be 35-56 mph": lambda p: p["alternation"].update(max_mph=70),
-    "tests must cover all four windows": lambda p: p["tests"].update(windows=["21-27"]),
+    "tests must cover all four windows": lambda p: p["tests"].update(windows=p["tests"]["windows"][:1]),
     "tests must be sweep, pulses, ladder": lambda p: p["tests"].update(ids=["ti_dither"]),
     "no plan name": lambda p: p.update(name=""),
   }

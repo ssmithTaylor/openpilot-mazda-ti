@@ -60,7 +60,7 @@ QUIET = dict(engaged=True, v_ego=v(45.0), curvature=0.0003, steer=0.02, saturate
 # ---- the pure decision and its speed hysteresis ---------------------------------------------------------------------------
 
 def test_the_first_trial_constants_and_defaults():
-  assert (tp.PLAN_ALT_MIN_MPH, tp.PLAN_ALT_MAX_MPH, tp.TARGET_MIN_PER_SIDE) == (35.0, 56.0, 20.0)
+  assert (tp.PLAN_ALT_MIN_MPH, tp.PLAN_ALT_MAX_MPH, tp.TARGET_MIN_PER_SIDE) == (35.0, 56.0, 10.0)
   assert tp.MIN_DWELL_S > 0 and tp.QUIET_SETTLE_S > 0 and tp.STALE_S > 0
 
 
@@ -777,3 +777,99 @@ def test_the_alternations_tally_survives_a_controls_restart_mid_drive():
   car.run(second, t, 40.0, mph=45.0)
   after = second.ab.committed
   assert after["A"] >= stored["A"] - 1e-6 and after["B"] >= stored["B"] - 1e-6 and after["A"] + after["B"] > stored["A"] + stored["B"] - 1.0
+
+
+# ---- interleaving the tests' windows inside the alternation's range ------------------------------------------------------------
+
+def test_tests_behind_is_pure_needs_a_gap_and_holds_until_caught_up():
+  assert not tp.tests_behind("21-27", 0.0, 1.0, False) and not tp.tests_behind(None, 0.0, 1.0, False)
+  assert not tp.tests_behind("35-41", None, 0.5, False) and not tp.tests_behind("35-41", 0.0, None, False)      # unknown: as before
+  assert not tp.tests_behind("35-41", 0.49, 0.5, False)                                                             # inside the margin
+  assert tp.tests_behind("35-41", 0.40, 0.5, False) and tp.tests_behind("49-56", 0.0, 0.1, False)
+  assert tp.tests_behind("35-41", 0.49, 0.5, True) and not tp.tests_behind("35-41", 0.5, 0.5, True)               # keeps the visit until level
+  assert not tp.tests_behind("35-41", 1.0, 1.0, False)
+  assert tp.decide(True, False, True, True)[0] == "tests" and tp.decide(True, False, True, False)[0] == "ab"
+  assert tp.decide(True, True, True, True)[0] == "tests" and tp.decide(True, False, False, True)[0] == "tests"
+
+
+def _sim_mix(interleave, minutes=64, seed=3):
+  """The plan over a drive with the last drive's measured speed mix (6% 21-27, 12% 35-41, 23% 41-49, 30% 49-56, 14% 64-80, the rest
+  elsewhere), 3-minute stretches. Each hand-over costs 12 s of nothing counted; the alternation counts 1/1.35 of its time, the tests 1/1.3."""
+  rng = random.Random(seed)
+  mix = [(24.0, 0.06), (38.0, 0.12), (45.0, 0.23), (52.0, 0.30), (72.0, 0.14), (30.0, 0.08), (60.0, 0.07)]
+  windows = ("21-27", "35-41", "49-56", "64-80")
+  needs = {}
+  import openpilot.selfdrive.car.mazda.ti_tests as tt
+  defs, _ = tt.load_definitions()
+  for w in windows:
+    needs[w] = tt.window_share({}, defs, w)[1]
+  have = {w: 0.0 for w in windows}
+  alt = {"A": 0.0, "B": 0.0}
+  target = 60.0 * tp.TARGET_MIN_PER_SIDE
+  plan = tp.Plan(nonce="sim")
+  plan.update(on=False, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=0.0, tests_toggles_on=False)
+  behind, lost_until, last_mode = False, -1.0, None
+  time_in = {"ab": 0.0, "tests": 0.0, "hold": 0.0}
+  tests_time = {w: 0.0 for w in windows}
+  t = 0.0
+  while t < minutes * 60:
+    mph = rng.choices([m for m, _ in mix], [p for _, p in mix])[0]
+    for _ in range(F(180)):
+      window = next((w for w, (lo, hi) in zip(windows, ((21, 27), (35, 41), (49, 56), (64, 80))) if lo <= mph < hi), None)
+      done = lambda w: have[w] / needs[w] if needs[w] else 1.0
+      alt_share = min(alt["A"], alt["B"]) / target
+      behind = interleave and tp.tests_behind(window, done(window) if window else None, alt_share, behind)
+      complete = alt["A"] >= target and alt["B"] >= target
+      plan.update(on=plan.seen_off, cfg_valid=True, complete=complete, mph=mph, ab_at_a=True, ack=None, now=t, tests_toggles_on=False,
+                  tests_behind_here=behind)
+      mode = plan.mode
+      if last_mode is not None and mode != last_mode:
+        lost_until = t + 12.0                                    # a hand-over: the blend returns to A and settles, nothing counts
+      last_mode = mode
+      time_in[mode if mode in time_in else "hold"] += 0.01
+      if t >= lost_until:
+        if mode == "ab" and in_alt_range(mph):
+          alt["A"] += 0.005 / 1.35
+          alt["B"] += 0.005 / 1.35
+        elif mode == "tests" and window:
+          have[window] = min(needs[window], have[window] + 0.01 / 1.3)
+          tests_time[window] += 0.01
+      t += 0.01
+  return {"alt_min": (alt["A"] + alt["B"]) / 60.0, "alt_each_min": min(alt.values()) / 60.0, "tests_min": {w: round(have[w] / 60.0, 1) for w in windows},
+          "tests_need_min": {w: round(needs[w] / 60.0, 1) for w in windows}, "modes_min": {k: round(v / 60.0, 1) for k, v in time_in.items()}}
+
+
+def in_alt_range(mph):
+  return 35.0 <= mph < 56.0
+
+
+def test_interleaving_gives_the_tests_in_35_56_their_time_without_starving_the_alternation_on_the_last_drives_mix():
+  seq = _sim_mix(False, minutes=30)                       # a short drive: the alternation (10 min per side) cannot finish in it
+  inter = _sim_mix(True, minutes=30)
+  print("SEQUENTIAL", seq)
+  print("INTERLEAVED", inter)
+  # the old rule: the alternation holds 35-56 mph, so those two windows get nothing while it is open (it is not complete in an hour)
+  assert seq["tests_min"]["35-41"] == 0.0 and seq["tests_min"]["49-56"] == 0.0 and seq["alt_each_min"] < 10.0
+  # the new rule: both windows progress, the alternation still advances, the windows outside the range are untouched by the change
+  assert inter["tests_min"]["35-41"] > 0.5 and inter["tests_min"]["49-56"] > 0.5
+  assert inter["alt_each_min"] > 0.6 * seq["alt_each_min"]
+  assert abs(inter["tests_min"]["21-27"] - seq["tests_min"]["21-27"]) < 0.5 and inter["tests_min"]["64-80"] == seq["tests_min"]["64-80"]
+
+
+def test_the_runner_hands_a_test_window_inside_the_range_to_the_tests_when_they_are_behind():
+  mem, params, car = _two_process_rig()
+  rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  t = toggles()
+  car.run(rn, t, 1.0)
+  mem.d["TiPlanOn"] = True
+  car.run(rn, t, 20.0, mph=45.0)                       # the gap between the windows: the alternation
+  assert rn.plan.mode == "ab" and rn.ti_tests is not None
+  rn.ab.committed = {"A": 150.0, "B": 150.0}           # half of its target done; the tests' progress is empty
+  car.run(rn, t, 25.0, mph=38.0)                       # inside 35-41: the tests are behind, they get the time
+  assert rn.tests_behind and rn.plan.mode in ("hold", "tests")
+  car.run(rn, t, 20.0, mph=45.0)                       # out of the window again: back to the alternation
+  assert not rn.tests_behind and rn.plan.mode in ("hold", "ab")
+  # with no readable progress the tests never get a visit inside the range (the plan as before)
+  rn2 = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  rn2.ti_tests = None
+  assert rn2._tests_behind(v(38.0)) is False
