@@ -501,7 +501,7 @@ def target_window(mph, remaining, keys=KEYS):
     if cells == 0:
       continue
     dist = window_distance(mph, label)
-    rank = (round(dist), -secs)
+    rank = (int(math.floor(dist + 0.5)), -secs)     # whole mph, halves up (ti_tests_logic.h: std::lround)
     if best is None or rank < best[0]:
       best = (rank, (label, secs, cells, dist))
   return None if best is None else best[1]
