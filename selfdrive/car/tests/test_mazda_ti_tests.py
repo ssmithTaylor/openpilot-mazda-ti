@@ -641,7 +641,7 @@ def test_qt_limits_agree():
   # UI-only: status line length, staleness of the live block (the car publishes every 5 s), NOT APPLIED delay,
   # auto-close
   assert set(consts) == {'MAX_STATUS', 'STALE_S', 'MISMATCH_S', 'IDLE_CLOSE_MS', 'INPUT_DELAY_MS', 'RESET_POLLS',
-                         'CONTROLS_STALE_S'}
+                         'CONTROLS_STALE_S', 'GATE_STALE_S'}
   assert consts['INPUT_DELAY_MS'] >= 300 and consts['CONTROLS_STALE_S'] <= 0.5
   # a reset request is repeated for longer than two of the car side's 5 s publishes (polls are 1 s)
   assert consts['RESET_POLLS'] > 10
@@ -659,7 +659,8 @@ def test_qt_key_sets_and_names_agree():
   strings = dict(re.findall(r'const char \*const TI_TEST_(\w+) = "([^"]*)";', src))
   assert strings == {'DEFINITIONS': '../car/mazda/ti_tests.json', 'PROGRESS_KEY': tt.PROGRESS_KEY,
                      'LIVE_KEY': tt.LIVE_KEY, 'RESET_KEY': tt.RESET_KEY, 'OTHER': tt.OTHER_BIN, 'ALL': tt.ALL_BIN,
-                     'UNSUPPORTED': tt.UNSUPPORTED, 'CRASH_LOG': '/data/error_logs/error.txt'}
+                     'UNSUPPORTED': tt.UNSUPPORTED, 'CRASH_LOG': '/data/error_logs/error.txt',
+                     'GATE_KEY': 'TiTestGate', 'LOCK_KEY': 'TiTestLock'}
   # the crash log the road view shows "openpilot crashed" for (onroad/alerts.cc)
   assert '"/data/error_logs/error.txt"' in (ROOT / 'selfdrive/ui/qt/onroad/alerts.cc').read_text(encoding='utf-8')
   values = (ROOT / 'selfdrive/car/mazda/values.py').read_text(encoding='utf-8')
@@ -670,3 +671,14 @@ def test_qt_key_sets_and_names_agree():
 def test_definitions_path_seen_from_the_ui_resolves_to_the_file():
   # The UI runs with selfdrive/ui as its working directory (window.cc loads "../assets/fonts/...").
   assert (ROOT / 'selfdrive/ui' / '../car/mazda/ti_tests.json').resolve() == tt.DEFINITIONS_PATH.resolve()
+
+def test_the_gate_and_lock_params_are_registered_everywhere_they_must_be():
+  params = (ROOT / 'common/params.cc').read_text(encoding='utf-8')
+  variables = (ROOT / 'frogpilot/common/frogpilot_variables.py').read_text(encoding='utf-8')
+  for key in ('TiTestGate', 'TiTestLock'):
+    assert re.search(rf'\{{"{key}", CLEAR_ON_MANAGER_START\}}', params), key      # tmpfs state: gone at a manager start
+    assert f'("{key}", "", 3, "")' in variables                                     # the default table
+    excluded = re.search(r'^EXCLUDED_KEYS = \{(.*?)\}', variables, re.S | re.M).group(1)
+    assert f'"{key}"' in excluded                                                  # not synced or exported as a setting
+  car = (ROOT / 'selfdrive/car/mazda/carcontroller.py').read_text(encoding='utf-8')
+  assert 'self.params_memory.put("TiTestGate"' in car

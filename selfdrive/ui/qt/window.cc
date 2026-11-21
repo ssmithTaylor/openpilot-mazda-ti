@@ -36,6 +36,13 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
       main_layout->setCurrentWidget(testsWindow);
     }
   });
+  // A LOCKED Tests page that an alert or the end of a drive took off the screen comes back, still locked, once no alert
+  // has shown for a couple of seconds (never over an alert: openPage refuses while one shows)
+  QObject::connect(uiState(), &UIState::uiUpdate, [=]() {
+    if (testsWindow->wantsReopen(main_layout->currentWidget() == homeWindow) && testsWindow->openPage()) {
+      main_layout->setCurrentWidget(testsWindow);
+    }
+  });
 
   onboardingWindow = new OnboardingWindow(this);
   main_layout->addWidget(onboardingWindow);
@@ -52,7 +59,8 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
     }
   });
   QObject::connect(device(), &Device::interactiveTimeout, [=]() {
-    if (main_layout->currentWidget() == settingsWindow || main_layout->currentWidget() == testsWindow) {
+    if (main_layout->currentWidget() == settingsWindow ||
+        (main_layout->currentWidget() == testsWindow && ti_logic::timeoutMayClose(testsWindow->isLocked()))) {
       closeSettings();
     }
   });

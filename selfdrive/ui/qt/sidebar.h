@@ -11,6 +11,7 @@
 #include <QTimer>
 #include <QWidget>
 
+#include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/ui.h"
 
 typedef QPair<QPair<QString, QString>, QColor> ItemStatus;
@@ -51,7 +52,23 @@ struct TiTestView {
   QMap<QString, double> seconds;   // bin label, "other" or "all" -> seconds collected
   QMap<QString, double> step_seconds;  // step_seconds tests: bin label -> its steps' seconds, each clipped to the target
   QMap<QString, double> step_extra;    // step_seconds tests: bin label -> its steps' seconds beyond the target
+  QMap<QString, std::vector<double>> step_have;  // step_seconds tests: window label -> seconds collected per step
   int mismatch_ticks = 0;
+};
+
+// What closes the armed test's gate right now (the car side's TiTestGate block): a command, bend or lateral-demand
+// limit, with its value and its limit. valid only while fresh.
+struct TiTestGate {
+  bool valid = false;
+  QString test;     // setting key of the test (TiLadder ...)
+  QString reason;   // command, curve, lat
+  QString what;     // "steering command"
+  QString unit;     // counts, 1/m, m/s2
+  QString window;
+  double value = 0;
+  double limit = 0;
+  bool rearm = false;    // back under the limit, waiting out the re-arm dwell
+  bool running = false;  // the step still to capture waits; other steps of the test run meanwhile
 };
 
 class TiTests {
@@ -66,6 +83,15 @@ public:
   int queued();
   int queueSize() const;
   bool moveQueue(int from, int to);
+  bool hasStepTests() const;
+  bool overviewQueued();
+  void openOverview();
+  void closeOverview(int to);
+  void startAll();
+  bool locked();
+  void setLocked(bool on);
+  bool windowLeft(int i, const QString &label, double &secs, int &cells) const;
+  ti_logic::Target target(const std::vector<int> &scope, double mph) const;
 
   bool done(int i) const;
   int countOn() const;
@@ -79,6 +105,7 @@ public:
   std::vector<TiTestView> views;
   TiTestView all_view;  // the run-all mode (TiIdentAll): state and the car side's _live.all status; no seconds
   QString all_test;     // the test the run-all mode is running now (_live.all.test); empty: none or stale
+  TiTestGate gate;      // the limit closing the armed test's gate now
   QStringList errors;
 
 private:
@@ -92,13 +119,17 @@ private:
   Params tests_params_memory{"/dev/shm/params"};
 };
 
-// Full-screen Tests page, opened from the sidebar's TESTS card on the driving screen. A page of MainWindow's stack,
+// Full-screen Tests page, opened from the sidebar's TESTS card on the driving screen. It can be LOCKED on screen
+// (ti_tests_logic.h): then it has no idle close and no BACK, but the end of a drive and every alert still take the
+// screen, and it comes back by itself, locked, once no alert has shown for a moment. A page of MainWindow's stack,
 // the way SettingsWindow is (window.cc). Painted and hit-tested like the sidebar; no signals or slots of its own, so
 // no Q_OBJECT (as ScreenRefreshOverlay, frogpilot/ui/qt/offroad/screen_refresh.h).
 class TestsWindow : public QWidget {
 public:
   explicit TestsWindow(QWidget *parent = nullptr);
   bool openPage();
+  bool wantsReopen(bool home_showing);
+  bool isLocked() const { return locked; }
 
   std::function<void()> on_close;
 
@@ -119,6 +150,9 @@ private:
   QRect allOffRect() const;
   QRect prevRect() const;
   QRect nextRect() const;
+  QRect runAllRect() const;
+  QRect lockRect() const;
+  QRect bannerRect() const;
   QRect toggleRect() const;
   QRect resetRect() const;
   int controlAt(const QPoint &pos) const;
@@ -126,13 +160,19 @@ private:
   void drawToggle(QPainter &p, const TiTestView &view, bool off_at_ignition_off) const;
   void drawTest(QPainter &p, int i);
   void drawAll(QPainter &p);
+  int drawGuidance(QPainter &p, int x, int y, int w, const std::vector<int> &scope);
+  int drawGate(QPainter &p, int x, int y, int w, const QString &key);
 
   TiTests tests;
   QTimer *ticker;
   QElapsedTimer idle;
   QElapsedTimer opened;          // input is ignored for a moment after the page opens
   int pressed_control = 0;       // the control under the last accepted press; 0: none
-  int queue_pos = -1;            // the queued test on the page (defs.size(): run all); -1: read the queue at the next refresh
+  int queue_pos = -1;            // the queued test on the page; -1: read the queue at the next refresh
+  bool overview = false;         // the run-all overview page instead of a test's page
+  bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
+  QString overview_banner;       // set by drawAll for the banner row
+  ti_logic::LockReopen reopen;
   int tick_count = 0;
   bool is_metric = false;
   bool have_speed = false;

@@ -10,6 +10,7 @@
 #include <QPainter>
 
 #include "common/util.h"
+#include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/widgets/input.h"
 
@@ -35,7 +36,8 @@ constexpr int TI_TEST_MAX_LABEL = 16;
 constexpr int TI_TEST_MAX_STATUS = 80;
 constexpr int TI_TEST_STALE_S = 12;          // the car side publishes every 5 s
 constexpr int TI_TEST_MISMATCH_S = 2;        // requested but not applied for longer than this: NOT APPLIED
-constexpr int TI_TEST_IDLE_CLOSE_MS = 15000;  // the Tests page closes itself after this long without a touch
+constexpr int TI_TEST_IDLE_CLOSE_MS = 15000;  // the Tests page closes itself after this long without a touch (not when locked)
+constexpr int TI_TEST_GATE_STALE_S = 4;       // the car side writes the gate block every second
 constexpr int TI_TEST_INPUT_DELAY_MS = 400;   // ...and ignores touches this long after it opens
 constexpr int TI_TEST_RESET_POLLS = 15;       // a reset request is repeated for this many polls until echoed
 constexpr double TI_TEST_CONTROLS_STALE_S = 0.5;  // controlsState older than this counts as an alert
@@ -49,7 +51,9 @@ const char *const TI_TEST_OTHER = "other";
 const char *const TI_TEST_ALL = "all";
 const char *const TI_TEST_UNSUPPORTED = "alternate is not supported yet (test ignored)";
 const char *const TESTS_QUEUE_KEY = "TiTestQueue";  // UI only: the id of the queued test the Tests page shows
-const char *const TESTS_ALL_ID = "_all";            // UI only: TESTS_QUEUE_KEY value for the run-all page
+const char *const TESTS_ALL_ID = "_all";            // UI only: TESTS_QUEUE_KEY value for the run-all overview page
+const char *const TI_TEST_GATE_KEY = "TiTestGate";  // tmpfs, car side, 1 Hz: the limit now closing the armed test's gate
+const char *const TI_TEST_LOCK_KEY = "TiTestLock";  // tmpfs, UI only: the Tests page is locked on screen
 const char *const TESTS_ALL_KEY = "TiIdentAll";     // the run-all mode switch (allow-listed; in no definition)
 
 struct TiTestAllowed {
@@ -598,14 +602,17 @@ void TiTests::poll(const QJsonObject &toggles) {
     // A step_seconds bin is {step index: seconds}; it counts its steps 0..steps-1, each up to what it needs
     view.step_seconds.clear();
     view.step_extra.clear();
+    view.step_have.clear();
     if (def.metric == "step_seconds") {
       for (const TiTestBin &bin : def.bins) {
         const QJsonObject steps = entry.value(bin.label).toObject();
         double sum = 0;
         double extra = 0;
+        std::vector<double> per_step;
         for (int k = 0; k < bin.steps; k++) {
           const QJsonValue v = steps.value(QString::number(k));
           const double step_need = k < (int)bin.needs.size() ? bin.needs[k] : def.target;
+          per_step.push_back(v.isDouble() ? v.toDouble() : 0.0);
           if (v.isDouble()) {
             sum += std::min(v.toDouble(), step_need);
             extra += std::max(0.0, v.toDouble() - step_need);
@@ -613,6 +620,7 @@ void TiTests::poll(const QJsonObject &toggles) {
         }
         view.step_seconds.insert(bin.label, sum);
         view.step_extra.insert(bin.label, extra);
+        view.step_have.insert(bin.label, per_step);
       }
     }
     tiTestState(view);
@@ -630,6 +638,25 @@ void TiTests::poll(const QJsonObject &toggles) {
   all_view.status = live_all.value("status").toString().left(TI_TEST_MAX_STATUS);
   all_view.active = live_all.value("on") == QJsonValue(true) && !all_test.isEmpty();
   tiTestState(all_view);
+
+  // The limit that closes the armed test's gate right now (command, bend, lateral demand), written by the car side once a
+  // second; an empty or old block is no limit
+  const QJsonObject gj = QJsonDocument::fromJson(QByteArray::fromStdString(tests_params_memory.get(TI_TEST_GATE_KEY))).object();
+  const double gate_age = QDateTime::currentSecsSinceEpoch() - gj.value("t").toDouble();
+  gate = TiTestGate();
+  if (gj.value("t").isDouble() && gj.value("reason").isString() && gj.value("value").isDouble() && gj.value("limit").isDouble() &&
+      gate_age > -TI_TEST_STALE_S && gate_age < TI_TEST_GATE_STALE_S) {
+    gate.valid = true;
+    gate.test = gj.value("test").toString().left(TI_TEST_MAX_ID);
+    gate.reason = gj.value("reason").toString().left(TI_TEST_MAX_ID);
+    gate.what = gj.value("what").toString().left(TI_TEST_MAX_LABEL * 2);
+    gate.unit = gj.value("unit").toString().left(TI_TEST_MAX_LABEL);
+    gate.window = gj.value("window").toString().left(TI_TEST_MAX_LABEL);
+    gate.value = gj.value("value").toDouble();
+    gate.limit = gj.value("limit").toDouble();
+    gate.rearm = gj.value("rearm") == QJsonValue(true);
+    gate.running = gj.value("running") == QJsonValue(true);
+  }
 }
 
 void TiTests::setTest(int i, bool on) {
@@ -660,21 +687,28 @@ void TiTests::setAll(bool on) {
   }
 }
 
-// The run-all mode on or off, written as toggle() writes a test's settings
-void TiTests::toggleAll() {
-  const bool on = !all_view.requested;
-  setAll(on);
+// The run-all mode on, written as toggle() writes a test's settings: one injection at a time, so the single
+// identification tests go off (the dither stays as it is and, while on, holds everything else)
+void TiTests::startAll() {
+  setAll(true);
   all_view.mismatch_ticks = 0;
-  if (on) {
-    // one injection at a time: run all switches the single identification tests off (the dither stays as it is and,
-    // while on, holds everything else)
-    for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
-      if (defs[i].metric == "step_seconds" && views[i].any_on) {
-        setTest((int)i, false);
-        views[i].mismatch_ticks = 0;
-      }
+  for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
+    if (defs[i].metric == "step_seconds" && views[i].any_on) {
+      setTest((int)i, false);
+      views[i].mismatch_ticks = 0;
     }
   }
+  updateFrogPilotToggles();
+}
+
+// The run-all mode on or off
+void TiTests::toggleAll() {
+  if (!all_view.requested) {
+    startAll();
+    return;
+  }
+  setAll(false);
+  all_view.mismatch_ticks = 0;
   updateFrogPilotToggles();
 }
 
@@ -704,11 +738,12 @@ void TiTests::resetProgress(int i) {
     views[i].seconds.clear();
     views[i].step_seconds.clear();
     views[i].step_extra.clear();
+    views[i].step_have.clear();
   }
 }
 
-// The queued test (TESTS_QUEUE_KEY): that id when it is a loaded test (TESTS_ALL_ID: the run-all page, when there is
-// one), else the first test not done, else the first
+// The queued test (TESTS_QUEUE_KEY): that id when it is a loaded test, else the first test not done, else the first.
+// (TESTS_ALL_ID, the run-all overview, is not a test of the queue: see overviewQueued.)
 int TiTests::queued() {
   const std::string key = TESTS_QUEUE_KEY;
   const QString id = tests_params.checkKey(key) ? QString::fromStdString(tests_params.get(key)) : QString();
@@ -716,9 +751,6 @@ int TiTests::queued() {
     if (defs[i].id == id) {
       return i;
     }
-  }
-  if (id == QString(TESTS_ALL_ID) && queueSize() > (int)defs.size()) {
-    return (int)defs.size();
   }
   for (int i = 0; i < (int)defs.size(); i++) {
     if (!done(i)) {
@@ -728,47 +760,124 @@ int TiTests::queued() {
   return 0;
 }
 
-// The queue: the loaded tests, then the run-all page when at least one step_seconds test is loaded
+// The queue: the loaded tests. The run-all overview is a page of its own, opened by the RUN ALL button.
 int TiTests::queueSize() const {
-  for (const TiTestDef &def : defs) {
-    if (def.metric == "step_seconds") {
-      return (int)defs.size() + 1;
-    }
-  }
   return (int)defs.size();
 }
 
-// The queue pointer from test `from` to test `to` (defs.size(): the run-all page, its "on" = TiIdentAll). A test that
-// is on moves with it: off for the one left, on for the new one; one that is off only moves the pointer. Only ever on
-// a tap, never by itself.
+bool TiTests::hasStepTests() const {
+  for (const TiTestDef &def : defs) {
+    if (def.metric == "step_seconds") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The page the queue key last left: the run-all overview
+bool TiTests::overviewQueued() {
+  const std::string key = TESTS_QUEUE_KEY;
+  return hasStepTests() && tests_params.checkKey(key) && QString::fromStdString(tests_params.get(key)) == QString(TESTS_ALL_ID);
+}
+
+// The queue pointer from test `from` to test `to`. A test that is on moves with it: off for the one left, on for the
+// new one; one that is off only moves the pointer. Only ever on a tap, never by itself.
 bool TiTests::moveQueue(int from, int to) {
-  const int run_all = (int)defs.size();
   if (from < 0 || from >= queueSize() || to < 0 || to >= queueSize() || from == to) {
     return false;
   }
   const std::string key = TESTS_QUEUE_KEY;
   if (tests_params.checkKey(key)) {
-    tests_params.put(key, to == run_all ? std::string(TESTS_ALL_ID) : defs[to].id.toStdString());
+    tests_params.put(key, defs[to].id.toStdString());
   }
-  const bool from_on = from == run_all ? all_view.requested : (from < (int)views.size() && views[from].requested);
+  const bool from_on = from < (int)views.size() && views[from].requested;
   if (from_on) {
-    if (from == run_all) {
-      setAll(false);
-    } else {
-      setTest(from, false);
-    }
-    if (to == run_all) {
-      setAll(true);
-    } else {
-      setTest(to, true);
-    }
+    setTest(from, false);
+    setTest(to, true);
     for (TiTestView &view : views) {
       view.mismatch_ticks = 0;
     }
-    all_view.mismatch_ticks = 0;
     updateFrogPilotToggles();
   }
   return true;
+}
+
+// RUN ALL: the overview page, and run-all mode switched on (a single test that was on goes off: one injection at a
+// time)
+void TiTests::openOverview() {
+  if (!hasStepTests()) {
+    return;
+  }
+  if (tests_params.checkKey(TESTS_QUEUE_KEY)) {
+    tests_params.put(TESTS_QUEUE_KEY, std::string(TESTS_ALL_ID));
+  }
+  startAll();
+}
+
+// Back to the test pages: run-all mode off (nothing else is switched on by it), the queue on test `to`
+void TiTests::closeOverview(int to) {
+  if (to >= 0 && to < (int)defs.size() && tests_params.checkKey(TESTS_QUEUE_KEY)) {
+    tests_params.put(TESTS_QUEUE_KEY, defs[to].id.toStdString());
+  }
+  if (all_view.requested) {
+    setAll(false);
+    all_view.mismatch_ticks = 0;
+    updateFrogPilotToggles();
+  }
+}
+
+// The lock of the Tests page (tmpfs param: gone at reboot, kept across engaging, disengaging and a drive ending)
+bool TiTests::locked() {
+  return tests_params_memory.checkKey(TI_TEST_LOCK_KEY) && tests_params_memory.getBool(TI_TEST_LOCK_KEY);
+}
+
+void TiTests::setLocked(bool on) {
+  if (tests_params_memory.checkKey(TI_TEST_LOCK_KEY)) {
+    tests_params_memory.putBool(TI_TEST_LOCK_KEY, on);
+  }
+}
+
+// Required seconds and required cells (steps) still to collect by test i in the window `label`; false when there is
+// no such step test or window
+bool TiTests::windowLeft(int i, const QString &label, double &secs, int &cells) const {
+  secs = 0;
+  cells = 0;
+  if (i < 0 || i >= (int)defs.size() || i >= (int)views.size() || defs[i].metric != "step_seconds") {
+    return false;
+  }
+  for (const TiTestBin &bin : defs[i].bins) {
+    if (bin.label != label) {
+      continue;
+    }
+    const std::vector<double> have = views[i].step_have.value(label);
+    for (int k = 0; k < bin.steps; k++) {
+      const double step_need = k < (int)bin.needs.size() ? bin.needs[k] : defs[i].target;
+      const double got = k < (int)have.size() ? have[k] : 0.0;
+      if (step_need > 0 && got < step_need - 1e-6) {
+        secs += step_need - got;
+        cells++;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+// The window to ask the driver for, among the step tests `scope` (indices into defs)
+ti_logic::Target TiTests::target(const std::vector<int> &scope, double mph) const {
+  double secs[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
+  int cells[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    for (int i : scope) {
+      double s = 0;
+      int c = 0;
+      if (windowLeft(i, QString(ti_logic::WINDOWS[w].label), s, c)) {
+        secs[w] += s;
+        cells[w] += c;
+      }
+    }
+  }
+  return ti_logic::chooseTarget(mph, secs, cells);
 }
 
 // At the end of a drive (onroad -> offroad): switch off the tests that ask for it and the run-all mode, and copy the
@@ -890,6 +999,7 @@ QString TiTests::binFor(const TiTestDef &def, double speed_mph) {
 TestsWindow::TestsWindow(QWidget *parent) : QWidget(parent) {
   idle.start();
   opened.start();
+  locked = tests.locked();
 
   ticker = new QTimer(this);
   QObject::connect(ticker, &QTimer::timeout, [this]() {
@@ -903,6 +1013,9 @@ bool TestsWindow::openPage() {
     return false;
   }
   tests.load();
+  locked = tests.locked();
+  overview = tests.overviewQueued();
+  reopen.reset();
   idle.start();
   opened.start();
   pressed_control = 0;
@@ -910,6 +1023,14 @@ bool TestsWindow::openPage() {
   tick_count = 0;
   refresh();
   return true;
+}
+
+// Called by the main window on every UI update: true when a LOCKED page that an alert (or the end of a drive) took
+// off the screen should come back, once nothing has alerted for a couple of seconds (ti_tests_logic.h LockReopen)
+bool TestsWindow::wantsReopen(bool home_showing) {
+  const UIState &s = *uiState();
+  const FrogPilotUIState &fs = *frogpilotUIState();
+  return reopen.step(locked, home_showing, s.scene.started, tiTestsAllowed(s, fs), tiTestsAlertShowing(s, fs));
 }
 
 void TestsWindow::showEvent(QShowEvent *event) {
@@ -932,9 +1053,11 @@ void TestsWindow::tick() {
   }
   const UIState &s = *uiState();
 
-  // Back to the driving screen at the end of the drive, after 15 s without a touch, and at once for ANY alert the
-  // road view would show
-  if (!s.scene.started || idle.elapsed() > TI_TEST_IDLE_CLOSE_MS || tiTestsAlertShowing(s, *frogpilotUIState())) {
+  // Back to the driving screen at the end of the drive and at once for ANY alert the road view would show, locked or
+  // not (an alert is never hidden behind this page); after 15 s without a touch unless the page is locked
+  const bool alert = tiTestsAlertShowing(s, *frogpilotUIState());
+  const bool idle_expired = idle.elapsed() > TI_TEST_IDLE_CLOSE_MS;
+  if (ti_logic::pageDecision(locked, s.scene.started, alert, idle_expired) == ti_logic::PageDecision::Leave) {
     leave();
     return;
   }
@@ -955,6 +1078,9 @@ void TestsWindow::refresh() {
   // The queue is read when the page opens; after that only PREV / NEXT move the shown test
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     queue_pos = tests.queued();
+  }
+  if (overview && !tests.hasStepTests()) {
+    overview = false;
   }
   update();
 }
@@ -990,6 +1116,19 @@ QRect TestsWindow::nextRect() const {
   return QRect(right - w, 24, w, 150);
 }
 
+// The row under the header: RUN ALL (on the overview: TEST PAGES) on the left, the LOCK on the right, the banner between
+QRect TestsWindow::runAllRect() const {
+  return QRect(30, 184, 420, 66);
+}
+
+QRect TestsWindow::lockRect() const {
+  return QRect(width() - 450, 184, 420, 66);
+}
+
+QRect TestsWindow::bannerRect() const {
+  return QRect(runAllRect().right() + 20, 184, lockRect().left() - runAllRect().right() - 40, 66);
+}
+
 QRect TestsWindow::toggleRect() const {
   return QRect(30, rowTop() + 10, 600, rowHeight() - 30);
 }
@@ -998,8 +1137,9 @@ QRect TestsWindow::resetRect() const {
   return QRect(width() - 430, rowTop() + 10, 400, 110);
 }
 
-// Controls: 1 BACK, 2 ALL TESTS OFF, 3 PREV, 4 NEXT (none at the ends of the queue), 10 + i the on/off box of the
-// shown test i, 20 + i its Reset progress (the run-all page, i = defs.size(): its on/off box only); 0 none
+// Controls: 1 BACK (ignored while locked), 2 ALL TESTS OFF, 3 PREV, 4 NEXT (none at the ends of the queue), 5 LOCK,
+// 6 RUN ALL (opens the overview), 7 TEST PAGES (leaves it), 10 + i the on/off box of the shown test i (the overview:
+// i = defs.size(), run-all mode), 20 + i its Reset progress; 0 none
 int TestsWindow::controlAt(const QPoint &pos) const {
   if (backRect().contains(pos)) {
     return 1;
@@ -1007,7 +1147,19 @@ int TestsWindow::controlAt(const QPoint &pos) const {
   if (allOffRect().contains(pos)) {
     return 2;
   }
+  if (lockRect().contains(pos)) {
+    return 5;
+  }
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
+    return 0;
+  }
+  if (overview) {
+    if (runAllRect().contains(pos)) {
+      return 7;
+    }
+    if (toggleRect().contains(pos)) {
+      return 10 + (int)tests.defs.size();
+    }
     return 0;
   }
   if (prevRect().contains(pos)) {
@@ -1015,6 +1167,9 @@ int TestsWindow::controlAt(const QPoint &pos) const {
   }
   if (nextRect().contains(pos)) {
     return queue_pos + 1 < tests.queueSize() ? 4 : 0;
+  }
+  if (runAllRect().contains(pos)) {
+    return tests.hasStepTests() ? 6 : 0;
   }
   if (toggleRect().contains(pos)) {
     return 10 + queue_pos;
@@ -1043,11 +1198,32 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
   }
 
   if (control == 1) {
-    leave();
+    if (ti_logic::backAllowed(locked)) {  // locked: unlock first (the LOCK button), so a stray tap cannot dismiss the page
+      leave();
+    }
     return;
   }
   if (control == 2) {
     tests.allOff();
+    refresh();
+    return;
+  }
+  if (control == 5) {
+    locked = !locked;
+    tests.setLocked(locked);
+    reopen.reset();
+    refresh();
+    return;
+  }
+  if (control == 6) {
+    tests.openOverview();
+    overview = true;
+    refresh();
+    return;
+  }
+  if (control == 7) {
+    tests.closeOverview(queue_pos);
+    overview = false;
     refresh();
     return;
   }
@@ -1060,19 +1236,20 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     return;
   }
   const int i = control >= 20 ? control - 20 : control - 10;
-  if (i < 0 || i >= tests.queueSize() || i != queue_pos) {
-    return;
-  }
   if (control < 20) {
-    if (i == (int)tests.defs.size()) {
+    if (overview && i == (int)tests.defs.size()) {
       tests.toggleAll();
-    } else {
-      tests.toggle(i);
+      refresh();
+      return;
     }
+    if (i < 0 || i >= tests.queueSize() || i != queue_pos || overview) {
+      return;
+    }
+    tests.toggle(i);
     refresh();
     return;
   }
-  if (i >= (int)tests.defs.size()) {
+  if (i < 0 || i >= (int)tests.defs.size() || i != queue_pos) {
     return;
   }
   const QString prompt = QString("Reset the time collected for \"%1\"? This cannot be undone.").arg(tests.defs[i].title);
@@ -1113,6 +1290,105 @@ void TestsWindow::drawToggle(QPainter &p, const TiTestView &view, bool off_at_ig
   }
 }
 
+// What the screen asks of the driver (two lines): the speed to hold for the nearest window still needing something of
+// the tests in `scope` (indices into defs), what is left there, and where the car is now. Returns the next y.
+int TestsWindow::drawGuidance(QPainter &p, int x, int y, int w, const std::vector<int> &scope) {
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor green(0x33, 0xcc, 0x66);
+  const QColor amber(218, 202, 37);
+  const double conv = is_metric ? MILE_TO_KM : 1.0;
+  const QString unit = is_metric ? QString("km/h") : QString("mph");
+
+  QString zone_text = QString("Speed not known yet");
+  ti_logic::Zone zone;
+  if (have_speed) {
+    zone = ti_logic::zoneFor(speed_mph);
+    const QString now = QString("Now %1 %2: ").arg(qRound(speed_mph * conv)).arg(unit);
+    switch (zone.state) {
+      case ti_logic::ZoneState::Inside:
+        zone_text = now + QString("inside a window, progress counts");
+        break;
+      case ti_logic::ZoneState::Between:
+        zone_text = now + QString("between windows, tests run and are logged but count nothing");
+        if (zone.window == 0 && speed_mph < ti_logic::WINDOWS[0].low) {
+          zone_text = now + QString("%1-%2 %3 runs but counts nothing, the lowest window starts at %2").arg(qRound(ti_logic::MIN_TEST_MPH * conv))
+                                .arg(qRound(ti_logic::WINDOWS[0].low * conv)).arg(unit);
+        }
+        break;
+      case ti_logic::ZoneState::Transition:
+        zone_text = now + QString("steering mode changes here (%1-%2 %3), nothing runs").arg(qRound(ti_logic::EPS_LOW_MPH * conv))
+                              .arg(qRound(ti_logic::EPS_HIGH_MPH * conv)).arg(unit);
+        break;
+      case ti_logic::ZoneState::Below:
+        zone_text = now + QString("below %1 %2, nothing runs").arg(qRound(ti_logic::MIN_TEST_MPH * conv)).arg(unit);
+        break;
+      case ti_logic::ZoneState::Above:
+        zone_text = now + QString("above %1 %2, nothing runs").arg(qRound(ti_logic::MAX_TEST_MPH * conv)).arg(unit);
+        break;
+    }
+  }
+
+  const ti_logic::Target t = tests.target(scope, speed_mph);
+  QString head;
+  QColor color = white;
+  if (t.window < 0) {
+    head = QString("Every window is complete here. Extra data still helps.");
+    color = green;
+  } else {
+    const ti_logic::Window &win = ti_logic::WINDOWS[t.window];
+    const QString window_text = QString("%1-%2 %3").arg(qRound(win.low * conv)).arg(qRound(win.high * conv)).arg(unit);
+    const QString left = tiTestClock(int(std::ceil(t.secs))) + (t.cells == 1 ? QString(" and 1 cell") : QString(" and %1 cells").arg(t.cells));
+    const bool inside = have_speed && zone.state == ti_logic::ZoneState::Inside && zone.window == t.window;
+    if (inside) {
+      head = QString("IN THE WINDOW %1 · %2 to go").arg(window_text).arg(left);
+      color = green;
+    } else {
+      head = QString("HOLD %1 %2 · window %3 · %4 to go").arg(qRound(ti_logic::windowTargetMph(t.window) * conv)).arg(unit.toUpper())
+                 .arg(window_text).arg(left);
+      color = amber;
+    }
+  }
+  p.setPen(color);
+  p.setFont(InterFont(42, QFont::Bold));
+  p.drawText(QRect(x, y, w, 52), Qt::AlignLeft | Qt::AlignVCenter, head);
+  p.setPen(QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(32));
+  p.drawText(QRect(x, y + 52, w, 40), Qt::AlignLeft | Qt::AlignVCenter, zone_text);
+  return y + 96;
+}
+
+// While a limit (command, bend, lateral demand) blocks the test: which one, its value now and its limit, so a limit
+// that is too tight shows up in numbers. `key`: the test's setting key, or empty for any test.
+int TestsWindow::drawGate(QPainter &p, int x, int y, int w, const QString &key) {
+  const TiTestGate &g = tests.gate;
+  if (!g.valid || (!key.isEmpty() && g.test != key)) {
+    return y;
+  }
+  int decimals = 0;
+  QString unit = g.unit;
+  if (g.unit == "1/m") {
+    decimals = 4;
+  } else if (g.unit == "m/s2") {
+    decimals = 2;
+    unit = QString("m/s²");
+  }
+  const QString value = QString::number(g.value, 'f', decimals);
+  const QString limit = QString::number(g.limit, 'f', decimals);
+  QString text;
+  if (g.running) {
+    text = QString("The step still to capture waits: %1 %2 against the limit %3 (%4 window). Other steps run meanwhile.")
+               .arg(g.what).arg(value + " " + unit).arg(limit).arg(g.window);
+  } else if (g.rearm) {
+    text = QString("%1 is back under its limit (%2, now %3); starting again in a moment").arg(g.what).arg(limit).arg(value);
+  } else {
+    text = QString("Blocked: %1 %2 against the limit %3 (%4 window)").arg(g.what).arg(value + " " + unit).arg(limit).arg(g.window);
+  }
+  p.setPen(QColor(218, 202, 37));
+  p.setFont(InterFont(32, QFont::DemiBold));
+  p.drawText(QRect(x, y, w, 44), Qt::AlignLeft | Qt::AlignVCenter, text);
+  return y + 46;
+}
+
 void TestsWindow::drawTest(QPainter &p, int i) {
   if (i >= (int)tests.views.size()) {
     return;
@@ -1143,12 +1419,18 @@ void TestsWindow::drawTest(QPainter &p, int i) {
   if (!view.status.isEmpty()) {
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(38));
-    p.drawText(QRect(x0, top + 75, head_w, 45), Qt::AlignLeft | Qt::AlignVCenter, view.status);
+    p.drawText(QRect(x0, top + 70, head_w, 45), Qt::AlignLeft | Qt::AlignVCenter, view.status);
+  }
+  // The speed to hold (step tests only: the dither has its own bins), then any limit that is blocking this test
+  int y = top + 122;
+  if (def.metric == "step_seconds") {
+    y = drawGuidance(p, x0, y, x1 - x0, std::vector<int>{i});
+    drawGate(p, x0, y, x1 - x0, def.settings.empty() ? QString() : def.settings[0].first);
   }
 
   // One bar per bin (or one for a test without bins), then "other speeds"; the current bin outlined
   const int lines = def.bins.empty() ? 1 : (int)def.bins.size() + 1;
-  const int area_top = top + 135;
+  const int area_top = top + 270;
   const int lh = std::max(30, std::min(90, (top + row_h - 20 - area_top) / lines));
   const int px = std::max(24, std::min(46, lh * 55 / 100));
   const QString current = have_speed ? TiTests::binFor(def, speed_mph) : QString();
@@ -1175,7 +1457,7 @@ void TestsWindow::drawTest(QPainter &p, int i) {
       steps = def.bins[k].steps;
     } else if (!def.bins.empty()) {
       key = QString(TI_TEST_OTHER);
-      label = QString("other speeds");
+      label = def.metric == "step_seconds" ? QString("between windows") : QString("other speeds");
       has_bar = false;
       collected = view.seconds.value(key, 0.0);
     }
@@ -1210,7 +1492,7 @@ void TestsWindow::drawTest(QPainter &p, int i) {
         p.drawText(bar, Qt::AlignCenter, QString("optional"));
       }
       value = QString("%1 / %2 s").arg(int(collected)).arg(int(def.target));
-      if (steps > 0) {  // step_seconds: the time still to collect in this band, or the time beyond the targets
+      if (steps > 0) {  // step_seconds: the time still to collect in this window, or the time beyond the targets
         const int left = int(std::ceil(needed - collected));
         const int extra = int(view.step_extra.value(key, 0.0));
         value = collected < needed ? tiTestClock(left) + " left" : (extra > 0 ? "done +" + tiTestClock(extra) : QString("done"));
@@ -1222,7 +1504,7 @@ void TestsWindow::drawTest(QPainter &p, int i) {
   }
 }
 
-// The run-all page: the run-all switch, then one row per band with each step test's time still to collect there
+// The run-all overview: the run-all switch, the speed to hold, then every test against every window with what is left
 void TestsWindow::drawAll(QPainter &p) {
   const TiTestView &view = tests.all_view;
   const QColor white(0xff, 0xff, 0xff);
@@ -1236,14 +1518,14 @@ void TestsWindow::drawAll(QPainter &p) {
   const int x1 = width() - 30;
   p.setPen(white);
   p.setFont(InterFont(50, QFont::Bold));
-  p.drawText(QRect(x0, top + 10, x1 - x0, 60), Qt::AlignLeft | Qt::AlignVCenter, QString("Run all tests by band"));
+  p.drawText(QRect(x0, top + 10, x1 - x0, 60), Qt::AlignLeft | Qt::AlignVCenter, QString("Run all tests by speed window"));
   if (!view.status.isEmpty()) {
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(38));
-    p.drawText(QRect(x0, top + 75, x1 - x0, 45), Qt::AlignLeft | Qt::AlignVCenter, view.status);
+    p.drawText(QRect(x0, top + 70, x1 - x0, 45), Qt::AlignLeft | Qt::AlignVCenter, view.status);
   }
 
-  // The step tests in the order the car side runs them, and the bands of the first step test (they all share them)
+  // The step tests in the order the car side runs them (windows are shared by all of them)
   const QStringList ids = {"ti_sweep", "ti_pulses", "ti_ladder"};
   const QStringList names = {"Sweep", "Pulses", "Ladder"};
   std::vector<int> shown;
@@ -1266,14 +1548,19 @@ void TestsWindow::drawAll(QPainter &p) {
     return;
   }
 
-  // One row per band, the current band outlined; the test running now in bold with a bullet
+  int y = drawGuidance(p, x0, top + 122, x1 - x0, shown);
+  drawGate(p, x0, y, x1 - x0, QString());
+
+  // One row per window, the one the car is inside outlined, the target marked; the test running now in bold with a bullet
   const int lines = (int)bands->bins.size();
-  const int area_top = top + 135;
+  const int area_top = top + 270;
   const int lh = std::max(30, std::min(90, (top + row_h - 20 - area_top) / lines));
   const int px = std::max(24, std::min(46, lh * 55 / 100));
   const int item_px = std::min(36, px);
-  const QString current = have_speed ? TiTests::binFor(*bands, speed_mph) : QString();
-  const int label_w = 300;
+  const QString current = (have_speed && ti_logic::zoneFor(speed_mph).state == ti_logic::ZoneState::Inside) ? TiTests::binFor(*bands, speed_mph) : QString();
+  const ti_logic::Target t = tests.target(shown, speed_mph);
+  const QString target_label = t.window >= 0 ? QString(ti_logic::WINDOWS[t.window].label) : QString();
+  const int label_w = 360;
   const int item_w = (x1 - x0 - label_w - 20) / std::max(1, (int)shown.size());
   bool every_band = !shown.empty();
   bool this_band = false;
@@ -1289,9 +1576,10 @@ void TestsWindow::drawAll(QPainter &p) {
       p.setBrush(Qt::NoBrush);
       p.drawRoundedRect(QRect(x0 - 12, line_y + 2, x1 - x0 + 24, lh - 4), 12, 12);
     }
-    p.setPen(white);
+    p.setPen(band.label == target_label ? QColor(218, 202, 37) : white);
     p.setFont(InterFont(px, here ? QFont::Bold : QFont::Normal));
-    p.drawText(QRect(x0, line_y, label_w, lh), Qt::AlignLeft | Qt::AlignVCenter, TiTests::binText(band, is_metric));
+    p.drawText(QRect(x0, line_y, label_w, lh), Qt::AlignLeft | Qt::AlignVCenter,
+               (band.label == target_label ? QString("▶ ") : QString()) + TiTests::binText(band, is_metric));
 
     bool band_done = !shown.empty();
     for (int j = 0; j < (int)shown.size(); j++) {
@@ -1322,16 +1610,11 @@ void TestsWindow::drawAll(QPainter &p) {
     this_band = this_band || (here && band_done);
   }
 
-  QString banner;
+  overview_banner = QString();
   if (every_band) {
-    banner = QString("All bands complete. Extra is still collected while it runs.");
+    overview_banner = QString("All windows complete. Run all goes on, choosing tests at random.");
   } else if (this_band) {
-    banner = QString("This band is complete: other speeds still need data");
-  }
-  if (!banner.isEmpty()) {
-    p.setPen(green);
-    p.setFont(InterFont(46, QFont::Bold));
-    p.drawText(QRect(30, 184, width() - 60, 66), Qt::AlignCenter, banner);
+    overview_banner = QString("This window is complete: run all picks tests at random here. Other speeds still need data");
   }
 }
 
@@ -1341,22 +1624,43 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   p.fillRect(rect(), QColor(0, 0, 0));
 
   const QColor white(0xff, 0xff, 0xff);
-  drawBox(p, backRect(), QColor(0x33, 0x33, 0x33), white, QString("BACK"), 70);
+  const QColor dim_fill(0x1a, 0x1a, 0x1a);
+  const QColor dim_ink(0x55, 0x55, 0x55);
+  const QColor amber(218, 202, 37);
+  drawBox(p, backRect(), locked ? dim_fill : QColor(0x33, 0x33, 0x33), locked ? dim_ink : white, QString("BACK"), 70);
   drawBox(p, allOffRect(), QColor(201, 34, 49), white, QString("ALL TESTS OFF"), 60);
+  // The lock, always visible: amber and solid when locked (the page stays until it is unlocked), plain when not
+  drawBox(p, lockRect(), locked ? amber : QColor(0x33, 0x33, 0x33), locked ? QColor(0, 0, 0) : white,
+          locked ? QString("LOCKED · tap to unlock") : QString("LOCK PAGE"), 36);
+  if (locked) {
+    QPen pen(amber);
+    pen.setWidth(10);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+    p.drawRect(rect().adjusted(5, 5, -5, -5));
+  }
 
   const int n = tests.queueSize();
   const int n_defs = (int)tests.defs.size();
+  QString banner;
+  QColor banner_color(0x33, 0xcc, 0x66);
   if (queue_pos < 0 || queue_pos >= n) {
     p.setPen(white);
     p.setFont(InterFont(80, QFont::Bold));
     p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));
     p.setFont(InterFont(56, QFont::DemiBold));
     p.drawText(QRect(30, rowTop(), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
+  } else if (overview) {
+    // The overview of run all: no PREV / NEXT; TEST PAGES goes back to the individual tests (run all off)
+    drawBox(p, runAllRect(), QColor(0x33, 0x33, 0x33), white, QString("< TEST PAGES"), 40);
+    p.setPen(white);
+    p.setFont(InterFont(56, QFont::Bold));
+    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("RUN ALL TESTS"));
+    drawAll(p);
+    banner = overview_banner;
   } else {
     // The queue: PREV / TEST k OF n / NEXT; an end of the queue greyed out, NEXT green once the shown test is done
     const QColor green(0x17, 0x86, 0x44);
-    const QColor dim_fill(0x1a, 0x1a, 0x1a);
-    const QColor dim_ink(0x55, 0x55, 0x55);
     const bool finished = tests.done(queue_pos);
     const bool has_prev = queue_pos > 0;
     const bool has_next = queue_pos + 1 < n;
@@ -1367,26 +1671,24 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     p.setFont(InterFont(48, QFont::Bold));
     p.drawText(QRect(prevRect().right() + 10, 24, nextRect().left() - prevRect().right() - 20, 150), Qt::AlignCenter,
                QString("TEST %1 OF %2").arg(queue_pos + 1).arg(n));
+    if (tests.hasStepTests()) {
+      drawBox(p, runAllRect(), QColor(0x46, 0x5B, 0xEA), white, QString("RUN ALL >"), 40);
+    }
 
     if (finished) {
       bool all_done = true;
       for (int i = 0; i < n_defs; i++) {
         all_done = all_done && tests.done(i);
       }
-      const QString next_title = queue_pos + 1 < n_defs ? tests.defs[queue_pos + 1].title : QString("Run all tests by band");
-      QString banner = QString("Complete. Tap NEXT to switch to %1").arg(has_next ? next_title : QString());
-      if (!has_next) {
-        banner = all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test.");
-      }
-      p.setPen(QColor(0x33, 0xcc, 0x66));
-      p.setFont(InterFont(46, QFont::Bold));
-      p.drawText(QRect(30, 184, width() - 60, 66), Qt::AlignCenter, banner);
+      banner = has_next ? QString("Complete. Tap NEXT to switch to %1").arg(tests.defs[queue_pos + 1].title)
+                        : (all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test."));
     }
-    if (queue_pos == n_defs) {  // the run-all page (done() is false for it, so no banner above)
-      drawAll(p);
-    } else {
-      drawTest(p, queue_pos);
-    }
+    drawTest(p, queue_pos);
+  }
+  if (!banner.isEmpty()) {
+    p.setPen(banner_color);
+    p.setFont(InterFont(34, QFont::Bold));
+    p.drawText(bannerRect(), Qt::AlignCenter, banner);
   }
 
   // Definitions that were ignored, and why (at most two lines)
