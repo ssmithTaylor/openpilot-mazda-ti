@@ -391,6 +391,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiSweep", PERSISTENT},
     {"TiLadder", PERSISTENT},
     {"TiPulses", PERSISTENT},
+    {"TiIdentAll", PERSISTENT},
     {"SteerAuthorityAdvisory", PERSISTENT},
     {"NNFFGainCorrection", PERSISTENT},
     {"LastMapsUpdate", PERSISTENT},

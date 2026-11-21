@@ -96,6 +96,8 @@ class CarController(CarControllerBase):
                      if ti_ident_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
     self.ti_ident_on = ()
     self.ti_ident_armed = None
+    self.ti_ident_all = False          # run all (TiIdentAll): the scheduler picks the test, band by band
+    self.ti_ident_all_band = None      # the band the scheduler last armed a test for
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -107,6 +109,10 @@ class CarController(CarControllerBase):
     # Identification tests switched on during this run, and their frames with a non-zero signal (stats stamp)
     self.ti_ident_seen = set()
     self.ti_ident_frames = {}
+    self.ti_ident_all_seen = False
+    ident = getattr(self, "ti_ident", None)
+    if ident is not None:
+      ident.counts = {}
     tests = getattr(self, "ti_tests", None)
     if tests is not None:
       tests.run_seen = set()
@@ -151,8 +157,10 @@ class CarController(CarControllerBase):
       ident = getattr(self, "ti_ident", None)
       cfg["TiIdent"] = {k: {"version": ti_ident_mod.VERSION, "table": ti_ident_mod.TABLE_HASH[k],
                             "frames": self.ti_ident_frames.get(k, 0),
+                            "frames_by": ident.frames_by(k) if ident is not None else {},
                             "touch_confirm": ident.touch_confirm_frames if ident is not None else None}
                         for k in sorted(seen)}
+      cfg["TiIdent"]["run_all"] = bool(getattr(self, "ti_ident_all_seen", False))
     return cfg
 
   def ti_ident_failed(self):
@@ -185,8 +193,17 @@ class CarController(CarControllerBase):
         pass
     ident = getattr(self, "ti_ident", None)
     if ident is not None and tests.wants_reasons():
-      for key in getattr(self, "ti_ident_on", ()):
+      notes, run_all = {}, None
+      keys = ti_ident_mod.KEYS if self.ti_ident_all else getattr(self, "ti_ident_on", ())
+      for key in keys:
         reasons[key] = ident.reason if key == self.ti_ident_armed else "other"
+        share = ident.share(key)
+        if share is not None:
+          notes[key] = f" · {int(round(100 * share))}% captured"
+      if self.ti_ident_all:
+        run_all = (self.ti_ident_armed, ident.reason)
+      tests.publish(time.monotonic(), reasons, notes=notes, run_all=run_all)
+      return
     tests.publish(time.monotonic(), reasons)
 
   def record_ti_stats(self, CS, desired, sent):
@@ -477,6 +494,7 @@ class CarController(CarControllerBase):
     if ti_ident_mod is not None:
       self.ti_ident_on = tuple(k for k in ti_ident_mod.KEYS
                                if getattr(frogpilot_toggles, ti_ident_mod.TOGGLES[k], False) is True)
+      self.ti_ident_all = getattr(frogpilot_toggles, ti_ident_mod.RUN_ALL_TOGGLE, False) is True
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
@@ -526,10 +544,17 @@ class CarController(CarControllerBase):
           if ident is not None:
             tests = getattr(self, "ti_tests", None)
             on = self.ti_ident_on
-            armed = on[0] if (len(on) == 1 and tests is not None and not self.ti_dither_enabled
-                              and (dither is None or dither.envelope == 0.0)) else None
-            self.ti_ident_armed = armed
+            free = tests is not None and not self.ti_dither_enabled and (dither is None or dither.envelope == 0.0)
             try:
+              if free and self.ti_ident_all and not on:
+                # Run all: the scheduler picks the test for the band the car is in (ti_ident.schedule)
+                band, _ = ti_ident_mod.band_for(CS.out.vEgo, getattr(CS, "lkas_blocked", None))
+                armed = ti_ident_mod.schedule(self.ti_ident_armed, self.ti_ident_all_band, band, tests.remaining)
+                if band is not None:
+                  self.ti_ident_all_band = band
+              else:
+                armed = on[0] if (len(on) == 1 and free and not self.ti_ident_all) else None
+              self.ti_ident_armed = armed
               ti_ident = int(ident.update(
                 armed, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
                 driver_torque=CS.out.steeringTorque,
@@ -572,7 +597,8 @@ class CarController(CarControllerBase):
         dither.reset()   # lateral control off or TI not in RUN: zero at once, next fade-in from nothing
       ident = getattr(self, "ti_ident", None)
       if ident is not None:
-        self.ti_ident_seen |= set(self.ti_ident_on)
+        self.ti_ident_seen |= set(self.ti_ident_on) | (set(ti_ident_mod.KEYS) if self.ti_ident_all else set())
+        self.ti_ident_all_seen |= self.ti_ident_all
         if not (CC.latActive and CS.ti_lkas_allowed):
           try:
             ident.reset(self.frame)   # the same for the identification tests
@@ -727,7 +753,10 @@ class CarController(CarControllerBase):
       tests = getattr(self, "ti_tests", None)
       if tests is not None:
         ident = getattr(self, "ti_ident", None)
-        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, TI_DITHER_ACTIVE if ti_dither != 0 else (),
+        active = TI_DITHER_ACTIVE if ti_dither != 0 else ()
+        if ident is not None and ident.emitted and ident.reason in ("ok", "extra"):
+          active = active + (ident.emitted,)    # an identification test running clean (screen: ON · ACTIVE)
+        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, active,
                      credit=ident.credit if ident is not None else None)
 
       # Publishing moved from 1Hz to 0.2Hz. Params.put_nonblocking spawns a fresh thread through

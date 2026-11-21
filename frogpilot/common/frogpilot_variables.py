@@ -312,6 +312,7 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TiSweep", "0", 3, "0"),
   ("TiLadder", "0", 3, "0"),
   ("TiPulses", "0", 3, "0"),
+  ("TiIdentAll", "0", 3, "0"),
   ("SteerAuthorityAdvisory", "1", 2, "1"),
   ("NNFFGainCorrection", "0", 3, "0"),
   ("LateralTune", "0", 1, "0"),
@@ -749,6 +750,10 @@ class FrogPilotVariables:
     toggle.ti_pulses = (params.get_bool("TiPulses")
                         if toggle.tuning_level >= level["TiPulses"]
                         else default.get_bool("TiPulses"))
+    # Run all: the three identification tests one at a time, band by band (ti_ident.schedule). Default off.
+    toggle.ti_ident_all = (params.get_bool("TiIdentAll")
+                           if toggle.tuning_level >= level["TiIdentAll"]
+                           else default.get_bool("TiIdentAll"))
     toggle.lat_friction_comp = (params.get_bool("LatFrictionComp")
                                 if toggle.tuning_level >= level["LatFrictionComp"]
                                 else default.get_bool("LatFrictionComp"))

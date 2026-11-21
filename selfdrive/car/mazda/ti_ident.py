@@ -1,45 +1,54 @@
 """Steering identification tests on the Mazda torque-interceptor (TI) command: frequency sweep, amplitude ladder and
-short pulses. OFF unless one of the toggles TiSweep / TiLadder / TiPulses is on (Tests screen, default off).
+short pulses. OFF unless one of the toggles TiSweep / TiLadder / TiPulses, or the run-all toggle TiIdentAll, is on
+(Tests screen, default off, off at ignition off).
 
 Same principle and the same safety envelope as the identification dither (ti_dither.py), which stays exactly as it
 was: a small, known, zero-mean, always-moving signal is added to the TI request ONLY, BEFORE
 apply_ti_steer_torque_limits, so the magnitude, driver-torque and rate limits bound the total exactly as before. The
-stock command, CAN definitions and panda safety are untouched. At most one injection runs at a time: these tests run
-only while the dither toggle is off and the dither is silent, and only when exactly one of the three toggles is on.
+stock command, CAN definitions and panda safety are untouched. At most one signal runs at a time: these tests run only
+while the dither toggle is off and the dither is silent, and one generator runs one test at a time.
 
-Signal. Each test is a table of STEPS. A step is captured in CHUNKS: a whole number of cycles (sweep, ladder) or one
-pulse period (pulses). A chunk counts only when every one of its frames was clean (gate open, full amplitude, one
-speed band); a paused chunk is repeated, nothing else is. The step to run is chosen at every chunk start: the first
-step of the table that is not complete IN THE BAND THE CAR IS IN NOW (so mixed-speed driving fills every band, and a
-completed step is never repeated). Chunks of the same step follow each other with no gap; between two steps of the
-sweep or ladder the old tone fades out and the new one fades in (about 0.5-2 s); pulses follow at once.
+Signal. Each test is a table of STEPS. Progress is credited per UNIT: for sweep and ladder the smallest whole number
+of periods of the tone that is at least UNIT_MIN_PERIODS periods and UNIT_MIN_S long, for pulses one doublet with its
+settling gap. A unit counts only when every one of its frames was clean (gate open, full amplitude, one speed band);
+a pause loses only the unit in progress, and the same step resumes afterwards and keeps what it has. The step to run
+is chosen at every unit start: the first step of the table that is not complete IN THE BAND THE CAR IS IN NOW, so
+mixed-speed driving fills every band. When every step of the band is complete the test keeps running there and
+collects EXTRA, least-collected step first; completion is judged on the required amounts only. Units of the same step
+follow each other with no gap; between two steps of the sweep or ladder the old tone fades out and the new one fades
+in (about 0.5-2 s); pulses follow at once.
+
+Run all (TiIdentAll). `schedule` picks the test: in the band the car is in, RUN_ALL_ORDER (sweep, pulses, ladder:
+smallest signals first), staying on the current test until its requirement for this band is complete; after a band
+change, the first test not complete in the new band; with every test complete in the band, extra, least-collected
+test first (with hysteresis). A test change fades the old signal out completely, then SWITCH_QUIET_S of quiet, then
+the next one starts.
 
 Heading. Each sweep and ladder tone starts at the phase (PHASES) that makes the heading it produces zero-mean over a
-chunk, its lead-in included, so the car does not drift sideways (a sine from zero gives a one-sided heading and a
-steady drift); each period has an even number of frames, so a chunk still sums to exactly zero. Pulse doublets
-alternate sign, so each pair leaves no heading.
+unit, its lead-in included, so the car does not drift sideways (a sine from zero gives a one-sided heading and a
+steady drift); each period has an even number of frames, so a unit still sums to exactly zero. Units of a step that
+follow each other start where the last one ended (whole periods), so every unit has the same zero-mean heading.
+Pulse doublets alternate sign, so each pair leaves no heading.
 
 Gate. A driver touch (steeringPressed, |driver torque| >= 6 counts, or >= 4 counts for 3 frames) or too little rate
-room cut the signal to zero AT ONCE; after a touch or a blinker it stays off for HOLDOFF_S. Everything else that
-closes the gate FADES the signal out: blinker or lane change, hold-off, a bend, a large command, leaving the speed
-band, a steering-mode change, the band complete, and the toggle switched off. A fade lasts fade_frames(step): long
-enough that the signal never changes by more than MAX_SLEW counts per frame (0.25 s for the small steps, up to
-about 0.4 s for the 55-count ladder step); a pulse in progress finishes its doublet instead. Touch, blinker, hold-off,
-base-request, lateral-demand and rate-room rules are the dither's (ti_dither constants). Added for these tests:
-  - the speed is inside one of BANDS (19-28, 31-45, 45-60, 60-80 mph);
+room cut the signal to zero AT ONCE. Everything else that closes the gate FADES the signal out: blinker or lane
+change, the hold-off after a touch or a blinker, a bend, a large command, leaving the speed bands, a steering-mode
+change, a test change, and the toggle switched off. A fade lasts fade_frames(step): long enough that the signal never
+changes by more than MAX_SLEW counts per frame; a pulse in progress finishes its doublet instead. The thresholds are
+the named constants below; steps of at most SMALL_AMP counts (the dither's size) get looser bend, command and touch
+hold-off limits, the larger steps keep the strict ones. Also:
+  - the speed is inside one of BANDS (19-28, 31-45, 45-60, 60-80 mph); in the 28-31 mph gap the logged regime decides
+    which of the two neighbouring bands a sample belongs to;
   - the steering regime is the band's: below 28 mph the EPS blocks the stock lane-keep path and the TI steers alone
-    (LKAS_BLOCK set); from 31 mph both paths steer (LKAS_BLOCK clear). The regime must have been unchanged for
-    REGIME_SETTLE_S (the stock path clears about 3 s after rising through 50 km/h);
-  - |desired curvature| <= MAX_CURVATURE (straight roads and gentle bends only), as well as v^2 |curvature| <= 1;
-  - the band still has a step to capture.
+    (LKAS_BLOCK set); from 31 mph both paths steer (LKAS_BLOCK clear); it must have been unchanged REGIME_SETTLE_S.
 
 Reconstruction. The requested added counts are exact from logs, as for the dither:
   added = mazdaDiagnostics.tiRequested - round(carControl.actuators.steer * tiMax)
 (the dither is zero whenever these run). The regime of every sample is frogpilotCarState.lkasBlocked. Which test,
-step, band and phase produced it: the generator logs an event (cloudlog "ti_ident", JSON) at every run start, chunk
+step, band and phase produced it: the generator logs an event (cloudlog "ti_ident", JSON) at every run start, unit
 start and stop; `reconstruct(events, n)` rebuilds the added counts frame by frame from those events alone (exactly;
 test_mazda_ti_ident.py checks it). The run's stats config carries {"TiIdent": {test: {"version", "table", "frames",
-"touch_confirm"}}} for every test that was on, `table` being TABLE_HASH[test] of the step tables below.
+"touch_confirm", "frames_by": {band: {reason: frames}}}, "run_all": bool}}; `table` is TABLE_HASH[test].
 """
 import hashlib
 import json
@@ -49,66 +58,98 @@ from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_
                                                      MAX_BASE_FRACTION, MAX_LAT_DEMAND_MPS2, RATE_ROOM_FACTOR,
                                                      TOUCH_CONFIRM_FRAMES)
 
-VERSION = 2
+VERSION = 3
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
 SWEEP, LADDER, PULSES = "TiSweep", "TiLadder", "TiPulses"
 KEYS = (SWEEP, LADDER, PULSES)
 TOGGLES = {SWEEP: "ti_sweep", LADDER: "ti_ladder", PULSES: "ti_pulses"}
+RUN_ALL_KEY, RUN_ALL_TOGGLE = "TiIdentAll", "ti_ident_all"
 
-# (low mph, high mph, label, TI alone): half-open [low, high). 28-31 mph is left out on purpose: the stock path
-# switches there (blocked below 45 km/h, cleared above 50 km/h with a lag). The lowest band starts at 19 mph: the car
-# only lets cruise control (and so openpilot) engage from about 19 mph, so nothing below it is practical to capture.
+# (low mph, high mph, label, TI alone): half-open [low, high). Between the first two bands (28-31 mph) the stock path
+# switches (blocked below 45 km/h, cleared above 50 km/h with a lag); samples there count by the logged regime. The
+# lowest band starts at 19 mph: the car only lets cruise control (and so openpilot) engage from about 19 mph.
 BANDS = ((19.0, 28.0, "19-28", True), (31.0, 45.0, "31-45", False), (45.0, 60.0, "45-60", False),
          (60.0, 80.0, "60-80", False))
 
-MAX_CURVATURE = 0.004       # 1/m: radius 250 m or more
-REGIME_SETTLE_S = 3.0
 MAX_SLEW = 3.0              # counts per frame, lead-in and fades included: half of the default TI_STEER_DELTA_UP (6)
 
-# Sweep: one tone per step, (period in frames, even; peak TI counts; periods per 10 s chunk). 0.30, 0.60, 1.0, 1.6,
-# 2.4, 3.6 and 5.0 Hz. 2 chunks per step. Amplitudes in the dither's class (its preset 1 peaks at 22 counts, 12 at its
-# 1.1 Hz tone); the high tones are reduced so the slew stays under MAX_SLEW.
-SWEEP_TONES = ((334, 12.0, 3), (166, 12.0, 6), (100, 16.0, 10), (62, 16.0, 16), (42, 16.0, 24), (28, 12.0, 36),
-               (20, 9.0, 50))
+# ---- gates (named thresholds) ------------------------------------------------------------------------------------
+# A step of at most SMALL_AMP counts (the dither's peak) is "small": the dither ran at that size with only the
+# lateral-demand gate and measured <= 0.006 m/s^2 and <= 0.12 mm sideways at its tones. Larger steps (ladder 37 and
+# 55 counts, the 44-count pulse) keep the strict limits.
+SMALL_AMP = 22.0
+# Bends: keep the larger signals off where the controller is busy; the analysis fits the response relative to the
+# base command, so a steady bend does not spoil a small-signal measurement.
+MAX_CURVATURE = 0.004                  # 1/m (radius 250 m), larger steps
+MAX_CURVATURE_SMALL = 0.01             # 1/m (radius 100 m), small steps
+MAX_LAT_DEMAND = MAX_LAT_DEMAND_MPS2   # v^2 |desired curvature|, m/s^2 (the dither's 1.0), larger steps
+MAX_LAT_DEMAND_SMALL = 1.5             # small steps
+# Base command: stay clear of the 600 clip (a clipped signal leaves a bias; a flat command at the clip stalls the rack)
+MAX_BASE_FRACTION_STRICT = MAX_BASE_FRACTION   # |undithered request| <= 0.5 x TI_STEER_MAX (300), larger steps
+MAX_BASE_FRACTION_SMALL = 0.75                 # 450 + 22 leaves 128 counts to the clip, small steps
+# Hold-off after a confirmed touch (the driver may still be steering); a blinker keeps the full time (lane change)
+TOUCH_HOLDOFF_S = HOLDOFF_S            # 3 s, larger steps
+TOUCH_HOLDOFF_SMALL_S = 1.5            # small steps
+BLINKER_HOLDOFF_S = HOLDOFF_S          # 3 s, all steps
+# Steering-mode settle: a sample belongs to one regime; the regime is the logged LKAS_BLOCK flag, so this only lets
+# the response settle after a change. Measurement only.
+REGIME_SETTLE_S = 1.0
+# Rate room: the live limiter's smallest step must be >= RATE_ROOM_FACTOR (2) x the step's own largest slew
+# (STEP_SLEW), the dither's rule; with less, rate limiting clips the signal and leaves a bias.
+
+# ---- credited units ----------------------------------------------------------------------------------------------
+UNIT_MIN_PERIODS = 2
+UNIT_MIN_S = 2.0
+
+# Sweep: one tone per step, (period in frames, even; peak TI counts): 0.30, 0.60, 1.0, 1.6, 2.4, 3.6 and 5.0 Hz.
+# Amplitudes in the dither's class (its preset 1 peaks at 22 counts, 12 at its 1.1 Hz tone); the high tones are
+# reduced so the slew stays under MAX_SLEW.
+SWEEP_TONES = ((334, 12.0), (166, 12.0), (100, 16.0), (62, 16.0), (42, 16.0), (28, 12.0), (20, 9.0))
 SWEEP_LEAD_IN = 50
 
 # Ladder: one frequency (0.4 Hz, a 250-frame period), stepped amplitudes (TI counts; 1 count ~ 0.0544 EPS sensor
 # counts): 0.3 to 5.0 sensor counts, from below the 1.2 sc at which the dither already moved the wheel to above the
-# rack's friction (2.5-4 sc). 5 s chunks (2 periods), 2 per step. Per band only the steps up to the band's cap run.
-# The 19-28 mph cap is 55 counts until a drive has shown the measured wheel angle at 37 and 55 counts and no 0x25
-# fault; LADDER_LOW_BAND_FULL_CAP (92) then brings back the 74- and 92-count steps (and the ti_tests.json steps for
-# that band go from 5 to 7).
+# rack's friction (2.5-4 sc). Per band only the steps up to the band's cap run. The 19-28 mph cap is 55 counts until a
+# drive has shown the measured wheel angle at 37 and 55 counts and no 0x25 fault; LADDER_LOW_BAND_FULL_CAP (92) then
+# brings back the 74- and 92-count steps (and the ti_tests.json steps for that band go from 5 to 7).
 LADDER_PERIOD = 250
 LADDER_AMPS = (6.0, 11.0, 22.0, 37.0, 55.0, 74.0, 92.0)
 LADDER_LOW_BAND_CAP = 55.0
 LADDER_LOW_BAND_FULL_CAP = 92.0
 LADDER_CAPS = {"19-28": LADDER_LOW_BAND_CAP, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
-LADDER_CHUNK = 500
 LADDER_LEAD_IN = 100
 
 # Pulses: a bipolar trapezoid doublet (+A then -A, ramps at PULSE_RAMP counts per frame, PULSE_FLAT frames flat),
-# then quiet to the end of a PULSE_PERIOD-frame chunk for the settling; the doublet's sign alternates pulse by pulse.
+# then quiet to the end of a PULSE_PERIOD-frame unit for the settling; the doublet's sign alternates pulse by pulse.
 PULSE_AMPS = (22.0, 44.0)
 PULSE_PERIOD = 200
 PULSE_RAMP = 2.75
 PULSE_FLAT = 10
 
 STEP_SECONDS = {SWEEP: 20.0, LADDER: 10.0, PULSES: 40.0}
-CHUNKS_PER_STEP = {SWEEP: 2, LADDER: 2, PULSES: 20}
+
+# Run all
+RUN_ALL_ORDER = (SWEEP, PULSES, LADDER)
+SWITCH_QUIET_S = 0.5        # quiet between one test's complete fade-out and the next test's start
+EXTRA_HYSTERESIS = 0.25     # extra collection: leave the current test once it leads the least-collected by this share
+
+
+def unit_periods(p):
+  return max(UNIT_MIN_PERIODS, int(math.ceil(UNIT_MIN_S / (p * DT) - 1e-9)))
 
 
 def _table(key):
   if key == SWEEP:
-    return {"tones": SWEEP_TONES, "lead_in": SWEEP_LEAD_IN}
+    return {"tones": SWEEP_TONES, "lead_in": SWEEP_LEAD_IN, "unit": [UNIT_MIN_PERIODS, UNIT_MIN_S]}
   if key == LADDER:
-    return {"period": LADDER_PERIOD, "amps": LADDER_AMPS, "caps": LADDER_CAPS, "chunk": LADDER_CHUNK,
-            "lead_in": LADDER_LEAD_IN}
+    return {"period": LADDER_PERIOD, "amps": LADDER_AMPS, "caps": LADDER_CAPS, "lead_in": LADDER_LEAD_IN,
+            "unit": [UNIT_MIN_PERIODS, UNIT_MIN_S]}
   return {"amps": PULSE_AMPS, "period": PULSE_PERIOD, "ramp": PULSE_RAMP, "flat": PULSE_FLAT}
 
 
-TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), STEP_SECONDS[k], CHUNKS_PER_STEP[k], BANDS, MAX_SLEW],
+TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), STEP_SECONDS[k], BANDS, MAX_SLEW],
                                          sort_keys=True).encode()).hexdigest()[:12] for k in KEYS}
 
 
@@ -124,13 +165,26 @@ def steps_in_band(key, label):
 
 
 def step_params(key, step):
-  """(period frames or None for pulses, peak counts, chunk frames, lead-in frames)."""
+  """(period frames or None for pulses, peak counts, unit frames, lead-in frames)."""
   if key == SWEEP:
-    p, a, cycles = SWEEP_TONES[step]
-    return p, a, p * cycles, SWEEP_LEAD_IN
+    p, a = SWEEP_TONES[step]
+    return p, a, p * unit_periods(p), SWEEP_LEAD_IN
   if key == LADDER:
-    return LADDER_PERIOD, LADDER_AMPS[step], LADDER_CHUNK, LADDER_LEAD_IN
+    return LADDER_PERIOD, LADDER_AMPS[step], LADDER_PERIOD * unit_periods(LADDER_PERIOD), LADDER_LEAD_IN
   return None, PULSE_AMPS[step], PULSE_PERIOD, 0
+
+
+def units_per_step(key, step):
+  """Units that make up one step's STEP_SECONDS (each credited as its nominal share)."""
+  return max(1, int(round(STEP_SECONDS[key] / (step_params(key, step)[2] * DT))))
+
+
+def unit_credit(key, step):
+  return STEP_SECONDS[key] / units_per_step(key, step)
+
+
+def small(key, step):
+  return step_params(key, step)[1] <= SMALL_AMP
 
 
 def freq(key, step):
@@ -168,7 +222,7 @@ _DOUBLETS = {a: doublet(a) for a in PULSE_AMPS}
 
 def _tone(p, a, phi, ph):
   """a * sin(2 pi ph / p + phi), built so that the second half of every period is the exact negative of the first
-  (each period, and so each chunk, sums to exactly zero after rounding)."""
+  (each period, and so each unit, sums to exactly zero after rounding)."""
   j = ph % p
   half = p // 2
   if j >= half:
@@ -177,8 +231,8 @@ def _tone(p, a, phi, ph):
 
 
 def _zero_heading_phase(key, step):
-  """The tone's starting phase that makes the heading it produces zero-mean over a chunk, the lead-in included: the
-  heading is the running sum of the signal, and its chunk mean is linear in (cos phi, sin phi), so phi follows from
+  """The tone's starting phase that makes the heading it produces zero-mean over a unit, the lead-in included: the
+  heading is the running sum of the signal, and its unit mean is linear in (cos phi, sin phi), so phi follows from
   two sums. A sine from zero (phi = 0) would give a one-sided heading and a steady sideways drift."""
   p, a, n, lead = step_params(key, step)
   sums = []
@@ -197,7 +251,7 @@ PHASES = {(k, s): _zero_heading_phase(k, s) for k in (SWEEP, LADDER) for s in ra
 
 
 def unit(key, step, ph, sign=1):
-  """The full-amplitude signal (float counts) of a step at chunk phase `ph` (frames; negative: lead-in). Sweep and
+  """The full-amplitude signal (float counts) of a step at unit phase `ph` (frames; negative: lead-in). Sweep and
   ladder: a tone at the phase PHASES gives it (zero-mean heading); pulses: the doublet, then quiet."""
   p, a, _, _ = step_params(key, step)
   if p is None:
@@ -210,11 +264,34 @@ def value(key, step, ph, env, sign=1):
   return int(round(gain(env) * unit(key, step, ph, sign)))
 
 
-def band_for(v_ego):
+def _step_slew(key, step):
+  """The largest per-frame change of the step's signal (lead-in, two units, and a fade from any point)."""
+  p, a, n, lead = step_params(key, step)
+  if p is None:
+    shape = [0.0] + _DOUBLETS[a] + [0.0]
+    return max(abs(y - x) for x, y in zip(shape, shape[1:]))
+  x = [unit(key, step, ph) * (gain((ph + lead) / lead) if ph < 0 and lead else 1.0) for ph in range(-lead, 2 * n)]
+  worst = max(abs(y - v) for v, y in zip(x, x[1:]))
+  f = fade_frames(key, step)
+  for start in range(0, n, max(1, n // 23)):
+    seq = [gain(max(0.0, 1.0 - i / f)) * unit(key, step, start + i) for i in range(f + 1)]
+    worst = max(worst, max(abs(y - v) for v, y in zip(seq, seq[1:])))
+  return worst
+
+
+STEP_SLEW = {(k, s): _step_slew(k, s) for k in KEYS for s in range(n_steps(k))}
+
+
+def band_for(v_ego, lkas_blocked=None):
+  """(band label, TI alone) for a speed. In the 28-31 mph gap between the TI-alone band and the next one the logged
+  regime decides: stock path blocked counts in the band below, stock path active in the band above."""
   mph = v_ego * MS_TO_MPH
   for low, high, label, ti_alone in BANDS:
     if low <= mph < high:
       return label, ti_alone
+  lo_band, hi_band = BANDS[0], BANDS[1]
+  if lkas_blocked is not None and lo_band[1] <= mph < hi_band[0]:
+    return (lo_band[2], True) if lkas_blocked else (hi_band[2], False)
   return None, None
 
 
@@ -226,13 +303,15 @@ def rate_room(limits, key):
   """The smallest per-frame step the live TI limiter allows where this test works (as ti_dither.rate_room)."""
   up = limits.TI_STEER_DELTA_UP
   knee = getattr(limits, 'TI_STEER_DELTA_UP_KNEE', limits.TI_STEER_MAX)
-  if knee <= MAX_BASE_FRACTION * limits.TI_STEER_MAX + peak_counts(key):
+  if knee <= MAX_BASE_FRACTION_SMALL * limits.TI_STEER_MAX + peak_counts(key):
     up = min(up, getattr(limits, 'TI_STEER_DELTA_UP_HIGH', up))
   return min(up, limits.TI_STEER_DELTA_DOWN)
 
 
-def rate_room_ok(room):
-  return room >= RATE_ROOM_FACTOR * MAX_SLEW
+def rate_room_ok(room, key=None, step=None):
+  """Room for the step's own largest slew (lead-in and fade included); without a step, for MAX_SLEW."""
+  need = MAX_SLEW if key is None else STEP_SLEW[(key, step)]
+  return room >= RATE_ROOM_FACTOR * need
 
 
 def check_definition(key, bins, steps, target):
@@ -246,6 +325,39 @@ def check_definition(key, bins, steps, target):
   if target != STEP_SECONDS[key]:
     return f"target_seconds must be {STEP_SECONDS[key]:g}"
   return None
+
+
+def band_share(key, band, remaining):
+  """Collected / required for one test in one band, extra included (> 1 when it has extra); None when unknown."""
+  required, collected = 0.0, 0.0
+  for s in range(steps_in_band(key, band)):
+    left = remaining(key, band, s)
+    if left is None:
+      return None
+    required += STEP_SECONDS[key]
+    collected += STEP_SECONDS[key] - left
+  return collected / required
+
+
+def schedule(current, current_band, band, remaining):
+  """Run all: the test to arm now. `current`: the test armed so far; `current_band`: the band it was armed for;
+  `band`: the band now (None: keep the current test; its own gate pauses it). None when progress is unknown."""
+  if band is None:
+    return current
+  shares = {}
+  for k in RUN_ALL_ORDER:
+    shares[k] = band_share(k, band, remaining)
+    if shares[k] is None:
+      return None
+  if current in shares and band == current_band and shares[current] < 1.0 - 1e-9:
+    return current                       # stay until its requirement for this band is complete
+  for k in RUN_ALL_ORDER:
+    if shares[k] < 1.0 - 1e-9:
+      return k                           # the first test not complete in this band
+  least = min(RUN_ALL_ORDER, key=lambda k: (shares[k], RUN_ALL_ORDER.index(k)))
+  if current in shares and band == current_band and shares[current] - shares[least] < EXTRA_HYSTERESIS:
+    return current                       # extra: keep going until it leads by the hysteresis
+  return least
 
 
 def _advance(st):
@@ -268,7 +380,7 @@ def _advance(st):
 
 
 def _wrap(st):
-  """While fading, the tone keeps going past the chunk end (the cosine is continuous there)."""
+  """While fading, the tone keeps going past the unit end (it is continuous there)."""
   p, _, n, _ = step_params(st["test"], st["step"])
   if p is not None and st["fading"] and st["ph"] >= n:   # (a pulse never wraps: it stops after its doublet)
     st["ph"] -= n
@@ -284,25 +396,37 @@ class TiIdent:
     self.events = []             # the latest events (bounded), for tests and the replay
     self.loud = 0
     self.touch = False
-    self.holdoff = 0
+    self.touch_age = 10 ** 6     # frames since the last confirmed touch
+    self.blink_age = 10 ** 6     # frames since the last blinker
     self.regime = None           # last LKAS_BLOCK value seen
     self.regime_frames = 0       # frames it has been unchanged
     self.reason = "off"
+    self.extra = False           # the running unit is extra collection in a complete band
     self.credit = None           # (test key, band, step, seconds) credited on this frame, else None
     self.frames = {}             # test key -> frames with a non-zero output (stats stamp)
+    self.counts = {}             # (test key, band or "none", reason) -> frames armed (stats stamp; reset per run)
     self.emitted = None          # the test whose waveform produced this frame's output (even if it rounded to 0)
+    self.prev_test = None        # the test that ran last, and frames since it stopped (the quiet between tests)
+    self.stopped_age = 10 ** 6
     self._stop()
 
   def _stop(self):
+    if getattr(self, "test", None) is not None:
+      self.prev_test, self.stopped_age = self.test, 0
     self.test = None             # the test whose waveform is running (fading included)
     self.step = 0
     self.ph = 0
     self.env = 0.0
     self.fading = False
     self.sign = 1
-    self.band = None             # the band of the current chunk
-    self.clean = False           # every frame of the current chunk so far was clean
+    self.band = None             # the band of the current unit
+    self.clean = False           # every frame of the current unit so far was clean
     self.last = 0
+
+  @property
+  def holdoff(self):
+    """Frames of the strict (3 s) hold-off still to run (display / compatibility)."""
+    return max(0, int(round(TOUCH_HOLDOFF_S / DT)) - min(self.touch_age, self.blink_age))
 
   def _event(self, frame, kind, **kw):
     e = {"frame": frame, "kind": kind, **kw}
@@ -329,30 +453,36 @@ class TiIdent:
   def running(self):
     return self.test is not None
 
-  def _next_step(self, key, band, remaining, credit=None):
-    """The first step of the table still to capture in `band`, counting this frame's credit; None: band complete."""
+  def _pick(self, key, band, remaining, credit=None):
+    """(step, extra): the first step of the table still to capture in `band` (this frame's credit counted), else the
+    least-collected one as extra (ties: the first); (None, False) when progress is unknown."""
+    best, best_left = None, None
     for s in range(steps_in_band(key, band)):
       left = remaining(key, band, s)
+      if left is None:
+        return None, False
       if credit is not None and credit[:3] == (key, band, s):
         left -= credit[3]
       if left > 1e-6:
-        return s
-    return None
+        return s, False
+      if best_left is None or left > best_left + 1e-9:
+        best, best_left = s, left
+    return best, True
 
-  def _start_chunk(self, frame, key, band, step, lead_in):
+  def _start_chunk(self, frame, key, band, step, lead_in, extra):
     _, a, _, lead = step_params(key, step)
     if key == PULSES and self.test == key:
       self.sign = -self.sign
-    self.test, self.step, self.band, self.fading = key, step, band, False
+    self.test, self.step, self.band, self.fading, self.extra = key, step, band, False, extra
     self.ph = -lead if lead_in else 0
     self.env = 0.0 if lead_in and lead else 1.0
     self.clean = True
     self._event(frame, "run" if lead_in else "chunk", test=key, step=step, band=band, ph=self.ph, env=self.env,
-                sign=self.sign, amp=a)
+                sign=self.sign, amp=a, extra=extra)
 
   def _fade(self, frame, why):
     if self.test == PULSES and self.ph >= len(_DOUBLETS[PULSE_AMPS[self.step]]):
-      self._event(frame, "stop", mode="zero")      # between doublets: the signal is already zero
+      self._event(frame, "stop", mode="zero", why=why)   # between doublets: the signal is already zero
       self._stop()
       return
     self.fading = True
@@ -362,57 +492,73 @@ class TiIdent:
   def update(self, armed, frame, *, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
              lat_demand, curvature, lkas_blocked, room=None, remaining=None):
     """`armed`: the one test key to run (None: none). `room`: rate_room of the live limits for the armed test.
-    `remaining(key, band, step)`: seconds still to capture for that step in that band (the accountant's progress;
-    None: nothing captured yet)."""
+    `remaining(key, band, step)`: seconds still to capture for that step in that band, negative when it has extra
+    (the accountant's progress; None from it: unknown, nothing runs; None here: nothing captured yet)."""
     if remaining is None:
       remaining = lambda k, b, s: STEP_SECONDS[k]
     self.credit = None
+    self.stopped_age += 1
     magnitude = abs(driver_torque)
     self.loud = self.loud + 1 if magnitude >= DRIVER_QUIET_COUNTS else 0
     touch = self.touch = bool(steering_pressed or magnitude >= DRIVER_FIRM_COUNTS
                               or self.loud >= self.touch_confirm_frames)
-    if touch or blinker:
-      self.holdoff = int(round(HOLDOFF_S / DT))
-    elif self.holdoff > 0:
-      self.holdoff -= 1
+    self.touch_age = 0 if touch else self.touch_age + 1
+    self.blink_age = 0 if blinker else self.blink_age + 1
     if lkas_blocked is None or lkas_blocked != self.regime:
       self.regime, self.regime_frames = lkas_blocked, 0
     else:
       self.regime_frames += 1
 
-    # A chunk that ended on the previous frame is credited first (its frames were 0..n-1), whatever happens now
+    # A unit that ended on the previous frame is credited first (its frames were 0..n-1), whatever happens now
     if self.test is not None and not self.fading and self.ph >= step_params(self.test, self.step)[2] and self.clean:
-      self.credit = (self.test, self.band, self.step, STEP_SECONDS[self.test] / CHUNKS_PER_STEP[self.test])
+      self.credit = (self.test, self.band, self.step, unit_credit(self.test, self.step))
 
-    band, ti_alone = band_for(v_ego)
+    band, ti_alone = band_for(v_ego, lkas_blocked)
     key = armed if armed in KEYS else None
+    # The step whose limits apply: the running one, else the one that would start
+    step, extra = (None, False)
+    if key is not None and band is not None:
+      if self.test == key and not self.fading:
+        step, extra = self.step, self.extra
+      else:
+        step, extra = self._pick(key, band, remaining, self.credit)
+    strict = step is None or not small(key, step)
+    touch_hold = (TOUCH_HOLDOFF_S if strict else TOUCH_HOLDOFF_SMALL_S) / DT
     # Why not (display), and the gate, in the dither's order of precedence
     if key is None:
       reason = "off"
     elif touch:
       reason = "touch"
-    elif room is not None and not rate_room_ok(room):
+    elif room is not None and not rate_room_ok(room, key, step if step is not None else 0):
       reason = "rate"
     elif blinker:
       reason = "blinker"
-    elif self.holdoff > 0:
+    elif self.touch_age < touch_hold or self.blink_age < BLINKER_HOLDOFF_S / DT:
       reason = "holdoff"
     elif band is None:
       reason = "band"
     elif lkas_blocked is None or bool(lkas_blocked) != ti_alone or self.regime_frames < REGIME_SETTLE_S / DT:
       reason = "regime"
-    elif abs(base_request) > MAX_BASE_FRACTION * ti_max:
+    elif abs(base_request) > (MAX_BASE_FRACTION_STRICT if strict else MAX_BASE_FRACTION_SMALL) * ti_max:
       reason = "command"
-    elif abs(lat_demand) > MAX_LAT_DEMAND_MPS2 or abs(curvature) > MAX_CURVATURE:
+    elif (abs(lat_demand) > (MAX_LAT_DEMAND if strict else MAX_LAT_DEMAND_SMALL) or
+          abs(curvature) > (MAX_CURVATURE if strict else MAX_CURVATURE_SMALL)):
       reason = "curve"
-    elif self._next_step(key, band, remaining, self.credit) is None:
-      reason = "band_done"
+    elif step is None:
+      reason = "off"              # progress unknown (no accountant): nothing runs
     elif key == LADDER and self.test == key and step_params(key, self.step)[1] > LADDER_CAPS[band]:
       reason = "band"             # the band changed under a step above the new band's cap
+    elif self.test is None and key != self.prev_test and self.stopped_age <= SWITCH_QUIET_S / DT:
+      reason = "switch"           # quiet between two tests
     else:
-      reason = "ok"
+      reason = "extra" if extra else "ok"
+    if self.test is not None and key != self.test and reason in ("ok", "extra"):
+      reason = "switch"           # another test is next: this one fades out first
     self.reason = reason
-    open_ = reason == "ok"
+    open_ = reason in ("ok", "extra")
+    if key is not None:
+      slot = (key, band or "none", reason)
+      self.counts[slot] = self.counts.get(slot, 0) + 1
 
     if self.test is not None and (touch or (key is not None and reason == "rate")):
       self._event(frame, "stop", mode="zero")      # a touch or too little rate room: zero at once
@@ -422,12 +568,12 @@ class TiIdent:
 
     if self.test is None:
       if open_:
-        self._start_chunk(frame, key, band, self._next_step(key, band, remaining), lead_in=True)
+        self._start_chunk(frame, key, band, step, lead_in=True, extra=extra)
     elif not self.fading:
       if self.ph >= step_params(self.test, self.step)[2]:
-        nxt = self._next_step(key, band, remaining, self.credit)
+        nxt, nxt_extra = self._pick(key, band, remaining, self.credit)
         if nxt == self.step or self.test == PULSES:
-          self._start_chunk(frame, key, band, nxt, lead_in=False)   # straight on: continuous
+          self._start_chunk(frame, key, band, nxt, lead_in=False, extra=nxt_extra)   # straight on: continuous
         else:
           self._fade(frame, "step")     # another tone or amplitude: fade out, then a fresh lead-in
       elif self.ph >= 0 and (band != self.band or self.env < 1.0):
@@ -445,8 +591,23 @@ class TiIdent:
       self.frames[self.test] = self.frames.get(self.test, 0) + 1
     _advance(st)
     if self.test is None:
+      self.prev_test, self.stopped_age = self.emitted, 0
       self._stop()
     return self.last
+
+  def frames_by(self, key):
+    """{band: {reason: frames}} for one test since the counts were last cleared (stats stamp)."""
+    out = {}
+    for (k, band, reason), n in self.counts.items():
+      if k == key:
+        out.setdefault(band, {})[reason] = n
+    return out
+
+  def share(self, key):
+    """Fraction of the armed, engaged frames that were running clean ("ok" or "extra"), or None without any."""
+    total = sum(n for (k, _, _), n in self.counts.items() if k == key)
+    ok = sum(n for (k, _, r), n in self.counts.items() if k == key and r in ("ok", "extra"))
+    return ok / total if total else None
 
 
 def reconstruct(events, n_frames):
