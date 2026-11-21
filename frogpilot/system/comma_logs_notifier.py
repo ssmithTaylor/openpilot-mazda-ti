@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
-"""Tell the home log collector that the device is parked and on Wi-Fi, then wait briefly for it to finish.
+"""Tell the home log collector that the device is parked on the home network. One request, then stop.
 
 Off by default. It runs only while off-road (the manager starts it when the car is off and stops it when a drive
-starts) and only when the CommaLogsUrl param holds the collector's URL, e.g. https://comma-logs.<home domain>.
-An empty param means off. The shared token is read from TOKEN_PATH, which the owner provisions by hand; it is not
-a param, so it is not shown in the settings or included in param backups.
+starts) and only when the CommaLogsUrl param holds the collector's https:// URL. An empty param means off.
 
-Once per off-road period: wait for Wi-Fi (deviceState.networkType), POST /api/notify with the segment count and
-the newest route name, then poll /api/status until the collector says `done` or the poll window ends. Every step
-is bounded (attempts, timeouts, total time); when the collector is absent it gives up quietly and does nothing
-else until the next off-road period. The collector does the pulling itself, over SSH; this process sends
-nothing but the notification. Nothing here touches steering, control or the power-down logic.
+Two more settings live in CONFIG_DIR, outside the params (so they are not shown in settings, not in toggle
+backups, and not in this repository); the owner provisions them by hand:
+  token        the shared token for the collector
+  home_subnet  the home network in CIDR form, e.g. 10.0.0.0/24
+
+Nothing is sent anywhere else: before any DNS lookup or connection the device must be on Wi-Fi AND have a wlan0
+address inside home_subnet (read locally with `ip`, no traffic). Off the home subnet it does nothing at all.
+On the home network it POSTs /api/notify once (segment count and newest route name), retrying a bounded number of
+times, then exits its work: the collector pulls over SSH by itself, so there is nothing to wait for. https only,
+redirects refused (so the token can only go to the configured host, inside a verified TLS session). Any failure
+ends quietly. Nothing here touches steering, control or the power-down logic.
 """
+import http.client
+import ipaddress
 import json
 import os
 import ssl
+import subprocess
 import time
 import urllib.error
 import urllib.request
 
 URL_PARAM = "CommaLogsUrl"
-TOKEN_PATH = "/data/comma_logs/token"
-LOG_ROOT = "/data/media/0/realdata_konik"
+CONFIG_DIR = "/data/comma_logs"
 
 START_DELAY_S = 20           # let the manager and network settle after the drive ends
-WIFI_WAIT_S = 30 * 60        # give up on this off-road period if no Wi-Fi within this time
-NOTIFY_ATTEMPTS = 6          # bounded retries for the notification itself
+HOME_WAIT_S = 30 * 60        # give up on this off-road period if not on the home network within this time
+NOTIFY_ATTEMPTS = 6          # bounded retries for the notification
 NOTIFY_BACKOFF_S = (15, 30, 60, 120, 240)
 HTTP_TIMEOUT_S = 8
-POLL_EVERY_S = 60
-POLL_WINDOW_S = 3 * 3600     # stop asking after this long; the collector keeps pulling regardless
-POLL_MAX_FAILURES = 5        # consecutive status failures before giving up
+NET_ERRORS = (OSError, ValueError, http.client.HTTPException)  # URLError and HTTPError are OSErrors
 
 
-def segment_summary(root=LOG_ROOT):
+def segment_summary(root):
   """(segment count, newest route name) from directory names only; no file is opened."""
   try:
     names = os.listdir(root)
@@ -44,44 +48,86 @@ def segment_summary(root=LOG_ROOT):
   return len(segs), (routes[-1] if routes else "")
 
 
-def read_token(path=TOKEN_PATH):
+def read_setting(name, config_dir=CONFIG_DIR):
   try:
-    with open(path) as f:
+    with open(os.path.join(config_dir, name)) as f:
       return f.read().strip()
   except OSError:
     return ""
 
 
-class Http:
-  def __init__(self, base, token, timeout=HTTP_TIMEOUT_S):
-    self.base, self.token, self.timeout = base.rstrip("/"), token, timeout
-    self.ctx = ssl.create_default_context()
+def load_config(url, token, subnet):
+  """(config, None) or (None, why it is off). Validates without touching the network."""
+  url = (url or "").strip()
+  if not url:
+    return None, "CommaLogsUrl is empty"
+  if not url.startswith("https://"):
+    return None, "CommaLogsUrl must start with https://"
+  if not token:
+    return None, f"no token in {CONFIG_DIR}/token"
+  try:
+    net = ipaddress.ip_network(subnet, strict=False)
+  except ValueError:
+    return None, f"no valid home subnet in {CONFIG_DIR}/home_subnet"
+  return {"url": url.rstrip("/"), "token": token, "home": net}, None
 
-  def _req(self, method, path, body=None):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(self.base + path, data=data, method=method,
-                                 headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as r:
-      return r.status, json.loads(r.read(65536) or b"{}")
+
+def wlan_addresses(run=subprocess.run):
+  """IPv4 interface addresses on wlan0, read locally (`ip -4 -o addr show dev wlan0`)."""
+  try:
+    out = run(["ip", "-4", "-o", "addr", "show", "dev", "wlan0"], capture_output=True, text=True, timeout=5).stdout
+  except (OSError, subprocess.SubprocessError):
+    return []
+  addrs = []
+  for line in out.splitlines():
+    parts = line.split()
+    if "inet" in parts:
+      try:
+        addrs.append(ipaddress.ip_interface(parts[parts.index("inet") + 1]))
+      except (ValueError, IndexError):
+        pass
+  return addrs
+
+
+def on_home_subnet(home, addrs):
+  return any(a.ip in home for a in addrs)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+class Http:
+  def __init__(self, base, token, timeout=HTTP_TIMEOUT_S, require_https=True):
+    if require_https and not base.startswith("https://"):
+      raise ValueError("https only")
+    self.base, self.token, self.timeout = base.rstrip("/"), token, timeout
+    self.opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
   def notify(self, body):
-    return self._req("POST", "/api/notify", body)
-
-  def status(self):
-    return self._req("GET", "/api/status")
+    req = urllib.request.Request(self.base + "/api/notify", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+    with self.opener.open(req, timeout=self.timeout) as r:
+      r.read(65536)  # drain; the reply's content is not needed
+      return r.status
 
 
 class Notifier:
   """One off-road period. All I/O is injected so it can be tested without a device or network."""
 
-  def __init__(self, http, wifi, summary=segment_summary, sleep=time.sleep, clock=time.monotonic, log=print):
-    self.http, self.wifi, self.summary = http, wifi, summary
+  def __init__(self, http, wifi, home, addrs, summary, sleep=time.sleep, clock=time.monotonic, log=print):
+    self.http, self.wifi, self.home, self.addrs, self.summary = http, wifi, home, addrs, summary
     self.sleep, self.clock, self.log = sleep, clock, log
 
-  def wait_for_wifi(self):
+  def at_home(self):
+    """Checked before every attempt: Wi-Fi and a wlan0 address on the home subnet. No network traffic."""
+    return bool(self.wifi()) and on_home_subnet(self.home, self.addrs())
+
+  def wait_for_home(self):
     t0 = self.clock()
-    while not self.wifi():
-      if self.clock() - t0 > WIFI_WAIT_S:
+    while not self.at_home():
+      if self.clock() - t0 > HOME_WAIT_S:
         return False
       self.sleep(10)
     return True
@@ -90,66 +136,49 @@ class Notifier:
     count, newest = self.summary()
     body = {"device": "comma", "segments": count, "newest": newest}
     for i in range(NOTIFY_ATTEMPTS):
-      if not self.wifi():
-        return False
+      if not self.at_home():
+        return False  # left the home network: send nothing
       try:
-        code, _ = self.http.notify(body)
+        code = self.http.notify(body)
         if 200 <= code < 300:
           self.log(f"comma_logs_notifier: collector notified ({count} segments on the device)")
           return True
-        if code in (401, 403):
-          self.log("comma_logs_notifier: collector refused the token; not retrying")
-          return False
       except urllib.error.HTTPError as e:
         if e.code in (401, 403):
           self.log("comma_logs_notifier: collector refused the token; not retrying")
           return False
-      except (OSError, ValueError):
-        pass  # collector absent, DNS failure, timeout, TLS failure: retry a bounded number of times
+        if 300 <= e.code < 400:
+          self.log("comma_logs_notifier: collector answered with a redirect; refused, not retrying")
+          return False
+      except NET_ERRORS:
+        pass  # collector absent, DNS failure, timeout, TLS failure, malformed reply: bounded retries
       if i < NOTIFY_ATTEMPTS - 1:
         self.sleep(NOTIFY_BACKOFF_S[min(i, len(NOTIFY_BACKOFF_S) - 1)])
     self.log("comma_logs_notifier: collector not reachable; giving up until the next drive")
     return False
 
-  def wait_until_done(self):
-    t0, failures = self.clock(), 0
-    while self.clock() - t0 < POLL_WINDOW_S:
-      self.sleep(POLL_EVERY_S)
-      try:
-        _, st = self.http.status()
-        failures = 0
-        if st.get("done"):
-          self.log("comma_logs_notifier: collector reports done")
-          return "done"
-        if st.get("state") in ("low_space", "waiting_for_ssh_key"):
-          self.log(f"comma_logs_notifier: collector cannot pull ({st.get('state')}); stopping")
-          return st.get("state")
-      except (OSError, ValueError):
-        failures += 1
-        if failures >= POLL_MAX_FAILURES:
-          return "unreachable"
-    return "window_ended"
-
   def run_once(self):
     self.sleep(START_DELAY_S)
-    if not self.wait_for_wifi():
-      return "no_wifi"
-    if not self.notify():
-      return "not_notified"
-    return self.wait_until_done()
+    if not self.wait_for_home():
+      return "not_home"
+    return "notified" if self.notify() else "not_notified"
+
+
+def idle_forever():
+  while True:
+    time.sleep(3600)  # once per off-road period; the manager stops this process when a drive starts
 
 
 def main():
   from cereal import log, messaging
   from openpilot.common.params import Params
   from openpilot.common.swaglog import cloudlog
+  from openpilot.system.hardware.hw import Paths
 
-  url = (Params().get(URL_PARAM, encoding="utf-8") or "").strip()
-  token = read_token()
-  if not url.startswith(("https://", "http://")) or not token:
-    cloudlog.info("comma_logs_notifier: not configured (CommaLogsUrl or the token file is missing); idle")
-    while True:
-      time.sleep(3600)  # the manager stops this process when a drive starts
+  cfg, why = load_config(Params().get(URL_PARAM, encoding="utf-8"), read_setting("token"), read_setting("home_subnet"))
+  if cfg is None:
+    cloudlog.info(f"comma_logs_notifier: off ({why})")
+    idle_forever()
 
   sm = messaging.SubMaster(["deviceState"])
   wifi_type = log.DeviceState.NetworkType.wifi
@@ -158,10 +187,15 @@ def main():
     sm.update(0)
     return bool(sm.seen["deviceState"] and sm["deviceState"].networkType == wifi_type)
 
-  result = Notifier(Http(url, token), wifi, log=cloudlog.info).run_once()
+  root = Paths.log_root()
+  try:
+    result = Notifier(Http(cfg["url"], cfg["token"]), wifi, cfg["home"], wlan_addresses,
+                      lambda: segment_summary(root), log=cloudlog.info).run_once()
+  except Exception:  # never let a surprise here reach the manager as a crash loop
+    cloudlog.exception("comma_logs_notifier: unexpected error")
+    result = "error"
   cloudlog.info(f"comma_logs_notifier: {result}")
-  while True:
-    time.sleep(3600)  # once per off-road period; the manager restarts the process after the next drive
+  idle_forever()
 
 
 if __name__ == "__main__":
