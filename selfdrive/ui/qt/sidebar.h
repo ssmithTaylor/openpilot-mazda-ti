@@ -49,6 +49,7 @@ struct TiTestView {
   QString arm;                     // the car side's arm label; empty when absent or stale
   QMap<QString, double> seconds;   // bin label, "other" or "all" -> seconds collected
   QMap<QString, double> step_seconds;  // step_seconds tests: bin label -> its steps' seconds, each clipped to the target
+  QMap<QString, double> step_extra;    // step_seconds tests: bin label -> its steps' seconds beyond the target
   int mismatch_ticks = 0;
 };
 
@@ -57,10 +58,12 @@ public:
   void load();
   void poll(const QJsonObject &toggles);
   void toggle(int i);
+  void toggleAll();
   void allOff();
   void resetProgress(int i);
   void driveEnded();
   int queued();
+  int queueSize() const;
   bool moveQueue(int from, int to);
 
   bool done(int i) const;
@@ -73,10 +76,13 @@ public:
 
   std::vector<TiTestDef> defs;
   std::vector<TiTestView> views;
+  TiTestView all_view;  // the run-all mode (TiIdentAll): state and the car side's _live.all status; no seconds
+  QString all_test;     // the test the run-all mode is running now (_live.all.test); empty: none or stale
   QStringList errors;
 
 private:
   void setTest(int i, bool on);
+  void setAll(bool on);
 
   QStringList logged_errors;
   QMap<QString, qint64> pending_resets;  // test id -> reset token, until the car side echoes it
@@ -116,14 +122,16 @@ private:
   QRect resetRect() const;
   int controlAt(const QPoint &pos) const;
   void drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const;
+  void drawToggle(QPainter &p, const TiTestView &view, bool off_at_ignition_off) const;
   void drawTest(QPainter &p, int i);
+  void drawAll(QPainter &p);
 
   TiTests tests;
   QTimer *ticker;
   QElapsedTimer idle;
   QElapsedTimer opened;          // input is ignored for a moment after the page opens
   int pressed_control = 0;       // the control under the last accepted press; 0: none
-  int queue_pos = -1;            // the queued test on the page; -1: read the queue at the next refresh
+  int queue_pos = -1;            // the queued test on the page (defs.size(): run all); -1: read the queue at the next refresh
   int tick_count = 0;
   bool is_metric = false;
   bool have_speed = false;
