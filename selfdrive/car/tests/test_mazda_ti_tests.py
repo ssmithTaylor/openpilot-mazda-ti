@@ -703,3 +703,33 @@ def test_the_plan_forced_run_all_is_credited_although_the_run_all_toggle_is_not_
 def test_the_car_controller_tells_the_accountant_when_run_all_is_forced():
   src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
   assert "run_all_forced=bool(self.ti_ident_all)" in src
+
+
+def test_under_the_plan_the_generators_step_choice_and_the_stored_progress_evolve_exactly_as_under_run_all():
+  """The generator picks its next step from `remaining` (the accountant's progress). Same inputs, run-all by toggle against run-all
+  forced by the plan: every `remaining`, and the stored progress, must be equal after every credit; and the generator must move
+  off its first step (the installed build spent 485 s on one tone because under the plan nothing was ever credited)."""
+  defs, errors = tt.load_definitions()
+  assert errors == []
+  steps = [t for t in defs if t.metric == "step_seconds"]
+  by_toggle = tt.TestAccountant(defs, FakeParams(), FakeParams())
+  by_plan = tt.TestAccountant(defs, FakeParams(), FakeParams())
+  as_toggle = NS(ti_dither=False, ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=True)
+  as_plan = NS(ti_dither=False, ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False)
+  first = steps[0]
+  key, band = next(iter(first.keys)), first.bins[0][2]
+  start = by_plan.remaining(key, band, 0)
+  credits = [(next(iter(t.keys)), b[2], s, 4.0) for t in steps for k, b in enumerate(t.bins) for s in range(len(t.needs[k]))]
+  assert credits
+  for n, c in enumerate(credits * 2):
+    by_toggle.update(as_toggle, 24 * MPH, True, (), credit=c)
+    by_plan.update(as_plan, 24 * MPH, True, (), credit=c, run_all_forced=True)
+    for t in steps:
+      for k, b in enumerate(t.bins):
+        for s in range(len(t.needs[k])):
+          assert by_plan.remaining(next(iter(t.keys)), b[2], s) == by_toggle.remaining(next(iter(t.keys)), b[2], s), (n, t.id, b[2], s)
+  assert by_plan.remaining(key, band, 0) < start                      # the first step's remainder moved: the next pick can move on
+  by_toggle.publish(1.0)
+  by_plan.publish(1.0)
+  strip = lambda a: {k: v for k, v in json.loads(a.params_memory.store[tt.PROGRESS_KEY]).items() if k != tt.LIVE_KEY}
+  assert strip(by_plan) == strip(by_toggle)

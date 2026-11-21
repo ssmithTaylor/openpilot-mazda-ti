@@ -85,7 +85,7 @@ static void homeRules() {
   // the progress page's text boxes are not under a control and fit the screen
   Control pg_c[MAX_CONTROLS];
   const int pn = layout(Page::Progress, 0, pg_c);
-  const Rect prog[] = {PROG_TITLE, PROG_AB_HEAD, PROG_AB_BAR_A, PROG_AB_BAR_B, PROG_AB_LEFT,
+  const Rect prog[] = {PROG_TITLE, PROG_AB_HEAD, PROG_AB_BAR_A, PROG_AB_BAR_B, PROG_AB_LEFT, PROG_SPLIT,
                        Rect{480, PROG_ROWS_TOP, 1660, 4 * PROG_ROW_H}};
   for (const Rect &b : prog) {
     CHECK(b.right() <= SCREEN_W && b.bottom() <= SCREEN_H);
@@ -373,6 +373,36 @@ static void progressTexts() {
   CHECK(nearestCounting(30, false) == "Hold 24 or 38 mph");
 }
 
+static void setupOrderAndChoice() {
+  // on/off settings first, the number last; every setting appears once; stepping wraps and never leaves the list
+  bool seen[ti_ab::N_SETTINGS] = {false};
+  for (int i = 0; i < N_SETUP_ORDER; i++) {
+    const int idx = ti_ab::settingIndex(SETUP_ORDER[i]);
+    CHECK(idx >= 0 && !seen[idx]);
+    seen[idx] = true;
+    CHECK(i == N_SETUP_ORDER - 1 ? !ti_ab::SETTINGS[idx].is_bool : ti_ab::SETTINGS[idx].is_bool);
+  }
+  CHECK(N_SETUP_ORDER == ti_ab::N_SETTINGS && std::strcmp(SETUP_ORDER[0], "LatNoFrictionRelay") == 0 && std::strcmp(SETUP_ORDER[N_SETUP_ORDER - 1], "SteerKP") == 0);
+  int idx = ti_ab::settingIndex(SETUP_ORDER[0]);
+  for (int i = 0; i < N_SETUP_ORDER; i++) {
+    CHECK(std::strcmp(ti_ab::SETTINGS[idx].name, SETUP_ORDER[i]) == 0);
+    idx = setupStep(idx, 1);
+  }
+  CHECK(std::strcmp(ti_ab::SETTINGS[idx].name, SETUP_ORDER[0]) == 0);
+  CHECK(setupStep(setupStep(idx, 1), -1) == idx && std::strcmp(ti_ab::SETTINGS[setupStep(idx, -1)].name, "SteerKP") == 0);
+  CHECK(notRecommended("SteerKP") && !notRecommended("LatNoFrictionRelay") && (int)std::strlen(NOT_RECOMMENDED_TEXT) <= MAX_DETAIL_CHARS);
+  // the chosen experiment fits its large line, for every setting and every kind of value
+  CHECK(MAX_CHOSEN_CHARS * CHOSEN_PX * 0.62 <= HOME_EXPERIMENT.w && CHOSEN_PX + 4 <= HOME_EXPERIMENT.h);
+  for (int i = 0; i < ti_ab::N_SETTINGS; i++) {
+    CHECK((int)experimentLine(i, true, 0.80, 0.85).size() <= MAX_CHOSEN_CHARS && (int)experimentLine(i, false, 0, 0).size() <= MAX_CHOSEN_CHARS);
+  }
+  CHECK((int)experimentLine(-1, false, 0, 0).size() <= MAX_CHOSEN_CHARS);
+  // the split of the speed range
+  CHECK(splitNote(true, false) == "A/B has 36-55 mph until done; tests run below 35 and above 56 mph");
+  CHECK(splitNote(true, true).size() * DETAIL_PX * 0.62 <= PROG_SPLIT.w && splitNote(false, false).size() * DETAIL_PX * 0.62 <= PROG_SPLIT.w);
+  CHECK(PROG_SPLIT.bottom() <= SCREEN_H && PROG_SPLIT.h >= DETAIL_PX + 4);
+}
+
 static void setup() {
   CHECK(setupEditable(false, false, 0) && setupEditable(false, true, 0.5) && !setupEditable(false, true, 25) && !setupEditable(true, true, 0));
   CHECK((int)setupNote(false, true, 0).size() <= MAX_EXPERIMENT_CHARS && (int)setupNote(true, true, 0).size() <= MAX_EXPERIMENT_CHARS);
@@ -391,6 +421,7 @@ int main() {
   writes();
   startLabels();
   progressTexts();
+  setupOrderAndChoice();
   setup();
   if (failures == 0) {
     std::printf("ok\n");

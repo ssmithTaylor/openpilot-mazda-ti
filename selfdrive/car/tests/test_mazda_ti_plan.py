@@ -686,3 +686,103 @@ def test_the_new_hold_param_is_registered_and_the_screens_do_not_say_another_tes
   assert '{"TiTestHold", CLEAR_ON_MANAGER_START}' in cc and '("TiTestHold", ' in py and tp.PARAM_HOLD == "TiTestHold"
   ui = (ROOT / "selfdrive/ui/qt/sidebar.cc").read_text(encoding="utf-8")
   assert "ti_ab::holdText(" in ui and "view.status = text" in ui and "tests.all_view.status = text" in ui
+
+
+# ---- a plan left on across a restart of the controls process -----------------------------------------------------------------
+
+class CarSide:
+  """The car controller as simulate() models it: it keeps running across a controls restart (its own process), reads the plan at
+  10 Hz, arms the tests only on an allowed plan and acknowledges."""
+
+  def __init__(self, mem):
+    self.mem, self.gen = mem, TiIdent()
+    self.hold, self.allowed, self.nonce, self.seq, self.ack_key = True, False, None, None, None
+    self.k = 0
+
+  def step(self, rn, t, mph=45.0, engaged=True, curv=0.0003):
+    k = self.k
+    self.k += 1
+    v_ego = v(mph)
+    rn.step(t, **dict(QUIET, engaged=engaged, v_ego=v_ego, curvature=curv, mono_ns=k))
+    if k % 10 == 0:
+      raw = self.mem.get("TiPlan")
+      self.hold, self.allowed, _ = tp.tests_gate(bool(self.mem.get_bool("TiPlanOn")), raw, time.time())
+      self.nonce, self.seq = tp.plan_ident(raw)
+    armed = ti.SWEEP if (self.allowed and not self.hold) else None
+    if engaged:
+      self.gen.update(armed, k, v_ego=v_ego, steering_pressed=False, driver_torque=-1.0, blinker=False, base_request=40, ti_max=600,
+                      lat_demand=v_ego ** 2 * curv, curvature=curv, lkas_blocked=mph < 28.0, room=6)
+    else:
+      self.gen.reset(k)
+    if k % 10 == 0 and self.mem.get_bool("TiPlanOn"):
+      ack = tp.make_ack(self.nonce, self.seq, self.gen.running, self.gen.last, 0.0, time.time())
+      if (ack["nonce"], ack["seq"], ack["quiet"]) != self.ack_key or k % 50 == 0:
+        self.mem.put("TiPlanAck", json.dumps(ack))
+        self.ack_key = (ack["nonce"], ack["seq"], ack["quiet"])
+
+  def run(self, rn, t, seconds, **kw):
+    for _ in range(F(seconds)):
+      self.step(rn, t, **kw)
+
+
+def _two_process_rig():
+  mem = Mem(TiPlanOn=False)
+  params = Mem(TiAbConfig=CONFIG)
+  return mem, params, CarSide(mem)
+
+
+@pytest.mark.parametrize("mph,expect", [(45.0, "ab"), (25.0, "tests")])
+def test_a_plan_left_on_when_controls_restarts_resumes_by_itself_once_the_car_is_engaged(mph, expect):
+  mem, params, car = _two_process_rig()
+  t = toggles()
+  first = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  car.run(first, t, 1.0)
+  mem.d["TiPlanOn"] = True
+  car.run(first, t, 40.0, mph=mph)
+  assert first.plan.mode == expect and first.plan.nonce
+  # controls restarts (a new process, a new nonce); TiPlanOn, the old TiPlan and TiPlanAck stay in tmpfs, the car controller runs on
+  second = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  assert second.plan.nonce != first.plan.nonce and mem.d["TiPlanOn"] is True
+  car.run(second, t, 1.5, mph=mph)
+  assert second.plan.mode == "hold" and not second.plan.resumed          # not before the car has been engaged for a few seconds
+  assert car.hold or not car.allowed
+  car.run(second, t, 2.5, mph=mph)
+  assert second.plan.resumed and second.plan.mode == expect               # resumed with no action from the driver
+  car.run(second, t, 20.0, mph=mph)
+  if expect == "tests":
+    assert car.allowed and not car.hold and car.gen.running or car.gen.last != 0 or car.allowed
+  else:
+    assert second.ab.block is not None or second.ab.ramp.to == 1.0 or second.ab.mode == "running"
+  assert [e for e in second.ab.events if e["kind"] == "plan_resume"]
+
+
+def test_a_plan_left_on_stays_held_while_the_car_is_not_engaged_and_the_old_nonce_never_counts():
+  mem, params, car = _two_process_rig()
+  t = toggles()
+  first = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  car.run(first, t, 1.0)
+  mem.d["TiPlanOn"] = True
+  car.run(first, t, 30.0, mph=45.0)
+  old_nonce = first.plan.nonce
+  second = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  car.run(second, t, 30.0, mph=45.0, engaged=False)
+  assert second.plan.mode == "hold" and not second.plan.resumed and second.ab.block is None and car.hold
+  assert json.loads(mem.d["TiPlan"])["nonce"] == second.plan.nonce != old_nonce
+  # a driver cycling the switch still works exactly as before
+  mem.d["TiPlanOn"] = False
+  car.run(second, t, 1.0, mph=45.0)
+  mem.d["TiPlanOn"] = True
+  car.run(second, t, 10.0, mph=45.0)
+  assert second.plan.mode == "ab" and not second.plan.resumed
+
+
+def test_the_plan_unit_still_holds_without_an_engaged_input_and_logs_the_resume():
+  plan = tp.Plan(nonce="x")
+  logged = []
+  plan.log = lambda kind, **kw: logged.append(kind)
+  for _ in range(F(20)):
+    plan.update(on=True, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=time.time(), tests_toggles_on=False)
+  assert plan.mode == "hold" and not plan.resumed                         # engaged never reported: nothing changes
+  for _ in range(F(tp.RESUME_ENGAGED_S) + 2):
+    plan.update(on=True, cfg_valid=True, complete=False, mph=45.0, ab_at_a=True, ack=None, now=time.time(), tests_toggles_on=False, engaged=True)
+  assert plan.resumed and plan.mode == "ab" and "plan_resume" in logged

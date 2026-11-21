@@ -1308,6 +1308,7 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
 
 // The first page again (from the set-up page and the individual tests). Nothing is switched by going there.
 void TestsWindow::goHome() {
+  abOpen();                // the set-up page's unconfirmed draft is dropped: the first page shows, and START runs, what is saved
   home_page = true;
   setup_page = false;
   progress_page = false;
@@ -1384,17 +1385,32 @@ void TestsWindow::setupAct(int control) {
     return;
   }
   if (control == CTL_SETUP_USE) {
-    if (ab_configured) {
+    const bool same = ab_configured && saved_setting == ab_setting && std::fabs(saved_b - ab_b) < 1e-9 && std::fabs(saved_block - ab_block_min) < 1e-9;
+    if (same) {
       ab_params.remove(TI_AB_CONFIG_KEY);   // not used: START runs the tests alone
       ab_configured = false;
+      saved_setting = -1;
     } else if (ab_a_known) {
-      ab_configured = true;
-      abSave();
+      // Nothing is stored until it is chosen here AND confirmed: there is no default experiment
+      QString text = QString("Run this experiment?\n%1\nBlocks of %2 min.").arg(QString::fromStdString(ti_pages::experimentLine(ab_setting, ab_a_known, ab_a, ab_b)))
+                         .arg((int)ab_block_min);
+      if (ti_pages::notRecommended(s.name)) {
+        text += QString("\n%1.").arg(QString(ti_pages::NOT_RECOMMENDED_TEXT));
+      }
+      if (ConfirmationDialog::confirm(text, QString("Choose"), this)) {
+        ab_configured = true;
+        abSave();
+        saved_setting = ab_setting;
+        saved_b = ab_b;
+        saved_block = ab_block_min;
+      }
+      idle.start();
+      opened.start();                       // the dialog's own taps end here
     }
     return;
   }
   if (control == CTL_SETUP_PREV || control == CTL_SETUP_NEXT) {
-    ab_setting = ti_ab::cycleSetting(ab_setting, control == CTL_SETUP_NEXT ? 1 : -1);
+    ab_setting = ti_pages::setupStep(ab_setting, control == CTL_SETUP_NEXT ? 1 : -1);   // on/off settings first, the number last
     abFixB(false);
   } else if (control == CTL_SETUP_B_MINUS || control == CTL_SETUP_B_PLUS) {
     if (ab_a_known) {
@@ -1402,9 +1418,6 @@ void TestsWindow::setupAct(int control) {
     }
   } else if (control == CTL_SETUP_BLOCK_MINUS || control == CTL_SETUP_BLOCK_PLUS) {
     ab_block_min = ti_ab::stepBlock(ab_block_min, control == CTL_SETUP_BLOCK_PLUS ? 1 : -1);
-  }
-  if (ab_configured) {
-    abSave();
   }
 }
 
@@ -1531,7 +1544,7 @@ bool TestsWindow::abStoredValue(int i, double &value) const {
 
 // Read the saved configuration (the setting, B and the block length) and fix B to something the car side accepts
 void TestsWindow::abOpen() {
-  ab_setting = 0;
+  ab_setting = ti_ab::settingIndex(ti_pages::SETUP_ORDER[0]);   // where the set-up page starts when nothing is chosen (not an experiment)
   ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
   bool have_b = false;
   const QJsonObject cfg = QJsonDocument::fromJson(QByteArray::fromStdString(ab_params.get(TI_AB_CONFIG_KEY))).object();
@@ -1546,6 +1559,9 @@ void TestsWindow::abOpen() {
   const double minutes = cfg.value("block_min").toDouble(ti_ab::DEFAULT_BLOCK_MIN);
   ab_block_min = std::min(ti_ab::MAX_BLOCK_MIN, std::max(ti_ab::MIN_BLOCK_MIN, std::round(minutes)));
   abFixB(have_b);
+  saved_setting = ab_configured ? ab_setting : -1;
+  saved_b = ab_b;
+  saved_block = ab_block_min;
   abPoll();
 }
 
@@ -1818,8 +1834,8 @@ void TestsWindow::drawHome(QPainter &p) {
 
   // What will run, in plain words
   const bool a_known = ab_a_known;
-  p.setPen(QColor(0xc9, 0xc9, 0xc9));
-  p.setFont(InterFont(EXPERIMENT_PX));
+  p.setPen(ab_configured ? white : QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(CHOSEN_PX, QFont::DemiBold));
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
              QString::fromStdString(experimentLine(ab_configured ? ab_setting : -1, a_known, ab_a, ab_b)));
 
@@ -1884,9 +1900,10 @@ void TestsWindow::drawSetup(QPainter &p) {
   drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< BACK"), NAV_PX);
   drawTitle(p, qr(TITLE_SETUP), QString("A/B SET-UP"), 90);
 
-  drawBox2(p, ctlRect(CTL_SETUP_USE), !editable ? dim_fill : (ab_configured ? QColor(0x17, 0x86, 0x44) : grey), editable ? white : dim_ink,
-           ab_configured ? QString("A/B RELAY: USED") : QString("A/B RELAY: NOT USED"), ACTION_PX,
-           ab_configured ? QString("tap to stop using it") : QString("tap to use it"), EXPERIMENT_PX);
+  const bool same = ab_configured && saved_setting == ab_setting && std::fabs(saved_b - ab_b) < 1e-9 && std::fabs(saved_block - ab_block_min) < 1e-9;
+  drawBox2(p, ctlRect(CTL_SETUP_USE), !editable ? dim_fill : (same ? QColor(0x17, 0x86, 0x44) : QColor(0x46, 0x5B, 0xEA)), editable ? white : dim_ink,
+           same ? QString("EXPERIMENT CHOSEN") : (ab_configured ? QString("CHANGE TO THIS EXPERIMENT") : QString("CHOOSE THIS EXPERIMENT")), ACTION_PX,
+           same ? QString("tap to stop using it") : QString("tap, then confirm (nothing is chosen until then)"), EXPERIMENT_PX);
 
   const QColor box = editable ? grey : dim_fill;
   const QColor box_ink = editable ? white : dim_ink;
@@ -1903,8 +1920,15 @@ void TestsWindow::drawSetup(QPainter &p) {
   const QRect next = ctlRect(CTL_SETUP_NEXT);
   p.setPen(white);
   p.setFont(InterFont(ACTION_PX, QFont::Bold));
-  p.drawText(QRect(prev.right() + 20, prev.top(), next.left() - prev.right() - 40, prev.height()), Qt::AlignCenter,
+  p.drawText(QRect(prev.right() + 20, prev.top(), next.left() - prev.right() - 40, prev.height() - (notRecommended(s.name) ? 55 : 0)), Qt::AlignCenter,
              QString("Setting: %1").arg(QString(plainName(s.name))));
+  if (notRecommended(s.name)) {
+    p.setPen(QColor(218, 202, 37));
+    p.setFont(InterFont(DETAIL_PX, QFont::DemiBold));
+    p.drawText(QRect(prev.right() + 20, prev.bottom() - 60, next.left() - prev.right() - 40, 55), Qt::AlignCenter, QString("not recommended yet"));
+    p.setPen(white);
+    p.setFont(InterFont(ACTION_PX, QFont::Bold));
+  }
   const QRect bm = ctlRect(CTL_SETUP_B_MINUS);
   const QRect bp = ctlRect(CTL_SETUP_B_PLUS);
   p.drawText(QRect(bm.right() + 20, bm.top(), bp.left() - bm.right() - 40, bm.height()), Qt::AlignCenter,
@@ -1922,7 +1946,8 @@ void TestsWindow::drawSetup(QPainter &p) {
   p.setPen(QColor(218, 202, 37));
   p.setFont(InterFont(DETAIL_PX));
   p.drawText(QRect(480, 1020, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
-             QString::fromStdString(setupNote(running(), have_speed, speed_mph)) + (ti_ab::bendsOnly(s.name) ? QString("  Counts only in bends.") : QString()));
+             notRecommended(s.name) ? QString(NOT_RECOMMENDED_TEXT)
+                                    : QString::fromStdString(setupNote(running(), have_speed, speed_mph)) + (ti_ab::bendsOnly(s.name) ? QString("  Counts only in bends.") : QString()));
 }
 
 void TestsWindow::drawBar(QPainter &p, const QRect &r, double fraction, const QColor &fill) {
@@ -1963,6 +1988,11 @@ void TestsWindow::drawProgress(QPainter &p) {
   } else {
     p.drawText(qr(PROG_AB_HEAD), Qt::AlignLeft | Qt::AlignVCenter, QString("A/B relay: not used"));
   }
+
+  const bool alternation_open = ab_configured && abMinutesLeft(a_s, b_s, target) > 0.0;
+  p.setPen(amber);
+  p.setFont(InterFont(DETAIL_PX, QFont::DemiBold));
+  p.drawText(qr(PROG_SPLIT), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(splitNote(alternation_open, is_metric)));
 
   const std::vector<int> scope = stepScope();
   for (int w = 0; w < ti_logic::N_WINDOWS; w++) {

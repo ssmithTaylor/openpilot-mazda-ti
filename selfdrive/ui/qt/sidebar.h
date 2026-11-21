@@ -213,6 +213,9 @@ private:
   double drive_base_a = 0;
   double drive_base_b = 0;
   bool ab_configured = false;    // TiAbConfig names a setting: START runs the plan (tests + A/B relay)
+  int saved_setting = -1;        // the stored experiment (TiAbConfig); the set-up page edits a draft until it is confirmed
+  double saved_b = 0;
+  double saved_block = 0;
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row
   ti_logic::LockReopen reopen;

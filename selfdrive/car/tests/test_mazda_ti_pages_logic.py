@@ -107,3 +107,15 @@ def test_the_qt_page_takes_its_rectangles_and_writes_from_the_header():
   assert "runOps(ti_pages::runAllOps())" in SIDEBAR and "runOps(ti_pages::allTestsOffOps())" in SIDEBAR
   # the controller's params are written through the executor only (no direct write of the plan switch is left on a page)
   assert SIDEBAR.count('TI_PLAN_ON_KEY, true') == 0 and SIDEBAR.count('"TiPlanOn", true') == 0
+
+
+def test_the_set_up_order_puts_on_off_first_and_the_page_has_no_default_experiment_and_no_silent_save():
+  block = HEADER[HEADER.index("SETUP_ORDER[N_SETUP_ORDER]"):]
+  names = re.findall(r'"(\w+)"', block[:block.index("};")])
+  assert sorted(names) == sorted(ab.ALLOWED) and names[0] == "LatNoFrictionRelay" and names[-1] == "SteerKP"
+  body = SIDEBAR[SIDEBAR.index("void TestsWindow::setupAct"):SIDEBAR.index("void TestsWindow::mouseReleaseEvent")]
+  assert "ConfirmationDialog::confirm" in body and body.count("abSave()") == 1       # the one save is after the confirm
+  assert body.index("ConfirmationDialog::confirm(text") < body.index("abSave()")
+  assert "ab_setting = ti_ab::settingIndex(ti_pages::SETUP_ORDER[0])" in SIDEBAR       # an unchosen page starts on the first on/off setting
+  assert "ab_setting = 0;" not in SIDEBAR
+  assert "setupStep(ab_setting" in body

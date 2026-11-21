@@ -913,6 +913,7 @@ class TiAbRunner:
     self._written = None
     self.plan = ti_plan.Plan(log=lambda kind, **kw: self.ab._event(kind, **kw))
     self.plan_on, self.plan_ack, self.plan_dead = False, None, False
+    self.plan_resumed_ab = False
     self.plan_out = None
     self.plan_target_s = 60.0 * (ti_plan.TARGET_MIN_PER_SIDE if plan_target_min is None else plan_target_min)
     self.plan_published = None
@@ -986,7 +987,10 @@ class TiAbRunner:
           self.ab.clear_plan_limits()
         po = self.plan.update(on=self.plan_on, cfg_valid=self.ab.cfg_valid, complete=self.ab.complete, mph=mph,
                               ab_at_a=self.ab.at_a_settled, ack=self.plan_ack, now=time.time(), tests_toggles_on=tests,
-                              ceiling=ti_plan.PLAN_ALT_MAX_MPH)
+                              ceiling=ti_plan.PLAN_ALT_MAX_MPH, engaged=bool(inputs.get("engaged")))
+        if self.plan.resumed and not self.plan_resumed_ab and self.plan_on:
+          self.plan_resumed_ab = True
+          self.ab.seen_off = True       # the alternation takes the same resumed plan (no cycling of the switch)
         self.plan_out = po
         if self.plan_on:
           on, paused = True, tests or not po.ab_allowed

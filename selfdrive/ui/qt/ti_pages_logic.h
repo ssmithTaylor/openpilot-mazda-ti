@@ -34,7 +34,8 @@ constexpr int ROW_TOP = 500;       // where the content of the individual pages 
 // Font sizes in pixels (InterFont(px), the device's own font; bold for the status lines and every control label)
 constexpr int PRIMARY_PX = 100;    // the primary status line
 constexpr int SECOND_PX = 70;      // the second line
-constexpr int EXPERIMENT_PX = 40;  // the experiment in plain words
+constexpr int EXPERIMENT_PX = 40;  // the experiment in plain words (set-up page, progress page)
+constexpr int CHOSEN_PX = 52;      // the chosen experiment on the first page, in large plain words
 constexpr int START_PX = 72;       // START label (its second line: START_SUB_PX)
 constexpr int START_SUB_PX = 40;
 constexpr int STOP_PX = 110;       // STOP
@@ -46,6 +47,7 @@ constexpr int DETAIL_PX = 36;      // the detail line (not needed while driving)
 constexpr int MAX_PRIMARY_CHARS = 22;
 constexpr int MAX_SECOND_CHARS = 36;
 constexpr int MAX_EXPERIMENT_CHARS = 80;
+constexpr int MAX_CHOSEN_CHARS = 60;     // at CHOSEN_PX in the 2120 px line of the first page
 constexpr int MAX_DETAIL_CHARS = 70;
 constexpr int MAX_PROGRESS_CHARS = 56;   // a progress line at PROGRESS_PX in a 1660 px box
 constexpr int PROGRESS_PX = 44;
@@ -133,6 +135,7 @@ constexpr Rect PROG_AB_HEAD = {480, 210, 1660, 56};
 constexpr Rect PROG_AB_BAR_A = {480, 276, 1660, 44};
 constexpr Rect PROG_AB_BAR_B = {480, 330, 1660, 44};
 constexpr Rect PROG_AB_LEFT = {480, 384, 1660, 50};
+constexpr Rect PROG_SPLIT = {480, 990, 1660, 70};   // the expected split of the speed range
 constexpr int PROG_ROWS_TOP = 470;
 constexpr int PROG_ROW_H = 125;                       // four windows, each a label, a bar and one line
 // The individual pages' title row and banner (text, not controls)
@@ -476,6 +479,18 @@ inline std::string windowRowText(int w, int done, int total, double secs_left, b
   return buf;
 }
 
+// What the tests and the alternation each get of the speed range (the plan gives 36-55 mph to the alternation until it is done)
+inline std::string splitNote(bool alternation_open, bool metric) {
+  char buf[128];
+  if (!alternation_open) {
+    return "The alternation is not running: the tests run in every window";
+  }
+  std::snprintf(buf, sizeof(buf), "A/B has %d-%d %s until done; tests run below %d and above %d %s", speedValue(ti_ab::PLAN_ALT_MIN_MPH + 1, metric),
+                speedValue(ti_ab::PLAN_ALT_MAX_MPH - 1, metric), metric ? "km/h" : "mph", speedValue(ti_ab::PLAN_ALT_MIN_MPH, metric),
+                speedValue(ti_ab::PLAN_ALT_MAX_MPH, metric), metric ? "km/h" : "mph");
+  return buf;
+}
+
 // What the drive has added since START was last pressed: tests, seconds credited per window; the alternation, minutes per side.
 // win_s: credited seconds per window since START; a_s, b_s: scored seconds per side since START; has_ab: an alternation is set up.
 inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double a_s, double b_s, bool has_ab, bool metric) {
@@ -670,6 +685,33 @@ inline std::string valueWord(const ti_ab::Setting &s, double v) {
   std::snprintf(buf, sizeof(buf), "%.2f", v);
   return buf;
 }
+
+// The order the set-up page offers the settings in: on/off settings first (the reviewed first-trial order), the number last
+constexpr int N_SETUP_ORDER = 6;
+constexpr const char *SETUP_ORDER[N_SETUP_ORDER] = {"LatNoFrictionRelay", "LatFrictionComp", "LatDamping", "LatOutputFilter",
+                                                    "LatCommitSetpoint", "SteerKP"};
+
+inline int setupPos(const char *name) {
+  for (int i = 0; i < N_SETUP_ORDER; i++) {
+    if (std::strcmp(SETUP_ORDER[i], name) == 0) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+// The setting after / before `index` (an index of ti_ab::SETTINGS) in the order of the set-up page, wrapping
+inline int setupStep(int index, int dir) {
+  const int pos = ((setupPos(ti_ab::SETTINGS[index].name) + (dir > 0 ? 1 : -1)) % N_SETUP_ORDER + N_SETUP_ORDER) % N_SETUP_ORDER;
+  return ti_ab::settingIndex(SETUP_ORDER[pos]);
+}
+
+// A soft guard: SteerKP is offered but marked (its effect is smaller than the drive-to-drive variation)
+inline bool notRecommended(const char *setting) {
+  return std::strcmp(setting, "SteerKP") == 0;
+}
+
+constexpr const char *NOT_RECOMMENDED_TEXT = "Not recommended yet: effect smaller than drive-to-drive variation";
 
 // "A/B: friction relay, yours (off) against on"; setting < 0: no alternation is set up
 inline std::string experimentLine(int setting, bool a_known, double a, double b) {
