@@ -519,7 +519,7 @@ static void planAndBands() {
   // the bands: one figure each, the alternation and the tests merged
   HomeState hs;
   hs.configured = true; hs.target_min = 20; hs.ab_stored_a_s = hs.ab_stored_b_s = 0;
-  hs.tests_left_s[0] = 6.0 * 60 / 1.3; hs.tests_left_s[1] = 4.0 * 60 / 1.3; hs.tests_left_s[2] = 3.0 * 60 / 1.3; hs.tests_left_s[3] = 4.0 * 60 / 1.3;
+  hs.tests_left_s[0] = 6.0 * 60 / OVERHEAD_TESTS_LOW; hs.tests_left_s[1] = 4.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[2] = 3.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[3] = 4.0 * 60 / OVERHEAD_TESTS;
   Band b[MAX_BANDS];
   int n = bandsFromState(hs, b);
   CHECK(n == 3 && b[0].target_mph == 24 && b[2].target_mph == 72 && b[1].target_mph == 45 && b[0].minutes == 6 && b[2].minutes == 4);
@@ -597,7 +597,7 @@ static void listAndStatusAgree() {
                       // the minutes of a band: exactly what completing it requires now (recomputed here from the inputs)
                       const bool alt_open = conf && std::fmax(0.0, 1200.0 - a) + std::fmax(0.0, 1200.0 - a) > 0.0;
                       const double alt_min = alt_open ? (2 * std::fmax(0.0, 1200.0 - a) / 60.0) * OVERHEAD_ALT : 0.0;
-                      const double w0 = t0 * OVERHEAD_TESTS / 60.0, w1 = t1 * OVERHEAD_TESTS / 60.0, w3 = t3 * OVERHEAD_TESTS / 60.0;
+                      const double w0 = t0 * OVERHEAD_TESTS_LOW / 60.0, w1 = t1 * OVERHEAD_TESTS / 60.0, w3 = t3 * OVERHEAD_TESTS / 60.0;
                       CHECK(b[0].minutes == std::ceil(w0 - 1e-9) && b[n - 1].minutes == std::ceil(w3 - 1e-9));
                       if (alt_open) {
                         CHECK(n == 3 && b[1].minutes == std::ceil(alt_min + 2 * w1 - 1e-9));

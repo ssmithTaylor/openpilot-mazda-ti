@@ -555,7 +555,10 @@ class RunAll:
     self.current, self.profile, self.mode, self.blocked = test, profile, mode, 0
     return test
 
-  def pick(self, frame, profile, remaining, can_run=None):
+  def pick(self, frame, profile, remaining, can_run=None, strict=None):
+    """`strict(k, profile)`: this test's next step is a strict-gated one (the 44-count pulse, the ladder's larger steps). Strict-open
+    stretches are the scarce resource (the limits are tighter), so when one is open a test that can use it goes first instead of the
+    current one finishing its small steps (which can run in any stretch). No limit changes."""
     if profile is None:
       return self.current
     run = (lambda k: True) if can_run is None else (lambda k: bool(can_run(k, profile)))
@@ -569,6 +572,10 @@ class RunAll:
     cur = self.current
     patience = int(round(BLOCK_PATIENCE_S / DT))
     incomplete = [k for k in RUN_ALL_ORDER if shares[k] < 1.0 - 1e-9]
+    if incomplete and strict is not None:
+      scarce = [k for k in incomplete if run(k) and strict(k, profile)]
+      if scarce and not (same and cur in scarce and self.mode in ("required", "blocked")):
+        return self._choose(frame, profile, scarce[0], "required", totals)
     if incomplete:
       if same and cur in incomplete and self.mode in ("required", "blocked"):
         if run(cur):
@@ -804,6 +811,11 @@ class TiIdent:
       if not math.isfinite(values[reason]) or values[reason] > bounds[reason]:   # NaN fails every comparison: closed
         return reason, values[reason], bounds[reason]
     return None, None, None
+
+  def next_is_strict(self, key, profile, remaining):
+    """True when the step this test would run next (one the limits allow now) is a strict-gated one."""
+    step, _ = self._pick(key, profile, remaining, None, lambda s: self._feasible(key, s, profile))
+    return step is not None and not small(key, step)
 
   def can_run(self, key, profile, remaining):
     """False when the step this test would run next is closed right now only by a command / curve / lateral-demand

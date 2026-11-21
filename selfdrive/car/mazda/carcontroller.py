@@ -645,7 +645,8 @@ class CarController(CarControllerBase):
                 # windows (ti_ident.RunAll); a seeded random choice once the window is complete
                 profile = ident.advance_zone(CS.out.vEgo).profile      # with the speed hysteresis
                 armed = self.ti_run_all.pick(self.frame, profile, tests.remaining,
-                                             lambda k, w: ident.can_run(k, w, tests.remaining))
+                                             lambda k, w: ident.can_run(k, w, tests.remaining),
+                                             lambda k, w: ident.next_is_strict(k, w, tests.remaining))
               else:
                 armed = on[0] if (len(on) == 1 and free and not self.ti_ident_all) else None
               self.ti_ident_armed = armed

@@ -88,7 +88,7 @@ static Scene homeScene(const std::string &name, const std::string &title, HomeSt
   hs.target_min = 20; hs.ab_stored_known = hs.configured; hs.ab_stored_a_s = 14.2 * 60; hs.ab_stored_b_s = 12.9 * 60;
   const bool alt_done = hs.ab_complete || name == "home-gap-alternation-done";
   if (alt_done) hs.ab_stored_a_s = hs.ab_stored_b_s = 1200;
-  hs.tests_left_s[0] = 6.0 * 60 / 1.3; hs.tests_left_s[1] = 4.0 * 60 / 1.3; hs.tests_left_s[2] = 3.0 * 60 / 1.3; hs.tests_left_s[3] = 4.0 * 60 / 1.3;
+  hs.tests_left_s[0] = 6.0 * 60 / OVERHEAD_TESTS_LOW; hs.tests_left_s[1] = 4.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[2] = 3.0 * 60 / OVERHEAD_TESTS; hs.tests_left_s[3] = 4.0 * 60 / OVERHEAD_TESTS;
   const HomeLines h = home(hs);
   const ToneColor tc = toneColor(h.primary.tone);
   const int fill[3] = {tc.r, tc.g, tc.b};

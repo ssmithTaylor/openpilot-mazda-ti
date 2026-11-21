@@ -873,3 +873,34 @@ def test_the_runner_hands_a_test_window_inside_the_range_to_the_tests_when_they_
   rn2 = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
   rn2.ti_tests = None
   assert rn2._tests_behind(v(38.0)) is False
+
+
+def test_a_tests_visit_that_credits_nothing_is_ended_and_not_repeated_at_once():
+  mem, params, car = _two_process_rig()
+  rn = ab.TiAbRunner(params, mem, block_s=8.0, plan_target_min=5.0)
+  rn.ab.set_plan_limits(56.0, 300.0)
+  rn.ab.committed = {"A": 250.0, "B": 250.0}          # the alternation is well ahead (share 0.83); the tests have nothing
+  states = []
+  for sec in range(0, 200, 5):
+    rn.k = sec * 100
+    states.append((sec, rn._tests_behind(v(38.0))))
+  first_visit = [s for s, b in states if b]
+  assert first_visit and first_visit[0] == 0
+  ended = next(s for s, b in states if s > 0 and not b)
+  assert 45 <= ended <= 55                           # VISIT_PATIENCE_S without any credit
+  again = [s for s, b in states if b and s > ended]
+  assert again and again[0] >= ended + 55            # not before the cooldown
+
+
+def test_run_all_gives_a_strict_stretch_to_a_test_that_needs_it_and_changes_nothing_without_the_hint():
+  import itertools
+  needs = {k: 1.0 for k in ti.KEYS}
+  remaining = lambda key, band, step: ti.required_seconds(key, band, step)           # nothing collected anywhere
+  for strict_hint in (None, lambda k, w: k == ti.LADDER):
+    ra = ti.RunAll(seed=1)
+    first = ra.pick(0, "21-27", remaining, lambda k, w: True, strict_hint)
+    assert first == (ti.SWEEP if strict_hint is None else ti.LADDER)                  # the scarce stretch goes to the ladder first
+  ra = ti.RunAll(seed=1)
+  assert ra.pick(0, "21-27", remaining, lambda k, w: True) == ti.SWEEP                  # as before without the hint
+  assert ra.pick(1, "21-27", remaining, lambda k, w: True, lambda k, w: k == ti.LADDER) == ti.LADDER   # the sweep gives way when one opens
+  assert ra.pick(2, "21-27", remaining, lambda k, w: k != ti.LADDER, lambda k, w: k == ti.LADDER) in (ti.SWEEP, ti.PULSES, ti.LADDER)

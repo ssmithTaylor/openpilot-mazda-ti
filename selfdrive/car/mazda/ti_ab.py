@@ -976,19 +976,43 @@ class TiAbRunner:
     except Exception:
       self.tests_doc = None
 
+  VISIT_PATIENCE_S, VISIT_COOLDOWN_S = 45.0, 60.0    # a tests visit that credits nothing for this long is ended; no new one for the cooldown
+
   def _tests_behind(self, v_ego):
-    """Are the tests of the test window the car is in behind the alternation in share of completion (ti_plan.tests_behind)? False on any doubt."""
+    """Interleaving inside the alternation's range (ti_plan.tests_behind): the need with the lowest share of its requirement done is
+    served, so that every need in the range finishes together. The alternation's share counts the block in progress (blocks are
+    4 minutes, so only counting them at their end made the alternation look behind for most of the time). A visit that credits nothing
+    (the gates are closed, the road is not straight) is ended after VISIT_PATIENCE_S so the alternation is not starved by it.
+    False on any doubt."""
     try:
       window = ti.zone_for(v_ego).window
+      now = self.k * DT
       if self.ti_tests is None or self.tests_defs is None or window not in ti_plan.INTERLEAVE_WINDOWS:
         self.tests_behind = False
         return False
       have, need = self.ti_tests.window_share(self.tests_doc or {}, self.tests_defs, window)
       tests_share = have / need if need > 0 else 1.0
       target = self.ab.target_s
-      alt_share = None if not target else min(1.0, min(self.ab.committed["A"], self.ab.committed["B"]) / target)
-      self.tests_behind = ti_plan.tests_behind(window, tests_share, alt_share, self.tests_behind)
-      return self.tests_behind
+      if not target:
+        alt_share = None
+      else:
+        in_block = self.ab.block_scored * DT if self.ab.block is not None else 0.0
+        alt_share = min(1.0, (self.ab.committed["A"] + self.ab.committed["B"] + in_block) / (2.0 * target))
+      was = self.tests_behind
+      behind = ti_plan.tests_behind(window, tests_share, alt_share, was)
+      if behind and not was:
+        self._visit = (now, tests_share)
+      if behind and was:
+        t0, share0 = getattr(self, "_visit", (now, tests_share))
+        if now - t0 >= self.VISIT_PATIENCE_S and tests_share <= share0 + 1e-9:
+          behind = False
+          self._cooldown_until = now + self.VISIT_COOLDOWN_S
+        elif tests_share > share0 + 1e-9:
+          self._visit = (now, tests_share)             # it is crediting: the patience starts again from here
+      if behind and now < getattr(self, "_cooldown_until", -1.0):
+        behind = False
+      self.tests_behind = behind
+      return behind
     except Exception:
       self.tests_behind = False
       return False

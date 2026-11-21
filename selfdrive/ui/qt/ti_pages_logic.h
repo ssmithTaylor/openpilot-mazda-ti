@@ -556,8 +556,12 @@ inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double
 // windows interleave there, ti_plan.tests_behind); once it is complete the bands are the test windows themselves (38 and 52 mph) and
 // the gap between them counts nothing. Both the list and the primary line are computed from these bands and from what the car reports
 // is counting, so they cannot disagree. Overheads (fades, hand-overs, wash-in, voided time, gate waits) are estimates, named here.
-constexpr double OVERHEAD_TESTS = 1.3;   // engaged minutes per minute of credited test signal (assumption: the plan never credited on the last drive)
-constexpr double OVERHEAD_ALT = 1.35;    // engaged minutes per scored minute of alternation (wash-in about 11 s per switch, margin and settle waits, partial blocks)
+// MEASURED by replaying the two reference drives through the build (accept harness, ti-acceptance branch; not yet by a drive on the car):
+// alternation 1.16-1.33 engaged minutes per scored minute; tests 1.06-1.75, about 1.4 outside the lowest window (where the gates close most of
+// the time: the released drives 33b/33c show the strict gates open about 29% of the time at 21-27 mph).
+constexpr double OVERHEAD_ALT = 1.25;        // mid-range of the replay's 1.16-1.33
+constexpr double OVERHEAD_TESTS = 1.4;       // the three higher windows
+constexpr double OVERHEAD_TESTS_LOW = 1.75;  // the lowest window (21-27 mph): the top of the replay's range
 constexpr int MAX_BANDS = 4;
 
 struct Band {
@@ -576,7 +580,7 @@ inline bool altOpen(const HomeState &s) {
 inline int bandsFromState(const HomeState &s, Band out[MAX_BANDS]) {
   double t[ti_logic::N_WINDOWS];
   for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
-    t[w] = s.tests_left_s[w] * OVERHEAD_TESTS / 60.0;
+    t[w] = s.tests_left_s[w] * (w == 0 ? OVERHEAD_TESTS_LOW : OVERHEAD_TESTS) / 60.0;
   }
   int n = 0;
   auto win = [&](int w, int target, double minutes) {
