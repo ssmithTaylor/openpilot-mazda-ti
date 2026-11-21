@@ -18,7 +18,7 @@ lead-in (LEAD_IN_S) into a fresh chunk, pulses with the next pulse (a pulse star
 Gate (all must hold, else the signal fades out in FADE_OUT_S; a driver touch or too little rate room zero it at
 once; after a touch or a blinker it stays off for HOLDOFF_S). Touch, blinker, hold-off, base-request, lateral-demand
 and rate-room rules are the dither's (ti_dither constants). Added for these tests:
-  - the speed is inside one of BANDS (12-28, 31-45, 45-60, 60-80 mph);
+  - the speed is inside one of BANDS (19-28, 31-45, 45-60, 60-80 mph);
   - the steering regime is the band's: below 28 mph the EPS blocks the stock lane-keep path and the TI steers alone
     (LKAS_BLOCK set); from 31 mph both paths steer (LKAS_BLOCK clear). The regime must have been unchanged for
     REGIME_SETTLE_S (the stock path clears about 3 s after rising through 50 km/h);
@@ -50,8 +50,9 @@ KEYS = (SWEEP, LADDER, PULSES)
 TOGGLES = {SWEEP: "ti_sweep", LADDER: "ti_ladder", PULSES: "ti_pulses"}
 
 # (low mph, high mph, label, TI alone): half-open [low, high). 28-31 mph is left out on purpose: the stock path
-# switches there (blocked below 45 km/h, cleared above 50 km/h with a lag).
-BANDS = ((12.0, 28.0, "12-28", True), (31.0, 45.0, "31-45", False), (45.0, 60.0, "45-60", False),
+# switches there (blocked below 45 km/h, cleared above 50 km/h with a lag). The lowest band starts at 19 mph: the car
+# only lets cruise control (and so openpilot) engage from about 19 mph, so nothing below it is practical to capture.
+BANDS = ((19.0, 28.0, "19-28", True), (31.0, 45.0, "31-45", False), (45.0, 60.0, "45-60", False),
          (60.0, 80.0, "60-80", False))
 
 MAX_CURVATURE = 0.004       # 1/m: radius 250 m or more
@@ -68,10 +69,12 @@ SWEEP_LEAD_IN = 50
 # Ladder: one frequency, stepped amplitudes (TI counts; 1 count ~ 0.0544 EPS sensor counts): 0.3 to 5.0 sensor counts,
 # from below the 1.2 sc at which the dither already moved the wheel to above the rack's friction (2.5-4 sc). 0.4 Hz
 # keeps the 92-count step under MAX_SLEW. 5 s chunks (2 cycles), 2 per step. Per band only the steps up to the band's
-# cap run (LADDER_CAPS: TI counts by band label).
+# cap run (LADDER_CAPS: TI counts by band label). Worst case of the 92-count step in the 19-28 mph band, from the held
+# upper bound (6.4 deg of wheel per 100 counts at 16 mph; ratio 15.5, wheelbase 2.7 m, no understeer, no controller
+# correction): 5.9 deg of wheel; 0.18 m/s^2 and 2.8 cm sideways at 19 mph, 0.39 m/s^2 and 6.1 cm at 28 mph.
 LADDER_FREQ = 0.4
 LADDER_AMPS = (6.0, 11.0, 22.0, 37.0, 55.0, 74.0, 92.0)
-LADDER_CAPS = {"12-28": 92.0, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
+LADDER_CAPS = {"19-28": 92.0, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
 LADDER_CHUNK = 500
 LADDER_LEAD_IN = 100
 

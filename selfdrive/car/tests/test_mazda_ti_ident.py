@@ -112,9 +112,9 @@ def test_amplitudes_and_their_classes():
 
 def test_capture_time_per_band_is_short():
   per_band = {k: {b[2]: ti.steps_in_band(k, b[2]) * ti.STEP_SECONDS[k] for b in ti.BANDS} for k in ti.KEYS}
-  assert per_band[ti.SWEEP] == {"12-28": 140, "31-45": 140, "45-60": 140, "60-80": 140}
-  assert per_band[ti.LADDER] == {"12-28": 70, "31-45": 40, "45-60": 40, "60-80": 40}
-  assert per_band[ti.PULSES] == {"12-28": 80, "31-45": 80, "45-60": 80, "60-80": 80}
+  assert per_band[ti.SWEEP] == {"19-28": 140, "31-45": 140, "45-60": 140, "60-80": 140}
+  assert per_band[ti.LADDER] == {"19-28": 70, "31-45": 40, "45-60": 40, "60-80": 40}
+  assert per_band[ti.PULSES] == {"19-28": 80, "31-45": 80, "45-60": 80, "60-80": 80}
   for k in ti.KEYS:      # a step is a whole number of chunks
     for s in range(ti.n_steps(k)):
       n = ti.step_params(k, s)[2]
@@ -162,7 +162,7 @@ def test_off_or_no_band_or_unsettled_regime_is_zero():
   assert not any(out) and g.reason == "regime"           # 3 s for the regime to settle
   out = [g.update(ti.SWEEP, 299 + k, **quiet()) for k in range(200)]
   assert any(out) and g.reason == "ok"
-  for v_mph, reason in ((10, "band"), (29.5, "band"), (85, "band")):
+  for v_mph, reason in ((10, "band"), (18.9, "band"), (29.5, "band"), (85, "band")):
     g = TiIdent()
     out = [g.update(ti.SWEEP, k, **quiet(v_ego=v_mph * MPH)) for k in range(800)]
     assert not any(out) and g.reason == reason
@@ -293,7 +293,7 @@ def test_a_band_change_mid_chunk_is_not_credited():
 
 
 def test_the_ladder_runs_only_the_steps_under_the_bands_cap():
-  for band in ("12-28", "60-80"):
+  for band in ("19-28", "60-80"):
     prog = Progress()
     g = TiIdent()
     peak = 0
@@ -358,7 +358,7 @@ def test_progress_per_band_and_step_completion_persistence_and_reset():
   assert doc["ti_ladder"]["31-45"] == {str(s): 10.0 for s in range(4)}
   assert doc["_live"]["status"]["ti_ladder"] == tt.REASON_TEXT["band_done"]
   assert all(acc.remaining(ti.LADDER, "31-45", s) == 0 for s in range(4))
-  assert acc.remaining(ti.LADDER, "12-28", 0) == 10.0
+  assert acc.remaining(ti.LADDER, "19-28", 0) == 10.0
   # completion by the definition (what the UI computes): every required bin has steps x target
   t = next(t for t in acc.tests if t.id == "ti_ladder")
   def done(doc):
@@ -374,7 +374,7 @@ def test_progress_per_band_and_step_completion_persistence_and_reset():
   g2 = TiIdent()
   _drive(acc2, g2, "31-45", 1000, frame0=10**6)
   assert g2.reason == "band_done" and not any(k[0] == "ti_ladder" for k in [])
-  for band in ("12-28", "45-60", "60-80"):
+  for band in ("19-28", "45-60", "60-80"):
     _drive(acc2, g2, band, 300 + 100 + 7 * 1000 + 200, frame0=2 * 10**6 + hash(band) % 1000 * 10**4)
   acc2.publish(2e6, {}, wall=1e9)
   final = json.loads(mem2.store[tt.PROGRESS_KEY])
@@ -401,7 +401,7 @@ def _random_inputs(seed, n):
   rows, v, blocked = [], v_for("31-45"), False
   for k in range(n):
     seg = (k // 900) % 9
-    v = {0: v_for("31-45"), 1: v_for("12-28"), 2: v_for("45-60"), 3: 29.5 * MPH, 4: v_for("60-80")}.get(seg % 5)
+    v = {0: v_for("31-45"), 1: v_for("19-28"), 2: v_for("45-60"), 3: 29.5 * MPH, 4: v_for("60-80")}.get(seg % 5)
     blocked = v < 28 * MPH or (seg == 7 and k % 900 < 300)
     rows.append(dict(v_ego=v + rng.gauss(0, 0.05), steering_pressed=seg == 6 and k % 900 < 3,
                      driver_torque=rng.choice([-1.0, 0.0, 1.0, 4.0 if rng.random() < 0.02 else 2.0]),
@@ -495,7 +495,7 @@ def step(h, steer, *, lat_active=True, ti_allowed=True, v=v_for("31-45"), driver
 def _rows(seed, n=M.frames(60)):
   rows = M.drive(seed, n)
   for r in rows:
-    r['v'] = v_for("31-45") if r['v'] > 20 else v_for("12-28")
+    r['v'] = v_for("31-45") if r['v'] > 20 else v_for("19-28")
     r['blocked'] = r['v'] < 28 * MPH
   return rows
 
