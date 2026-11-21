@@ -1282,3 +1282,32 @@ def test_a_balanced_block_is_logged_with_its_reason_and_the_schedule_check_skips
   assert len(starts) >= 2 and starts[0]["arm_why"] == "seed" and starts[1]["arm"] == "A" and starts[1]["arm_why"] == "balance"
   assert ab.arm_for(first_a_seed(), starts[1]["idx"]) == "B"
   assert ab.verify_schedule(r.events) == []
+
+
+# ---- saturation: B in force and the request at its limit for a while goes back to A ----------------------------------------------
+
+def test_a_request_at_its_limit_for_half_a_second_on_b_returns_to_a_by_a_ramp_and_never_the_other_way():
+  r = running_b()
+  r.secs(0.4, steer=1.0)                                                # a moment at the limit: nothing happens
+  assert r.outs[-1].s == 1.0 and not r.kinds("switch")[-1]["why"].startswith("release")
+  r.step(steer=0.1)                                                     # one cycle off the limit resets the count
+  r.secs(0.4, steer=1.0)
+  assert r.outs[-1].s == 1.0
+  r.secs(0.2, steer=1.0)                                                # half a second in a row: back to A
+  assert r.outs[-1].s < 1.0
+  sw = r.kinds("switch")[-1]
+  assert sw["why"] == "release:saturation" and sw["s_to"] == 0.0 and sw["ramp_frames"] > 0 and not sw["immediate"]
+  r.secs(4.0, steer=1.0)
+  ss = [o.s for o in r.outs[-FRAMES(4.0) - 1:]]
+  assert r.outs[-1].s == 0.0 and max(abs(y - x) for x, y in zip(ss, ss[1:])) <= 1.0 / sw["ramp_frames"] + 1e-12
+  assert r.kinds("block_end")[-1]["reason"] == "saturation"
+  r.secs(20.0, steer=1.0)                                               # saturated: B is not blended in again
+  assert all(o.s == 0.0 for o in r.outs[-FRAMES(20.0):])
+
+
+def test_saturation_on_the_a_side_changes_nothing():
+  r = r_pending()
+  r.secs(0.2)
+  n = len(r.kinds("switch"))
+  r.secs(5.0, steer=1.0)
+  assert len(r.kinds("switch")) == n and r.outs[-1].s == 0.0

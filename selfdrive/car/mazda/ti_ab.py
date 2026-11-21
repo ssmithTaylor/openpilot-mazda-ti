@@ -135,6 +135,11 @@ BALANCE_MARGIN_S = 30.0     # the next block is the side that is behind when the
 MIN_SCORED_KEEP_S = 30.0    # a block cut short with less SCORED time than this is voided and run again; with this much or more its scored time is kept
 MARGIN_MPH = 3.0            # a block starts only when the speed is this far inside either edge of the range ...
 MARGIN_HOLD_S = 3.0         # ... and has been for this long (a block started at the edge ends within seconds, for speed)
+# Saturation: while B is in force (or being blended in) and the steering request sits at its limit (|steer| >= SAT_STEER of the interceptor
+# maximum, about 580 of 600 counts) for SAT_RELEASE_S in a row, the value returns to A by the normal ramp and the block ends (voided unless it
+# scored MIN_SCORED_KEEP_S). Only ever a return to the owner's value; nothing here lets anything run that did not.
+SAT_STEER = 0.97
+SAT_RELEASE_S = 0.5
 HB_S = 10.0
 H = ti.ZONE_HYSTERESIS_MPH
 SPEED_OFF_LOW, SPEED_ON_LOW = ALT_MIN_MPH, ALT_MIN_MPH + H                   # released below 35, ready from 36 mph
@@ -153,7 +158,7 @@ MESSAGE = {"input": "bad inputs", "touch": "hands on the wheel", "lane_change": 
 
 def _table_hash():
   spec = [[tuple(s) for s in SETTINGS.values()], DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN, MAX_WAIT_S, SETTLE_S,
-          MIN_SCORED_KEEP_S, BALANCE_MARGIN_S, MARGIN_MPH, MARGIN_HOLD_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
+          MIN_SCORED_KEEP_S, BALANCE_MARGIN_S, MARGIN_MPH, MARGIN_HOLD_S, SAT_STEER, SAT_RELEASE_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
   return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -388,6 +393,7 @@ class TiAb:
     self.gate_closed = {k: False for k in GATES}
     self.ok_frames = 0
     self.margin_frames = 0       # consecutive cycles with the speed well inside the range (MARGIN_MPH from either edge)
+    self.sat_frames = 0          # consecutive cycles with the steering request at its limit
     self.speed_ok = False
     self.last_reason = None
     self.mph = 0.0
@@ -591,6 +597,7 @@ class TiAb:
       self.seen_off = True
 
     finite = all(isinstance(x, (int, float)) and math.isfinite(x) for x in (v_ego, curvature, steer, driver_torque))
+    self.sat_frames = self.sat_frames + 1 if (finite and abs(steer) >= SAT_STEER) else 0
     mag = abs(driver_torque) if finite else 0.0
     self.loud = self.loud + 1 if mag >= DRIVER_QUIET_COUNTS else 0
     touch = bool(steering_pressed) or mag >= DRIVER_FIRM_COUNTS or self.loud >= TOUCH_CONFIRM_FRAMES
@@ -656,6 +663,9 @@ class TiAb:
       elif not self.speed_ok:
         hard = "speed"
         self.message = f"speed outside 35-{self.speed_off_high:g} mph"
+      elif self.sat_frames >= SAT_RELEASE_S / DT and (self.ramp.to != 0.0 or self.ramp.s != 0.0):
+        hard = "saturation"
+        self.message = "steering at its limit: back to your own value"
       else:
         self.message = ""
 
