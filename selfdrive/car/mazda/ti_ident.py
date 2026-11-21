@@ -883,6 +883,7 @@ class TiIdent:
 
     if self.zone_n != self.n:
       self.advance_zone(v_ego)
+      self.zone_n = self.n          # (advance_zone stamps n + 1 for a caller that runs it before this frame's update)
     zone = self.zone
     self.mph = v_ego * MS_TO_MPH if math.isfinite(v_ego) else 0.0
     band, ti_alone = zone.profile, zone.ti_alone      # the window whose caps, limits and needs apply
