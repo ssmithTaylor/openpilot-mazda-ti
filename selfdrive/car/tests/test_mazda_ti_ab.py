@@ -1061,7 +1061,9 @@ def test_the_toggles_view_passes_everything_else_through_and_defaults_work():
 
 def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it_off():
   ui = (ROOT / "selfdrive/ui/qt/sidebar.cc").read_text(encoding="utf-8")
-  assert ui.count('tests_params_memory.putBool("TiAbOn", false)') == 2                   # TiTests::toggle (on) and startAll
+  assert ui.count('tests_params_memory.putBool("TiAbOn", false)') == 1                   # TiTests::toggle (on); startAll writes it through ti_pages::runAllOps
+  hdr = (ROOT / "selfdrive/ui/qt/ti_pages_logic.h").read_text(encoding="utf-8")
+  assert hdr.count("memBool(KEY_AB_ON, false)") >= 3                                      # RUN ALL, the plan start and STOP switch the plain A/B off
   start = ui.index("void TestsWindow::abSetOn(bool on)")
   body = ui[start:ui.index("void TestsWindow::abAct", start)]
   assert body.index("tests.allOff()") < body.index("putBool(TI_AB_ON_KEY, on)")

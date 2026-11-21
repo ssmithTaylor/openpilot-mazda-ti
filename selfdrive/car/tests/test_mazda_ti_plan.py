@@ -539,7 +539,10 @@ def test_plan_events_let_the_analysis_tell_alternation_time_from_test_time():
 def test_all_tests_off_on_the_screen_also_ends_the_drive_plan():
   text = (ROOT / 'selfdrive/ui/qt/sidebar.cc').read_text(encoding='utf-8')
   body = text.split('void TiTests::allOff() {', 1)[1].split('}', 1)[0]
-  assert 'putBool("TiPlanOn", false)' in body
+  assert 'ti_pages::allTestsOffOps()' in body            # the writes are listed (and tested) in ti_pages_logic.h
+  header = (ROOT / 'selfdrive/ui/qt/ti_pages_logic.h').read_text(encoding='utf-8')
+  ops = header.split('inline std::vector<Op> allTestsOffOps() {', 1)[1].split('}', 1)[0]
+  assert 'memBool(KEY_PLAN_ON, false)' in ops and 'OpKind::AllowedOff' in ops
 
 
 # ---- the nonce, the blend-at-A word with the plan off, and the car controller's hold log -------------------------------------

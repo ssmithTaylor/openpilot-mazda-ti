@@ -14,6 +14,7 @@
 #include <QJsonObject>
 
 #include "selfdrive/ui/qt/ti_ab_logic.h"
+#include "selfdrive/ui/qt/ti_pages_logic.h"
 #include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/ui.h"
 
@@ -91,6 +92,9 @@ public:
   void openOverview();
   void closeOverview(int to);
   void startAll();
+  // The ordered writes of START, STOP, RUN ALL and ALL TESTS OFF (ti_pages_logic.h): one executor for every page
+  void runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config = nullptr);
+  bool singleTestOn() const;   // a test other than run-all is on (an individual test from the individual pages)
   bool locked();
   void setLocked(bool on);
   bool windowLeft(int i, const QString &label, double &secs, int &cells) const;
@@ -127,6 +131,8 @@ private:
 // screen, and it comes back by itself, locked, once no alert has shown for a moment. A page of MainWindow's stack,
 // the way SettingsWindow is (window.cc). Painted and hit-tested like the sidebar; no signals or slots of its own, so
 // no Q_OBJECT (as ScreenRefreshOverlay, frogpilot/ui/qt/offroad/screen_refresh.h).
+struct TiHomeStrings;
+
 class TestsWindow : public QWidget {
 public:
   explicit TestsWindow(QWidget *parent = nullptr);
@@ -149,18 +155,26 @@ private:
   void refresh();
   int rowTop() const;
   int rowHeight() const;
+  ti_pages::Page pageNow() const;
+  QRect ctlRect(int id) const;      // a control's rectangle on the page shown (ti_pages_logic.h layout)
   QRect backRect() const;
   QRect allOffRect() const;
   QRect prevRect() const;
   QRect nextRect() const;
-  QRect runAllRect() const;
   QRect lockRect() const;
   QRect bannerRect() const;
   QRect toggleRect() const;
   QRect resetRect() const;
-  QRect abRect() const;
-  QRect abBox(int id) const;
-  int abControlAt(const QPoint &pos) const;
+  void goHome();
+  void homeAct(int control);
+  void setupAct(int control);
+  void setupOpen();
+  bool running() const;
+  ti_pages::HomeState homeState(struct TiHomeStrings &keep);
+  void drawHome(QPainter &p);
+  void drawSetup(QPainter &p);
+  void drawTitle(QPainter &p, const QRect &r, const QString &text, int px);
+  void drawEngagedBadge(QPainter &p, const QRect &r);
   void abAct(int control);
   void abOpen();
   void abFixB(bool keep);
@@ -184,6 +198,9 @@ private:
   int pressed_control = 0;       // the control under the last accepted press; 0: none
   int queue_pos = -1;            // the queued test on the page; -1: read the queue at the next refresh
   bool overview = false;         // the run-all overview page instead of a test's page
+  bool home_page = true;         // the first page: START / STOP (ti_pages_logic.h); the test pages are the individual tests
+  bool setup_page = false;       // the A/B set-up page
+  bool ab_configured = false;    // TiAbConfig names a setting: START runs the plan (tests + A/B relay)
   bool locked = false;           // the page is locked on screen (param TiTestLock, tmpfs)
   QString overview_banner;       // set by drawAll for the banner row
   ti_logic::LockReopen reopen;

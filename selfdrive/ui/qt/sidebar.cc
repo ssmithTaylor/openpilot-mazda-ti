@@ -13,6 +13,7 @@
 
 #include "common/util.h"
 #include "selfdrive/ui/qt/ti_ab_logic.h"
+#include "selfdrive/ui/qt/ti_pages_logic.h"
 #include "selfdrive/ui/qt/ti_tests_logic.h"
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/widgets/input.h"
@@ -698,18 +699,59 @@ void TiTests::setAll(bool on) {
 // The run-all mode on, written as toggle() writes a test's settings: one injection at a time, so the single
 // identification tests go off (the dither stays as it is and, while on, holds everything else)
 void TiTests::startAll() {
-  tests_params_memory.putBool("TiPlanOn", false);
-  tests_params_memory.putBool("TiAbOn", false);     // A/B and the tests exclude each other
-  tests_params_memory.remove("TiAbPin");
-  setAll(true);
-  all_view.mismatch_ticks = 0;
-  for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
-    if (defs[i].metric == "step_seconds" && views[i].any_on) {
-      setTest((int)i, false);
-      views[i].mismatch_ticks = 0;
+  runOps(ti_pages::runAllOps());
+}
+
+// The ordered writes of ti_pages_logic.h (START, STOP, RUN ALL, ALL TESTS OFF), executed one by one in that order
+void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config) {
+  for (const ti_pages::Op &op : ops) {
+    switch (op.kind) {
+      case ti_pages::OpKind::MemBool:
+        tests_params_memory.putBool(op.key, op.value);
+        break;
+      case ti_pages::OpKind::MemRemove:
+        tests_params_memory.remove(op.key);
+        break;
+      case ti_pages::OpKind::AllowedOff:   // every allow-listed key to "off", whatever the definitions say (works with a broken file too)
+        for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
+          tiTestSwitchOff(tests_params, QString(a.key), a.on);
+        }
+        for (TiTestView &view : views) {
+          view.mismatch_ticks = 0;
+        }
+        all_view.mismatch_ticks = 0;
+        break;
+      case ti_pages::OpKind::RunAllOn:
+        setAll(true);
+        all_view.mismatch_ticks = 0;
+        break;
+      case ti_pages::OpKind::SingleStepTestsOff:   // the dither stays as it is and, while on, holds everything else
+        for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
+          if (defs[i].metric == "step_seconds" && views[i].any_on) {
+            setTest((int)i, false);
+            views[i].mismatch_ticks = 0;
+          }
+        }
+        break;
+      case ti_pages::OpKind::SaveAbConfig:
+        if (save_config) {
+          save_config();
+        }
+        break;
+      case ti_pages::OpKind::UpdateToggles:
+        updateFrogPilotToggles();
+        break;
     }
   }
-  updateFrogPilotToggles();
+}
+
+bool TiTests::singleTestOn() const {
+  for (const TiTestView &view : views) {
+    if (view.any_on) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The run-all mode on or off
@@ -723,17 +765,9 @@ void TiTests::toggleAll() {
   updateFrogPilotToggles();
 }
 
-// Every allow-listed key to "off", whatever the definitions say (works with a broken file too)
+// ALL TESTS OFF: the plan off and every allow-listed key to "off"
 void TiTests::allOff() {
-  tests_params_memory.putBool("TiPlanOn", false);  // the drive plan runs the tests itself: ALL TESTS OFF ends it too
-  for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
-    tiTestSwitchOff(tests_params, QString(a.key), a.on);
-  }
-  for (TiTestView &view : views) {
-    view.mismatch_ticks = 0;
-  }
-  all_view.mismatch_ticks = 0;
-  updateFrogPilotToggles();
+  runOps(ti_pages::allTestsOffOps());
 }
 
 // Reset = the test's entry deleted from both copies (ti_tests.py); the car side only ever adds to what is there
@@ -1026,7 +1060,11 @@ bool TestsWindow::openPage() {
   }
   tests.load();
   locked = tests.locked();
+  if (!locked) {
+    goHome();             // the first page; a locked page that an alert took away comes back as it was
+  }
   overview = tests.overviewQueued();
+  abOpen();               // the stored set-up: whether an alternation is set up decides what START runs
   reopen.reset();
   idle.start();
   opened.start();
@@ -1106,105 +1144,109 @@ void TestsWindow::refresh() {
   update();
 }
 
-// One test at a time: the queued one, below the header and its banner line
+namespace {
+const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
+const char *const TI_AB_ON_KEY = "TiAbOn";
+const char *const TI_AB_PIN_KEY = "TiAbPin";
+const char *const TI_AB_STATUS_KEY = "TiAbStatus";
+const char *const TI_PLAN_ON_KEY = "TiPlanOn";
+const char *const TI_HOLD_KEY = "TiTestHold";
+}  // namespace
+
+// Every rectangle comes from ti_pages_logic.h (layout), the one place the sizes and gaps are tested
+static QRect qr(const ti_pages::Rect &r) {
+  return QRect(r.x, r.y, r.w, r.h);
+}
+
 int TestsWindow::rowTop() const {
-  return 260;
+  return ti_pages::ROW_TOP;
 }
 
 int TestsWindow::rowHeight() const {
-  const int footer = tests.errors.isEmpty() ? 0 : 30 + 50 * std::min(2, (int)tests.errors.size());
-  return height() - 20 - footer - rowTop();
+  return ti_pages::rowHeight((int)tests.errors.size());
+}
+
+ti_pages::Page TestsWindow::pageNow() const {
+  if (setup_page) {
+    return ti_pages::Page::Setup;
+  }
+  if (home_page) {
+    return ti_pages::Page::Home;
+  }
+  if (ab_page) {
+    return ti_pages::Page::Ab;
+  }
+  return overview ? ti_pages::Page::Overview : ti_pages::Page::Tests;
+}
+
+QRect TestsWindow::ctlRect(int id) const {
+  ti_pages::Rect r{0, 0, 0, 0};
+  return ti_pages::rectOf(pageNow(), id, (int)tests.errors.size(), r) ? qr(r) : QRect();
 }
 
 QRect TestsWindow::backRect() const {
-  return QRect(30, 24, 440, 150);
+  return ctlRect(ti_pages::CTL_BACK);
 }
 
 QRect TestsWindow::allOffRect() const {
-  return QRect(width() - 670, 24, 640, 150);
+  return ctlRect(ti_pages::CTL_ALLOFF);
 }
 
-// PREV and NEXT share the header between BACK and ALL TESTS OFF with the "TEST k OF n" line
 QRect TestsWindow::prevRect() const {
-  const int left = backRect().right() + 20;
-  const int w = std::min(300, (allOffRect().left() - 20 - left) / 3);
-  return QRect(left, 24, w, 150);
+  return ctlRect(ti_pages::CTL_PREV);
 }
 
 QRect TestsWindow::nextRect() const {
-  const int right = allOffRect().left() - 20;
-  const int w = std::min(300, (right - backRect().right() - 20) / 3);
-  return QRect(right - w, 24, w, 150);
-}
-
-// The row under the header: RUN ALL (on the overview: TEST PAGES) on the left, the LOCK on the right, the banner between
-QRect TestsWindow::runAllRect() const {
-  return QRect(30, 184, 420, 66);
+  return ctlRect(ti_pages::CTL_NEXT);
 }
 
 QRect TestsWindow::lockRect() const {
-  return QRect(width() - 450, 184, 420, 66);
+  return ctlRect(ti_pages::CTL_LOCK);
 }
 
+// The banner: under a one-line note of what the page is for (both in the box beside the second row of controls)
 QRect TestsWindow::bannerRect() const {
-  const int right = ab_page ? lockRect().left() : abRect().left();
-  return QRect(runAllRect().right() + 20, 184, right - runAllRect().right() - 40, 66);
+  return QRect(ti_pages::BANNER_RECT.x, ti_pages::BANNER_RECT.y + 70, ti_pages::BANNER_RECT.w, ti_pages::BANNER_RECT.h - 70);
 }
 
 QRect TestsWindow::toggleRect() const {
-  return QRect(30, rowTop() + 10, 600, rowHeight() - 30);
+  return ctlRect(ti_pages::CTL_TOGGLE);
 }
 
 QRect TestsWindow::resetRect() const {
-  return QRect(width() - 430, rowTop() + 10, 400, 110);
+  return ctlRect(ti_pages::CTL_RESET);
 }
 
-// Controls: 1 BACK (ignored while locked), 2 ALL TESTS OFF, 3 PREV, 4 NEXT (none at the ends of the queue), 5 LOCK,
-// 6 RUN ALL (opens the overview), 7 TEST PAGES (leaves it), 8 A/B (opens the A/B page), 9 TEST PAGES (leaves the A/B page),
-// 10 + i the on/off box of the shown test i (the overview: i = defs.size(), run-all mode), 20 + i its Reset progress,
-// 30-38 the A/B page's boxes (abBox); 0 none
+// Controls (ti_pages_logic.h Ctl): the first page and the set-up page use the ids as they are; on the test pages 10 + i is
+// the on/off box of the shown test i (the overview: i = defs.size(), run-all mode) and 20 + i its Reset progress; 0 none
 int TestsWindow::controlAt(const QPoint &pos) const {
-  if (backRect().contains(pos)) {
-    return 1;
+  using namespace ti_pages;
+  const Page pg = pageNow();
+  const int id = ti_pages::controlAt(pg, (int)tests.errors.size(), pos.x(), pos.y());
+  if (pg != Page::Tests && pg != Page::Overview) {
+    return id;
   }
-  if (allOffRect().contains(pos)) {
-    return 2;
+  if (id == CTL_BACK || id == CTL_ALLOFF || id == CTL_LOCK) {
+    return id;
   }
-  if (lockRect().contains(pos)) {
-    return 5;
-  }
-  if (ab_page) {
-    return abControlAt(pos);
-  }
-  if (abRect().contains(pos)) {
-    return 8;
+  if (id == CTL_AB_PAGE) {
+    return id;
   }
   if (queue_pos < 0 || queue_pos >= tests.queueSize()) {
     return 0;
   }
-  if (overview) {
-    if (runAllRect().contains(pos)) {
+  if (pg == Page::Overview) {
+    if (id == CTL_OVERVIEW_BACK) {
       return 7;
     }
-    if (toggleRect().contains(pos)) {
-      return 10 + (int)tests.defs.size();
-    }
-    return 0;
+    return id == CTL_TOGGLE ? 10 + (int)tests.defs.size() : 0;
   }
-  if (prevRect().contains(pos)) {
-    return queue_pos > 0 ? 3 : 0;
-  }
-  if (nextRect().contains(pos)) {
-    return queue_pos + 1 < tests.queueSize() ? 4 : 0;
-  }
-  if (runAllRect().contains(pos)) {
-    return tests.hasStepTests() ? 6 : 0;
-  }
-  if (toggleRect().contains(pos)) {
-    return 10 + queue_pos;
-  }
-  if (resetRect().contains(pos)) {
-    return queue_pos < (int)tests.defs.size() ? 20 + queue_pos : 0;
+  switch (id) {
+    case CTL_PREV: return queue_pos > 0 ? 3 : 0;
+    case CTL_NEXT: return queue_pos + 1 < tests.queueSize() ? 4 : 0;
+    case CTL_OVERVIEW: return tests.hasStepTests() ? 6 : 0;
+    case CTL_TOGGLE: return 10 + queue_pos;
+    case CTL_RESET: return queue_pos < (int)tests.defs.size() ? 20 + queue_pos : 0;
   }
   return 0;
 }
@@ -1216,8 +1258,85 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
   pressed_control = opened.elapsed() < TI_TEST_INPUT_DELAY_MS ? 0 : controlAt(event->pos());
 }
 
+// The first page again (from the set-up page and the individual tests). Nothing is switched by going there.
+void TestsWindow::goHome() {
+  home_page = true;
+  setup_page = false;
+  ab_page = false;
+}
+
+// What is switched on, in the order of ti_pages::Run
+bool TestsWindow::running() const {
+  return ab_plan_on || ab_on || tests.all_view.requested || tests.singleTestOn();
+}
+
+// The first page's controls. START and STOP write exactly what ti_pages::startOps / stopOps list (tested off the device).
+void TestsWindow::homeAct(int control) {
+  using namespace ti_pages;
+  if (control == CTL_NAV_SETUP) {
+    setupOpen();
+    home_page = false;
+    setup_page = true;
+  } else if (control == CTL_NAV_INDIV) {
+    home_page = false;
+    setup_page = false;
+    ab_page = false;
+  } else if (control == CTL_STOP) {
+    ab_pin_b_armed = -1.0;
+    tests.runOps(stopOps());
+    abPoll();
+  } else if (control == CTL_START) {
+    abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
+    const Run run = ab_plan_on ? Run::Plan : (ab_on ? Run::AbPlain : (tests.all_view.requested ? Run::All : (tests.singleTestOn() ? Run::Single : Run::Stopped)));
+    if (!startLook(ab_configured, run).enabled) {
+      return;                   // it is running what the label says already
+    }
+    ab_pin_b_armed = -1.0;
+    tests.runOps(startOps(ab_configured), [this]() { abSave(); });
+    abPoll();
+  }
+}
+
+// The set-up page: reads the stored set-up, edits it and stores it at once (TiAbConfig, persistent). Only while parked and
+// nothing is running. The switches (TiAbOn, TiPlanOn: tmpfs) are never touched here: they are off after every boot.
+void TestsWindow::setupOpen() {
+  abOpen();
+}
+
+void TestsWindow::setupAct(int control) {
+  using namespace ti_pages;
+  if (!setupEditable(running(), have_speed, speed_mph)) {
+    return;
+  }
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  if (control == CTL_SETUP_USE) {
+    if (ab_configured) {
+      ab_params.remove(TI_AB_CONFIG_KEY);   // not used: START runs the tests alone
+      ab_configured = false;
+    } else if (ab_a_known) {
+      ab_configured = true;
+      abSave();
+    }
+    return;
+  }
+  if (control == CTL_SETUP_PREV || control == CTL_SETUP_NEXT) {
+    ab_setting = ti_ab::cycleSetting(ab_setting, control == CTL_SETUP_NEXT ? 1 : -1);
+    abFixB(false);
+  } else if (control == CTL_SETUP_B_MINUS || control == CTL_SETUP_B_PLUS) {
+    if (ab_a_known) {
+      ab_b = ti_ab::stepB(s, ab_a, ab_b, control == CTL_SETUP_B_PLUS ? 1 : -1);
+    }
+  } else if (control == CTL_SETUP_BLOCK_MINUS || control == CTL_SETUP_BLOCK_PLUS) {
+    ab_block_min = ti_ab::stepBlock(ab_block_min, control == CTL_SETUP_BLOCK_PLUS ? 1 : -1);
+  }
+  if (ab_configured) {
+    abSave();
+  }
+}
+
 // A control acts on release, and only when press and release are on the same control
 void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
+  using namespace ti_pages;
   idle.start();
   const int control = controlAt(event->pos());
   const int pressed = pressed_control;
@@ -1226,15 +1345,29 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     return;
   }
 
-  if (control == 1) {
-    if (ti_logic::backAllowed(locked)) {  // locked: unlock first (the LOCK button), so a stray tap cannot dismiss the page
-      ab_page = false;                    // the next opening from the sidebar card starts on the test pages
-      leave();
+  if (control == CTL_BACK) {
+    if (home_page) {
+      if (ti_logic::backAllowed(locked)) {  // locked: unlock first (the LOCK button), so a stray tap cannot dismiss the page
+        leave();
+      }
+      return;
     }
+    goHome();                               // the other pages: back to the first page (allowed while locked: the page stays)
+    refresh();
     return;
   }
-  if (control == 8 || control == 9 || control >= 30 || (control == 2 && ab_page)) {
-    abAct(control);       // the A/B page: its red box turns A/B off, not the tests
+  if (control == CTL_START || control == CTL_STOP || control == CTL_NAV_SETUP || control == CTL_NAV_INDIV) {
+    homeAct(control);
+    refresh();
+    return;
+  }
+  if (control >= CTL_SETUP_USE && control <= CTL_SETUP_BLOCK_PLUS) {
+    setupAct(control);
+    refresh();
+    return;
+  }
+  if (control == 8 || control == 9 || control == CTL_AB_SWITCH || control == CTL_PIN_A || control == CTL_PIN_B || (control == 2 && ab_page)) {
+    abAct(control);       // the A/B switch page: its red box turns A/B off, not the tests
     refresh();
     return;
   }
@@ -1301,14 +1434,6 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
 // persistent) and the switch and pin (TiAbOn, TiAbPin: tmpfs, off at every boot) and reads what the car side publishes
 // (TiAbStatus, tmpfs). It never writes a tuning setting.
 
-namespace {
-const char *const TI_AB_CONFIG_KEY = "TiAbConfig";
-const char *const TI_AB_ON_KEY = "TiAbOn";
-const char *const TI_AB_PIN_KEY = "TiAbPin";
-const char *const TI_AB_STATUS_KEY = "TiAbStatus";
-const char *const TI_PLAN_ON_KEY = "TiPlanOn";
-const char *const TI_HOLD_KEY = "TiTestHold";
-}  // namespace
 
 // The owner's value of setting i as the controller reads it (frogpilot_toggles); false when absent or unreadable
 bool TestsWindow::abStoredValue(int i, double &value) const {
@@ -1337,6 +1462,7 @@ void TestsWindow::abOpen() {
   bool have_b = false;
   const QJsonObject cfg = QJsonDocument::fromJson(QByteArray::fromStdString(ab_params.get(TI_AB_CONFIG_KEY))).object();
   const int i = ti_ab::settingIndex(cfg.value("setting").toString().toStdString().c_str());
+  ab_configured = i >= 0;   // an alternation is set up: START runs the plan (tests + A/B relay)
   if (i >= 0) {
     ab_setting = i;
     const QJsonValue b = cfg.value("b");
@@ -1390,43 +1516,10 @@ void TestsWindow::abPoll() {
   }
 }
 
-QRect TestsWindow::abRect() const {
-  return QRect(lockRect().left() - 250, 184, 230, 66);
-}
-
-// Boxes of the A/B page by control id: 30 on/off, 31 pin A, 32 pin B, 33 / 34 previous / next setting, 35 / 36 B - / B +,
-// 37 / 38 block - / +
-QRect TestsWindow::abBox(int id) const {
-  const int top = rowTop() + 10;
-  const int row2 = top + 210;
-  switch (id) {
-    case 30: return QRect(30, top, 560, 190);
-    case 31: return QRect(620, top, 330, 190);
-    case 32: return QRect(980, top, 330, 190);
-    case 33: return QRect(30, row2, 100, 120);
-    case 34: return QRect(30 + 100 + 560 + 16, row2, 100, 120);
-    case 35: return QRect(30 + 100 + 560 + 16 + 100 + 30 + 250 + 20, row2, 100, 120);
-    case 36: return QRect(abBox(35).right() + 1 + 16 + 200, row2, 100, 120);
-    case 37: return QRect(abBox(36).right() + 1 + 40, row2, 100, 120);
-    case 38: return QRect(abBox(37).right() + 1 + 16 + 200, row2, 100, 120);
-    case 39: return QRect(1250, row2 + 160, 640, 110);
-  }
-  return QRect();
-}
-
-int TestsWindow::abControlAt(const QPoint &pos) const {
-  if (runAllRect().contains(pos)) {
-    return 9;
-  }
-  for (int id = 30; id <= 39; id++) {
-    if (abBox(id).contains(pos)) {
-      return id;
-    }
-  }
-  return 0;
-}
-
 void TestsWindow::abSetOn(bool on) {
+  if (on && !ab_configured) {
+    return;                                  // nothing is set up: SET UP A/B on the first page
+  }
   ab_memory.putBool(TI_PLAN_ON_KEY, false);   // the plain A/B switch and the drive plan exclude each other
   if (on) {
     tests.allOff();                          // one injection at a time: the tests go off before A/B starts
@@ -1440,8 +1533,9 @@ void TestsWindow::abSetOn(bool on) {
   abPoll();
 }
 
+// The A/B switch page (a diagnostic page): 8 opens it, 9 leaves it, 2 / 30 switch A/B off / on, 31 / 32 the pins.
+// The set-up (which setting, B, block length) is made on the set-up page.
 void TestsWindow::abAct(int control) {
-  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
   if (control == 8) {
     abOpen();
     ab_page = true;
@@ -1449,16 +1543,6 @@ void TestsWindow::abAct(int control) {
     ab_page = false;
   } else if (control == 2 || control == 30) {   // A/B OFF (the red box), or the on/off box
     abSetOn(control == 30 && !ab_on);
-  } else if (control == 39) {                    // the drive plan: A/B until complete or out of its speeds, then the tests
-    if (ab_plan_on) {
-      ab_memory.putBool(TI_PLAN_ON_KEY, false);
-    } else {
-      tests.allOff();                            // the single tests off first; the plan runs the tests itself
-      abSave();
-      ab_memory.putBool(TI_AB_ON_KEY, false);
-      ab_memory.remove(TI_AB_PIN_KEY);
-      ab_memory.putBool(TI_PLAN_ON_KEY, true);
-    }
   } else if (control == 31 || control == 32) {
     if (ab_on) {                                // a pin means nothing while A/B is off
       const ti_ab::Pin next = ti_ab::tapPin(ab_pin, control == 31 ? ti_ab::Pin::A : ti_ab::Pin::B);
@@ -1473,24 +1557,8 @@ void TestsWindow::abAct(int control) {
         ab_memory.put(TI_AB_PIN_KEY, ti_ab::pinText(next));
       }
     }
-  } else if (ti_ab::canEdit(ab_on) && control >= 33 && control <= 38) {
-    if (control == 33 || control == 34) {
-      ab_setting = ti_ab::cycleSetting(ab_setting, control == 34 ? 1 : -1);
-      abFixB(false);
-    } else if (control == 35 || control == 36) {
-      if (ab_a_known) {
-        ab_b = ti_ab::stepB(s, ab_a, ab_b, control == 36 ? 1 : -1);
-      }
-    } else {
-      ab_block_min = ti_ab::stepBlock(ab_block_min, control == 38 ? 1 : -1);
-    }
-    abSave();
   }
   abPoll();
-}
-
-static QString abValueText(const ti_ab::Setting &s, double v) {
-  return s.is_bool ? (v != 0.0 ? QString("ON") : QString("OFF")) : QString::number(v, 'f', 2);
 }
 
 // One line at the bottom of both pages: what the drive plan runs now, what is next, the alternation's minutes against target
@@ -1511,8 +1579,224 @@ void TestsWindow::drawPlanLine(QPainter &p) {
   }
 }
 
-// Draws the A/B page below the shared header; returns the banner line
+// A box with a label and, under it, a smaller line (the first page's controls)
+static void drawBox2(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &label, int label_px,
+                     const QString &sub, int sub_px) {
+  p.setPen(Qt::NoPen);
+  p.setBrush(fill);
+  p.drawRoundedRect(r, 24, 24);
+  p.setPen(ink);
+  if (sub.isEmpty()) {
+    p.setFont(InterFont(label_px, QFont::Bold));
+    p.drawText(r, Qt::AlignCenter, label);
+    return;
+  }
+  const int sub_h = sub_px + 30;
+  p.setFont(InterFont(label_px, QFont::Bold));
+  p.drawText(QRect(r.x(), r.y(), r.width(), r.height() - sub_h), Qt::AlignCenter, label);
+  p.setFont(InterFont(sub_px, QFont::DemiBold));
+  p.drawText(QRect(r.x() + 10, r.bottom() - sub_h - 20, r.width() - 20, sub_h), Qt::AlignCenter, sub);
+}
+
+static QColor toneQColor(ti_pages::Tone t) {
+  const ti_pages::ToneColor c = ti_pages::toneColor(t);
+  return QColor(c.r, c.g, c.b);
+}
+
+// The strings a HomeState points into
+struct TiHomeStrings {
+  std::string mode, why, state, arm, reason, gate;
+};
+
+// What the first page is told: from the params, the car side's status and the tests' own progress (nothing computed here that
+// the Tests page does not already show)
+ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
+  using namespace ti_pages;
+  HomeState h;
+  h.run = ab_plan_on ? Run::Plan : (ab_on ? Run::AbPlain : (tests.all_view.requested ? Run::All : (tests.singleTestOn() ? Run::Single : Run::Stopped)));
+  h.configured = ab_configured;
+  const UIStatus st = uiState()->status;
+  h.engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
+  h.metric = is_metric;
+  h.have_speed = have_speed;
+  h.mph = speed_mph;
+
+  const QJsonObject plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
+  keep.mode = (ab_plan_on && !plan.isEmpty()) ? plan.value("mode").toString().toStdString() : std::string();
+  keep.why = ab_hold_why.toStdString();
+  keep.state = ab_fresh ? ab_status.value("state").toString().toStdString() : std::string();
+  keep.arm = ab_fresh ? ab_status.value("arm").toString().toStdString() : std::string();
+  h.plan_mode = keep.mode.c_str();
+  h.hold_why = keep.why.c_str();
+  h.ab_fresh = ab_fresh;
+  h.ab_state = keep.state.c_str();
+  h.ab_arm = keep.arm.c_str();
+  const QJsonObject block = ab_fresh ? ab_status.value("block").toObject() : QJsonObject();
+  h.ab_block = !block.isEmpty();
+  h.ab_block_left_s = block.value("left_s").toDouble();
+  const QJsonObject wait = ab_fresh ? ab_status.value("wait").toObject() : QJsonObject();
+  h.ab_wait = !wait.isEmpty();
+  keep.reason = wait.value("reason").toString().toStdString();
+  h.ab_wait_reason = keep.reason.c_str();
+  h.ab_wait_s = wait.value("s").toDouble();
+  h.ab_wait_max_s = wait.value("max_s").toDouble();
+  h.ab_complete = ab_fresh && ab_status.value("complete").toBool();
+
+  std::vector<int> scope;
+  for (int i = 0; i < (int)tests.defs.size(); i++) {
+    if (tests.defs[i].metric == "step_seconds") {
+      scope.push_back(i);
+    }
+  }
+  if (have_speed && !scope.empty()) {
+    const ti_logic::Target t = tests.target(scope, speed_mph);
+    h.target = t.window >= 0;
+    h.target_window = t.window;
+    h.target_secs = t.secs;
+  }
+  bool active = tests.all_view.active;
+  for (const TiTestView &view : tests.views) {
+    active = active || view.active;
+  }
+  h.tests_active = active;
+  keep.gate = tests.gate.valid ? tests.gate.reason.toStdString() : std::string();
+  h.gate_reason = keep.gate.c_str();
+  return h;
+}
+
+// Colour of the engaged badge: the same status the road view colours its border by (green engaged, amber override, grey not)
+void TestsWindow::drawEngagedBadge(QPainter &p, const QRect &pill) {
+  const QColor amber(218, 202, 37);
+  const UIStatus st = uiState()->status;
+  const bool engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
+  drawBox(p, pill, engaged ? QColor(0x17, 0x86, 0x44) : st == STATUS_OVERRIDE ? amber : QColor(0x54, 0x54, 0x54),
+          (engaged || st != STATUS_OVERRIDE) ? QColor(0xff, 0xff, 0xff) : QColor(0, 0, 0),
+          engaged ? QString("● ENGAGED") : st == STATUS_OVERRIDE ? QString("OVERRIDE") : QString("○ NOT ENGAGED"), 40);
+}
+
+void TestsWindow::drawTitle(QPainter &p, const QRect &r, const QString &text, int px) {
+  p.setPen(QColor(0xff, 0xff, 0xff));
+  p.setFont(InterFont(px, QFont::Bold));
+  p.drawText(r, Qt::AlignCenter, text);
+}
+
+// The first page: one status line, one number, what will run, START and STOP, and (small, not needed while driving) the detail
+void TestsWindow::drawHome(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  TiHomeStrings keep;
+  const HomeState hs = homeState(keep);
+  const HomeLines lines = home(hs);
+
+  // The status band: its colour is the state (the same colours on every page), its words say the same
+  const ToneColor tc = toneColor(lines.primary.tone);
+  const QColor ink = tc.light ? QColor(0, 0, 0) : white;
+  const QRect band(HOME_PRIMARY.x, HOME_PRIMARY.y, HOME_PRIMARY.w, HOME_SECOND.bottom() - HOME_PRIMARY.y);
+  p.setPen(Qt::NoPen);
+  p.setBrush(toneQColor(lines.primary.tone));
+  p.drawRoundedRect(band, 24, 24);
+  p.setPen(ink);
+  p.setFont(InterFont(PRIMARY_PX, QFont::Bold));
+  p.drawText(qr(HOME_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.primary.text));
+  p.setFont(InterFont(SECOND_PX, QFont::DemiBold));
+  p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.second));
+
+  // What will run, in plain words
+  const bool a_known = ab_a_known;
+  p.setPen(QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(EXPERIMENT_PX));
+  p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
+             QString::fromStdString(experimentLine(ab_configured ? ab_setting : -1, a_known, ab_a, ab_b)));
+
+  // START (what it will run, and what it replaces), STOP
+  const StartLook look = startLook(ab_configured, hs.run);
+  drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : QColor(0x0f, 0x4d, 0x28), white,
+           QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
+  const bool any = hs.run != Run::Stopped;
+  drawBox2(p, ctlRect(CTL_STOP), any ? QColor(201, 34, 49) : QColor(0x6b, 0x1d, 0x25), any ? white : QColor(0xc9, 0xc9, 0xc9),
+           QString("STOP"), STOP_PX, QString("stops every test and the A/B relay"), START_SUB_PX);
+
+  // Navigation at the screen edge
+  drawBox(p, ctlRect(CTL_BACK), locked ? QColor(0x1a, 0x1a, 0x1a) : grey, locked ? QColor(0x55, 0x55, 0x55) : white, QString("< EXIT"), NAV_PX);
+  drawBox(p, ctlRect(CTL_NAV_SETUP), grey, white, QString("SET UP A/B >"), NAV_PX);
+  drawBox(p, ctlRect(CTL_NAV_INDIV), grey, white, QString("INDIVIDUAL\nTESTS >"), NAV_PX);
+  drawEngagedBadge(p, qr(HOME_BADGE));
+
+  // The detail line: why the tests are held, or the alternation's scored minutes against its target
+  QString detail;
+  QColor detail_color(0xc9, 0xc9, 0xc9);
+  if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
+    detail = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
+    detail_color = QColor(218, 202, 37);
+  } else if (ab_configured && ab_fresh) {
+    const QJsonObject scored = ab_status.value("scored").toObject();
+    const QJsonObject plan_status = ab_status.value("plan").toObject();
+    detail = QString::fromStdString(detailScored(scored.value("A").toDouble(), scored.value("B").toDouble(),
+                                                 plan_status.value("target_min").toDouble(ti_ab::PLAN_TARGET_MIN_DEFAULT),
+                                                 ab_status.value("complete").toBool()));
+  }
+  p.setPen(detail_color);
+  p.setFont(InterFont(DETAIL_PX));
+  p.drawText(qr(HOME_DETAIL), Qt::AlignLeft | Qt::AlignVCenter, detail);
+}
+
+// The set-up page: which setting, value B, block length, chosen with the car stopped; stored as it is changed
+void TestsWindow::drawSetup(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  const QColor dim_fill(0x1a, 0x1a, 0x1a);
+  const QColor dim_ink(0x55, 0x55, 0x55);
+  const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
+  const bool editable = setupEditable(running(), have_speed, speed_mph);
+
+  drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< BACK"), NAV_PX);
+  drawTitle(p, qr(TITLE_SETUP), QString("A/B SET-UP"), 90);
+
+  drawBox2(p, ctlRect(CTL_SETUP_USE), !editable ? dim_fill : (ab_configured ? QColor(0x17, 0x86, 0x44) : grey), editable ? white : dim_ink,
+           ab_configured ? QString("A/B RELAY: USED") : QString("A/B RELAY: NOT USED"), ACTION_PX,
+           ab_configured ? QString("tap to stop using it") : QString("tap to use it"), EXPERIMENT_PX);
+
+  const QColor box = editable ? grey : dim_fill;
+  const QColor box_ink = editable ? white : dim_ink;
+  const bool b_editable = editable && ab_a_known && !s.is_bool;
+  drawBox(p, ctlRect(CTL_SETUP_PREV), box, box_ink, QString("<"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_NEXT), box, box_ink, QString(">"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_B_MINUS), b_editable ? grey : dim_fill, b_editable ? white : dim_ink, QString("-"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_B_PLUS), b_editable ? grey : dim_fill, b_editable ? white : dim_ink, QString("+"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_BLOCK_MINUS), box, box_ink, QString("-"), ACTION_PX + 24);
+  drawBox(p, ctlRect(CTL_SETUP_BLOCK_PLUS), box, box_ink, QString("+"), ACTION_PX + 24);
+
+  const QRect prev = ctlRect(CTL_SETUP_PREV);
+  const QRect next = ctlRect(CTL_SETUP_NEXT);
+  p.setPen(white);
+  p.setFont(InterFont(ACTION_PX, QFont::Bold));
+  p.drawText(QRect(prev.right() + 20, prev.top(), next.left() - prev.right() - 40, prev.height()), Qt::AlignCenter,
+             QString("Setting: %1").arg(QString(plainName(s.name))));
+  const QRect bm = ctlRect(CTL_SETUP_B_MINUS);
+  const QRect bp = ctlRect(CTL_SETUP_B_PLUS);
+  p.drawText(QRect(bm.right() + 20, bm.top(), bp.left() - bm.right() - 40, bm.height()), Qt::AlignCenter,
+             ab_a_known ? QString("Yours %1 | B %2").arg(QString::fromStdString(valueWord(s, ab_a))).arg(QString::fromStdString(valueWord(s, ab_b)))
+                        : QString("Your value cannot be read"));
+  const QRect km = ctlRect(CTL_SETUP_BLOCK_MINUS);
+  const QRect kp = ctlRect(CTL_SETUP_BLOCK_PLUS);
+  p.drawText(QRect(km.right() + 20, km.top(), kp.left() - km.right() - 40, km.height()), Qt::AlignCenter,
+             QString("Blocks of %1 min").arg((int)ab_block_min));
+
+  p.setPen(QColor(0xc9, 0xc9, 0xc9));
+  p.setFont(InterFont(EXPERIMENT_PX));
+  p.drawText(QRect(480, 970, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
+             QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b)));
+  p.setPen(QColor(218, 202, 37));
+  p.setFont(InterFont(DETAIL_PX));
+  p.drawText(QRect(480, 1020, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter,
+             QString::fromStdString(setupNote(running(), have_speed, speed_mph)) + (ti_ab::bendsOnly(s.name) ? QString("  Counts only in bends.") : QString()));
+}
+
+// Draws the plain A/B switch page below the shared header; returns the banner line
 QString TestsWindow::drawAb(QPainter &p) {
+  using namespace ti_pages;
   const QColor white(0xff, 0xff, 0xff);
   const QColor dim_fill(0x1a, 0x1a, 0x1a);
   const QColor dim_ink(0x55, 0x55, 0x55);
@@ -1521,37 +1805,37 @@ QString TestsWindow::drawAb(QPainter &p) {
   const QColor grey(0x33, 0x33, 0x33);
   const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
   const QString state = ab_fresh ? ab_status.value("state").toString() : QString("off");
-  const bool running = ab_on && ab_fresh && (state == "running" || state == "pinned");
+  const bool running_now = ab_on && ab_fresh && (state == "running" || state == "pinned");
   const QString arm = ab_status.value("arm").toString();
 
   // the switch and the pins
-  drawBox(p, abBox(30), ab_on ? QColor(0x17, 0x86, 0x44) : QColor(201, 34, 49), white,
-          ab_on ? QString("A/B ON\ntap to stop") : QString("A/B OFF\ntap to start"), 52);
-  drawBox(p, abBox(31), ab_pin == ti_ab::Pin::A ? blue : (ab_on ? grey : dim_fill), ab_on ? white : dim_ink,
-          ab_pin == ti_ab::Pin::A ? QString("A PINNED\ntap to release") : QString("PIN A"), 44);
-  drawBox(p, abBox(32), ab_pin == ti_ab::Pin::B ? amber : (ab_on ? grey : dim_fill),
+  drawBox(p, ctlRect(CTL_AB_SWITCH), ab_on ? QColor(0x17, 0x86, 0x44) : QColor(201, 34, 49), white,
+          ab_on ? QString("A/B ON\ntap to stop") : QString("A/B OFF\ntap to start"), ACTION_PX);
+  drawBox(p, ctlRect(CTL_PIN_A), ab_pin == ti_ab::Pin::A ? blue : (ab_on ? grey : dim_fill), ab_on ? white : dim_ink,
+          ab_pin == ti_ab::Pin::A ? QString("A PINNED\ntap to release") : QString("PIN A"), ACTION_PX);
+  drawBox(p, ctlRect(CTL_PIN_B), ab_pin == ti_ab::Pin::B ? amber : (ab_on ? grey : dim_fill),
           ab_pin == ti_ab::Pin::B ? QColor(0, 0, 0) : (ab_on ? white : dim_ink),
           ab_pin == ti_ab::Pin::B ? QString("B PINNED\ntap to release")
                                   : (ti_ab::pinBConfirmed(QDateTime::currentMSecsSinceEpoch() / 1000.0, ab_pin_b_armed)
-                                         ? QString("TAP AGAIN\nto pin B") : QString("PIN B")), 44);
+                                         ? QString("TAP AGAIN\nto pin B") : QString("PIN B")), ACTION_PX);
 
   // which value is in force, and its number
-  const QRect panel(1340, rowTop() + 10, width() - 1340 - 30, 190);
+  const QRect panel = qr(AB_PANEL);
   p.setPen(Qt::NoPen);
   p.setBrush(QColor(0x11, 0x11, 0x11));
   p.drawRoundedRect(panel, 24, 24);
-  if (running && (arm == "A" || arm == "B")) {
+  if (running_now && (arm == "A" || arm == "B")) {
     p.setPen(arm == "B" ? amber : blue);
     p.setFont(InterFont(130, QFont::Bold));
-    p.drawText(QRect(panel.left() + 20, panel.top(), 150, panel.height()), Qt::AlignCenter, arm);
+    p.drawText(QRect(panel.left() + 10, panel.top(), 130, panel.height()), Qt::AlignCenter, arm);
     p.setPen(white);
-    p.setFont(InterFont(70, QFont::Bold));
+    p.setFont(InterFont(56, QFont::Bold));
     const QJsonValue value = ab_status.value("value");
     const QString number = value.isBool() ? (value.toBool() ? QString("ON") : QString("OFF")) : QString::number(value.toDouble(), 'f', 2);
     const double blend = ab_status.value("blend").toDouble();
-    p.drawText(QRect(panel.left() + 180, panel.top() + 10, panel.width() - 190, 90), Qt::AlignLeft | Qt::AlignVCenter,
-               number + (blend > 0.001 && blend < 0.999 ? QString("  (blending)") : QString()));
-    p.setFont(InterFont(34));
+    p.drawText(QRect(panel.left() + 150, panel.top() + 5, panel.width() - 160, 80), Qt::AlignLeft | Qt::AlignVCenter,
+               number + (blend > 0.001 && blend < 0.999 ? QString(" (blending)") : QString()));
+    p.setFont(InterFont(30));
     const QJsonObject block = ab_status.value("block").toObject();
     QString line;
     if (state == "pinned") {
@@ -1567,46 +1851,22 @@ QString TestsWindow::drawAb(QPainter &p) {
                                   .arg((int)wait.value("s").toDouble()).arg((int)wait.value("max_s").toDouble());
     }
     if (ab_status.value("wash_in").toBool()) {
-      line += QString("   settling after a switch");
+      line += QString("  settling after a switch");
     }
     p.setPen(amber);
-    p.drawText(QRect(panel.left() + 180, panel.top() + 100, panel.width() - 190, 80), Qt::AlignLeft | Qt::AlignVCenter, line);
+    p.drawText(QRect(panel.left() + 150, panel.top() + 85, panel.width() - 160, 110), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap, line);
   } else {
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
-    p.setFont(InterFont(44, QFont::DemiBold));
+    p.setFont(InterFont(34, QFont::DemiBold));
     const QString msg = ab_status.value("msg").toString();
-    p.drawText(panel.adjusted(20, 0, -20, 0), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap,
+    p.drawText(panel.adjusted(16, 0, -16, 0), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap,
                !ab_on ? QString("A/B is off: your own value is in force")
                       : (msg.isEmpty() ? QString("Waiting for engagement") : msg));
   }
 
-  // the configuration: only while A/B is off
-  const bool edit = ti_ab::canEdit(ab_on || ab_plan_on);
-  const QColor box = edit ? grey : dim_fill;
-  const QColor ink = edit ? white : dim_ink;
-  drawBox(p, abBox(33), box, ink, QString("<"), 56);
-  drawBox(p, abBox(34), box, ink, QString(">"), 56);
-  drawBox(p, abBox(35), (edit && ab_a_known && !s.is_bool) ? grey : dim_fill, (edit && ab_a_known && !s.is_bool) ? white : dim_ink, QString("-"), 56);
-  drawBox(p, abBox(36), (edit && ab_a_known && !s.is_bool) ? grey : dim_fill, (edit && ab_a_known && !s.is_bool) ? white : dim_ink, QString("+"), 56);
-  drawBox(p, abBox(37), box, ink, QString("-"), 56);
-  drawBox(p, abBox(38), box, ink, QString("+"), 56);
-  p.setPen(white);
-  p.setFont(InterFont(46, QFont::Bold));
-  p.drawText(QRect(abBox(33).right() + 8, abBox(33).top(), abBox(34).left() - abBox(33).right() - 16, 120), Qt::AlignCenter, QString(s.name));
-  p.setFont(InterFont(40));
-  p.drawText(QRect(abBox(34).right() + 30, abBox(34).top(), 250, 120), Qt::AlignCenter,
-             QString("A (yours)\n") + (ab_a_known ? abValueText(s, ab_a) : QString("unreadable")));
-  p.drawText(QRect(abBox(35).right() + 8, abBox(35).top(), abBox(36).left() - abBox(35).right() - 16, 120), Qt::AlignCenter,
-             QString("B\n") + abValueText(s, ab_b));
-  p.drawText(QRect(abBox(37).right() + 8, abBox(37).top(), abBox(38).left() - abBox(37).right() - 16, 120), Qt::AlignCenter,
-             QString("Block\n%1 min").arg((int)ab_block_min));
-
-  drawBox(p, abBox(39), ab_plan_on ? QColor(0x17, 0x86, 0x44) : QColor(0x46, 0x5B, 0xEA), white,
-          ab_plan_on ? QString("DRIVE PLAN ON\ntap to stop") : QString("DRIVE PLAN\nA/B, then the tests"), 40);
-
   // engaged minutes per side and per speed window (the wash-in after each switch is not counted)
-  const int table_top = abBox(33).bottom() + 40;
-  const int row_h = std::max(36, std::min(60, (height() - 110 - table_top) / 6));
+  const int table_top = AB_TABLE_TOP;
+  const int row_h = std::max(32, std::min(60, (height() - 150 - table_top) / 6));
   p.setFont(InterFont(std::min(38, row_h * 7 / 10), QFont::Bold));
   p.setPen(white);
   p.drawText(QRect(30, table_top, 600, row_h), Qt::AlignLeft | Qt::AlignVCenter, QString("Engaged minutes"));
@@ -1629,7 +1889,10 @@ QString TestsWindow::drawAb(QPainter &p) {
     }
   }
 
-  // refusals and advice
+  // refusals and advice (the set-up is made on the first page's SET UP A/B)
+  if (!ab_configured) {
+    return QString("Not set up. Choose the setting on SET UP A/B (START page).");
+  }
   if (!ab_on && !ab_a_known) {
     return QString("Your stored value of %1 cannot be read: A/B cannot start").arg(s.name);
   }
@@ -1639,7 +1902,121 @@ QString TestsWindow::drawAb(QPainter &p) {
   if (ti_ab::bendsOnly(s.name)) {
     return QString("%1 acts only in bends: minutes count only there").arg(s.name);
   }
-  return edit ? QString("Changes apply when you start A/B") : QString();
+  return QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
+}
+
+void TestsWindow::paintEvent(QPaintEvent *event) {
+  using namespace ti_pages;
+  QPainter p(this);
+  p.setRenderHint(QPainter::Antialiasing);
+  p.fillRect(rect(), QColor(0, 0, 0));
+
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor dim_fill(0x1a, 0x1a, 0x1a);
+  const QColor dim_ink(0x55, 0x55, 0x55);
+  const QColor amber(218, 202, 37);
+  const QColor grey(0x33, 0x33, 0x33);
+
+  // The lock, always visible and at the same place on the same row of every page: amber and solid when locked (the page stays
+  // until it is unlocked), plain when not
+  drawBox(p, lockRect(), locked ? amber : grey, locked ? QColor(0, 0, 0) : white,
+          locked ? QString("LOCKED\ntap to unlock") : QString("LOCK PAGE"), NAV_PX);
+  const auto lockBorder = [&]() {
+    if (locked) {
+      QPen pen(amber);
+      pen.setWidth(10);
+      p.setPen(pen);
+      p.setBrush(Qt::NoBrush);
+      p.drawRect(rect().adjusted(5, 5, -5, -5));
+    }
+  };
+
+  if (home_page) {
+    drawHome(p);
+    lockBorder();
+    return;
+  }
+  if (setup_page) {
+    drawSetup(p);
+    lockBorder();
+    return;
+  }
+
+  // The individual tests: diagnostic pages
+  drawBox(p, backRect(), grey, white, QString("< START\nPAGE"), NAV_PX);
+  drawBox(p, allOffRect(), QColor(201, 34, 49), white, ab_page ? QString("A/B OFF") : QString("ALL TESTS OFF"), 60);
+  lockBorder();
+
+  // Whether the system is engaged, always visible here: this page hides the road view and its engaged border.
+  drawEngagedBadge(p, QRect(width() - 520, height() - 84, 490, 64));
+
+  drawPlanLine(p);
+  const int n = tests.queueSize();
+  const int n_defs = (int)tests.defs.size();
+  QString banner;
+  QColor banner_color(0x33, 0xcc, 0x66);
+  const ti_pages::Run run = ab_plan_on ? Run::Plan : (ab_on ? Run::AbPlain : (tests.all_view.requested ? Run::All : (tests.singleTestOn() ? Run::Single : Run::Stopped)));
+  p.setPen(QColor(0xa0, 0xa0, 0xa0));
+  p.setFont(InterFont(30));
+  p.drawText(QRect(ti_pages::BANNER_RECT.x, ti_pages::BANNER_RECT.y, ti_pages::BANNER_RECT.w, 70), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap,
+             QString::fromStdString(individualNote(run)));
+  if (ab_page) {
+    drawBox(p, ctlRect(CTL_AB_BACK), grey, white, QString("< TEST PAGES"), NAV_PX);
+    drawTitle(p, qr(TITLE_WIDE), QString("A/B SWITCH"), 56);
+    banner = drawAb(p);
+    banner_color = amber;
+  } else if (queue_pos < 0 || queue_pos >= n) {
+    drawTitle(p, qr(TITLE_WIDE), QString("TESTS"), 80);
+    p.setPen(white);
+    p.setFont(InterFont(56, QFont::DemiBold));
+    p.drawText(QRect(30, rowTop(), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
+    drawBox(p, ctlRect(CTL_AB_PAGE), grey, white, QString("A/B\nSWITCH >"), NAV_PX);
+  } else if (overview) {
+    // The overview of run all: no PREV / NEXT; TEST PAGES goes back to the individual tests (run all off)
+    drawBox(p, ctlRect(CTL_OVERVIEW_BACK), grey, white, QString("< TEST PAGES"), NAV_PX);
+    drawTitle(p, qr(TITLE_WIDE), QString("RUN ALL TESTS"), 56);
+    drawAll(p);
+    banner = overview_banner;
+  } else {
+    // The queue: PREV / TEST k OF n / NEXT; an end of the queue greyed out, NEXT green once the shown test is done
+    const QColor green(0x17, 0x86, 0x44);
+    const bool finished = tests.done(queue_pos);
+    const bool has_prev = queue_pos > 0;
+    const bool has_next = queue_pos + 1 < n;
+    drawBox(p, prevRect(), has_prev ? grey : dim_fill, has_prev ? white : dim_ink, QString("< PREV"), 56);
+    drawBox(p, nextRect(), has_next ? (finished ? green : grey) : dim_fill, has_next ? white : dim_ink, QString("NEXT >"), 56);
+    drawTitle(p, qr(TITLE_PREV_NEXT), QString("TEST %1\nOF %2").arg(queue_pos + 1).arg(n), 48);
+    drawBox(p, ctlRect(CTL_OVERVIEW), tests.hasStepTests() ? QColor(0x46, 0x5B, 0xEA) : dim_fill, tests.hasStepTests() ? white : dim_ink,
+            QString("RUN-ALL\nPAGE >"), NAV_PX);
+    drawBox(p, ctlRect(CTL_AB_PAGE), ab_on ? QColor(0x17, 0x86, 0x44) : grey, white, ab_on ? QString("A/B ON >") : QString("A/B\nSWITCH >"), NAV_PX);
+
+    if (finished) {
+      bool all_done = true;
+      for (int i = 0; i < n_defs; i++) {
+        all_done = all_done && tests.done(i);
+      }
+      banner = has_next ? QString("Complete. Tap NEXT to switch to %1").arg(tests.defs[queue_pos + 1].title)
+                        : (all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test."));
+    }
+    drawTest(p, queue_pos);
+  }
+  if (!banner.isEmpty()) {
+    p.setPen(banner_color);
+    p.setFont(InterFont(32, QFont::Bold));
+    p.drawText(bannerRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap, banner);
+  }
+
+  // Definitions that were ignored, and why (at most two lines)
+  const int shown = std::min(2, (int)tests.errors.size());
+  p.setPen(QColor(218, 202, 37));
+  p.setFont(InterFont(34));
+  for (int k = 0; k < shown; k++) {
+    QString line = tests.errors[k];
+    if (k == 1 && tests.errors.size() > 2) {
+      line = QString("... and %1 more ignored definitions (see the log)").arg(tests.errors.size() - 1);
+    }
+    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
+  }
 }
 
 void TestsWindow::drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const {
@@ -1998,117 +2375,6 @@ void TestsWindow::drawAll(QPainter &p) {
     overview_banner = QString("This window is complete: run all picks tests at random here. Other speeds still need data");
   }
 }
-
-void TestsWindow::paintEvent(QPaintEvent *event) {
-  QPainter p(this);
-  p.setRenderHint(QPainter::Antialiasing);
-  p.fillRect(rect(), QColor(0, 0, 0));
-
-  const QColor white(0xff, 0xff, 0xff);
-  const QColor dim_fill(0x1a, 0x1a, 0x1a);
-  const QColor dim_ink(0x55, 0x55, 0x55);
-  const QColor amber(218, 202, 37);
-  drawBox(p, backRect(), locked ? dim_fill : QColor(0x33, 0x33, 0x33), locked ? dim_ink : white, QString("BACK"), 70);
-  drawBox(p, allOffRect(), QColor(201, 34, 49), white, ab_page ? QString("A/B OFF") : QString("ALL TESTS OFF"), 60);
-  if (!ab_page) {
-    drawBox(p, abRect(), ab_memory.getBool("TiAbOn") ? QColor(0x17, 0x86, 0x44) : QColor(0x33, 0x33, 0x33), white,
-            ab_memory.getBool("TiAbOn") ? QString("A/B ON >") : QString("A/B >"), 40);
-  }
-  // The lock, always visible: amber and solid when locked (the page stays until it is unlocked), plain when not
-  drawBox(p, lockRect(), locked ? amber : QColor(0x33, 0x33, 0x33), locked ? QColor(0, 0, 0) : white,
-          locked ? QString("LOCKED · tap to unlock") : QString("LOCK PAGE"), 36);
-  if (locked) {
-    QPen pen(amber);
-    pen.setWidth(10);
-    p.setPen(pen);
-    p.setBrush(Qt::NoBrush);
-    p.drawRect(rect().adjusted(5, 5, -5, -5));
-  }
-
-  // Whether the system is engaged, always visible here: this page hides the road view and its engaged border. The same
-  // status the road view colours its border by (UIState::status): green engaged, amber override, grey not engaged.
-  {
-    const UIStatus st = uiState()->status;
-    const bool engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
-    const QRect pill(width() - 520, height() - 84, 490, 64);
-    drawBox(p, pill, engaged ? QColor(0x17, 0x86, 0x44) : st == STATUS_OVERRIDE ? amber : QColor(0x54, 0x54, 0x54),
-            (engaged || st != STATUS_OVERRIDE) ? white : QColor(0, 0, 0),
-            engaged ? QString("● ENGAGED") : st == STATUS_OVERRIDE ? QString("OVERRIDE") : QString("○ NOT ENGAGED"), 40);
-  }
-
-  drawPlanLine(p);
-  const int n = tests.queueSize();
-  const int n_defs = (int)tests.defs.size();
-  QString banner;
-  QColor banner_color(0x33, 0xcc, 0x66);
-  if (ab_page) {
-    drawBox(p, runAllRect(), QColor(0x33, 0x33, 0x33), white, QString("< TEST PAGES"), 40);
-    p.setPen(white);
-    p.setFont(InterFont(56, QFont::Bold));
-    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("A/B ALTERNATION"));
-    banner = drawAb(p);
-    banner_color = QColor(218, 202, 37);
-  } else if (queue_pos < 0 || queue_pos >= n) {
-    p.setPen(white);
-    p.setFont(InterFont(80, QFont::Bold));
-    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("TESTS"));
-    p.setFont(InterFont(56, QFont::DemiBold));
-    p.drawText(QRect(30, rowTop(), width() - 60, rowHeight()), Qt::AlignCenter, QString("No valid test definitions"));
-  } else if (overview) {
-    // The overview of run all: no PREV / NEXT; TEST PAGES goes back to the individual tests (run all off)
-    drawBox(p, runAllRect(), QColor(0x33, 0x33, 0x33), white, QString("< TEST PAGES"), 40);
-    p.setPen(white);
-    p.setFont(InterFont(56, QFont::Bold));
-    p.drawText(QRect(backRect().right() + 20, 24, allOffRect().left() - backRect().right() - 40, 150), Qt::AlignCenter, QString("RUN ALL TESTS"));
-    drawAll(p);
-    banner = overview_banner;
-  } else {
-    // The queue: PREV / TEST k OF n / NEXT; an end of the queue greyed out, NEXT green once the shown test is done
-    const QColor green(0x17, 0x86, 0x44);
-    const bool finished = tests.done(queue_pos);
-    const bool has_prev = queue_pos > 0;
-    const bool has_next = queue_pos + 1 < n;
-    drawBox(p, prevRect(), has_prev ? QColor(0x33, 0x33, 0x33) : dim_fill, has_prev ? white : dim_ink, QString("< PREV"), 56);
-    drawBox(p, nextRect(), has_next ? (finished ? green : QColor(0x33, 0x33, 0x33)) : dim_fill, has_next ? white : dim_ink,
-            QString("NEXT >"), 56);
-    p.setPen(white);
-    p.setFont(InterFont(48, QFont::Bold));
-    p.drawText(QRect(prevRect().right() + 10, 24, nextRect().left() - prevRect().right() - 20, 150), Qt::AlignCenter,
-               QString("TEST %1 OF %2").arg(queue_pos + 1).arg(n));
-    if (tests.hasStepTests()) {
-      drawBox(p, runAllRect(), QColor(0x46, 0x5B, 0xEA), white, QString("RUN ALL >"), 40);
-    }
-
-    if (finished) {
-      bool all_done = true;
-      for (int i = 0; i < n_defs; i++) {
-        all_done = all_done && tests.done(i);
-      }
-      banner = has_next ? QString("Complete. Tap NEXT to switch to %1").arg(tests.defs[queue_pos + 1].title)
-                        : (all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test."));
-    }
-    drawTest(p, queue_pos);
-  }
-  if (!banner.isEmpty()) {
-    p.setPen(banner_color);
-    p.setFont(InterFont(34, QFont::Bold));
-    p.drawText(bannerRect(), Qt::AlignCenter, banner);
-  }
-
-  // Definitions that were ignored, and why (at most two lines)
-  const int shown = std::min(2, (int)tests.errors.size());
-  p.setPen(QColor(218, 202, 37));
-  p.setFont(InterFont(34));
-  for (int k = 0; k < shown; k++) {
-    QString line = tests.errors[k];
-    if (k == 1 && tests.errors.size() > 2) {
-      line = QString("... and %1 more ignored definitions (see the log)").arg(tests.errors.size() - 1);
-    }
-    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
-  }
-}
-
-// Sidebar
 
 void Sidebar::drawMetric(QPainter &p, const QPair<QString, QString> &label, QColor c, int y) {
   const QRect rect = {30, y, 240, 126};

@@ -8,7 +8,7 @@ only in memory. Off at every boot, off by default, off while any identification 
 
 | key | where | meaning |
 |---|---|---|
-| `TiAbConfig` | persistent | JSON `{"setting": "SteerKP", "b": 0.95, "block_min": 4, "seed": 123}`. `a` may be given but must equal the stored value. `block_min` 4-10 (default 4). `seed` optional (drawn and logged when absent). Refused with a message on the A/B page outside the ranges below. |
+| `TiAbConfig` | persistent (written by SET UP A/B; absent = no alternation set up, START then runs the tests alone) | JSON `{"setting": "SteerKP", "b": 0.95, "block_min": 4, "seed": 123}`. `a` may be given but must equal the stored value. `block_min` 4-10 (default 4). `seed` optional (drawn and logged when absent). Refused with a message on the A/B page outside the ranges below. |
 | `TiAbOn` | tmpfs, cleared at manager start | the switch (the A/B page's box). A configuration change while on stops the run: switch off and on again. |
 | `TiAbPin` | tmpfs | `A` or `B`: alternation stops, the value ramps to that arm; empty: alternate. |
 | `TiAbStatus` | tmpfs, 2 Hz while on | what the page shows (state, arm, value, block, wait reason, progress) |
@@ -60,7 +60,7 @@ Samples marked `gap` in `hb.progress` are driven between the four speed windows 
 
 ## Drive plan (ti_plan.py)
 
-`TiPlanOn` (tmpfs, off at every boot, set by the page's DRIVE PLAN box) sequences the alternation and the tests; with it off nothing here acts.
+`TiPlanOn` (tmpfs, off at every boot, set by START on the Tests first page when an alternation is set up; STOP, or starting a single test, switches it off) sequences the alternation and the tests; with it off nothing here acts.
 The alternation runs where it is configured, incomplete and the speed is 35-56 mph (`PLAN_ALT_MAX_MPH`, 56 because replay evidence covers 35-56 mph only;
 a mile of hysteresis, and `MIN_DWELL_S` = 10 s between speed-driven changes); everywhere else, and everywhere once it is complete, the tests run in run-all
 mode under all their own gates. Complete = `TARGET_MIN_PER_SIDE` (20) scored minutes on each side, counted at the end of each non-voided block from
