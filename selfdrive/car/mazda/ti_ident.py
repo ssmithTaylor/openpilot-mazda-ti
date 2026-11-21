@@ -18,11 +18,13 @@ collects EXTRA, least-collected step first; completion is judged on the required
 follow each other with no gap; between two steps of the sweep or ladder the old tone fades out and the new one fades
 in (about 0.5-2 s); pulses follow at once.
 
-Run all (TiIdentAll). `schedule` picks the test: in the band the car is in, RUN_ALL_ORDER (sweep, pulses, ladder:
-smallest signals first), staying on the current test until its requirement for this band is complete; after a band
-change, the first test not complete in the new band; with every test complete in the band, extra, least-collected
-test first (with hysteresis). A test change fades the old signal out completely, then SWITCH_QUIET_S of quiet, then
-the next one starts.
+Run all (TiIdentAll). `RunAll.pick` chooses the test: in the window the car is in (or the nearest one when between
+windows), RUN_ALL_ORDER (sweep, pulses, ladder: smallest signals first), staying on the current test until its
+requirement there is complete; a test that cannot run only because of a command / curve / lateral-demand limit for
+longer than BLOCK_PATIENCE_S is passed over for one that can. With every test complete in the window the run goes on:
+the test is drawn AT RANDOM among those whose total time in the window is within TIE_S of the least (seeded; the seed,
+draw number, totals and candidates are in the logged "pick" event, so `verify_picks` recomputes every choice). A test
+change fades the old signal out completely, then SWITCH_QUIET_S of quiet, then the next one starts.
 
 Heading. Each sweep and ladder tone starts at the phase (PHASES) that makes the heading it produces zero-mean over a
 unit, its lead-in included, so the car does not drift sideways (a sine from zero gives a one-sided heading and a
@@ -39,10 +41,16 @@ change, a test change, and the toggle switched off. A fade lasts fade_frames(ste
 changes by more than MAX_SLEW counts per frame; a pulse in progress finishes its doublet instead. The thresholds are
 the named constants below; steps of at most SMALL_AMP counts (the dither's size) get looser bend, command and touch
 hold-off limits, the larger steps keep the strict ones. Also:
-  - the speed is inside one of BANDS (19-28, 31-45, 45-60, 60-80 mph); in the 28-31 mph gap the logged regime decides
-    which of the two neighbouring bands a sample belongs to;
-  - the steering regime is the band's: below 28 mph the EPS blocks the stock lane-keep path and the TI steers alone
+  - the speed is from MIN_TEST_MPH (19) up to MAX_TEST_MPH (80) and not in the 28-31 mph region where the EPS starts to
+    allow the stock steering path (reason "transition": off there, the signal fades out);
+  - the steering regime is the speed's: below 28 mph the EPS blocks the stock lane-keep path and the TI steers alone
     (LKAS_BLOCK set); from 31 mph both paths steer (LKAS_BLOCK clear); it must have been unchanged REGIME_SETTLE_S.
+
+Windows (revision 3). Progress is credited ONLY while the car is inside one of WINDOWS (21-27, 35-41, 49-56, 64-80
+mph); a unit counts only if every frame of it was inside the same window. Between the windows (and 19-21 mph) the tests
+still run under every gate, with the amplitude cap, command limit and step choice of the nearest window of the same
+steering regime (`Zone.profile`), and the data is logged and tagged with the actual speed (events carry `mph`, `band`
+= the window or "gap", `profile`), but ticks no box.
 
 Reconstruction. The requested added counts are exact from logs, as for the dither:
   added = mazdaDiagnostics.tiRequested - round(carControl.actuators.steer * tiMax)
@@ -55,12 +63,14 @@ test_mazda_ti_ident.py checks it). The run's stats config carries {"TiIdent": {t
 import hashlib
 import json
 import math
+import os
+from typing import NamedTuple, Optional
 
 from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_QUIET_COUNTS, FADE_OUT_S, HOLDOFF_S,
                                                      MAX_BASE_FRACTION, MAX_LAT_DEMAND_MPS2, RATE_ROOM_FACTOR,
                                                      TOUCH_CONFIRM_FRAMES)
 
-VERSION = 5
+VERSION = 6
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
@@ -69,11 +79,44 @@ KEYS = (SWEEP, LADDER, PULSES)
 TOGGLES = {SWEEP: "ti_sweep", LADDER: "ti_ladder", PULSES: "ti_pulses"}
 RUN_ALL_KEY, RUN_ALL_TOGGLE = "TiIdentAll", "ti_ident_all"
 
-# (low mph, high mph, label, TI alone): half-open [low, high). Between the first two bands (28-31 mph) the stock path
-# switches (blocked below 45 km/h, cleared above 50 km/h with a lag); samples there count by the logged regime. The
-# lowest band starts at 19 mph: the car only lets cruise control (and so openpilot) engage from about 19 mph.
-BANDS = ((19.0, 28.0, "19-28", True), (31.0, 45.0, "31-45", False), (45.0, 60.0, "45-60", False),
-         (60.0, 80.0, "60-80", False))
+# Speed windows (low mph, high mph, label, TI alone): half-open [low, high). Progress counts only inside them. The gaps
+# between them keep clear of the 28-31 mph region (EPS: blocked below 45 km/h, cleared above 50 km/h with a lag), which
+# no window straddles and where no test runs. The lowest window starts above 19 mph: the car only lets cruise control
+# (and so openpilot) engage from about 19 mph.
+WINDOWS = ((21.0, 27.0, "21-27", True), (35.0, 41.0, "35-41", False), (49.0, 56.0, "49-56", False),
+           (64.0, 80.0, "64-80", False))
+BANDS = WINDOWS             # the old name
+MIN_TEST_MPH = 19.0         # nothing runs below this (no engaged driving there)
+EPS_LOW_MPH, EPS_HIGH_MPH = 28.0, 31.0   # the EPS starts to allow the stock path here: no test from 28 up to 31 mph
+MAX_TEST_MPH = 80.0
+
+
+class Zone(NamedTuple):
+  """Where a speed is. state: inside (a window), between (a gap that runs tests), below, transition, above (no test).
+  window: the window credited, or None. profile: the window whose caps, limits and step choice apply (the window itself,
+  else the nearest of the same steering regime), or None where nothing runs."""
+  window: Optional[str]
+  profile: Optional[str]
+  ti_alone: Optional[bool]
+  state: str
+
+
+def zone_for(v_ego):
+  mph = v_ego * MS_TO_MPH
+  if mph < MIN_TEST_MPH:
+    return Zone(None, None, None, "below")
+  if EPS_LOW_MPH <= mph < EPS_HIGH_MPH:
+    return Zone(None, None, None, "transition")
+  if mph >= MAX_TEST_MPH:
+    return Zone(None, None, None, "above")
+  ti_alone = mph < EPS_LOW_MPH
+  for low, high, label, alone in WINDOWS:
+    if low <= mph < high:
+      return Zone(label, label, alone, "inside")
+  same = [w for w in WINDOWS if w[3] == ti_alone]
+  near = min(same, key=lambda w: max(w[0] - mph, mph - w[1]))
+  return Zone(None, near[2], ti_alone, "between")
+
 
 MAX_SLEW = 3.0              # counts per frame, lead-in and fades included: half of the default TI_STEER_DELTA_UP (6)
 
@@ -91,6 +134,18 @@ MAX_LAT_DEMAND_SMALL = 1.5             # small steps
 # Base command: stay clear of the 600 clip (a clipped signal leaves a bias; a flat command at the clip stalls the rack)
 MAX_BASE_FRACTION_STRICT = MAX_BASE_FRACTION   # |undithered request| <= 0.5 x TI_STEER_MAX (300), larger steps
 MAX_BASE_FRACTION_SMALL = 0.75                 # 450 + 22 leaves 128 counts to the clip, small steps
+# The same limit PER WINDOW (strict steps, small steps), as shares of TI_STEER_MAX: the one place to change it for one
+# window when evidence shows what the car does there. The values are the previous revision's; none may exceed it
+# without the owner's decision (the unit tests pin the values). The gap between windows uses its nearest window's.
+COMMAND_LIMIT_FRACTION = {w[2]: (MAX_BASE_FRACTION_STRICT, MAX_BASE_FRACTION_SMALL) for w in WINDOWS}
+# Re-arm dwell: a gate that closed on the command (or a bend / lateral demand) opens again only after the value has been
+# inside its limit for this long. Cutting stays immediate; only starting a unit waits, so a command hovering at the
+# limit does not start and cut units (and lead-ins) over and over.
+REARM_S = 0.3
+# A test that is blocked only by one of those limits for this long is passed over in run all for one that can run.
+BLOCK_PATIENCE_S = 1.0
+# Run all, every test complete in the window: tests whose total time there is within this of the least are drawn from.
+TIE_S = 10.0
 # Hold-off after a confirmed touch (the driver may still be steering); a blinker keeps the full time (lane change)
 TOUCH_HOLDOFF_S = HOLDOFF_S            # 3 s, larger steps
 TOUCH_HOLDOFF_SMALL_S = 1.5            # small steps
@@ -120,7 +175,7 @@ LADDER_PERIOD = 250
 LADDER_AMPS = (6.0, 11.0, 22.0, 37.0, 55.0, 74.0, 92.0)
 LADDER_LOW_BAND_CAP = 55.0
 LADDER_LOW_BAND_FULL_CAP = 92.0
-LADDER_CAPS = {"19-28": LADDER_LOW_BAND_CAP, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
+LADDER_CAPS = {"21-27": LADDER_LOW_BAND_CAP, "35-41": 37.0, "49-56": 37.0, "64-80": 37.0}
 LADDER_LEAD_IN = 100
 
 # Pulses: a bipolar trapezoid doublet (+A then -A, ramps at PULSE_RAMP counts per frame, PULSE_FLAT frames flat),
@@ -141,10 +196,10 @@ PULSE_FLAT = 10
 STEP_CAP_S = 60.0
 OPTIONAL_ABOVE_S = 130.0
 REQUIRED_S = {
-  "19-28": {SWEEP: (0.0, 59.76, 48.0, 32.24, 27.3, 11.2, 12.0), LADDER: (0.0, 0.0, 0.0, 0.0, 60.0), PULSES: (0.0, 54.0)},
-  "31-45": {SWEEP: (0.0, 26.56, 14.0, 9.92, 6.3, 4.48, 6.0), LADDER: (0.0, 0.0, 60.0, 40.0), PULSES: (60.0, 20.0)},
-  "45-60": {SWEEP: (0.0, 26.56, 10.0, 7.44, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 60.0, 25.0), PULSES: (52.0, 20.0)},
-  "60-80": {SWEEP: (0.0, 13.28, 10.0, 4.96, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 55.0, 20.0), PULSES: (54.0, 20.0)},
+  "21-27": {SWEEP: (0.0, 59.76, 48.0, 32.24, 27.3, 11.2, 12.0), LADDER: (0.0, 0.0, 0.0, 0.0, 60.0), PULSES: (0.0, 54.0)},
+  "35-41": {SWEEP: (0.0, 26.56, 14.0, 9.92, 6.3, 4.48, 6.0), LADDER: (0.0, 0.0, 60.0, 40.0), PULSES: (60.0, 20.0)},
+  "49-56": {SWEEP: (0.0, 26.56, 10.0, 7.44, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 60.0, 25.0), PULSES: (52.0, 20.0)},
+  "64-80": {SWEEP: (0.0, 13.28, 10.0, 4.96, 4.2, 4.48, 4.0), LADDER: (0.0, 0.0, 55.0, 20.0), PULSES: (54.0, 20.0)},
 }
 # Nominal per-step figure kept in ti_tests.json as target_seconds (the cap); the screen uses the per-step "needs".
 STEP_SECONDS = {SWEEP: STEP_CAP_S, LADDER: STEP_CAP_S, PULSES: STEP_CAP_S}
@@ -160,6 +215,10 @@ def band_required(key, band):
 
 # Run all
 RUN_ALL_ORDER = (SWEEP, PULSES, LADDER)
+RUNNING_REASONS = ("ok", "extra", "gap")      # the gate is open: a signal is (or starts to be) sent
+# The limits that can close the gate on a step's own size, in the gate chain's order: (what, unit) for the screen
+GATE_WHAT = {"command": ("steering command", "counts"), "curve": ("road curvature", "1/m"),
+             "lat": ("lateral demand", "m/s2")}
 SWITCH_QUIET_S = 0.5        # quiet between one test's complete fade-out and the next test's start
 EXTRA_HYSTERESIS = 0.25     # extra collection: leave the current test once it leads the least-collected by this share
 EXTRA_DWELL_UNITS = 4       # extra collection: units on one step before moving to the next (fewer fade transitions)
@@ -183,10 +242,11 @@ TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), {b: REQUIRED_S[b][
 
 
 def _signal(key):
-  """What a credited second of this test means: the waveform of every step (not the needs, caps or gates)."""
+  """What a credited second of this test means: the waveform of every step (not the needs, caps or gates), and the
+  windows its seconds are counted in (revision 3: new windows start from empty, the old record is kept aside)."""
   t = dict(_table(key))
   t.pop("caps", None)
-  return ["zero-heading phase, sign alternating per run", t]
+  return ["zero-heading phase, sign alternating per run", t, ["windows", WINDOWS]]
 
 
 # Progress is kept per SIGNAL_HASH (ti_tests.py): seconds collected with another waveform do not count toward these.
@@ -327,16 +387,10 @@ LEAD_SUM = {(k, s): sum(value(k, s, ph, (ph + step_params(k, s)[3]) / step_param
 
 
 def band_for(v_ego, lkas_blocked=None):
-  """(band label, TI alone) for a speed. In the 28-31 mph gap between the TI-alone band and the next one the logged
-  regime decides: stock path blocked counts in the band below, stock path active in the band above."""
-  mph = v_ego * MS_TO_MPH
-  for low, high, label, ti_alone in BANDS:
-    if low <= mph < high:
-      return label, ti_alone
-  lo_band, hi_band = BANDS[0], BANDS[1]
-  if lkas_blocked is not None and lo_band[1] <= mph < hi_band[0]:
-    return (lo_band[2], True) if lkas_blocked else (hi_band[2], False)
-  return None, None
+  """(window label, TI alone) for a speed: the window it is inside, else (None, TI alone) between windows, and
+  (None, None) where nothing runs. Kept for callers of the old name; `zone_for` has the whole picture."""
+  z = zone_for(v_ego)
+  return z.window, z.ti_alone
 
 
 def peak_counts(key):
@@ -389,26 +443,158 @@ def band_share(key, band, remaining, clip=True):
   return collected / required
 
 
-def schedule(current, current_band, band, remaining):
-  """Run all: the test to arm now. `current`: the test armed so far; `current_band`: the band it was armed for;
-  `band`: the band now (None: keep the current test; its own gate pauses it). None when progress is unknown."""
-  if band is None:
-    return current
-  shares, totals = {}, {}
-  for k in RUN_ALL_ORDER:
-    shares[k] = band_share(k, band, remaining)
-    totals[k] = band_share(k, band, remaining, clip=False)
-    if shares[k] is None or totals[k] is None:
+def window_total(key, window, remaining):
+  """Seconds collected by one test in a window, extra and optional steps included; None when unknown."""
+  total = 0.0
+  for s in range(steps_in_band(key, window)):
+    left = remaining(key, window, s)
+    if left is None:
       return None
-  if current in shares and band == current_band and shares[current] < 1.0 - 1e-9:
-    return current                       # stay until every step of it is complete in this band
-  for k in RUN_ALL_ORDER:
-    if shares[k] < 1.0 - 1e-9:
-      return k                           # the first test not complete in this band
-  least = min(RUN_ALL_ORDER, key=lambda k: (totals[k], RUN_ALL_ORDER.index(k)))
-  if current in totals and band == current_band and totals[current] - totals[least] < EXTRA_HYSTERESIS:
-    return current                       # extra: keep going until it leads by the hysteresis
-  return least
+    total += required_seconds(key, window, s) - left
+  return round(total, 2)
+
+
+def window_left(key, window, remaining):
+  """(required seconds still to collect, required cells still incomplete) of one test in a window; None when unknown.
+  A cell is one step (a tone, an amplitude, a pulse size); optional steps (need 0) are not cells."""
+  secs, cells = 0.0, 0
+  for s in range(steps_in_band(key, window)):
+    need = required_seconds(key, window, s)
+    left = remaining(key, window, s)
+    if left is None:
+      return None
+    if need > 0 and left > 1e-6:
+      secs += left
+      cells += 1
+  return secs, cells
+
+
+def window_target_mph(window):
+  """The speed the screen asks for in a window: its middle, in whole mph (24, 38, 52, 72)."""
+  for low, high, label, _ in WINDOWS:
+    if label == window:
+      return int((low + high) / 2.0)
+  return None
+
+
+def window_distance(mph, window):
+  """mph to drive to be inside the window (0 when inside)."""
+  for low, high, label, _ in WINDOWS:
+    if label == window:
+      return max(low - mph, mph - high, 0.0)
+  return None
+
+
+def target_window(mph, remaining, keys=KEYS):
+  """(window, seconds left, cells left, mph to change) of the nearest window that still needs something of `keys`:
+  the least speed change first (whole mph), then the most still outstanding; None when every window is complete or
+  progress is unknown."""
+  best = None
+  for _, _, label, _ in WINDOWS:
+    secs, cells = 0.0, 0
+    for k in keys:
+      got = window_left(k, label, remaining)
+      if got is None:
+        return None
+      secs += got[0]
+      cells += got[1]
+    if cells == 0:
+      continue
+    dist = window_distance(mph, label)
+    rank = (round(dist), -secs)
+    if best is None or rank < best[0]:
+      best = (rank, (label, secs, cells, dist))
+  return None if best is None else best[1]
+
+
+def _uniform(seed, draw):
+  """The draw-th number in [0, 1) of a seed: a hash, so any reader recomputes it without our random module."""
+  h = hashlib.sha256(f"{seed}:{draw}".encode()).digest()
+  return int.from_bytes(h[:6], "big") / float(1 << 48)
+
+
+def draw_choice(seed, draw, cands):
+  return cands[min(int(_uniform(seed, draw) * len(cands)), len(cands) - 1)]
+
+
+class RunAll:
+  """Run all: the test to arm now. `pick(frame, profile, remaining, can_run)`; `profile` is the window whose progress
+  applies (Zone.profile; None: keep the current test, its own gate pauses it); `can_run(test, profile)`: False when
+  that test's next step is closed only by a command / curve / lateral-demand limit right now. Every change of test is
+  emitted as a "pick" event through `emit(frame, "pick", **fields)`."""
+
+  def __init__(self, seed=None, emit=None):
+    self.seed = int.from_bytes(os.urandom(4), "big") if seed is None else int(seed)
+    self.draw = 0
+    self.emit = emit
+    self.current = None
+    self.profile = None
+    self.mode = None
+    self.blocked = 0
+
+  def _choose(self, frame, profile, test, mode, totals, **kw):
+    if test != self.current or mode != self.mode or profile != self.profile:
+      if self.emit is not None and (test != self.current or profile != self.profile):
+        self.emit(frame, "pick", test=test, mode=mode, window=profile, seed=self.seed, totals=totals, **kw)
+    self.current, self.profile, self.mode, self.blocked = test, profile, mode, 0
+    return test
+
+  def pick(self, frame, profile, remaining, can_run=None):
+    if profile is None:
+      return self.current
+    run = (lambda k: True) if can_run is None else (lambda k: bool(can_run(k, profile)))
+    totals, shares = {}, {}
+    for k in RUN_ALL_ORDER:
+      totals[k] = window_total(k, profile, remaining)
+      shares[k] = band_share(k, profile, remaining)
+      if totals[k] is None or shares[k] is None:
+        return None
+    same = profile == self.profile
+    cur = self.current
+    patience = int(round(BLOCK_PATIENCE_S / DT))
+    incomplete = [k for k in RUN_ALL_ORDER if shares[k] < 1.0 - 1e-9]
+    if incomplete:
+      if same and cur in incomplete and self.mode in ("required", "blocked"):
+        if run(cur):
+          self.blocked = 0
+          return cur
+        self.blocked += 1
+        others = [k for k in incomplete if k != cur and run(k)]
+        if self.blocked < patience or not others:
+          return cur
+        return self._choose(frame, profile, others[0], "blocked", totals, passed_over=cur)
+      runnable = [k for k in incomplete if run(k)]
+      return self._choose(frame, profile, (runnable or incomplete)[0], "required", totals)
+    # every test is complete in this window: keep going, drawing among the least collected
+    lo = min(totals.values())
+    tied = [k for k in RUN_ALL_ORDER if totals[k] - lo < TIE_S]
+    if same and self.mode == "random" and cur in tied:
+      if run(cur):
+        self.blocked = 0
+        return cur
+      self.blocked += 1
+      if self.blocked < patience:
+        return cur
+    cands = [k for k in tied if run(k)] or tied
+    draw = self.draw
+    self.draw += 1
+    return self._choose(frame, profile, draw_choice(self.seed, draw, cands), "random", totals, draw=draw, tied=tied,
+                        cands=cands, tie_s=TIE_S)
+
+
+def verify_picks(events):
+  """Recompute every logged random pick from its seed, draw number and totals; the list of mismatching events."""
+  bad = []
+  for e in events:
+    if e.get("kind") != "pick" or e.get("mode") != "random":
+      continue
+    totals = e["totals"]
+    lo = min(totals.values())
+    tied = [k for k in RUN_ALL_ORDER if totals[k] - lo < e["tie_s"]]
+    cands = e["cands"]
+    if tied != e["tied"] or not set(cands) <= set(tied) or draw_choice(e["seed"], e["draw"], cands) != e["test"]:
+      bad.append(e)
+  return bad
 
 
 def _advance(st):
@@ -462,6 +648,14 @@ class TiIdent:
     self.tone_sign = -1          # sweep and ladder: the sign of the current run's tone
     self.net = 0                 # running sum of every count sent (the heading the test has left); kept near zero
     self.units_on_step = 0       # units started on the current step in this run (extra dwell)
+    self.gate_last = None        # (frame count, gate) of the latest frame a limit closed the gate (published at 1 Hz)
+    self.gate = None             # while a limit closes the gate: {reason, what, value, limit, unit, window} (screen)
+    self.profile = None          # the window whose caps and limits apply to the running unit
+    self.n = 0                   # frames seen (re-arm dwell)
+    self.viol_at = {}            # (test key, step) -> frame a limit last closed that step, and which
+    self.inputs = None           # the last frame's limit inputs, for can_run
+    self.zone = Zone(None, None, None, "below")
+    self.mph = 0.0
     self._stop()
 
   def _stop(self):
@@ -476,6 +670,10 @@ class TiIdent:
     self.band = None             # the band of the current unit
     self.clean = False           # every frame of the current unit so far was clean
     self.last = 0
+
+  def event_for_pick(self, frame, kind, **kw):
+    """Run all's scheduler logs its choices through the same event stream as the signal's own events."""
+    self._event(frame, kind, **kw)
 
   @property
   def holdoff(self):
@@ -502,26 +700,74 @@ class TiIdent:
     self.touch = False
     self.credit = None
     self.emitted = None
+    self.gate = None
 
   @property
   def running(self):
     return self.test is not None
 
-  def _pick(self, key, band, remaining, credit=None):
-    """(step, extra): the first step of the table still to capture in `band` (this frame's credit counted), else the
-    least-collected one as extra (ties: the first); (None, False) when progress is unknown."""
-    best, best_left = None, None
+  def _pick(self, key, band, remaining, credit=None, feasible=None):
+    """(step, extra): the first step of the table still to capture in `band` (this frame's credit counted) that the
+    limits allow now, else the first still to capture; with everything captured, the least-collected one as extra
+    (ties: the first), among those the limits allow if any; (None, False) when progress is unknown."""
+    lefts = []
     for s in range(steps_in_band(key, band)):
       left = remaining(key, band, s)
       if left is None:
         return None, False
       if credit is not None and credit[:3] == (key, band, s):
         left -= credit[3]
-      if left > 1e-6:
-        return s, False
+      lefts.append((s, left))
+    todo = [s for s, left in lefts if left > 1e-6]
+    allowed = [(s, left) for s, left in lefts if feasible is None or feasible(s)]
+    if todo:
+      ok = [s for s in todo if feasible is None or feasible(s)]
+      if ok:
+        return ok[0], False
+      if not allowed:
+        return todo[0], False      # nothing the limits allow: the first still to capture (its gate shows why)
+      # every step still to capture is closed by a limit right now: the signal goes on with the least-collected step
+      # that is allowed (extra), so a gate hovering at its limit does not leave the test idle
+    pool = allowed or lefts
+    best, best_left = None, None
+    for s, left in pool:
       if best_left is None or left > best_left + 1e-9:
         best, best_left = s, left
     return best, True
+
+  @staticmethod
+  def limit_bounds(key, step, profile, ti_max):
+    """The three limits that apply to a step in a window: command (counts of the undithered TI request, per window and
+    step size, COMMAND_LIMIT_FRACTION), curve (|curvature|, 1/m) and lat (|v^2 curvature|, m/s^2)."""
+    strict = not small(key, step)
+    return {"command": COMMAND_LIMIT_FRACTION[profile][0 if strict else 1] * ti_max,
+            "curve": MAX_CURVATURE if strict else MAX_CURVATURE_SMALL,
+            "lat": MAX_LAT_DEMAND if strict else MAX_LAT_DEMAND_SMALL}
+
+  def limit_state(self, key, step, profile, base_request, curvature, lat_demand, ti_max):
+    """(reason, value, limit) of the first limit that closes this step now, else (None, None, None), in the gate
+    chain's order."""
+    bounds = self.limit_bounds(key, step, profile, ti_max)
+    values = {"command": abs(base_request), "curve": abs(curvature), "lat": abs(lat_demand)}
+    for reason in GATE_WHAT:
+      if values[reason] > bounds[reason]:
+        return reason, values[reason], bounds[reason]
+    return None, None, None
+
+  def can_run(self, key, profile, remaining):
+    """False when the step this test would run next is closed right now only by a command / curve / lateral-demand
+    limit, or is still inside that limit's re-arm dwell (run all passes such a test over after BLOCK_PATIENCE_S)."""
+    if self.inputs is None or profile is None:
+      return True
+    step, _ = self._pick(key, profile, remaining, None, lambda s: self._feasible(key, s, profile))
+    return step is not None and self._feasible(key, step, profile)
+
+  def _feasible(self, key, step, profile):
+    if self.inputs is None:
+      return True
+    if self.limit_state(key, step, profile, **self.inputs)[0] is not None:
+      return False
+    return (self.n - self.viol_at.get((key, step), (-10 ** 9, None))[0]) > REARM_S / DT
 
   def _start_chunk(self, frame, key, band, step, lead_in, extra):
     p, a, _, lead = step_params(key, step)
@@ -537,12 +783,16 @@ class TiIdent:
         self.tone_sign = -self.tone_sign
       self.sign = self.tone_sign
     self.units_on_step = self.units_on_step + 1 if (not lead_in and self.test == key and self.step == step) else 1
-    self.test, self.step, self.band, self.fading, self.extra = key, step, band, False, extra
+    window = self.zone.window
+    self.test, self.step, self.band, self.fading, self.extra = key, step, window, False, extra
+    self.profile = band
     self.ph = -lead if lead_in else 0
     self.env = 0.0 if lead_in and lead else 1.0
     self.clean = True
-    self._event(frame, "run" if lead_in else "chunk", test=key, step=step, band=band, ph=self.ph, env=self.env,
-                sign=self.sign, amp=a, extra=extra)
+    # `band`: the window the unit starts in ("gap" between windows: logged, not counted); `profile`: whose caps and
+    # limits apply; `mph`: the speed now
+    self._event(frame, "run" if lead_in else "chunk", test=key, step=step, band=window or "gap", profile=band,
+                mph=round(self.mph, 1), ph=self.ph, env=self.env, sign=self.sign, amp=a, extra=extra)
 
   def _fade(self, frame, why):
     if self.test == PULSES and self.ph >= len(_DOUBLETS[PULSE_AMPS[self.step]]):
@@ -556,11 +806,13 @@ class TiIdent:
   def update(self, armed, frame, *, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
              lat_demand, curvature, lkas_blocked, room=None, remaining=None):
     """`armed`: the one test key to run (None: none). `room`: rate_room of the live limits for the armed test.
-    `remaining(key, band, step)`: seconds still to capture for that step in that band, negative when it has extra
+    `remaining(key, band, step)`: seconds still to capture for that step in that window, negative when it has extra
     (the accountant's progress; None from it: unknown, nothing runs; None here: nothing captured yet)."""
     if remaining is None:
       remaining = lambda k, b, s: required_seconds(k, b, s)
     self.credit = None
+    self.gate = None
+    self.n += 1
     self.stopped_age += 1
     magnitude = abs(driver_torque)
     self.loud = self.loud + 1 if magnitude >= DRIVER_QUIET_COUNTS else 0
@@ -573,21 +825,46 @@ class TiIdent:
     else:
       self.regime_frames += 1
 
-    # A unit that ended on the previous frame is credited first (its frames were 0..n-1), whatever happens now
-    if self.test is not None and not self.fading and self.ph >= step_params(self.test, self.step)[2] and self.clean:
-      self.credit = (self.test, self.band, self.step, unit_credit(self.test, self.step))
+    zone = self.zone = zone_for(v_ego)
+    self.mph = v_ego * MS_TO_MPH
+    band, ti_alone = zone.profile, zone.ti_alone      # the window whose caps, limits and needs apply
+    self.inputs = dict(base_request=base_request, curvature=curvature, lat_demand=lat_demand, ti_max=ti_max)
 
-    band, ti_alone = band_for(v_ego, lkas_blocked)
+    # A unit that ended on the previous frame is credited first (its frames were 0..n-1), whatever happens now. Only
+    # a unit that stayed inside one window counts (self.band is None for a unit that started between windows).
+    if (self.test is not None and not self.fading and self.ph >= step_params(self.test, self.step)[2] and self.clean
+        and self.band is not None):
+      self.credit = (self.test, self.band, self.step, unit_credit(self.test, self.step))
+      left = remaining(self.test, self.band, self.step)
+      # a compact progress snapshot for the analysis: seconds still to capture in this cell after this credit
+      self._event(frame, "credit", test=self.test, band=self.band, step=self.step, s=self.credit[3],
+                  left=None if left is None else round(left - self.credit[3], 2))
+
     key = armed if armed in KEYS else None
+    # Which steps the limits close right now: when each last did, for the re-arm dwell
+    if key is not None and band is not None:
+      for st_ in range(steps_in_band(key, band)):
+        why = self.limit_state(key, st_, band, **self.inputs)
+        if why[0] is not None:
+          self.viol_at[(key, st_)] = (self.n, why[0])
     # The step whose limits apply: the running one, else the one that would start
     step, extra = (None, False)
     if key is not None and band is not None:
       if self.test == key and not self.fading:
         step, extra = self.step, self.extra
       else:
-        step, extra = self._pick(key, band, remaining, self.credit)
+        step, extra = self._pick(key, band, remaining, self.credit, lambda s: self._feasible(key, s, band))
     strict = step is None or not small(key, step)
     touch_hold = (TOUCH_HOLDOFF_S if strict else TOUCH_HOLDOFF_SMALL_S) / DT
+    limit = (None, None, None)
+    rearming = None
+    if step is not None and band is not None:
+      limit = self.limit_state(key, step, band, **self.inputs)
+      # A step about to START (nothing running) waits out the re-arm dwell after a limit closed it; cutting is immediate
+      if limit[0] is None and self.test is None:
+        last = self.viol_at.get((key, step))
+        if last is not None and self.n - last[0] <= REARM_S / DT:
+          rearming = last[1]
     # Why not (display), and the gate, in the dither's order of precedence
     if key is None:
       reason = "off"
@@ -599,16 +876,16 @@ class TiIdent:
       reason = "blinker"
     elif self.touch_age < touch_hold or self.blink_age < BLINKER_HOLDOFF_S / DT:
       reason = "holdoff"
+    elif zone.state == "transition":
+      reason = "transition"
     elif band is None:
       reason = "band"
     elif lkas_blocked is None or bool(lkas_blocked) != ti_alone or self.regime_frames < REGIME_SETTLE_S / DT:
       reason = "regime"
-    elif abs(base_request) > (MAX_BASE_FRACTION_STRICT if strict else MAX_BASE_FRACTION_SMALL) * ti_max:
-      reason = "command"
-    elif abs(curvature) > (MAX_CURVATURE if strict else MAX_CURVATURE_SMALL):
-      reason = "curve"
-    elif abs(lat_demand) > (MAX_LAT_DEMAND if strict else MAX_LAT_DEMAND_SMALL):
-      reason = "lat"
+    elif limit[0] is not None:
+      reason = limit[0]
+    elif rearming is not None:
+      reason = rearming
     elif step is None:
       reason = "off"              # progress unknown (no accountant): nothing runs
     elif key == LADDER and self.test == key and step_params(key, self.step)[1] > LADDER_CAPS[band]:
@@ -617,12 +894,33 @@ class TiIdent:
       reason = "switch"           # quiet between two tests
     else:
       reason = "extra" if extra else "ok"
-    if self.test is not None and key != self.test and reason in ("ok", "extra"):
+      if zone.window is None:
+        reason = "gap"            # between the windows: runs, logged with its speed, counts toward nothing
+    if self.test is not None and key != self.test and reason in RUNNING_REASONS:
       reason = "switch"           # another test is next: this one fades out first
     self.reason = reason
-    open_ = reason in ("ok", "extra")
+    open_ = reason in RUNNING_REASONS
+    if reason in GATE_WHAT and step is not None and band is not None:
+      val = {"command": abs(base_request), "curve": abs(curvature), "lat": abs(lat_demand)}[reason]
+      bound = self.limit_bounds(key, step, band, ti_max)[reason]
+      what, unit = GATE_WHAT[reason]
+      self.gate = {"reason": reason, "what": what, "value": round(val, 3), "limit": round(bound, 3), "unit": unit,
+                   "window": band, "rearm": limit[0] is None}
+    if self.gate is None and key is not None and band is not None and self.test == key and extra and not self.fading:
+      # running extra only because a limit closes the step still to capture: say which limit, and that it waits
+      for st_ in range(steps_in_band(key, band)):
+        left = remaining(key, band, st_)
+        if left is not None and left > 1e-6 and required_seconds(key, band, st_) > 0:
+          why = self.limit_state(key, st_, band, **self.inputs)
+          if why[0] is not None:
+            what, unit = GATE_WHAT[why[0]]
+            self.gate = {"reason": why[0], "what": what, "value": round(why[1], 3), "limit": round(why[2], 3),
+                         "unit": unit, "window": band, "rearm": False, "running": True}
+            break
+    if self.gate is not None:
+      self.gate_last = (self.n, self.gate)
     if key is not None:
-      slot = (key, band or "none", reason)
+      slot = (key, zone.window or ("gap" if band is not None else "none"), reason)
       self.counts[slot] = self.counts.get(slot, 0) + 1
 
     if self.test is not None and (touch or (key is not None and reason == "rate")):
@@ -636,15 +934,15 @@ class TiIdent:
         self._start_chunk(frame, key, band, step, lead_in=True, extra=extra)
     elif not self.fading:
       if self.ph >= step_params(self.test, self.step)[2]:
-        nxt, nxt_extra = self._pick(key, band, remaining, self.credit)
+        nxt, nxt_extra = self._pick(key, band, remaining, self.credit, lambda s: self._feasible(key, s, band))
         if (nxt_extra and self.extra and nxt != self.step and self.units_on_step < EXTRA_DWELL_UNITS
-            and self.step < steps_in_band(key, band) and band == self.band):
+            and self.step < steps_in_band(key, band) and band == self.profile):
           nxt = self.step                 # extra: a few units on one step before moving on (fewer transitions)
         if nxt == self.step or self.test == PULSES:
           self._start_chunk(frame, key, band, nxt, lead_in=False, extra=nxt_extra)   # straight on: continuous
         else:
           self._fade(frame, "step")     # another tone or amplitude: fade out, then a fresh lead-in
-      elif self.ph >= 0 and (band != self.band or self.env < 1.0):
+      elif self.ph >= 0 and (zone.window != self.band or self.env < 1.0):
         self.clean = False
 
     if self.test is None:
@@ -675,7 +973,7 @@ class TiIdent:
   def share(self, key):
     """Fraction of the armed, engaged frames that were running clean ("ok" or "extra"), or None without any."""
     total = sum(n for (k, _, _), n in self.counts.items() if k == key)
-    ok = sum(n for (k, _, r), n in self.counts.items() if k == key and r in ("ok", "extra"))
+    ok = sum(n for (k, _, r), n in self.counts.items() if k == key and r in RUNNING_REASONS)
     return ok / total if total else None
 
 

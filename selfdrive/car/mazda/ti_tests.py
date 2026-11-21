@@ -108,10 +108,12 @@ REASON_TEXT = {
   "ok": "Running",
   # the identification tests (ti_ident.TiIdent.reason)
   "other": "Waiting: another test is on",
-  "band": "Waiting: speed outside the test bands",
+  "band": "Waiting: speed below 19 or above 80 mph",
+  "transition": "Waiting: 28-31 mph, steering mode changing",
+  "gap": "Running between windows: logged, not counted",
   "regime": "Waiting: steering mode settling",
-  "band_done": "Waiting: this speed band is complete",
-  "extra": "Running: band complete, collecting extra",
+  "band_done": "Waiting: this speed window is complete",
+  "extra": "Running: window complete, collecting extra",
   "lat": "Waiting: lateral demand above the limit",
   "switch": "Switching to the next test",
 }

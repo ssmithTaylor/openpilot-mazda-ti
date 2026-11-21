@@ -594,6 +594,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiTuningStatsPrevious", PERSISTENT},
     {"TiTestProgress", PERSISTENT},
     {"TiTestQueue", PERSISTENT},
+    {"TiTestGate", CLEAR_ON_MANAGER_START},  // tmpfs: what closes the armed test's gate now (car side, 1 Hz)
+    {"TiTestLock", CLEAR_ON_MANAGER_START},  // tmpfs: the Tests page lock (UI); gone at reboot
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

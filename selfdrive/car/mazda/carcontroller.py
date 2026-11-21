@@ -96,8 +96,12 @@ class CarController(CarControllerBase):
                      if ti_ident_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
     self.ti_ident_on = ()
     self.ti_ident_armed = None
-    self.ti_ident_all = False          # run all (TiIdentAll): the scheduler picks the test, band by band
-    self.ti_ident_all_band = None      # the band the scheduler last armed a test for
+    self.ti_ident_all = False          # run all (TiIdentAll): the scheduler picks the test, window by window
+    # The run-all scheduler: seeded, every pick logged as a "pick" ti_ident event (ti_ident.RunAll, verify_picks)
+    self.ti_run_all = (ti_ident_mod.RunAll(emit=self.ti_ident.event_for_pick)
+                       if self.ti_ident is not None else None)
+    self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
+    self.ti_gate_frame = 0
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -205,6 +209,24 @@ class CarController(CarControllerBase):
       tests.publish(time.monotonic(), reasons, notes=notes, run_all=run_all)
       return
     tests.publish(time.monotonic(), reasons)
+
+  def publish_ti_gate(self):
+    """What closes the armed identification test's gate right now, once a second, for the Tests screen: {t, test, reason,
+    what, value, limit, unit, window} while a limit (command, curve, lateral demand) blocks it, else nothing (the
+    screen reads an empty or stale block as no limit). tmpfs only; written when it changes, never raises."""
+    ident = getattr(self, "ti_ident", None)
+    if ident is None or self.ti_tests is None:
+      return
+    try:
+      last = ident.gate_last     # the latest closure within the last second, so a value hovering at its limit shows
+      gate = last[1] if (last is not None and ident.n - last[0] <= 100 and self.ti_ident_armed is not None) else None
+      if gate is None and self.ti_gate_published is None:
+        return
+      block = None if gate is None else {**gate, "test": self.ti_ident_armed, "t": round(time.time(), 1)}
+      self.params_memory.put("TiTestGate", json.dumps(block if block is not None else {"t": round(time.time(), 1)}))
+      self.ti_gate_published = block
+    except Exception:
+      pass
 
   def record_ti_stats(self, CS, desired, sent):
     # Counters for A/B-ing a tuning change over a chosen stretch of road. "short" is how often the
@@ -550,11 +572,11 @@ class CarController(CarControllerBase):
             free = tests is not None and not self.ti_dither_enabled and (dither is None or dither.envelope == 0.0)
             try:
               if free and self.ti_ident_all and not on:
-                # Run all: the scheduler picks the test for the band the car is in (ti_ident.schedule)
-                band, _ = ti_ident_mod.band_for(CS.out.vEgo, getattr(CS, "lkas_blocked", None))
-                armed = ti_ident_mod.schedule(self.ti_ident_armed, self.ti_ident_all_band, band, tests.remaining)
-                if band is not None:
-                  self.ti_ident_all_band = band
+                # Run all: the scheduler picks the test for the window the car is in, or the nearest one between
+                # windows (ti_ident.RunAll); a seeded random choice once the window is complete
+                profile = ti_ident_mod.zone_for(CS.out.vEgo).profile
+                armed = self.ti_run_all.pick(self.frame, profile, tests.remaining,
+                                             lambda k, w: ident.can_run(k, w, tests.remaining))
               else:
                 armed = on[0] if (len(on) == 1 and free and not self.ti_ident_all) else None
               self.ti_ident_armed = armed
@@ -757,7 +779,7 @@ class CarController(CarControllerBase):
       if tests is not None:
         ident = getattr(self, "ti_ident", None)
         active = TI_DITHER_ACTIVE if ti_dither != 0 else ()
-        if ident is not None and ident.emitted and ident.reason in ("ok", "extra"):
+        if ident is not None and ident.emitted and ident.reason in ti_ident_mod.RUNNING_REASONS:
           active = active + (ident.emitted,)    # an identification test running clean (screen: ON · ACTIVE)
         tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, active,
                      credit=ident.credit if ident is not None else None)
@@ -773,6 +795,8 @@ class CarController(CarControllerBase):
       if self.frame % 500 == 0:
         self.publish_ti_stats()
         self.publish_ti_tests(CS, CC, ti_new_steer - ti_dither - ti_ident)
+      if self.frame % 100 == 0:
+        self.publish_ti_gate()
 
     self.frame += 1
     Timer.tick()

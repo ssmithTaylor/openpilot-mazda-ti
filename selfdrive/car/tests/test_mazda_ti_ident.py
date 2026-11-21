@@ -34,7 +34,7 @@ def blocked_for(band):
   return next(b[3] for b in ti.BANDS if b[2] == band)
 
 
-def quiet(band="31-45", **over):
+def quiet(band="35-41", **over):
   q = dict(v_ego=v_for(band), steering_pressed=False, driver_torque=-1.0, blinker=False, base_request=50,
            ti_max=TI_MAX, lat_demand=0.2, curvature=0.0003, lkas_blocked=blocked_for(band), room=6)
   q.update(over)
@@ -134,7 +134,7 @@ def test_amplitudes_and_their_classes():
   assert list(ti.LADDER_AMPS) == sorted(ti.LADDER_AMPS)
   caps = [ti.LADDER_CAPS[b[2]] for b in ti.BANDS]
   assert caps == sorted(caps, reverse=True)
-  assert ti.LADDER_CAPS["19-28"] == ti.LADDER_LOW_BAND_CAP == 55.0 and ti.LADDER_LOW_BAND_FULL_CAP == 92.0
+  assert ti.LADDER_CAPS["21-27"] == ti.LADDER_LOW_BAND_CAP == 55.0 and ti.LADDER_LOW_BAND_FULL_CAP == 92.0
   # the strict limits are the dither's; the small ones only for steps of the dither's size
   assert (ti.MAX_LAT_DEMAND, ti.MAX_BASE_FRACTION_STRICT, ti.TOUCH_HOLDOFF_S) == (1.0, 0.5, 3.0)
   assert ti.BLINKER_HOLDOFF_S == 3.0 and ti.MAX_CURVATURE == 0.004
@@ -144,9 +144,9 @@ def test_amplitudes_and_their_classes():
 
 def test_capture_time_per_band_follows_what_each_step_needs():
   per_band = {k: {b[2]: round(ti.band_required(k, b[2]), 2) for b in ti.BANDS} for k in ti.KEYS}
-  assert per_band[ti.SWEEP] == {"19-28": 190.5, "31-45": 67.26, "45-60": 56.68, "60-80": 40.92}
-  assert per_band[ti.LADDER] == {"19-28": 60.0, "31-45": 100.0, "45-60": 85.0, "60-80": 75.0}
-  assert per_band[ti.PULSES] == {"19-28": 54.0, "31-45": 80.0, "45-60": 72.0, "60-80": 74.0}
+  assert per_band[ti.SWEEP] == {"21-27": 190.5, "35-41": 67.26, "49-56": 56.68, "64-80": 40.92}
+  assert per_band[ti.LADDER] == {"21-27": 60.0, "35-41": 100.0, "49-56": 85.0, "64-80": 75.0}
+  assert per_band[ti.PULSES] == {"21-27": 54.0, "35-41": 80.0, "49-56": 72.0, "64-80": 74.0}
   for b in ti.BANDS:
     assert sum(ti.band_required(k, b[2]) for k in ti.KEYS) <= 6 * 60        # no band needs an inordinate time
     for k in ti.KEYS:
@@ -161,7 +161,7 @@ def test_capture_time_per_band_follows_what_each_step_needs():
   for b in ti.BANDS:
     assert ti.required_seconds(ti.SWEEP, b[2], 0) == 0
     assert ti.required_seconds(ti.LADDER, b[2], 0) == ti.required_seconds(ti.LADDER, b[2], 1) == 0
-  assert ti.required_seconds(ti.PULSES, "19-28", 0) == 0 and ti.required_seconds(ti.LADDER, "19-28", 3) == 0
+  assert ti.required_seconds(ti.PULSES, "21-27", 0) == 0 and ti.required_seconds(ti.LADDER, "21-27", 3) == 0
 
 
 def test_shipped_definitions_match_the_generator():
@@ -256,13 +256,104 @@ def test_off_or_no_band_or_unsettled_regime_is_zero():
     assert not any(out) and g.reason == "band"
 
 
-def test_the_28_31_mph_gap_counts_by_the_logged_regime():
-  assert ti.band_for(29.5 * MPH, True) == ("19-28", True)
-  assert ti.band_for(29.5 * MPH, False) == ("31-45", False)
-  assert ti.band_for(29.5 * MPH, None) == (None, None)
-  for blocked, band in ((True, "19-28"), (False, "31-45")):
-    _, prog = drive(TiIdent(), ti.PULSES, "31-45", 2000, v_ego=29.5 * MPH, lkas_blocked=blocked)
-    assert prog.have and all(b == band for (_, b, _) in prog.have)
+def test_the_windows_have_gaps_and_none_straddles_the_eps_region():
+  assert [(w[0], w[1], w[2]) for w in ti.WINDOWS] == [(21, 27, "21-27"), (35, 41, "35-41"), (49, 56, "49-56"),
+                                                      (64, 80, "64-80")]
+  for lo, hi, _, alone in ti.WINDOWS:
+    assert hi <= ti.EPS_LOW_MPH or lo >= ti.EPS_HIGH_MPH             # nothing straddles 28-31 mph
+    assert alone == (hi <= ti.EPS_LOW_MPH)
+  assert all(a[1] < b[0] for a, b in zip(ti.WINDOWS, ti.WINDOWS[1:]))      # gaps between every two
+  assert ti.MIN_TEST_MPH == 19.0 and ti.EPS_LOW_MPH == 28.0 and ti.EPS_HIGH_MPH == 31.0
+
+
+@pytest.mark.parametrize('mph,window,profile,state', [
+  (18.9, None, None, "below"), (19.0, None, "21-27", "between"), (20.9, None, "21-27", "between"),
+  (21.0, "21-27", "21-27", "inside"), (26.99, "21-27", "21-27", "inside"), (27.0, None, "21-27", "between"),
+  (27.99, None, "21-27", "between"), (28.0, None, None, "transition"), (30.99, None, None, "transition"),
+  (31.0, None, "35-41", "between"), (34.9, None, "35-41", "between"), (35.0, "35-41", "35-41", "inside"),
+  (41.0, None, "35-41", "between"), (44.9, None, "35-41", "between"), (45.1, None, "49-56", "between"),
+  (49.0, "49-56", "49-56", "inside"), (56.0, None, "49-56", "between"), (59.9, None, "49-56", "between"),
+  (60.1, None, "64-80", "between"), (64.0, "64-80", "64-80", "inside"), (79.9, "64-80", "64-80", "inside"),
+  (80.0, None, None, "above")])
+def test_zone_for_windows_gaps_and_the_no_test_regions(mph, window, profile, state):
+  z = ti.zone_for(mph * MPH)
+  assert (z.window, z.profile, z.state) == (window, profile, state)
+
+
+@pytest.mark.parametrize('mph,reason', [(18.0, "band"), (29.5, "transition"), (85.0, "band")])
+def test_no_test_runs_below_19_or_in_28_31_or_above_80(mph, reason):
+  for blocked in (True, False):
+    g = TiIdent()
+    out = [g.update(ti.SWEEP, k, **quiet(v_ego=mph * MPH, lkas_blocked=blocked)) for k in range(600)]
+    assert not any(out) and g.reason == reason
+
+
+def test_a_running_test_fades_out_on_entering_the_28_31_region_not_a_cut():
+  g, k, prog = _running(ti.SWEEP, "21-27", step_to=1)
+  out = [g.update(ti.SWEEP, k + i, **quiet("21-27", v_ego=29.5 * MPH), remaining=prog.remaining) for i in range(200)]
+  assert g.reason == "transition" and out[-1] == 0
+  assert max(abs(b - a) for a, b in zip(out, out[1:])) <= ti.MAX_SLEW + 1
+
+
+@pytest.mark.parametrize('mph,blocked,profile', [(20.0, True, "21-27"), (27.5, True, "21-27"), (33.0, False, "35-41"),
+                                                 (43.0, False, "35-41"), (47.0, False, "49-56"),
+                                                 (58.0, False, "49-56"), (62.0, False, "64-80")])
+def test_between_windows_the_test_runs_logged_and_tagged_but_ticks_no_box(mph, blocked, profile):
+  logged = []
+  g = TiIdent(log=logged.append)
+  prog = Progress()
+  out = []
+  for k in range(6000):
+    out.append(g.update(ti.SWEEP, k, **quiet(v_ego=mph * MPH, lkas_blocked=blocked), remaining=prog.remaining))
+    prog.add(g.credit)
+    assert g.credit is None
+  assert any(out) and g.reason == "gap" and not prog.have
+  runs = [e for e in logged if e["kind"] in ("run", "chunk")]
+  assert runs and all(e["band"] == "gap" and e["profile"] == profile and abs(e["mph"] - mph) < 0.1 for e in runs)
+  assert ti.reconstruct(logged, len(out)) == out
+
+
+def test_the_regime_must_match_the_speed_between_windows_too():
+  for mph, wrong in ((20.0, False), (33.0, True)):
+    g = TiIdent()
+    out = [g.update(ti.SWEEP, k, **quiet(v_ego=mph * MPH, lkas_blocked=wrong)) for k in range(500)]
+    assert not any(out) and g.reason == "regime"
+
+
+def test_a_unit_that_wanders_out_of_its_window_is_not_credited_and_one_inside_is():
+  prog = Progress()
+  g = TiIdent()
+  k = 0
+  while not g.running or g.env < 1.0:                       # a unit under way inside the window
+    g.update(ti.SWEEP, k, **quiet("35-41"), remaining=prog.remaining)
+    k += 1
+  drive_out = 0
+  while g.step == 1 and drive_out < 3000 and prog.have == {}:
+    g.update(ti.SWEEP, k, **quiet("35-41", v_ego=43.0 * MPH), remaining=prog.remaining)   # the gap above 41 mph
+    prog.add(g.credit)
+    k += 1
+    drive_out += 1
+  assert prog.have == {}                                    # the unit that crossed the edge counted nothing
+  for _ in range(3000):
+    g.update(ti.SWEEP, k, **quiet("35-41"), remaining=prog.remaining)
+    prog.add(g.credit)
+    k += 1
+  assert prog.have and all(b == "35-41" for (_, b, _) in prog.have)
+
+
+def test_progress_ticks_per_window_only_inside_it():
+  # one drive crossing every window and gap: credit lands only under the four window labels
+  prog = Progress()
+  g = TiIdent()
+  k = 0
+  for mph, blocked in ((20, True), (24, True), (33, False), (38, False), (45, False), (52, False), (62, False),
+                       (70, False)):
+    for _ in range(4000):
+      g.update(ti.SWEEP, k, **quiet(v_ego=mph * MPH, lkas_blocked=blocked), remaining=prog.remaining)
+      prog.add(g.credit)
+      k += 1
+  assert {b for (_, b, _) in prog.have} <= {"21-27", "35-41", "49-56", "64-80"} and len({b for (_, b, _) in prog.have}) == 4
+  assert {"21-27", "35-41", "49-56", "64-80"} == {b for (_, b, _) in prog.have}
 
 
 @pytest.mark.parametrize('band', [b[2] for b in ti.BANDS])
@@ -272,7 +363,7 @@ def test_the_regime_must_be_the_bands(band):
   assert not any(out) and g.reason == "regime"
 
 
-def _running(key=ti.SWEEP, band="31-45", prog=None, step_to=None):
+def _running(key=ti.SWEEP, band="35-41", prog=None, step_to=None):
   g = TiIdent()
   prog = prog if prog is not None else Progress()
   if step_to is not None:                                  # earlier steps already complete
@@ -322,9 +413,15 @@ def test_a_small_reading_must_persist_like_the_dithers():
 def test_other_gate_conditions_fade_out(key, step, change, reason):
   g, k, prog = _running(key, step_to=step)
   out = [g.update(key, k + i, **quiet(**change), remaining=prog.remaining) for i in range(200)]
-  assert g.reason == reason and not g.running
   stop = max(ti.fade_frames(key, step), len(ti.doublet(ti.step_params(key, step)[1])) if key == ti.PULSES else 0)
-  assert not any(out[stop + 1:])
+  if ti.small(key, step) or reason in ("blinker", "band"):
+    assert g.reason == reason and not g.running
+    assert not any(out[stop + 1:])
+  else:
+    # revision 3: a strict step closed only by a limit fades out as before; the same test then goes on with a SMALL
+    # step (which that limit does not close) instead of idling. Nothing above the small amplitude is ever sent again.
+    assert max(abs(v) for v in out[stop + 1:]) <= ti.SMALL_AMP
+    assert g.gate is None or g.gate["reason"] == reason
 
 
 @pytest.mark.parametrize('key,step,change', [
@@ -356,15 +453,15 @@ def test_rate_room_is_judged_on_the_steps_own_slew():
 
 def test_a_band_completes_with_no_dead_time_and_keeps_collecting_extra():
   g = TiIdent()
-  out, prog = drive(g, ti.SWEEP, "31-45", band_frames(ti.SWEEP, "31-45") + 2000)
-  assert prog.band_done(ti.SWEEP, "31-45")
+  out, prog = drive(g, ti.SWEEP, "35-41", band_frames(ti.SWEEP, "35-41") + 2000)
+  assert prog.band_done(ti.SWEEP, "35-41")
   quiet_run, longest = 0, 0
   for v in out[SETTLE + 5:]:
     quiet_run = quiet_run + 1 if v == 0 else 0
     longest = max(longest, quiet_run)
   assert longest < 40                                     # it keeps moving: no dead time beyond the fades
   assert g.reason == "extra" and g.running and any(out[-500:])
-  extra = {s: prog.have.get((ti.SWEEP, "31-45", s), 0.0) - ti.required_seconds(ti.SWEEP, "31-45", s)
+  extra = {s: prog.have.get((ti.SWEEP, "35-41", s), 0.0) - ti.required_seconds(ti.SWEEP, "35-41", s)
            for s in range(7)}
   assert sum(extra.values()) > 0                           # extra is counted
 
@@ -372,24 +469,24 @@ def test_a_band_completes_with_no_dead_time_and_keeps_collecting_extra():
 def test_extra_goes_to_the_least_collected_step_first():
   prog = Progress()
   for s in range(4):
-    prog.have[(ti.LADDER, "31-45", s)] = ti.required_seconds(ti.LADDER, "31-45", s) + (5.0 if s != 2 else 0.0)
+    prog.have[(ti.LADDER, "35-41", s)] = ti.required_seconds(ti.LADDER, "35-41", s) + (5.0 if s != 2 else 0.0)
   g = TiIdent()
-  drive(g, ti.LADDER, "31-45", SETTLE + 5, prog=prog)
+  drive(g, ti.LADDER, "35-41", SETTLE + 5, prog=prog)
   assert g.running and g.step == 2 and g.extra
 
 
 def test_a_pause_loses_only_the_unit_in_progress_and_the_step_resumes():
   g = TiIdent()
-  s0 = first_required(ti.SWEEP, "31-45")
+  s0 = first_required(ti.SWEEP, "35-41")
   n = ti.step_params(ti.SWEEP, s0)[2]
   lead = ti.SWEEP_LEAD_IN
-  _, prog = drive(g, ti.SWEEP, "31-45", SETTLE + lead + n + n // 2)   # one unit done, half of the next
-  assert prog.have == {(ti.SWEEP, "31-45", s0): ti.unit_credit(ti.SWEEP, s0)}
+  _, prog = drive(g, ti.SWEEP, "35-41", SETTLE + lead + n + n // 2)   # one unit done, half of the next
+  assert prog.have == {(ti.SWEEP, "35-41", s0): ti.unit_credit(ti.SWEEP, s0)}
   for i in range(30):
     g.update(ti.SWEEP, 5000 + i, **quiet(blinker=True), remaining=prog.remaining)
   assert not g.running
-  out, _ = drive(g, ti.SWEEP, "31-45", int(ti.BLINKER_HOLDOFF_S / ti.DT) + lead + n + 10, frame0=6000, prog=prog)
-  assert prog.have[(ti.SWEEP, "31-45", s0)] == pytest.approx(2 * ti.unit_credit(ti.SWEEP, s0))   # kept, one more
+  out, _ = drive(g, ti.SWEEP, "35-41", int(ti.BLINKER_HOLDOFF_S / ti.DT) + lead + n + 10, frame0=6000, prog=prog)
+  assert prog.have[(ti.SWEEP, "35-41", s0)] == pytest.approx(2 * ti.unit_credit(ti.SWEEP, s0))   # kept, one more
   first = next(i for i, v in enumerate(out) if v != 0)
   assert first <= int(ti.BLINKER_HOLDOFF_S / ti.DT) + 20
   assert g.step == s0                                      # the same step resumed
@@ -397,22 +494,22 @@ def test_a_pause_loses_only_the_unit_in_progress_and_the_step_resumes():
 
 def test_a_step_counts_in_whatever_band_the_car_is_in():
   g = TiIdent()
-  _, prog = drive(g, ti.PULSES, "45-60", SETTLE + ti.PULSE_PERIOD * 3 + 2)
-  assert prog.have == {(ti.PULSES, "45-60", 0): 6.0}
-  drive(g, ti.PULSES, "60-80", SETTLE + ti.PULSE_PERIOD * 2 + 5, frame0=2000, prog=prog)
-  assert prog.have.get((ti.PULSES, "60-80", 0), 0) >= 2.0 and prog.have[(ti.PULSES, "45-60", 0)] == 6.0
+  _, prog = drive(g, ti.PULSES, "49-56", SETTLE + ti.PULSE_PERIOD * 3 + 2)
+  assert prog.have == {(ti.PULSES, "49-56", 0): 6.0}
+  drive(g, ti.PULSES, "64-80", SETTLE + ti.PULSE_PERIOD * 2 + 5, frame0=2000, prog=prog)
+  assert prog.have.get((ti.PULSES, "64-80", 0), 0) >= 2.0 and prog.have[(ti.PULSES, "49-56", 0)] == 6.0
 
 
 def test_a_band_change_mid_unit_is_not_credited():
   g = TiIdent()
-  _, prog = drive(g, ti.SWEEP, "45-60", SETTLE + 50 + 300)
-  s0 = first_required(ti.SWEEP, "45-60")
-  drive(g, ti.SWEEP, "60-80", ti.step_params(ti.SWEEP, s0)[2] - 300, frame0=1000, prog=prog)
-  assert (ti.SWEEP, "45-60", s0) not in prog.have and (ti.SWEEP, "60-80", s0) not in prog.have
+  _, prog = drive(g, ti.SWEEP, "49-56", SETTLE + 50 + 300)
+  s0 = first_required(ti.SWEEP, "49-56")
+  drive(g, ti.SWEEP, "64-80", ti.step_params(ti.SWEEP, s0)[2] - 300, frame0=1000, prog=prog)
+  assert (ti.SWEEP, "49-56", s0) not in prog.have and (ti.SWEEP, "64-80", s0) not in prog.have
 
 
 def test_the_ladder_runs_only_the_steps_under_the_bands_cap():
-  for band in ("19-28", "60-80"):
+  for band in ("21-27", "64-80"):
     g = TiIdent()
     out, prog = drive(g, ti.LADDER, band, band_frames(ti.LADDER, band) + 20000)
     assert max(abs(v) for v in out) <= ti.LADDER_CAPS[band]
@@ -421,7 +518,7 @@ def test_the_ladder_runs_only_the_steps_under_the_bands_cap():
 
 
 def test_pulse_signs_alternate_and_each_doublet_balances():
-  out, _ = drive(TiIdent(), ti.PULSES, "31-45", SETTLE + ti.PULSE_PERIOD * 4 + 1)
+  out, _ = drive(TiIdent(), ti.PULSES, "35-41", SETTLE + ti.PULSE_PERIOD * 4 + 1)
   run = out[SETTLE:]
   firsts = [next(v for v in run[i * ti.PULSE_PERIOD:(i + 1) * ti.PULSE_PERIOD] if v != 0) for i in range(4)]
   assert [math.copysign(1, f) for f in firsts] == [1, -1, 1, -1]
@@ -437,40 +534,128 @@ def test_unknown_progress_runs_nothing():
 
 # ---- run all: the scheduler -----------------------------------------------------------------------------------------
 
-def test_schedule_order_stickiness_band_change_and_extra():
+def _pick(r, prog, window="35-41", frame=0, can_run=None):
+  return r.pick(frame, window, prog.remaining, can_run)
+
+
+def test_run_all_order_stickiness_window_change_and_unknown_progress():
   prog = Progress()
-  r = prog.remaining
   assert ti.RUN_ALL_ORDER == (ti.SWEEP, ti.PULSES, ti.LADDER)
-  assert ti.schedule(None, None, "31-45", r) == ti.SWEEP
-  prog.have[(ti.PULSES, "31-45", 0)] = 5.0
-  assert ti.schedule(ti.PULSES, "31-45", "31-45", r) == ti.PULSES      # stays on an incomplete test
-  assert ti.schedule(ti.PULSES, "19-28", "31-45", r) == ti.SWEEP       # band change: the first incomplete one
-  assert ti.schedule(ti.SWEEP, "31-45", None, r) == ti.SWEEP           # no band: keep
-  complete(prog, ti.SWEEP, "31-45")
-  assert ti.schedule(ti.SWEEP, "31-45", "31-45", r) == ti.PULSES       # complete: the next in order
-  complete(prog, ti.PULSES, "31-45")
-  complete(prog, ti.LADDER, "31-45")
-  # all complete: extra, least collected first, with hysteresis
-  assert ti.schedule(ti.LADDER, "31-45", "31-45", r) == ti.LADDER
-  prog.have[(ti.LADDER, "31-45", 2)] += 0.3 * ti.band_required(ti.LADDER, "31-45")
-  assert ti.schedule(ti.LADDER, "31-45", "31-45", r) == ti.SWEEP
-  assert ti.schedule(None, None, "31-45", lambda k, b, s: None) is None
+  r = ti.RunAll(seed=1)
+  assert _pick(r, prog) == ti.SWEEP
+  prog.have[(ti.PULSES, "35-41", 0)] = 5.0
+  r.current = ti.PULSES
+  assert _pick(r, prog) == ti.PULSES                                    # stays on an incomplete test
+  assert _pick(r, prog, "21-27") == ti.SWEEP                            # window change: the first incomplete one
+  assert r.pick(1, None, prog.remaining) == ti.SWEEP                    # nowhere: keep
+  complete(prog, ti.SWEEP, "35-41")
+  assert _pick(r, prog) == ti.PULSES                                    # complete: the next in order
+  assert ti.RunAll(seed=1).pick(0, "35-41", lambda k, b, s: None) is None
+
+
+def _all_complete(prog, window="35-41", level=200.0):
+  """Every test complete in the window, and level at `level` total seconds each (extra on step 0)."""
+  for k in ti.KEYS:
+    complete(prog, k, window)
+    have = sum(prog.have[(k, window, s_)] for s_ in range(ti.steps_in_band(k, window)))
+    prog.have[(k, window, 0)] += level - have
+
+
+def test_random_continuation_keeps_running_among_the_least_collected_and_is_seeded():
+  prog = Progress()
+  _all_complete(prog)
+  seen = set()
+  for seed in range(40):
+    ev = []
+    r = ti.RunAll(seed=seed, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
+    t = _pick(r, prog)
+    assert t in ti.KEYS and r.mode == "random" and r.draw == 1
+    assert ev[0]["tied"] == list(ti.RUN_ALL_ORDER)                      # all complete: all within TIE_S
+    seen.add(t)
+    again = ti.RunAll(seed=seed)
+    assert _pick(again, prog) == t                                      # same seed, same choice
+  assert seen == set(ti.KEYS)                                           # random: every test gets drawn
+
+
+def test_random_continuation_prefers_the_least_total_and_never_starves():
+  prog = Progress()
+  _all_complete(prog)
+  prog.have[(ti.SWEEP, "35-41", 0)] += ti.TIE_S * 3                     # sweep far ahead of the others
+  prog.have[(ti.LADDER, "35-41", 0)] += ti.TIE_S * 1.5
+  r = ti.RunAll(seed=3)
+  assert _pick(r, prog) == ti.PULSES                                    # the only one within TIE_S of the least
+  # simulate the continuation: each pick adds time to the picked test; totals stay level within TIE_S + one block
+  tot = {k: ti.window_total(k, "35-41", prog.remaining) for k in ti.KEYS}
+  r = ti.RunAll(seed=5)
+  counts = {k: 0 for k in ti.KEYS}
+  for i in range(300):
+    t = _pick(r, prog, frame=i)
+    counts[t] += 1
+    prog.have[(t, "35-41", 0)] += 4.0                                   # one block of a test: 4 s
+    r.current = t
+  totals = [ti.window_total(k, "35-41", prog.remaining) for k in ti.KEYS]
+  assert max(totals) - min(totals) < ti.TIE_S + 4.0 + 1e-6
+  assert all(c > 20 for c in counts.values())
+
+
+def test_random_choice_stays_while_the_current_test_is_within_tie_and_leaves_when_it_leads():
+  prog = Progress()
+  _all_complete(prog)
+  r = ti.RunAll(seed=2)
+  first = _pick(r, prog)
+  draws = r.draw
+  prog.have[(first, "35-41", 0)] += ti.TIE_S - 1.0
+  assert _pick(r, prog, frame=1) == first and r.draw == draws          # stays: no new draw
+  prog.have[(first, "35-41", 0)] += 2.0
+  assert _pick(r, prog, frame=2) != first and r.draw == draws + 1
+
+
+def test_picks_are_logged_and_every_random_one_is_recomputed_from_the_log():
+  prog = Progress()
+  _all_complete(prog)
+  ev = []
+  r = ti.RunAll(seed=99, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
+  for i in range(200):
+    t = _pick(r, prog, frame=i)
+    prog.have[(t, "35-41", 0)] += 5.0
+    r.current = t
+  picks = [e for e in ev if e["kind"] == "pick"]
+  assert len(picks) > 10 and all(e["seed"] == 99 and e["window"] == "35-41" for e in picks)
+  assert all(e["mode"] == "random" and set(e) >= {"test", "draw", "totals", "tied", "cands", "tie_s"} for e in picks)
+  assert ti.verify_picks(ev) == []
+  tampered = [dict(e) for e in ev]
+  tampered[3]["test"] = next(k for k in ti.KEYS if k != tampered[3]["test"])
+  assert ti.verify_picks(tampered)
+
+
+def test_required_phase_picks_are_logged_too_and_a_blocked_test_is_passed_over_after_patience():
+  prog = Progress()
+  ev = []
+  r = ti.RunAll(seed=1, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
+  blocked = {ti.SWEEP}
+  can = lambda k, w: k not in blocked
+  assert _pick(r, prog, can_run=can) == ti.PULSES                        # blocked from the start: the next that can run
+  r = ti.RunAll(seed=1, emit=lambda f, kind, **kw: ev.append(dict(kind=kind, frame=f, **kw)))
+  assert _pick(r, prog) == ti.SWEEP
+  n = int(ti.BLOCK_PATIENCE_S / ti.DT)
+  got = [_pick(r, prog, frame=i, can_run=can) for i in range(1, n + 5)]
+  assert got[0] == ti.SWEEP and got[n - 3] == ti.SWEEP and got[-1] == ti.PULSES   # patience, then passed over
+  assert [e["mode"] for e in ev if e["kind"] == "pick"][-1] == "blocked"
+  assert ev[-1]["passed_over"] == ti.SWEEP
 
 
 def _run_all(n, seed=None, frame0=0, prog=None, rows=None):
-  """The controller's run-all loop around one generator: schedule, then update."""
+  """The controller's run-all loop around one generator: pick, then update."""
   prog = prog if prog is not None else Progress()
   g = TiIdent(log=None)
   logged = []
   g.log = logged.append
-  armed, band_armed, out, keys = None, None, [], []
-  rng = random.Random(seed)
+  runner = ti.RunAll(seed=seed if seed is not None else 11, emit=g.event_for_pick)
+  out, keys = [], []
   for k in range(n):
-    row = rows[k] if rows is not None else quiet("31-45")
-    band, _ = ti.band_for(row["v_ego"], row["lkas_blocked"])
-    armed = ti.schedule(armed, band_armed, band, prog.remaining)
-    if band is not None:
-      band_armed = band
+    row = rows[k] if rows is not None else quiet("35-41")
+    profile = ti.zone_for(row["v_ego"]).profile
+    armed = runner.pick(frame0 + k, profile, prog.remaining, lambda t, w: g.can_run(t, w, prog.remaining))
     out.append(g.update(armed, frame0 + k, **row, remaining=prog.remaining))
     keys.append(g.emitted)
     prog.add(g.credit)
@@ -478,9 +663,9 @@ def _run_all(n, seed=None, frame0=0, prog=None, rows=None):
 
 
 def test_run_all_runs_the_tests_in_order_and_only_after_a_full_fade_and_quiet():
-  total = sum(band_frames(k, "31-45") for k in ti.KEYS) + 5000
+  total = sum(band_frames(k, "35-41") for k in ti.KEYS) + 5000
   g, out, keys, logged, prog = _run_all(total)
-  assert all(prog.band_done(k, "31-45") for k in ti.KEYS)
+  assert all(prog.band_done(k, "35-41") for k in ti.KEYS)
   starts = [e for e in logged if e["kind"] == "run"]
   order = []
   for e in starts:
@@ -499,7 +684,9 @@ def test_run_all_runs_the_tests_in_order_and_only_after_a_full_fade_and_quiet():
         assert i - last[1] > quiet_frames                  # at least SWITCH_QUIET_S of zero in between
       last = (k_, i)
   assert ti.reconstruct(logged, len(out)) == out
-  assert g.reason == "extra"
+  assert g.reason in ("extra", "ok")
+  assert [e for e in logged if e["kind"] == "pick" and e["mode"] == "random"]      # went on, drawing at random
+  assert ti.verify_picks(logged) == []
 
 
 def _random_rows(seed, n):
@@ -507,7 +694,7 @@ def _random_rows(seed, n):
   rows = []
   for k in range(n):
     seg = (k // 900) % 9
-    v = {0: v_for("31-45"), 1: v_for("19-28"), 2: v_for("45-60"), 3: 29.5 * MPH, 4: v_for("60-80")}.get(seg % 5)
+    v = {0: v_for("35-41"), 1: v_for("21-27"), 2: v_for("49-56"), 3: 29.5 * MPH, 4: v_for("64-80")}.get(seg % 5)
     blocked = v < 28 * MPH or (seg == 3 and k % 900 < 450) or (seg == 7 and k % 900 < 300)
     rows.append(dict(v_ego=v + rng.gauss(0, 0.05), steering_pressed=seg == 6 and k % 900 < 3,
                      driver_torque=rng.choice([-1.0, 0.0, 1.0, 4.0 if rng.random() < 0.02 else 2.0]),
@@ -521,9 +708,9 @@ def _random_rows(seed, n):
 def test_run_all_over_a_random_drive_is_one_signal_at_a_time_and_exactly_reconstructed(seed):
   rows = _random_rows(seed, 60000)
   prog = Progress()                                        # some tests already complete in some bands
-  complete(prog, ti.SWEEP, "31-45")
-  complete(prog, ti.SWEEP, "45-60")
-  complete(prog, ti.PULSES, "45-60")
+  complete(prog, ti.SWEEP, "35-41")
+  complete(prog, ti.SWEEP, "49-56")
+  complete(prog, ti.PULSES, "49-56")
   g, out, keys, logged, prog = _run_all(len(rows), rows=rows, prog=prog)
   assert len({k_ for k_ in keys if k_}) >= 2 and sum(1 for v in out if v) > 5000
   assert ti.reconstruct(logged, len(out)) == out
@@ -560,11 +747,11 @@ def test_the_logged_events_rebuild_a_single_test_exactly(key, seed):
 
 def test_pause_counters_per_test_band_and_reason():
   g = TiIdent()
-  drive(g, ti.SWEEP, "31-45", 300)
-  drive(g, ti.SWEEP, "31-45", 100, frame0=300, blinker=True)
-  drive(g, ti.SWEEP, "31-45", 100, frame0=400, v_ego=85 * MPH)
+  drive(g, ti.SWEEP, "35-41", 300)
+  drive(g, ti.SWEEP, "35-41", 100, frame0=300, blinker=True)
+  drive(g, ti.SWEEP, "35-41", 100, frame0=400, v_ego=85 * MPH)
   fb = g.frames_by(ti.SWEEP)
-  assert fb["31-45"]["regime"] == SETTLE and fb["31-45"]["blinker"] == 100 and sum(fb["none"].values()) == 100
+  assert fb["35-41"]["regime"] == SETTLE and fb["35-41"]["blinker"] == 100 and sum(fb["none"].values()) == 100
   assert 0 < g.share(ti.SWEEP) < 1 and g.share(ti.LADDER) is None
 
 
@@ -607,26 +794,26 @@ def test_progress_per_band_and_step_completion_extra_persistence_and_reset():
   params, mem = FakeParams(), FakeParams()
   acc = _accountant(params, mem)
   g = TiIdent()
-  _drive_acc(acc, g, "31-45", band_frames(ti.LADDER, "31-45") + 1200)
+  _drive_acc(acc, g, "35-41", band_frames(ti.LADDER, "35-41") + 1200)
   acc.publish(1e6, {ti.LADDER: g.reason}, wall=1e9)
   doc = json.loads(mem.store[tt.PROGRESS_KEY])
-  entry = doc["ti_ladder"]["31-45"]
+  entry = doc["ti_ladder"]["35-41"]
   assert entry["2"] >= 60.0 and entry["3"] >= 40.0 and sum(entry.values()) > 100.0      # extra counted
   assert doc["_live"]["status"]["ti_ladder"] == tt.REASON_TEXT["extra"]
-  assert all(acc.remaining(ti.LADDER, "31-45", s) <= 0 for s in range(4))
-  assert acc.remaining(ti.LADDER, "19-28", 4) == 60.0 and acc.remaining(ti.LADDER, "19-28", 0) == 0.0
+  assert all(acc.remaining(ti.LADDER, "35-41", s) <= 0 for s in range(4))
+  assert acc.remaining(ti.LADDER, "21-27", 4) == 60.0 and acc.remaining(ti.LADDER, "21-27", 0) == 0.0
   # a reboot: the flash copy carries it
   acc.publish(1e6 + 100, {}, wall=1e9)
   acc2 = tt.TestAccountant(acc.tests, params, FakeParams())
-  assert acc2.remaining(ti.LADDER, "31-45", 3) <= 0 and acc2.remaining(ti.LADDER, "45-60", 2) == 60.0
+  assert acc2.remaining(ti.LADDER, "35-41", 3) <= 0 and acc2.remaining(ti.LADDER, "49-56", 2) == 60.0
   # reset (what the UI writes)
   acc2.params_memory.store[tt.PROGRESS_KEY] = json.dumps({tt.RESET_KEY: {"ti_ladder": 7}})
-  acc2.update(TOGGLES, v_for("31-45"), True, ())          # the test is on, so the next publish runs
+  acc2.update(TOGGLES, v_for("35-41"), True, ())          # the test is on, so the next publish runs
   acc2.publish(2e6, {}, wall=1e9)
-  assert acc2.remaining(ti.LADDER, "31-45", 2) == 60.0
+  assert acc2.remaining(ti.LADDER, "35-41", 2) == 60.0
   # a broken accountant: unknown progress, so nothing runs
   acc2.failed = True
-  assert acc2.remaining(ti.LADDER, "31-45", 0) is None
+  assert acc2.remaining(ti.LADDER, "35-41", 0) is None
 
 
 def test_a_running_test_reads_active_between_credits():
@@ -638,7 +825,7 @@ def test_a_running_test_reads_active_between_credits():
   for k in range(SETTLE + 3000):
     g.update(ti.SWEEP, k, **quiet(), remaining=acc.remaining)
     active = (g.emitted,) if g.emitted and g.reason in ("ok", "extra") else ()
-    acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("31-45"), True, active,
+    acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("35-41"), True, active,
                credit=g.credit)
     if k % 200 == 199 and k > SETTLE + 200:
       acc.publish(k * ti.DT, {ti.SWEEP: g.reason}, wall=1e9)
@@ -652,7 +839,7 @@ def test_run_all_counts_every_step_test_and_publishes_the_all_block():
   for k in range(SETTLE + 1500):
     g.update(ti.SWEEP, k, **quiet(), remaining=acc.remaining)
     active = (g.emitted,) if g.emitted and g.reason in ("ok", "extra") else ()
-    acc.update(ALL, v_for("31-45"), True, active, credit=g.credit)
+    acc.update(ALL, v_for("35-41"), True, active, credit=g.credit)
   acc.publish(100.0, {ti.SWEEP: g.reason, ti.PULSES: "other", ti.LADDER: "other"},
               notes={ti.SWEEP: " · 80% captured"}, run_all=(ti.SWEEP, g.reason), wall=1e9)
   live = json.loads(acc.params_memory.store[tt.PROGRESS_KEY])["_live"]
@@ -701,7 +888,7 @@ def host(on=(), dither=False, ident=True, run_all=False):
     h.ti_ident = TiIdent()
     h.ti_ident_on = tuple(on)
     h.ti_ident_all = run_all
-    h.ti_ident_all_band = None
+    h.ti_run_all = ti.RunAll(seed=7, emit=h.ti_ident.event_for_pick)
     h.ti_ident_all_seen = False
     h.ti_ident_armed = None
     h.ti_ident_frames = {}
@@ -710,7 +897,7 @@ def host(on=(), dither=False, ident=True, run_all=False):
   return h
 
 
-def step(h, steer, *, lat_active=True, ti_allowed=True, v=v_for("31-45"), driver=-1.0, pressed=False, blinker=False,
+def step(h, steer, *, lat_active=True, ti_allowed=True, v=v_for("35-41"), driver=-1.0, pressed=False, blinker=False,
          curvature=0.0003, blocked=False):
   cc = car.CarControl.new_message(latActive=lat_active, leftBlinker=blinker)
   cc.actuators.steer = steer
@@ -736,7 +923,7 @@ def step(h, steer, *, lat_active=True, ti_allowed=True, v=v_for("31-45"), driver
 def _rows(seed, n=M.frames(60)):
   rows = M.drive(seed, n)
   for r in rows:
-    r['v'] = v_for("31-45") if r['v'] > 20 else v_for("19-28")
+    r['v'] = v_for("35-41") if r['v'] > 20 else v_for("21-27")
     r['blocked'] = r['v'] < 28 * MPH
   return rows
 
@@ -767,8 +954,8 @@ def test_the_dither_and_a_test_never_run_together():
 @pytest.mark.parametrize('seed', range(2))
 def test_armed_tests_stay_inside_the_limits_and_are_recoverable_from_logged_fields(kw, seed):
   h = host(**kw)
-  if kw.get('run_all'):                                    # sweep already complete at 31-45 mph: the scheduler moves on
-    complete(h.ti_tests.prog, ti.SWEEP, "31-45")
+  if kw.get('run_all'):                                    # sweep already complete at 35-41 mph: the scheduler moves on
+    complete(h.ti_tests.prog, ti.SWEEP, "35-41")
   saw, keys = 0, set()
   for row in _rows(seed, M.frames(240)):
     prev, shadow = h.ti_apply_steer_last, h.ti_reported_last
@@ -849,8 +1036,8 @@ def test_every_pause_reason_has_its_own_screen_text_and_stop_events_name_it():
   prog = Progress()
   for change in (dict(blinker=True), dict(curvature=0.02), dict(lat_demand=2.0), dict(base_request=500),
                  dict(v_ego=85 * MPH), dict(driver_torque=7.0)):
-    drive(g, ti.SWEEP, "31-45", 600, frame0=len(logged) * 1000 + 10 ** 5, prog=prog)
-    drive(g, ti.SWEEP, "31-45", 5, frame0=len(logged) * 1000 + 10 ** 5 + 600, prog=prog, **change)
+    drive(g, ti.SWEEP, "35-41", 600, frame0=len(logged) * 1000 + 10 ** 5, prog=prog)
+    drive(g, ti.SWEEP, "35-41", 5, frame0=len(logged) * 1000 + 10 ** 5 + 600, prog=prog, **change)
   whys = [e.get("why") for e in logged if e["kind"] == "stop"]
   assert {"blinker", "curve", "lat", "command", "band", "touch"} <= set(whys)
   assert all("step" in e for e in logged if e["kind"] == "stop")
@@ -860,50 +1047,51 @@ def test_every_pause_reason_has_its_own_screen_text_and_stop_events_name_it():
 
 def test_run_all_completion_is_per_step_not_per_band_total():
   # The fd05555 progress pattern: 20 s on every sweep step, the now-optional 0.3 Hz step included, is 140 s against
-  # 67.3 s required at 31-45 mph, yet the 0.6 Hz step (26.56 s needed) is short.
+  # 67.3 s required at 35-41 mph, yet the 0.6 Hz step (26.56 s needed) is short.
   prog = Progress()
   for s_ in range(7):
-    prog.have[(ti.SWEEP, "31-45", s_)] = 20.0
-  assert ti.band_share(ti.SWEEP, "31-45", prog.remaining, clip=False) > 1.0
-  assert ti.band_share(ti.SWEEP, "31-45", prog.remaining) < 1.0
-  assert ti.schedule(None, None, "31-45", prog.remaining) == ti.SWEEP
-  assert ti.schedule(ti.SWEEP, "31-45", "31-45", prog.remaining) == ti.SWEEP
+    prog.have[(ti.SWEEP, "35-41", s_)] = 20.0
+  assert ti.band_share(ti.SWEEP, "35-41", prog.remaining, clip=False) > 1.0
+  assert ti.band_share(ti.SWEEP, "35-41", prog.remaining) < 1.0
+  r = ti.RunAll(seed=1)
+  assert _pick(r, prog) == ti.SWEEP
+  assert _pick(r, prog) == ti.SWEEP
   # and the generator goes to the short step
   g = TiIdent()
-  drive(g, ti.SWEEP, "31-45", SETTLE + 5, prog=prog)
+  drive(g, ti.SWEEP, "35-41", SETTLE + 5, prog=prog)
   assert g.step == 1 and not g.extra
 
 
 def test_progress_from_another_signal_table_is_kept_aside_and_does_not_count():
   mem, flash = FakeParams(), FakeParams()
-  old = {"ti_sweep": {"31-45": {str(k): 20.0 for k in range(7)}, "45-60": {str(k): 20.0 for k in range(7)}},
+  old = {"ti_sweep": {"35-41": {str(k): 20.0 for k in range(7)}, "49-56": {str(k): 20.0 for k in range(7)}},
          "ti_dither": {"43-50": 120.0}}
   flash.store[tt.PROGRESS_KEY] = json.dumps(old)              # what fd05555 left (no table recorded)
   acc = _accountant(flash, mem)
-  assert acc.remaining(ti.SWEEP, "31-45", 1) == ti.required_seconds(ti.SWEEP, "31-45", 1)   # starts from zero
-  acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("31-45"), True, (),
-             credit=(ti.SWEEP, "31-45", 1, 3.32))
+  assert acc.remaining(ti.SWEEP, "35-41", 1) == ti.required_seconds(ti.SWEEP, "35-41", 1)   # starts from zero
+  acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("35-41"), True, (),
+             credit=(ti.SWEEP, "35-41", 1, 3.32))
   acc.publish(1.0, {}, wall=1e9)
   doc = json.loads(mem.store[tt.PROGRESS_KEY])
   assert doc["ti_sweep~old"] == old["ti_sweep"]                # kept, under its own key
-  assert doc["ti_sweep"]["_table"] == ti.SIGNAL_HASH[ti.SWEEP] and doc["ti_sweep"]["31-45"] == {"1": 3.32}
+  assert doc["ti_sweep"]["_table"] == ti.SIGNAL_HASH[ti.SWEEP] and doc["ti_sweep"]["35-41"] == {"1": 3.32}
   assert doc["ti_dither"] == {"43-50": 120.0}                  # the dither's record is untouched
   # a later table change moves this one aside too, under its hash
   doc["ti_sweep"]["_table"] = "0123456789ab"
   mem.store[tt.PROGRESS_KEY] = json.dumps(doc)
   acc2 = tt.TestAccountant(acc.tests, flash, mem)
-  assert acc2.remaining(ti.SWEEP, "31-45", 1) == ti.required_seconds(ti.SWEEP, "31-45", 1)
-  acc2.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("31-45"), True, ())
+  assert acc2.remaining(ti.SWEEP, "35-41", 1) == ti.required_seconds(ti.SWEEP, "35-41", 1)
+  acc2.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("35-41"), True, ())
   acc2.publish(2.0, {}, wall=1e9)
   doc2 = json.loads(mem.store[tt.PROGRESS_KEY])
-  assert doc2["ti_sweep~0123456789ab"]["31-45"] == {"1": 3.32} and doc2["ti_sweep~old"] == old["ti_sweep"]
+  assert doc2["ti_sweep~0123456789ab"]["35-41"] == {"1": 3.32} and doc2["ti_sweep~old"] == old["ti_sweep"]
   # the same table survives a reboot as it is
   flash.store[tt.PROGRESS_KEY] = json.dumps({k: v for k, v in doc.items() if not k.startswith("_")})
   flash_doc = json.loads(flash.store[tt.PROGRESS_KEY])
   flash_doc["ti_sweep"]["_table"] = ti.SIGNAL_HASH[ti.SWEEP]
   flash.store[tt.PROGRESS_KEY] = json.dumps(flash_doc)
   acc3 = tt.TestAccountant(acc.tests, flash, FakeParams())
-  assert acc3.remaining(ti.SWEEP, "31-45", 1) == pytest.approx(ti.required_seconds(ti.SWEEP, "31-45", 1) - 3.32)
+  assert acc3.remaining(ti.SWEEP, "35-41", 1) == pytest.approx(ti.required_seconds(ti.SWEEP, "35-41", 1) - 3.32)
 
 
 def _transition_sums(key, band):
@@ -918,7 +1106,7 @@ def _transition_sums(key, band):
   return np.array(out, dtype=float), logged
 
 
-@pytest.mark.parametrize('band', ["31-45", "19-28"])
+@pytest.mark.parametrize('band', ["35-41", "21-27"])
 @pytest.mark.parametrize('key', [ti.SWEEP, ti.LADDER])
 def test_extra_mode_long_run_mean_and_heading_stay_near_zero(key, band):
   out, logged = _transition_sums(key, band)
@@ -934,7 +1122,7 @@ def test_extra_mode_long_run_mean_and_heading_stay_near_zero(key, band):
 
 
 def test_extra_dwells_several_units_per_step():
-  _, logged = _transition_sums(ti.SWEEP, "45-60")
+  _, logged = _transition_sums(ti.SWEEP, "49-56")
   per_run = []
   units = 0
   for e in logged:
@@ -959,3 +1147,226 @@ def test_the_dither_waits_for_a_running_test_to_end():
   first_dither = next(i for i, r in enumerate(rows) if r['dither'] != 0)
   last_test = max(i for i, r in enumerate(rows) if r['emitted'])
   assert first_dither > last_test                              # the dither starts only after the test has ended
+
+
+# ---- revision 3: window limits, re-arm dwell, gate readout, targets, credit events -------------------------------------
+
+def test_no_amplitude_cap_or_limit_was_raised_in_revision_3():
+  assert ti.LADDER_CAPS == {"21-27": 55.0, "35-41": 37.0, "49-56": 37.0, "64-80": 37.0}
+  assert ti.PULSE_AMPS == (22.0, 44.0) and max(a for _, a in ti.SWEEP_TONES) == 22.0
+  assert ti.LADDER_LOW_BAND_CAP == 55.0 and ti.MAX_SLEW == 3.0
+  assert ti.COMMAND_LIMIT_FRACTION == {w[2]: (0.5, 0.75) for w in ti.WINDOWS}      # the previous revision's 300 / 450
+  assert (ti.MAX_CURVATURE, ti.MAX_CURVATURE_SMALL, ti.MAX_LAT_DEMAND, ti.MAX_LAT_DEMAND_SMALL) == (0.004, 0.01, 1.0, 1.5)
+  assert (ti.TOUCH_HOLDOFF_S, ti.TOUCH_HOLDOFF_SMALL_S, ti.BLINKER_HOLDOFF_S) == (3.0, 1.5, 3.0)
+  assert ti.REGIME_SETTLE_S == 1.0 and ti.RATE_ROOM_FACTOR == 2
+
+
+@pytest.mark.parametrize('window', [w[2] for w in ti.WINDOWS])
+def test_the_command_limit_is_per_window_and_per_step_size(window, monkeypatch):
+  step_small, step_big = 1, 3                               # ladder 11 counts and 37 counts
+  g = TiIdent()
+  assert g.limit_bounds(ti.LADDER, step_big, window, 600)["command"] == 300
+  assert g.limit_bounds(ti.LADDER, step_small, window, 600)["command"] == 450
+  monkeypatch.setitem(ti.COMMAND_LIMIT_FRACTION, window, (0.4, 0.6))     # the one place to change it for one window
+  assert g.limit_bounds(ti.LADDER, step_big, window, 600)["command"] == 240
+  other = next(w[2] for w in ti.WINDOWS if w[2] != window)
+  assert g.limit_bounds(ti.LADDER, step_big, other, 600)["command"] == 300
+
+
+def test_every_limit_still_closes_the_gate_and_reports_its_value_against_the_limit():
+  for key, step, over, reason, value, limit in (
+      (ti.LADDER, 3, dict(base_request=301), "command", 301, 300),
+      (ti.SWEEP, 1, dict(curvature=0.011), "curve", 0.011, 0.01),
+      (ti.LADDER, 3, dict(curvature=0.005), "curve", 0.005, 0.004),
+      (ti.SWEEP, 1, dict(lat_demand=1.6), "lat", 1.6, 1.5),
+      (ti.LADDER, 3, dict(lat_demand=1.1), "lat", 1.1, 1.0)):
+    g, k, prog = _running(key, "35-41", step_to=step)
+    g.update(key, k, **quiet("35-41", **over), remaining=prog.remaining)
+    assert g.reason == reason and g.fading, (reason, g.reason)
+    assert g.gate["value"] == pytest.approx(value, rel=1e-3) and g.gate["limit"] == pytest.approx(limit, rel=1e-3)
+    assert g.gate["window"] == "35-41" and g.gate["what"] and g.gate["unit"]
+    out = [g.update(key, k + 1 + i, **quiet("35-41", **over), remaining=prog.remaining) for i in range(400)]
+    if ti.small(key, step):
+      assert out[-1] == 0 and not g.running             # fades out, then nothing
+    else:
+      assert max(abs(v) for v in out[ti.fade_frames(key, step) + 1:]) <= ti.SMALL_AMP   # only small steps go on
+    assert max(abs(b - a) for a, b in zip(out, out[1:])) <= ti.MAX_SLEW + 1
+
+
+def _chatter(over_counts, period, n, window="21-27"):
+  """The ladder 55 step at base commands hovering at the 300 limit: `period` frames alternately above and below."""
+  logged = []
+  g = TiIdent(log=logged.append)
+  prog = Progress()
+  complete(prog, ti.LADDER, window, range(4))
+  out = []
+  for k in range(n):
+    base = 280 + (over_counts if (k // period) % 2 else 0)
+    out.append(g.update(ti.LADDER, k, **quiet(window, base_request=base), remaining=prog.remaining))
+    prog.add(g.credit)
+  return g, out, logged
+
+
+def test_a_command_hovering_at_the_limit_does_not_start_and_cut_units_over_and_over():
+  # 9 frames (0.09 s) above 300, 9 below: with the dwell no unit ever starts (before, one started every time it dipped)
+  g, out, logged = _chatter(30, 9, 3000)
+  assert [e for e in logged if e["kind"] in ("run", "chunk") and e["amp"] > ti.SMALL_AMP] == []   # no 55-count unit
+  assert [e for e in logged if e["kind"] == "stop" and e["why"] == "command"] == []              # and none cut by it
+  assert max(abs(v) for v in out) <= ti.SMALL_AMP
+  assert g.gate_last is not None and g.gate_last[1]["reason"] == "command"      # the screen still says why
+
+
+def test_the_gate_rearms_after_the_dwell_and_cuts_stay_immediate():
+  logged = []
+  g = TiIdent(log=logged.append)
+  prog = Progress()
+  complete(prog, ti.LADDER, "21-27", range(4))
+  base = 350
+  for k in range(1500):
+    if k == 400:
+      base = 250                                           # the command comes down for good
+    if k == 1000:
+      base = 360                                           # and goes over again
+    g.update(ti.LADDER, k, **quiet("21-27", base_request=base), remaining=prog.remaining)
+  first = next(e["frame"] for e in logged if e["kind"] in ("run", "chunk") and e["amp"] == 55.0)
+  dwell = int(round(ti.REARM_S / ti.DT))
+  unit = ti.step_params(ti.LADDER, 0)[2]                    # a small extra unit under way finishes first (no dead time)
+  assert 400 + dwell <= first <= 400 + dwell + unit + ti.fade_frames(ti.LADDER, 0) + ti.LADDER_LEAD_IN
+  stop = next(e for e in logged if e["kind"] == "stop" and e["frame"] >= 1000)
+  assert stop["frame"] == 1000 and stop["why"] == "command"                       # the cut is at once
+
+
+def test_a_unit_cut_in_its_lead_in_fades_only_what_had_come_in():
+  g = TiIdent()
+  prog = Progress()
+  complete(prog, ti.LADDER, "21-27", range(4))
+  k = 0
+  while not g.running:
+    g.update(ti.LADDER, k, **quiet("21-27"), remaining=prog.remaining)
+    k += 1
+  for _ in range(20):                                       # 20 frames into a 100-frame lead-in
+    g.update(ti.LADDER, k, **quiet("21-27"), remaining=prog.remaining)
+    k += 1
+  env = g.env
+  assert 0 < env < 0.3
+  g.update(ti.LADDER, k, **quiet("21-27", base_request=400), remaining=prog.remaining)
+  n = 0
+  while g.running and n < 1000:
+    n += 1
+    k += 1
+    g.update(ti.LADDER, k, **quiet("21-27", base_request=400), remaining=prog.remaining)
+  assert n <= int(env * ti.fade_frames(ti.LADDER, 4)) + 3                      # only the remaining envelope fades
+
+
+def test_run_all_passes_over_a_test_blocked_only_by_a_limit_and_keeps_a_signal_running():
+  prog = Progress()
+  complete(prog, ti.SWEEP, "21-27")
+  complete(prog, ti.PULSES, "21-27")                        # only the ladder is left: its 55-count step is closed
+  g = TiIdent()
+  r = ti.RunAll(seed=4, emit=g.event_for_pick)
+  outs = []
+  for k in range(4000):                                     # the base command sits above 300 the whole time
+    armed = r.pick(k, "21-27", prog.remaining, lambda t, w: g.can_run(t, w, prog.remaining))
+    outs.append(g.update(armed, k, **quiet("21-27", base_request=330), remaining=prog.remaining))
+    prog.add(g.credit)
+  assert sum(1 for v in outs if v) > 2000                   # the small steps of the same test keep it busy
+  assert max(abs(v) for v in outs) <= 22
+  assert all(e["amp"] <= 22 for e in g.events if e["kind"] in ("run", "chunk"))
+
+
+def test_a_blocked_big_step_does_not_stall_the_test_while_a_small_step_may_run():
+  prog = Progress()
+  g = TiIdent()
+  out = [g.update(ti.LADDER, k, **quiet("21-27", base_request=330), remaining=prog.remaining) for k in range(3000)]
+  assert sum(1 for v in out if v) > 1500 and max(abs(v) for v in out) <= 22
+
+
+def test_credit_events_carry_a_progress_snapshot_for_the_analysis():
+  logged = []
+  g = TiIdent(log=logged.append)
+  prog = Progress()
+  for k in range(6000):
+    g.update(ti.SWEEP, k, **quiet("35-41"), remaining=prog.remaining)
+    prog.add(g.credit)
+  credits = [e for e in logged if e["kind"] == "credit"]
+  assert credits
+  c = credits[0]
+  assert set(c) >= {"test", "band", "step", "s", "left", "frame"} and c["band"] == "35-41"
+  assert c["left"] == pytest.approx(ti.required_seconds(ti.SWEEP, "35-41", c["step"]) - c["s"], abs=0.01)
+  assert ti.reconstruct(logged, 6000)
+
+
+def test_target_window_least_speed_change_then_most_outstanding_and_how_much_is_left():
+  prog = Progress()
+  r = prog.remaining
+  w, secs, cells, dist = ti.target_window(52.0, r)
+  assert (w, dist) == ("49-56", 0.0) and cells > 0 and secs > 0                 # inside: the window itself
+  assert ti.target_window(30.0, r)[0] == "21-27" and ti.target_window(33.0, r)[0] == "35-41"
+  assert ti.window_target_mph("21-27") == 24 and ti.window_target_mph("35-41") == 38
+  assert ti.window_target_mph("49-56") == 52 and ti.window_target_mph("64-80") == 72
+  # 60 mph is 4 mph above 49-56 and 4 below 64-80: the one with more outstanding wins the tie
+  prog.have[(ti.SWEEP, "64-80", 1)] = 13.0
+  assert ti.target_window(60.0, r)[0] == "49-56"
+  for k in ti.KEYS:
+    complete(prog, k, "49-56")
+  assert ti.target_window(52.0, r)[0] != "49-56"                                  # complete windows are not targets
+  for w_ in ("21-27", "35-41", "64-80"):
+    for k in ti.KEYS:
+      complete(prog, k, w_)
+  assert ti.target_window(52.0, r) is None
+  assert ti.target_window(52.0, lambda k, b, s: None) is None
+  one = ti.target_window(24.0, Progress().remaining, keys=(ti.PULSES,))
+  assert one[0] == "21-27" and one[2] == 1                                        # pulses: one required cell at 21-27
+
+
+def test_revision_2_progress_is_moved_aside_and_the_new_windows_start_empty():
+  # What the installed build (526c88c, generator 5) keeps: bands 19-28 ... 60-80, signal hash without the windows
+  rev2_hash = "r2sweep00000"
+  old = {"ti_sweep": {"_table": rev2_hash, "19-28": {"1": 30.0}, "31-45": {"1": 26.56}, "60-80": {"6": 4.0}},
+         "ti_sweep~old": {"19-28": {"0": 20.0}}, "ti_dither": {"43-50": 120.0}}
+  mem, flash = FakeParams(), FakeParams()
+  flash.store[tt.PROGRESS_KEY] = json.dumps(old)
+  acc = _accountant(flash, mem)
+  for w in ("21-27", "35-41", "49-56", "64-80"):
+    assert acc.remaining(ti.SWEEP, w, 1) == ti.required_seconds(ti.SWEEP, w, 1)       # nothing carried over
+  acc.update(NS(**{**vars(TOGGLES), 'ti_ladder': False, 'ti_sweep': True}), v_for("35-41"), True, (),
+             credit=(ti.SWEEP, "35-41", 1, 3.32))
+  acc.publish(1.0, {}, wall=1e9)
+  doc = json.loads(mem.store[tt.PROGRESS_KEY])
+  assert doc[f"ti_sweep~{rev2_hash}"] == {k: v for k, v in old["ti_sweep"].items() if k != "_table"} | {"_table": rev2_hash}
+  assert doc["ti_sweep~old"] == old["ti_sweep~old"]                    # the earlier aside is untouched
+  assert doc["ti_dither"] == old["ti_dither"]
+  assert doc["ti_sweep"]["35-41"] == {"1": 3.32} and set(doc["ti_sweep"]) == {"_table", "35-41"}
+  # the signal hash changed with the windows, so any record collected under the old windows is set aside
+  import hashlib
+  old_signal = ["zero-heading phase, sign alternating per run", ti._table(ti.SWEEP)]
+  assert hashlib.sha1(json.dumps(old_signal, sort_keys=True).encode()).hexdigest()[:12] != ti.SIGNAL_HASH[ti.SWEEP]
+
+
+def test_the_gate_block_is_published_once_a_second_for_the_screen_and_cleared_after():
+  publish = _controller_method('publish_ti_gate')
+  mem = FakeParams()
+  puts = []
+  mem.put = lambda k, v: puts.append((k, json.loads(v)))
+  g = TiIdent()
+  prog = Progress()
+  complete(prog, ti.LADDER, "21-27", range(4))
+  h = NS(ti_ident=g, ti_tests=object(), ti_ident_armed=ti.LADDER, params_memory=mem, ti_gate_published=None)
+  env = dict(self=h, json=json, time=__import__("time"))
+  fn = publish
+  fn.__globals__.update(json=json, time=__import__("time"))
+  for k in range(150):
+    g.update(ti.LADDER, k, **quiet("21-27", base_request=330), remaining=lambda a, b, c: 0.0 if (a, b, c) != (ti.LADDER, "21-27", 4) else 60.0)
+  fn(h)
+  assert puts and puts[-1][0] == "TiTestGate"
+  blk = puts[-1][1]
+  assert blk["reason"] == "command" and blk["value"] == 330 and blk["limit"] == 300 and blk["window"] == "21-27"
+  assert blk["test"] == ti.LADDER and blk["t"] > 0
+  # the limit no longer closes anything: one clearing block, then nothing more
+  for k in range(150, 400):
+    g.update(ti.LADDER, k, **quiet("21-27", base_request=100), remaining=lambda a, b, c: 0.0)
+  fn(h)
+  assert set(puts[-1][1]) == {"t"}
+  n = len(puts)
+  fn(h)
+  assert len(puts) == n
