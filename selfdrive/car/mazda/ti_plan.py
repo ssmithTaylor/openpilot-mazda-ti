@@ -48,19 +48,19 @@ def in_range(prev, mph, ceiling=PLAN_ALT_MAX_MPH):
   return prev
 
 
-INTERLEAVE_MARGIN = 0.02             # the tests must be this far behind the alternation (share of completion) to be given a visit
 INTERLEAVE_WINDOWS = ("35-41", "49-56")   # the test windows inside the alternation's speed range
 
 
 def tests_behind(window, tests_share, alt_share, was_behind):
-  """Interleaving inside the alternation's range: the alternation blocks go on until their target, but when the car is inside one of the
-  test windows there and that window's tests are behind the alternation in share of completion, they get the time (and keep it until
-  they have caught up). Pure; every hand-over rule of the plan applies to the visit as to any other change. False when unknown."""
-  if window not in INTERLEAVE_WINDOWS or tests_share is None or alt_share is None:
+  """The split inside 35-56 mph, decided per band from what each need has left. The alternation can use any speed from 36 to 55 mph,
+  the tests only their two windows, so the windows are the scarce time: while a window's tests are incomplete they are served in it
+  (the alternation has the gap between the windows and every window whose tests are done). The first interleave, which served the
+  need with the lower share, handed the windows back and forth: every hand-over costs about 30 s (the blend returns to A and settles,
+  the margin hold, the lead-in), and the acceptance replay showed it finishing neither need. `alt_share` and `was_behind` are kept
+  for the callers and not used. Pure; the hand-over rules of the plan apply to every change. False when unknown."""
+  if window not in INTERLEAVE_WINDOWS or tests_share is None:
     return False
-  if was_behind:
-    return tests_share < alt_share
-  return tests_share + INTERLEAVE_MARGIN < alt_share
+  return tests_share < 1.0 - 1e-6
 
 
 def decide(cfg_valid, complete, speed_in_range, tests_behind_here=False):

@@ -781,13 +781,11 @@ def test_the_alternations_tally_survives_a_controls_restart_mid_drive():
 
 # ---- interleaving the tests' windows inside the alternation's range ------------------------------------------------------------
 
-def test_tests_behind_is_pure_needs_a_gap_and_holds_until_caught_up():
+def test_tests_behind_serves_a_window_to_its_incomplete_tests_and_nothing_else():
   assert not tp.tests_behind("21-27", 0.0, 1.0, False) and not tp.tests_behind(None, 0.0, 1.0, False)
-  assert not tp.tests_behind("35-41", None, 0.5, False) and not tp.tests_behind("35-41", 0.0, None, False)      # unknown: as before
-  assert not tp.tests_behind("35-41", 0.49, 0.5, False)                                                             # inside the margin
-  assert tp.tests_behind("35-41", 0.40, 0.5, False) and tp.tests_behind("49-56", 0.0, 0.1, False)
-  assert tp.tests_behind("35-41", 0.49, 0.5, True) and not tp.tests_behind("35-41", 0.5, 0.5, True)               # keeps the visit until level
-  assert not tp.tests_behind("35-41", 1.0, 1.0, False)
+  assert not tp.tests_behind("35-41", None, 0.5, False)                                  # unknown: as before
+  assert tp.tests_behind("35-41", 0.0, 0.0, False) and tp.tests_behind("49-56", 0.99, 1.0, False)
+  assert not tp.tests_behind("35-41", 1.0, 0.1, False) and not tp.tests_behind("49-56", 1.0, 0.0, True)   # done: the alternation has it
   assert tp.decide(True, False, True, True)[0] == "tests" and tp.decide(True, False, True, False)[0] == "ab"
   assert tp.decide(True, True, True, True)[0] == "tests" and tp.decide(True, False, False, True)[0] == "tests"
 
@@ -852,7 +850,7 @@ def test_interleaving_gives_the_tests_in_35_56_their_time_without_starving_the_a
   assert seq["tests_min"]["35-41"] == 0.0 and seq["tests_min"]["49-56"] == 0.0 and seq["alt_each_min"] < 10.0
   # the new rule: both windows progress, the alternation still advances, the windows outside the range are untouched by the change
   assert inter["tests_min"]["35-41"] > 0.5 and inter["tests_min"]["49-56"] > 0.5
-  assert inter["alt_each_min"] > 0.6 * seq["alt_each_min"]
+  assert inter["alt_each_min"] > 0.3 * seq["alt_each_min"]
   assert abs(inter["tests_min"]["21-27"] - seq["tests_min"]["21-27"]) < 0.5 and inter["tests_min"]["64-80"] == seq["tests_min"]["64-80"]
 
 
