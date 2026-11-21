@@ -11,13 +11,21 @@ Signal. Each test is a table of STEPS. A step is captured in CHUNKS: a whole num
 pulse period (pulses). A chunk counts only when every one of its frames was clean (gate open, full amplitude, one
 speed band); a paused chunk is repeated, nothing else is. The step to run is chosen at every chunk start: the first
 step of the table that is not complete IN THE BAND THE CAR IS IN NOW (so mixed-speed driving fills every band, and a
-completed step is never repeated). Tone and amplitude changes happen at a zero of the waveform, so a chunk follows
-the previous one with no gap. After a pause the test resumes at once: sweep and ladder with a short raised-cosine
-lead-in (LEAD_IN_S) into a fresh chunk, pulses with the next pulse (a pulse starts at zero and ramps anyway).
+completed step is never repeated). Chunks of the same step follow each other with no gap; between two steps of the
+sweep or ladder the old tone fades out and the new one fades in (about 0.5-2 s); pulses follow at once.
 
-Gate (all must hold, else the signal fades out in FADE_OUT_S; a driver touch or too little rate room zero it at
-once; after a touch or a blinker it stays off for HOLDOFF_S). Touch, blinker, hold-off, base-request, lateral-demand
-and rate-room rules are the dither's (ti_dither constants). Added for these tests:
+Heading. Each sweep and ladder tone starts at the phase (PHASES) that makes the heading it produces zero-mean over a
+chunk, its lead-in included, so the car does not drift sideways (a sine from zero gives a one-sided heading and a
+steady drift); each period has an even number of frames, so a chunk still sums to exactly zero. Pulse doublets
+alternate sign, so each pair leaves no heading.
+
+Gate. A driver touch (steeringPressed, |driver torque| >= 6 counts, or >= 4 counts for 3 frames) or too little rate
+room cut the signal to zero AT ONCE; after a touch or a blinker it stays off for HOLDOFF_S. Everything else that
+closes the gate FADES the signal out: blinker or lane change, hold-off, a bend, a large command, leaving the speed
+band, a steering-mode change, the band complete, and the toggle switched off. A fade lasts fade_frames(step): long
+enough that the signal never changes by more than MAX_SLEW counts per frame (0.25 s for the small steps, up to
+about 0.4 s for the 55-count ladder step); a pulse in progress finishes its doublet instead. Touch, blinker, hold-off,
+base-request, lateral-demand and rate-room rules are the dither's (ti_dither constants). Added for these tests:
   - the speed is inside one of BANDS (19-28, 31-45, 45-60, 60-80 mph);
   - the steering regime is the band's: below 28 mph the EPS blocks the stock lane-keep path and the TI steers alone
     (LKAS_BLOCK set); from 31 mph both paths steer (LKAS_BLOCK clear). The regime must have been unchanged for
@@ -41,7 +49,7 @@ from openpilot.selfdrive.car.mazda.ti_dither import (DRIVER_FIRM_COUNTS, DRIVER_
                                                      MAX_BASE_FRACTION, MAX_LAT_DEMAND_MPS2, RATE_ROOM_FACTOR,
                                                      TOUCH_CONFIRM_FRAMES)
 
-VERSION = 1
+VERSION = 2
 DT = 0.01
 MS_TO_MPH = 1.0 / 0.44704
 
@@ -57,24 +65,26 @@ BANDS = ((19.0, 28.0, "19-28", True), (31.0, 45.0, "31-45", False), (45.0, 60.0,
 
 MAX_CURVATURE = 0.004       # 1/m: radius 250 m or more
 REGIME_SETTLE_S = 3.0
-MAX_SLEW = 3.0              # counts per frame, lead-in included: half of the default TI_STEER_DELTA_UP (6)
+MAX_SLEW = 3.0              # counts per frame, lead-in and fades included: half of the default TI_STEER_DELTA_UP (6)
 
-# Sweep: one tone per step, (Hz, peak TI counts). 10 s chunks (a whole number of cycles of every tone), 2 per step.
-# Amplitudes in the dither's class (its preset 1 peaks at 22 counts, 12 at its 1.1 Hz tone); the high tones are
-# reduced so the slew stays under MAX_SLEW.
-SWEEP_TONES = ((0.3, 12.0), (0.6, 12.0), (1.0, 16.0), (1.6, 16.0), (2.4, 16.0), (3.5, 12.0), (5.0, 9.0))
-SWEEP_CHUNK = 1000
+# Sweep: one tone per step, (period in frames, even; peak TI counts; periods per 10 s chunk). 0.30, 0.60, 1.0, 1.6,
+# 2.4, 3.6 and 5.0 Hz. 2 chunks per step. Amplitudes in the dither's class (its preset 1 peaks at 22 counts, 12 at its
+# 1.1 Hz tone); the high tones are reduced so the slew stays under MAX_SLEW.
+SWEEP_TONES = ((334, 12.0, 3), (166, 12.0, 6), (100, 16.0, 10), (62, 16.0, 16), (42, 16.0, 24), (28, 12.0, 36),
+               (20, 9.0, 50))
 SWEEP_LEAD_IN = 50
 
-# Ladder: one frequency, stepped amplitudes (TI counts; 1 count ~ 0.0544 EPS sensor counts): 0.3 to 5.0 sensor counts,
-# from below the 1.2 sc at which the dither already moved the wheel to above the rack's friction (2.5-4 sc). 0.4 Hz
-# keeps the 92-count step under MAX_SLEW. 5 s chunks (2 cycles), 2 per step. Per band only the steps up to the band's
-# cap run (LADDER_CAPS: TI counts by band label). Worst case of the 92-count step in the 19-28 mph band, from the held
-# upper bound (6.4 deg of wheel per 100 counts at 16 mph; ratio 15.5, wheelbase 2.7 m, no understeer, no controller
-# correction): 5.9 deg of wheel; 0.18 m/s^2 and 2.8 cm sideways at 19 mph, 0.39 m/s^2 and 6.1 cm at 28 mph.
-LADDER_FREQ = 0.4
+# Ladder: one frequency (0.4 Hz, a 250-frame period), stepped amplitudes (TI counts; 1 count ~ 0.0544 EPS sensor
+# counts): 0.3 to 5.0 sensor counts, from below the 1.2 sc at which the dither already moved the wheel to above the
+# rack's friction (2.5-4 sc). 5 s chunks (2 periods), 2 per step. Per band only the steps up to the band's cap run.
+# The 19-28 mph cap is 55 counts until a drive has shown the measured wheel angle at 37 and 55 counts and no 0x25
+# fault; LADDER_LOW_BAND_FULL_CAP (92) then brings back the 74- and 92-count steps (and the ti_tests.json steps for
+# that band go from 5 to 7).
+LADDER_PERIOD = 250
 LADDER_AMPS = (6.0, 11.0, 22.0, 37.0, 55.0, 74.0, 92.0)
-LADDER_CAPS = {"19-28": 92.0, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
+LADDER_LOW_BAND_CAP = 55.0
+LADDER_LOW_BAND_FULL_CAP = 92.0
+LADDER_CAPS = {"19-28": LADDER_LOW_BAND_CAP, "31-45": 37.0, "45-60": 37.0, "60-80": 37.0}
 LADDER_CHUNK = 500
 LADDER_LEAD_IN = 100
 
@@ -86,19 +96,20 @@ PULSE_RAMP = 2.75
 PULSE_FLAT = 10
 
 STEP_SECONDS = {SWEEP: 20.0, LADDER: 10.0, PULSES: 40.0}
+CHUNKS_PER_STEP = {SWEEP: 2, LADDER: 2, PULSES: 20}
 
 
 def _table(key):
   if key == SWEEP:
-    return {"tones": SWEEP_TONES, "chunk": SWEEP_CHUNK, "lead_in": SWEEP_LEAD_IN}
+    return {"tones": SWEEP_TONES, "lead_in": SWEEP_LEAD_IN}
   if key == LADDER:
-    return {"freq": LADDER_FREQ, "amps": LADDER_AMPS, "caps": LADDER_CAPS, "chunk": LADDER_CHUNK,
+    return {"period": LADDER_PERIOD, "amps": LADDER_AMPS, "caps": LADDER_CAPS, "chunk": LADDER_CHUNK,
             "lead_in": LADDER_LEAD_IN}
   return {"amps": PULSE_AMPS, "period": PULSE_PERIOD, "ramp": PULSE_RAMP, "flat": PULSE_FLAT}
 
 
-TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), STEP_SECONDS[k], BANDS], sort_keys=True).encode())
-              .hexdigest()[:12] for k in KEYS}
+TABLE_HASH = {k: hashlib.sha1(json.dumps([VERSION, _table(k), STEP_SECONDS[k], CHUNKS_PER_STEP[k], BANDS, MAX_SLEW],
+                                         sort_keys=True).encode()).hexdigest()[:12] for k in KEYS}
 
 
 def n_steps(key):
@@ -113,13 +124,36 @@ def steps_in_band(key, label):
 
 
 def step_params(key, step):
-  """(frequency Hz or None, peak counts, chunk frames, lead-in frames)."""
+  """(period frames or None for pulses, peak counts, chunk frames, lead-in frames)."""
   if key == SWEEP:
-    f, a = SWEEP_TONES[step]
-    return f, a, SWEEP_CHUNK, SWEEP_LEAD_IN
+    p, a, cycles = SWEEP_TONES[step]
+    return p, a, p * cycles, SWEEP_LEAD_IN
   if key == LADDER:
-    return LADDER_FREQ, LADDER_AMPS[step], LADDER_CHUNK, LADDER_LEAD_IN
+    return LADDER_PERIOD, LADDER_AMPS[step], LADDER_CHUNK, LADDER_LEAD_IN
   return None, PULSE_AMPS[step], PULSE_PERIOD, 0
+
+
+def freq(key, step):
+  p = step_params(key, step)[0]
+  return None if p is None else 1.0 / (p * DT)
+
+
+def gain(env):
+  return 0.5 - 0.5 * math.cos(math.pi * env)
+
+
+def fade_frames(key, step):
+  """Frames of a fade-out: at least FADE_OUT_S, and long enough that the raised-cosine fade of the tone never moves the
+  signal by more than MAX_SLEW counts per frame (bound: A * DT * sqrt((pi / 2F)^2 + w^2) <= MAX_SLEW, with 10 %
+  margin). Pulses do not fade: a doublet in progress finishes, see TiIdent."""
+  p, a, _, _ = step_params(key, step)
+  base = int(round(FADE_OUT_S / DT))
+  if p is None:
+    return base
+  w = 2.0 * math.pi / (p * DT)
+  room = (MAX_SLEW / (a * DT)) ** 2 - w ** 2
+  need = math.pi / (2.0 * math.sqrt(room)) / DT * 1.1
+  return max(base, int(math.ceil(need)))
 
 
 def doublet(amp):
@@ -132,20 +166,44 @@ def doublet(amp):
 _DOUBLETS = {a: doublet(a) for a in PULSE_AMPS}
 
 
+def _tone(p, a, phi, ph):
+  """a * sin(2 pi ph / p + phi), built so that the second half of every period is the exact negative of the first
+  (each period, and so each chunk, sums to exactly zero after rounding)."""
+  j = ph % p
+  half = p // 2
+  if j >= half:
+    return -a * math.sin(2.0 * math.pi * (j - half) / p + phi)
+  return a * math.sin(2.0 * math.pi * j / p + phi)
+
+
+def _zero_heading_phase(key, step):
+  """The tone's starting phase that makes the heading it produces zero-mean over a chunk, the lead-in included: the
+  heading is the running sum of the signal, and its chunk mean is linear in (cos phi, sin phi), so phi follows from
+  two sums. A sine from zero (phi = 0) would give a one-sided heading and a steady sideways drift."""
+  p, a, n, lead = step_params(key, step)
+  sums = []
+  for phi in (0.0, math.pi / 2):
+    heading, total = 0.0, 0.0
+    for ph in range(-lead, n):
+      g = gain((ph + lead) / lead) if ph < 0 and lead else 1.0
+      heading += g * _tone(p, 1.0, phi, ph)
+      if ph >= 0:
+        total += heading
+    sums.append(total)
+  return math.atan2(-sums[0], sums[1])
+
+
+PHASES = {(k, s): _zero_heading_phase(k, s) for k in (SWEEP, LADDER) for s in range(n_steps(k))}
+
+
 def unit(key, step, ph, sign=1):
   """The full-amplitude signal (float counts) of a step at chunk phase `ph` (frames; negative: lead-in). Sweep and
-  ladder: antisymmetric about the chunk's middle by construction, so a whole chunk sums to exactly zero."""
-  f, a, n, _ = step_params(key, step)
-  if f is None:
+  ladder: a tone at the phase PHASES gives it (zero-mean heading); pulses: the doublet, then quiet."""
+  p, a, _, _ = step_params(key, step)
+  if p is None:
     shape = _DOUBLETS[a]
     return sign * shape[ph] if 0 <= ph < len(shape) else 0.0
-  if 0 <= ph < n and 2 * ph > n:
-    return -a * math.sin(2.0 * math.pi * f * (n - ph) * DT)
-  return a * math.sin(2.0 * math.pi * f * ph * DT)
-
-
-def gain(env):
-  return 0.5 - 0.5 * math.cos(math.pi * env)
+  return _tone(p, a, PHASES[(key, step)], ph)
 
 
 def value(key, step, ph, env, sign=1):
@@ -188,6 +246,32 @@ def check_definition(key, bins, steps, target):
   if target != STEP_SECONDS[key]:
     return f"target_seconds must be {STEP_SECONDS[key]:g}"
   return None
+
+
+def _advance(st):
+  """One frame of the state machine shared by TiIdent and reconstruct: st = dict(test, step, ph, env, fading)."""
+  test, step = st["test"], st["step"]
+  p, _, n, lead = step_params(test, step)
+  st["ph"] += 1
+  if st["fading"]:
+    if p is None:
+      if st["ph"] >= len(_DOUBLETS[PULSE_AMPS[step]]):
+        st["test"] = None           # the doublet is finished: stopped
+    else:
+      st["env"] = max(0.0, st["env"] - 1.0 / fade_frames(test, step))
+      if st["env"] <= 0.0:
+        st["test"] = None
+  elif st["ph"] <= 0 and lead:
+    st["env"] = (st["ph"] + lead) / lead
+  else:
+    st["env"] = 1.0
+
+
+def _wrap(st):
+  """While fading, the tone keeps going past the chunk end (the cosine is continuous there)."""
+  p, _, n, _ = step_params(st["test"], st["step"])
+  if p is not None and st["fading"] and st["ph"] >= n:   # (a pulse never wraps: it stops after its doublet)
+    st["ph"] -= n
 
 
 class TiIdent:
@@ -266,6 +350,15 @@ class TiIdent:
     self._event(frame, "run" if lead_in else "chunk", test=key, step=step, band=band, ph=self.ph, env=self.env,
                 sign=self.sign, amp=a)
 
+  def _fade(self, frame, why):
+    if self.test == PULSES and self.ph >= len(_DOUBLETS[PULSE_AMPS[self.step]]):
+      self._event(frame, "stop", mode="zero")      # between doublets: the signal is already zero
+      self._stop()
+      return
+    self.fading = True
+    self.clean = False
+    self._event(frame, "stop", mode="fade", env=self.env, why=why)
+
   def update(self, armed, frame, *, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
              lat_demand, curvature, lkas_blocked, room=None, remaining=None):
     """`armed`: the one test key to run (None: none). `room`: rate_room of the live limits for the armed test.
@@ -289,7 +382,7 @@ class TiIdent:
 
     # A chunk that ended on the previous frame is credited first (its frames were 0..n-1), whatever happens now
     if self.test is not None and not self.fading and self.ph >= step_params(self.test, self.step)[2] and self.clean:
-      self.credit = (self.test, self.band, self.step, round(step_params(self.test, self.step)[2] * DT, 2))
+      self.credit = (self.test, self.band, self.step, STEP_SECONDS[self.test] / CHUNKS_PER_STEP[self.test])
 
     band, ti_alone = band_for(v_ego)
     key = armed if armed in KEYS else None
@@ -321,24 +414,22 @@ class TiIdent:
     self.reason = reason
     open_ = reason == "ok"
 
-    if self.test is not None and key is not None and reason in ("touch", "rate"):
+    if self.test is not None and (touch or (key is not None and reason == "rate")):
       self._event(frame, "stop", mode="zero")      # a touch or too little rate room: zero at once
       self._stop()
-    elif self.test is not None and key is None and touch:
-      self._event(frame, "stop", mode="zero")
-      self._stop()
     if self.test is not None and not self.fading and (not open_ or key != self.test):
-      self.fading = True
-      self.clean = False
-      self._event(frame, "stop", mode="fade", env=self.env)
+      self._fade(frame, reason)
 
     if self.test is None:
       if open_:
         self._start_chunk(frame, key, band, self._next_step(key, band, remaining), lead_in=True)
     elif not self.fading:
       if self.ph >= step_params(self.test, self.step)[2]:
-        # The next chunk at once; the gate is open, so the band has a step left
-        self._start_chunk(frame, key, band, self._next_step(key, band, remaining, self.credit), lead_in=False)
+        nxt = self._next_step(key, band, remaining, self.credit)
+        if nxt == self.step or self.test == PULSES:
+          self._start_chunk(frame, key, band, nxt, lead_in=False)   # straight on: continuous
+        else:
+          self._fade(frame, "step")     # another tone or amplitude: fade out, then a fresh lead-in
       elif self.ph >= 0 and (band != self.band or self.env < 1.0):
         self.clean = False
 
@@ -347,24 +438,14 @@ class TiIdent:
       self.emitted = None
       return 0
     self.emitted = self.test
-    if self.fading and self.ph >= step_params(self.test, self.step)[2]:
-      self.ph = 0                 # the waveform keeps going (whole cycles, next pulse) while it fades
-      if self.test == PULSES:
-        self.sign = -self.sign
+    st = self.__dict__
+    _wrap(st)
     self.last = value(self.test, self.step, self.ph, self.env, self.sign)
     if self.last != 0:
       self.frames[self.test] = self.frames.get(self.test, 0) + 1
-    # Advance to the next frame
-    self.ph += 1
-    lead = step_params(self.test, self.step)[3]
-    if self.fading:
-      self.env = max(0.0, self.env - DT / FADE_OUT_S)
-      if self.env <= 0.0:
-        self._stop()
-    elif self.ph <= 0 and lead:
-      self.env = (self.ph + lead) / lead
-    else:
-      self.env = 1.0
+    _advance(st)
+    if self.test is None:
+      self._stop()
     return self.last
 
 
@@ -374,35 +455,22 @@ def reconstruct(events, n_frames):
   for e in events:
     by_frame.setdefault(e["frame"], []).append(e)
   out = []
-  test = None
-  step = ph = sign = 0
-  env, fading = 0.0, False
+  st = dict(test=None, step=0, ph=0, env=0.0, fading=False)
+  sign = 1
   for k in range(n_frames):
     for e in by_frame.get(k, ()):
       if e["kind"] in ("run", "chunk"):
-        test, step, ph, env, sign, fading = e["test"], e["step"], e["ph"], e["env"], e["sign"], False
+        st.update(test=e["test"], step=e["step"], ph=e["ph"], env=e["env"], fading=False)
+        sign = e["sign"]
       elif e["kind"] == "stop" and e["mode"] == "zero":
-        test = None
-      elif e["kind"] == "stop" and test is not None and not fading:
-        fading = True
-        if e.get("env") is not None:
-          env = e["env"]
-    if test is None:
+        st["test"] = None
+      elif e["kind"] == "stop" and st["test"] is not None and not st["fading"]:
+        st["fading"] = True
+        st["env"] = e["env"]
+    if st["test"] is None:
       out.append(0)
       continue
-    n, lead = step_params(test, step)[2], step_params(test, step)[3]
-    if fading and ph >= n:
-      ph = 0
-      if test == PULSES:
-        sign = -sign
-    out.append(value(test, step, ph, env, sign))
-    ph += 1
-    if fading:
-      env = max(0.0, env - DT / FADE_OUT_S)
-      if env <= 0.0:
-        test = None
-    elif ph <= 0 and lead:
-      env = (ph + lead) / lead
-    else:
-      env = 1.0
+    _wrap(st)
+    out.append(value(st["test"], st["step"], st["ph"], st["env"], sign))
+    _advance(st)
   return out

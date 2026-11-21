@@ -19,6 +19,10 @@ from openpilot.selfdrive.car.mazda.ti_ident import TiIdent
 ROOT = Path(__file__).resolve().parents[3]
 MPH = 0.44704
 TI_MAX = 600
+SWEEP_CHUNK0 = 1002   # the 0.3 Hz tone's chunk (3 periods of 334 frames)
+# 7 tones x 2 chunks plus the lead-ins and the fade-outs between tones
+CHUNKS_14 = sum(2 * ti.step_params(ti.SWEEP, k)[2] + ti.SWEEP_LEAD_IN + ti.fade_frames(ti.SWEEP, k) + 1
+                for k in range(ti.n_steps(ti.SWEEP)))
 MAX_HELD_FRAMES = 40     # longest run of one non-zero integer value at full amplitude (the stuck fault needs seconds)
 
 
@@ -67,17 +71,18 @@ def settle(g, key, band, frame0=0, n=None, prog=None):
 @pytest.mark.parametrize('key', ti.KEYS)
 def test_every_chunk_is_exactly_zero_mean_bounded_and_slew_limited(key):
   for s in range(ti.n_steps(key)):
-    f, a, n, lead = ti.step_params(key, s)
+    p, a, n, lead = ti.step_params(key, s)
     w = [ti.value(key, s, ph, 1.0) for ph in range(n)]
     assert sum(w) == 0, (key, s)                         # exact, integer counts, every chunk
     assert max(abs(x) for x in w) <= a
-    full = [ti.unit(key, s, ph) for ph in range(-lead, n)]
-    gains = [ti.gain((ph + lead) / lead) if ph < 0 and lead else 1.0 for ph in range(-lead, n)]
+    full = [ti.unit(key, s, ph) for ph in range(-lead, 2 * n)]
+    gains = [ti.gain((ph + lead) / lead) if ph < 0 and lead else 1.0 for ph in range(-lead, 2 * n)]
     x = np.array(full) * np.array(gains)
-    assert np.max(np.abs(np.diff(x))) <= ti.MAX_SLEW + 1e-9, (key, s)
-    if f is not None:
-      assert abs(f * n * ti.DT - round(f * n * ti.DT)) < 1e-9   # whole cycles: seamless chunk to chunk
-      assert ti.unit(key, s, 0) == 0.0 and abs(ti.unit(key, s, n - 1) + ti.unit(key, s, 1)) < 1e-9
+    assert np.max(np.abs(np.diff(x))) <= ti.MAX_SLEW + 1e-9, (key, s)   # lead-in, and chunk into chunk
+    if p is not None:
+      assert p % 2 == 0 and n % p == 0                    # whole periods of an even number of frames
+      heading = np.cumsum(x)                              # zero-mean heading over the chunk, lead-in included
+      assert abs(heading[lead:lead + n].mean()) < 1e-6 * a * n
     else:
       assert len(ti.doublet(a)) < n                       # a quiet settling gap after every doublet
 
@@ -98,27 +103,79 @@ def test_never_a_held_non_zero_value_for_long(key):
 def test_amplitudes_and_their_classes():
   # Sweep and pulses' small step in the dither's class (preset 1 peaks at 22 counts); the ladder and the large pulse
   # step above it, justified in the drive card / report. Nothing near the 600 clip even on top of a 300-count request.
-  assert max(a for _, a in ti.SWEEP_TONES) <= td.peak_counts()
+  assert max(a for _, a, _ in ti.SWEEP_TONES) <= td.peak_counts()
   assert ti.PULSE_AMPS[0] <= td.peak_counts()
   assert max(ti.LADDER_AMPS) == 92 and max(ti.LADDER_AMPS) + td.MAX_BASE_FRACTION * TI_MAX < TI_MAX
-  freqs = [f for f, _ in ti.SWEEP_TONES]
-  assert freqs[0] == pytest.approx(0.3) and freqs[-1] == pytest.approx(5.0) and freqs == sorted(freqs)
+  freqs = [ti.freq(ti.SWEEP, s) for s in range(ti.n_steps(ti.SWEEP))]
+  assert freqs[0] == pytest.approx(0.3, abs=0.005) and freqs[-1] == pytest.approx(5.0) and freqs == sorted(freqs)
   assert list(ti.LADDER_AMPS) == sorted(ti.LADDER_AMPS)
   assert min(ti.LADDER_AMPS) * 0.0544 < 0.5 < 4.0 < max(ti.LADDER_AMPS) * 0.0544   # below the response, above friction
-  # Per-band ladder caps fall with speed
+  # Per-band ladder caps fall with speed; for now the lowest band stops at 55 counts (74 / 92 come back by a constant)
   caps = [ti.LADDER_CAPS[b[2]] for b in ti.BANDS]
   assert caps == sorted(caps, reverse=True)
+  assert ti.LADDER_CAPS["19-28"] == ti.LADDER_LOW_BAND_CAP == 55.0 and ti.LADDER_LOW_BAND_FULL_CAP == 92.0
 
 
 def test_capture_time_per_band_is_short():
   per_band = {k: {b[2]: ti.steps_in_band(k, b[2]) * ti.STEP_SECONDS[k] for b in ti.BANDS} for k in ti.KEYS}
   assert per_band[ti.SWEEP] == {"19-28": 140, "31-45": 140, "45-60": 140, "60-80": 140}
-  assert per_band[ti.LADDER] == {"19-28": 70, "31-45": 40, "45-60": 40, "60-80": 40}
+  assert per_band[ti.LADDER] == {"19-28": 50, "31-45": 40, "45-60": 40, "60-80": 40}
   assert per_band[ti.PULSES] == {"19-28": 80, "31-45": 80, "45-60": 80, "60-80": 80}
-  for k in ti.KEYS:      # a step is a whole number of chunks
+  for k in ti.KEYS:      # a step is a whole number of chunks of about the nominal length
     for s in range(ti.n_steps(k)):
       n = ti.step_params(k, s)[2]
-      assert (ti.STEP_SECONDS[k] / (n * ti.DT)) == int(ti.STEP_SECONDS[k] / (n * ti.DT))
+      assert abs(n * ti.DT * ti.CHUNKS_PER_STEP[k] - ti.STEP_SECONDS[k]) <= 0.2
+
+
+def _drift(key, step, v, chunks=1):
+  """Open-loop lateral offset (m) from one lead-in plus `chunks` chunks, with the HELD upper bound of the wheel's
+  response (6.4 deg per 100 counts, steering ratio 15.5, wheelbase 2.7 m, no understeer, no controller)."""
+  _, _, n, lead = ti.step_params(key, step)
+  tau = np.array([ti.unit(key, step, ph) * (ti.gain((ph + lead) / lead) if ph < 0 and lead else 1.0)
+                  for ph in range(-lead, n * chunks)])
+  kappa = np.radians(tau * 0.064 / 15.5) / 2.7
+  heading = np.cumsum(v * kappa * ti.DT)
+  return np.cumsum(v * np.sin(heading) * ti.DT)
+
+
+@pytest.mark.parametrize('key,step,band_top_mph', [
+  (ti.LADDER, 4, 28), (ti.LADDER, 3, 45), (ti.LADDER, 3, 80), (ti.SWEEP, 0, 80), (ti.SWEEP, 1, 80),
+])
+def test_no_sideways_drift_from_a_chunk(key, step, band_top_mph):
+  # A sine from zero gives a one-sided heading and a steady drift (review: ~0.3 m over 11 s at 92 counts, 28 mph);
+  # the cosine start gives a zero-mean heading, so what is left is a bounded wobble that does not grow.
+  y = _drift(key, step, band_top_mph * MPH, chunks=4)
+  n = ti.step_params(key, step)[2]
+  ends = y[ti.step_params(key, step)[3] - 1::n]
+  assert np.ptp(ends[1:]) < 0.02                          # chunk ends do not walk away
+  assert np.max(np.abs(y)) < 0.5                        # held upper bound, open loop; measured response is far smaller
+
+
+def test_the_pulse_pairs_cancel_their_heading():
+  amp = ti.PULSE_AMPS[1]
+  tau = np.array([ti.unit(ti.PULSES, 1, ph, sign) for sign in (1, -1) for ph in range(ti.PULSE_PERIOD)])
+  heading = np.cumsum(tau)
+  assert abs(heading[-1]) < 1e-9 and abs(heading.sum()) < 1e-6 * amp * len(tau) ** 2
+
+
+@pytest.mark.parametrize('key', ti.KEYS)
+def test_every_fade_stays_under_the_slew_limit(key):
+  for s in range(ti.n_steps(key)):
+    p, a, n, lead = ti.step_params(key, s)
+    for start in range(0, n, max(1, n // 37)):            # a fade beginning anywhere in the chunk
+      env, ph, x = 1.0, start, []
+      while True:
+        x.append(ti.gain(env) * ti.unit(key, s, ph % n if p is not None else ph))
+        ph += 1
+        if p is None:
+          if ph >= len(ti.doublet(a)):
+            break
+        else:
+          env -= 1.0 / ti.fade_frames(key, s)
+          if env <= 0:
+            break
+      x.append(0.0)
+      assert np.max(np.abs(np.diff(x))) <= ti.MAX_SLEW + 1e-9, (key, s, start)
 
 
 def test_shipped_definitions_match_the_generator():
@@ -136,7 +193,7 @@ def test_shipped_definitions_match_the_generator():
   bad["progress"]["steps"] = [7, 7, 7, 7]
   t, why = tt.validate_test(bad)
   assert t is None and "steps must be" in why
-  bad["progress"]["steps"] = [7, 4, 4]
+  bad["progress"]["steps"] = [5, 4, 4]
   assert tt.validate_test(bad)[1] == "steps must list one count per bin"
   good = doc["tests"][1]
   for change, text in ((dict(target_seconds=30), "target_seconds must be"), (dict(metric="engaged_seconds"),
@@ -233,15 +290,17 @@ def test_too_little_rate_room_zeroes_at_once():
 def test_chunks_follow_each_other_without_a_gap_and_steps_advance():
   prog = Progress()
   g = TiIdent()
-  out = settle(g, ti.SWEEP, "31-45", n=300 + 50 + ti.SWEEP_CHUNK * 14 + 40, prog=prog)
+  out = settle(g, ti.SWEEP, "31-45", n=300 + CHUNKS_14 + 200, prog=prog)
   # after the 3 s settle and a 0.5 s lead-in, 14 chunks back to back: all 7 tones x 2 chunks, then band complete
   credits = [k for k, v in prog.have.items()]
   assert sorted(credits) == [(ti.SWEEP, "31-45", s) for s in range(7)]
   assert all(v == ti.STEP_SECONDS[ti.SWEEP] for v in prog.have.values())
-  run = out[300:300 + 50 + ti.SWEEP_CHUNK * 14]
-  zeros = [i for i, v in enumerate(run) if v == 0]
-  gaps = max((b - a for a, b in zip(zeros, zeros[1:])), default=0)
-  assert gaps < 400                         # it keeps moving (zeros only at crossings)
+  run = out[300:300 + CHUNKS_14]
+  quiet_run, longest = 0, 0
+  for v in run:
+    quiet_run = quiet_run + 1 if v == 0 else 0
+    longest = max(longest, quiet_run)
+  assert longest < 40                       # it keeps moving: no dead time between chunks or tones beyond the fade
   assert g.reason == "band_done"
   # after the last chunk only the 0.25 s fade-out of the waveform, then nothing
   assert not any(out[-5:])
@@ -250,7 +309,7 @@ def test_chunks_follow_each_other_without_a_gap_and_steps_advance():
 def test_a_paused_chunk_is_repeated_and_nothing_else():
   prog = Progress()
   g = TiIdent()
-  settle(g, ti.SWEEP, "31-45", n=300 + 50 + ti.SWEEP_CHUNK + 500, prog=prog)    # one chunk done, half of the next
+  settle(g, ti.SWEEP, "31-45", n=300 + 50 + SWEEP_CHUNK0 + 500, prog=prog)    # one chunk done, half of the next
   assert prog.have == {(ti.SWEEP, "31-45", 0): 10.0}
   assert g.step == 0 and g.ph == 500
   for i in range(30):                                                      # blinker: pause
@@ -286,7 +345,7 @@ def test_a_band_change_mid_chunk_is_not_credited():
   prog = Progress()
   g = TiIdent()
   settle(g, ti.SWEEP, "45-60", n=300 + 50 + 400, prog=prog)
-  for i in range(ti.SWEEP_CHUNK):
+  for i in range(SWEEP_CHUNK0):
     g.update(ti.SWEEP, 1000 + i, **quiet("60-80"), remaining=prog.remaining)
     prog.add(g.credit)
   assert (ti.SWEEP, "45-60", 0) not in prog.have and (ti.SWEEP, "60-80", 0) not in prog.have
@@ -352,7 +411,7 @@ def test_progress_per_band_and_step_completion_persistence_and_reset():
   params, mem = FakeParams(), FakeParams()
   acc = _accountant(params, mem)
   g = TiIdent()
-  _drive(acc, g, "31-45", 300 + 100 + 4 * 1000 + 200)
+  _drive(acc, g, "31-45", 300 + 4 * (1000 + 100 + 60) + 200)
   acc.publish(1e6, {ti.LADDER: g.reason}, wall=1e9)
   doc = json.loads(mem.store[tt.PROGRESS_KEY])
   assert doc["ti_ladder"]["31-45"] == {str(s): 10.0 for s in range(4)}
@@ -425,6 +484,9 @@ def test_the_logged_events_rebuild_the_signal_exactly(key, seed):
     prog.add(g.credit)
   assert sum(1 for v in out if v) > 2000
   assert ti.reconstruct(logged, len(rows)) == out
+  # the slew limit holds everywhere, fades and lead-ins included, except where a touch or the rate rule cut to zero
+  cuts = {e["frame"] for e in logged if e["kind"] == "stop" and e["mode"] == "zero"}
+  assert all(abs(b - a) <= ti.MAX_SLEW + 1 for k, (a, b) in enumerate(zip(out, out[1:])) if k + 1 not in cuts)
   assert all(e["test"] == key for e in logged if "test" in e)
   json.dumps(logged)                                       # the events are plain JSON (cloudlog)
   # bounded, and no held non-zero plateau even with the random pauses
@@ -457,8 +519,22 @@ class Acc:
     return self.prog.remaining(key, band, step)
 
 
+def _controller_method(name):
+  import ast
+  tree = ast.parse((ROOT / 'selfdrive/car/mazda/carcontroller.py').read_text(encoding='utf-8'))
+  cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CarController')
+  fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+  env = {}
+  exec(compile(ast.Module(body=[fn], type_ignores=[]), name, 'exec'), env)
+  return env[name]
+
+
+TI_IDENT_FAILED = _controller_method('ti_ident_failed')
+
+
 def host(on=(), dither=False, ident=True):
   h = M.host(True, dither)
+  h.ti_ident_failed = lambda: TI_IDENT_FAILED(h)
   if ident:
     h.ti_ident = TiIdent()
     h.ti_ident_on = tuple(on)
@@ -546,3 +622,48 @@ def test_steering_block_without_the_ident_attribute_still_runs():
   h = host(ident=False)
   rows = [step(h, 0.05) for _ in range(100)]
   assert all(r['ident'] == 0 for r in rows)
+
+
+class Boom(TiIdent):
+  def __init__(self, at):
+    super().__init__()
+    self.at, self.calls = at, 0
+
+  def update(self, *a, **kw):
+    self.calls += 1
+    if self.calls >= self.at:
+      raise RuntimeError("forced")
+    return super().update(*a, **kw)
+
+
+@pytest.mark.parametrize('at', [1, 200, M.frames(8)])
+def test_a_raising_generator_is_switched_off_and_the_controller_runs_on(at, monkeypatch):
+  logged = []
+  import openpilot.common.swaglog as swaglog
+  monkeypatch.setattr(swaglog.cloudlog, "exception", lambda msg, *a, **k: logged.append(msg))
+  h, ref = host((ti.SWEEP,)), M.host(True, False)
+  h.ti_ident = Boom(at)
+  rows = [dict(steer=0.05)] * M.frames(20)
+  before = [step(h, **r) for r in rows[:at - 1]]
+  after = [step(h, **r) for r in rows[at - 1:]]            # raises on its first frame: caught
+  assert h.ti_ident is None and h.ti_ident_armed is None and logged == ["ti_ident disabled"]
+  assert all(r['ident'] == 0 for r in after)
+  # From the failing frame on, the output is the no-test output (exactly, when no signal had been sent before)
+  refs = [M.step(ref, **r) for r in rows]
+  if not any(r['ident'] for r in before):
+    assert [{k: r[k] for k in refs[0]} for r in before + after] == refs
+  else:
+    for r, q in zip(after[5:], refs[at - 1 + 5:]):
+      assert r['requested'] == q['requested']
+
+
+def test_a_raising_reset_is_switched_off_too(monkeypatch):
+  import openpilot.common.swaglog as swaglog
+  monkeypatch.setattr(swaglog.cloudlog, "exception", lambda *a, **k: None)
+  h = host((ti.SWEEP,))
+  def bad(*a, **k):
+    raise RuntimeError("forced")
+  h.ti_ident.reset = bad
+  r = step(h, 0.05, lat_active=False)
+  assert h.ti_ident is None and r['sent'] == 0
+  assert step(h, 0.05)['ident'] == 0
