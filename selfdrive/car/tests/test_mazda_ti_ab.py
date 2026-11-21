@@ -1258,3 +1258,27 @@ def test_a_partial_block_keeps_its_scored_time_when_it_reached_the_minimum_and_i
     assert not e3["voided"] and e3["scored_s"] >= 30.0 and r3.ab.committed["B"] >= 30.0
   # events carry what the analysis needs: the time in force comes from the switch events, not the block label
   assert {"idx", "arm", "engaged_s", "scored_s", "reason", "voided"} <= set(e2)
+
+
+def test_the_next_block_is_the_side_that_is_behind_when_the_sides_differ_and_the_seeded_one_otherwise():
+  r = Rig(config=cfg(seed=first_b_seed()), block_s=10.0)
+  arm, why = r.ab._next_arm(0)
+  assert (arm, why) == (ab.arm_for(r.ab.seed if r.ab.seed else first_b_seed(), 0), "seed") or why == "seed"
+  r.secs(1.0)
+  r.ab.committed = {"A": 100.0, "B": 100.0 + ab.BALANCE_MARGIN_S}              # exactly at the margin: still the seeded order
+  assert r.ab._next_arm(5)[1] == "seed"
+  r.ab.committed = {"A": 100.0, "B": 100.0 + ab.BALANCE_MARGIN_S + 1.0}        # B is ahead: A next, whatever the seed says
+  assert r.ab._next_arm(5) == ("A", "balance") and r.ab._next_arm(6) == ("A", "balance")
+  r.ab.committed = {"A": 300.0, "B": 100.0}
+  assert r.ab._next_arm(0) == ("B", "balance")
+
+
+def test_a_balanced_block_is_logged_with_its_reason_and_the_schedule_check_skips_it():
+  r = Rig(config=cfg(seed=first_a_seed()), block_s=10.0)
+  r.secs(0.5)                                                                   # block 0 (A, by the seed) starts at once: A is in force
+  r.ab.committed = {"A": 0.0, "B": 400.0}                                       # B far ahead: block 1 must be A although the seed says B
+  r.secs(12.0)
+  starts = r.kinds("block_start")
+  assert len(starts) >= 2 and starts[0]["arm_why"] == "seed" and starts[1]["arm"] == "A" and starts[1]["arm_why"] == "balance"
+  assert ab.arm_for(first_a_seed(), starts[1]["idx"]) == "B"
+  assert ab.verify_schedule(r.events) == []

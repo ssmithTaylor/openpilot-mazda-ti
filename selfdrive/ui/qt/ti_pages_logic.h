@@ -312,6 +312,7 @@ struct HomeState {
   bool live_fresh = false;                 // the test accountant's live block (TiTestProgress._live) is recent
   bool live_all_on = false;                // ... and says run-all is on (the plan forces it): what the car controller is doing
   bool live_tests_on = false;              // ... and lists a test as on
+  bool low_optional = false;               // the plan marks the 21-27 mph tests optional: not a band, never blocks DONE
   double tests_left_s[ti_logic::N_WINDOWS] = {0, 0, 0, 0};   // required test seconds still to collect per window (step tests)
   bool ab_stored_known = false;            // the persistent record is for the alternation set up now
   double ab_stored_a_s = 0;                // ... scored seconds per side, kept across ignition cycles
@@ -586,7 +587,9 @@ inline int bandsFromState(const HomeState &s, Band out[MAX_BANDS]) {
   auto win = [&](int w, int target, double minutes) {
     out[n++] = Band{target, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, (int)ti_logic::WINDOWS[w].low, (int)ti_logic::WINDOWS[w].high, minutes, false};
   };
-  win(0, ti_logic::windowTargetMph(0), t[0]);
+  if (!s.low_optional) {
+    win(0, ti_logic::windowTargetMph(0), t[0]);   // an optional lowest window is shown on the progress page only
+  }
   if (altOpen(s)) {
     const double alt = abMinutesLeft(s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) * OVERHEAD_ALT;
     out[n++] = Band{45, (int)ti_ab::PLAN_ALT_MIN_MPH, (int)ti_ab::PLAN_ALT_MAX_MPH, (int)ti_ab::PLAN_ALT_MIN_MPH + 1, (int)ti_ab::PLAN_ALT_MAX_MPH - 1,
@@ -766,6 +769,11 @@ inline HomeLines home(const HomeState &s) {
     return h;
   }
   const int here = bandIndexAt(bands, n, s.mph);
+  if (here < 0 && s.low_optional && s.mph >= ti_logic::WINDOWS[0].low && s.mph < ti_logic::WINDOWS[0].high && s.tests_active) {
+    h.primary = line("OPTIONAL: TESTS COUNT", Tone::Running);      // credited if they run, but not a band he has to complete
+    h.second = "Not required: bonus data";
+    return h;
+  }
   if (here < 0) {
     // no band that still needs time contains this speed: nothing counts here, and the list shows the bands that do
     char buf[48];
@@ -929,6 +937,8 @@ inline std::string detailScored(double a_s, double b_s, double target_min, bool 
 struct PlanFields {
   bool named = false;
   bool reasons_ok = false;               // every amount carries its reason, minimum and buffer
+  bool low_optional = false;             // the 21-27 mph tests are optional: credited when they run, never a band to complete
+  bool optional_bad = false;             // `optional` on any other window, or not true
   std::vector<std::string> test_ids, windows;
   bool has_alt = false;
   std::string setting, a, b_text;       // b_text: "other", or "number" when b is a number
@@ -946,6 +956,9 @@ inline std::string planProblem(const PlanFields &p) {
   }
   if (p.windows != std::vector<std::string>{"21-27", "35-41", "49-56", "64-80"}) {
     return "tests must cover all four windows";
+  }
+  if (p.optional_bad) {
+    return "only the lowest window may be optional";
   }
   if (!p.has_alt) {
     return p.reasons_ok ? "" : "an amount has no reason";

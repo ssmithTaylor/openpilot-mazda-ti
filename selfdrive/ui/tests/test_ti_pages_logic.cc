@@ -494,6 +494,7 @@ static void planAndBands() {
     {"tests must cover all four windows", [](PlanFields &x) { x.windows = {"21-27"}; }},
     {"tests must be sweep, pulses, ladder", [](PlanFields &x) { x.test_ids = {"ti_dither"}; }},
     {"no plan name", [](PlanFields &x) { x.named = false; }},
+    {"only the lowest window may be optional", [](PlanFields &x) { x.optional_bad = true; }},
   };
   for (const Case &c : cases) {
     PlanFields q = goodPlan();
@@ -609,6 +610,38 @@ static void listAndStatusAgree() {
   CHECK(states > 100000 && highlighted > 1000 && nocount > 1000);
 }
 
+static void lowWindowOptional() {
+  PlanFields p = goodPlan();
+  p.low_optional = true;
+  CHECK(planProblem(p).empty());
+  HomeState s;
+  s.configured = true; s.target_min = 10; s.ab_stored_a_s = s.ab_stored_b_s = 100; s.low_optional = true;
+  s.tests_left_s[0] = 600; s.tests_left_s[1] = s.tests_left_s[2] = 60; s.tests_left_s[3] = 60;
+  Band b[MAX_BANDS];
+  int n = bandsFromState(s, b);
+  CHECK(n == 2 && b[0].target_mph == 45 && b[1].target_mph == 72);          // no 24 mph band; the alternation's band and 72 mph
+  s.configured = false;
+  n = bandsFromState(s, b);
+  CHECK(n == 3 && b[0].target_mph == 38 && b[1].target_mph == 52 && b[2].target_mph == 72);
+  // only the optional window still needs something: the plan is DONE
+  HomeState d;
+  d.run = Run::All; d.engaged = true; d.have_speed = true; d.mph = 24; d.low_optional = true; d.tests_left_s[0] = 600;
+  confirm(d);
+  d.tests_active = false;
+  CHECK(home(d).primary.text == "DONE: TESTS COMPLETE");
+  d.low_optional = false;
+  CHECK(home(d).primary.text != "DONE: TESTS COMPLETE");                      // required: still a band
+  // tests that do run there are said to be a bonus, and the list never shows the band
+  HomeState o = d;
+  o.low_optional = true; o.tests_left_s[3] = 60; o.tests_active = true;
+  CHECK(home(o).primary.text == "OPTIONAL: TESTS COUNT" && home(o).primary.tone == Tone::Running);
+  Band ob[MAX_BANDS];
+  const int on = bandsFromState(o, ob);
+  CHECK(bandIndexAt(ob, on, 24.0) < 0 && countingBand(o, ob, on) < 0);
+  o.mph = 72;
+  CHECK(home(o).primary.text == "TESTING: HOLD 72 MPH");
+}
+
 static void setup() {
   CHECK(setupEditable(false, false, 0) && setupEditable(false, true, 0.5) && !setupEditable(false, true, 25) && !setupEditable(true, true, 0));
   CHECK((int)setupNote(false, true, 0).size() <= MAX_EXPERIMENT_CHARS && (int)setupNote(true, true, 0).size() <= MAX_EXPERIMENT_CHARS);
@@ -630,6 +663,7 @@ int main() {
   progressTexts();
   setupOrderAndChoice();
   planAndBands();
+  lowWindowOptional();
   listAndStatusAgree();
   setup();
   if (failures == 0) {

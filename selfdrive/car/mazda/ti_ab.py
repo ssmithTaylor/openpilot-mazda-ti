@@ -131,6 +131,7 @@ assert set(SETTINGS) | set(EXCLUDED) == {
 DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN = 4.0, 4.0, 10.0
 MAX_WAIT_S = 60.0           # a pending switch waits this long, then is skipped
 SETTLE_S = 1.0              # every gate open this long before a switch
+BALANCE_MARGIN_S = 30.0     # the next block is the side that is behind when the two sides' scored time differs by more than this
 MIN_SCORED_KEEP_S = 30.0    # a block cut short with less SCORED time than this is voided and run again; with this much or more its scored time is kept
 MARGIN_MPH = 3.0            # a block starts only when the speed is this far inside either edge of the range ...
 MARGIN_HOLD_S = 3.0         # ... and has been for this long (a block started at the edge ends within seconds, for speed)
@@ -152,7 +153,7 @@ MESSAGE = {"input": "bad inputs", "touch": "hands on the wheel", "lane_change": 
 
 def _table_hash():
   spec = [[tuple(s) for s in SETTINGS.values()], DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN, MAX_WAIT_S, SETTLE_S,
-          MIN_SCORED_KEEP_S, MARGIN_MPH, MARGIN_HOLD_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
+          MIN_SCORED_KEEP_S, BALANCE_MARGIN_S, MARGIN_MPH, MARGIN_HOLD_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
   return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -782,10 +783,19 @@ class TiAb:
       return "settle"
     return first
 
+  def _next_arm(self, idx):
+    """(arm, why) of block idx: the seeded pair order ("seed"), except that when one side is behind the other by more than
+    BALANCE_MARGIN_S of scored time (partial blocks cut at hand-overs make the sides uneven) the next block is the side that is behind
+    ("balance"). The analysis pairs by time in force, so the label of a block does not matter to it; the reason is logged."""
+    a, b = self.committed["A"], self.committed["B"]
+    if abs(a - b) > BALANCE_MARGIN_S:
+      return ("A" if a < b else "B"), "balance"
+    return arm_for(self.seed, idx), "seed"
+
   def _blocks(self, reason, block_s):
     if self.block is None:
       idx = self.idx
-      arm = arm_for(self.seed, idx)
+      arm, arm_why = self._next_arm(idx)
       target = 0.0 if arm == "A" else 1.0
       if self.pending_since is None:
         self.pending_since = self.n
@@ -811,7 +821,7 @@ class TiAb:
         self._end_wait("not_needed")
       self.block, self.block_frames = (idx, arm), 0
       self.pending_since = None
-      self._event("block_start", idx=idx, arm=arm, switched=bool(need), waited_s=waited, block_s=block_s,
+      self._event("block_start", idx=idx, arm=arm, arm_why=arm_why, switched=bool(need), waited_s=waited, block_s=block_s,
                   first=first_of_pair(self.seed, idx // 2), repeat=self.voided_idx == idx)
       return
     self.block_frames += 1
@@ -862,7 +872,7 @@ class TiAb:
     elif self.mode == "running" and self.block is None and self.pending_since is not None:
       wait = {"reason": self.last_reason or "settle", "why": MESSAGE.get(self.last_reason or "settle", ""),
               "s": round((self.n - self.pending_since) * DT, 1), "max_s": MAX_WAIT_S,
-              "arm": arm_for(self.seed, self.idx)}
+              "arm": self._next_arm(self.idx)[0]}
     spec = self.spec
     value, weight = self.effective()
     return {"v": VERSION, "t": round(time.time() if now is None else now, 1), "state": "error" if self.dead else self.mode,
@@ -904,6 +914,8 @@ def verify_schedule(events):
     if e.get("kind") == "config":
       seed = e["seed"]
     elif e.get("kind") == "block_start" and seed is not None:
+      if e.get("arm_why") == "balance":
+        continue                       # chosen to even out the sides' scored time, not by the seed
       if arm_for(seed, e["idx"]) != e["arm"] or first_of_pair(seed, e["idx"] // 2) != e["first"]:
         bad.append(e)
   return bad

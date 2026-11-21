@@ -156,6 +156,7 @@ def test_an_invalid_plan_is_refused_with_a_reason_and_the_header_agrees():
     "tests must cover all four windows": lambda p: p["tests"].update(windows=p["tests"]["windows"][:1]),
     "tests must be sweep, pulses, ladder": lambda p: p["tests"].update(ids=["ti_dither"]),
     "no plan name": lambda p: p.update(name=""),
+    "only the lowest window may be optional": lambda p: p["tests"]["windows"][1].update(optional=True),
   }
   for why, mutate in mutations.items():
     bad = copy.deepcopy(plan)

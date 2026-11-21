@@ -1548,6 +1548,13 @@ void TestsWindow::loadPlan() {
   for (const QJsonValue &v : o.value("tests").toObject().value("windows").toArray()) {
     const QJsonObject e = v.toObject();
     plan.windows.push_back(e.value("window").toString().toStdString());
+    if (e.contains("optional")) {
+      if (e.value("optional") == QJsonValue(true) && e.value("window").toString() == QString("21-27")) {
+        plan.low_optional = true;
+      } else {
+        plan.optional_bad = true;
+      }
+    }
     if (e.value("reason").toString() != QString("As reviewed earlier; not changed this round.")) {
       note(QString("Tests at %1 mph (%2)").arg(e.value("window").toString(), e.value("amount").toString()), e);
     } else {
@@ -1775,6 +1782,7 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.configured = ab_configured;
   const UIStatus st = uiState()->status;
   h.engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
+  h.low_optional = plan_ok && plan.low_optional;
   h.metric = is_metric;
   h.have_speed = have_speed;
   h.mph = speed_mph;
@@ -2055,7 +2063,7 @@ void TestsWindow::drawProgress(QPainter &p) {
     const int y = PROG_ROWS_TOP + w * PROG_ROW_H;
     p.setPen(white);
     p.setFont(InterFont(PROGRESS_PX, QFont::Bold));
-    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)));
+    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)) + ((w == 0 && plan_ok && plan.low_optional) ? QString("  (optional: counts if it happens)") : QString()));
     drawBar(p, QRect(900, y + 8, 1240, 36), total > 0 ? double(done) / total : 1.0, done >= total ? green : blue);
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(EXPERIMENT_PX));
