@@ -29,7 +29,7 @@ BASE = dict(on=True, pin=None, stored=STORED, engaged=True, v_ego=v_mph(38.0), c
 
 
 def cfg(**over):
-  c = {"setting": "LatDamping", "b": True, "block_min": 2, "seed": 5}
+  c = {"setting": "LatDamping", "b": True, "block_min": 4, "seed": 5}
   c.update(over)
   return json.dumps(c)
 
@@ -111,7 +111,7 @@ def test_every_allowlisted_attribute_is_read_live_each_cycle_by_the_controller()
   (cfg(setting="SteerKP", b=1.5), "outside the SteerKP range"), (cfg(setting="SteerKP", b=0.3), "outside"),
   (cfg(setting="SteerKP", b=True), "must be a number"), (cfg(setting="SteerKP", b=float("nan")), "must be a number"),
   (cfg(setting="SteerKP", b=0.8), "same as your stored"), (cfg(setting="SteerKP", b=0.805), "same as your stored"),
-  (cfg(a=True), "A is always your stored"), (cfg(setting="SteerKP", a=0.9, b=1.0), "A is always your stored"),
+  (cfg(a=True), "A is always your stored"), (cfg(setting="SteerKP", a=0.9, b=0.9), "A is always your stored"),
   (cfg(block_min=1), "block length"), (cfg(block_min=11), "block length"), (cfg(block_min="4"), "block length"),
   (cfg(seed=-1), "seed"), (cfg(seed=2 ** 32), "seed"), (cfg(seed=1.5), "seed"),
 ])
@@ -121,13 +121,12 @@ def test_a_configuration_outside_the_allowlist_ranges_or_steps_is_refused_with_a
 
 
 def test_a_step_larger_than_the_limit_is_refused_and_one_at_the_limit_is_not():
-  big = ab.SETTINGS["SteerKP"].max_step                                  # 0.25 around a stored 0.8: 0.55 .. 1.05
-  for b in (0.55, 0.9, 1.05):
+  assert ab.SETTINGS["SteerKP"].max_step == 0.10 and (ab.SETTINGS["SteerKP"].lo, ab.SETTINGS["SteerKP"].hi) == (0.70, 1.00)
+  for b in (0.70, 0.85, 0.9):                                            # around a stored 0.8
     assert ab.validate(cfg(setting="SteerKP", b=b), STORED)[0] is not None, b
-  for b in (1.06, 1.10, 0.50, 0.54):
+  for b in (0.91, 1.0, 0.65, 0.69, 1.05):
     c, msg = ab.validate(cfg(setting="SteerKP", b=b), STORED)
-    assert c is None and "step" in msg and "limit" in msg, (b, msg)
-  assert big == 0.25
+    assert c is None and ("step" in msg or "outside" in msg), (b, msg)
 
 
 def test_a_stored_value_outside_the_range_or_unreadable_is_refused():
@@ -270,8 +269,8 @@ GATE_CASES = [
   ("touch", dict(steering_pressed=True)), ("touch", dict(driver_torque=7.0)),
   ("lane_change", dict(lane_change=True)), ("lane_change", dict(blinker=True)),
   ("speed", dict(v_ego=v_mph(18.0))), ("speed", dict(v_ego=v_mph(85.0))),
-  ("eps", dict(v_ego=v_mph(29.5))), ("eps", dict(v_ego=v_mph(27.4))), ("eps", dict(v_ego=v_mph(31.6))),
-  ("curve", dict(curvature=0.003)), ("lat", dict(curvature=0.0019, v_ego=v_mph(75.0))),
+  ("speed", dict(v_ego=v_mph(34.0))), ("speed", dict(v_ego=v_mph(71.0))),
+  ("curve", dict(curvature=0.003)), ("lat", dict(curvature=0.0015, v_ego=v_mph(60.0))),
   ("request", dict(steer=0.4)), ("saturated", dict(saturated=True)), ("input", dict(curvature=float("nan"))),
 ]
 
@@ -312,15 +311,16 @@ def test_the_gates_have_hysteresis_and_a_condition_that_closes_resets_the_settle
   assert r.ab.block is None
   r.secs(0.3)
   assert r.ab.block is not None
-  slow = v_mph(22.0)                                    # (the lateral-demand gate stays open at this speed)
+  # lateral demand v^2 |k|: open at 0.4, close at 0.5 m/s^2 (at 40 mph: k 0.00125 and 0.00156)
+  fast = dict(v_ego=v_mph(40.0))
   r2 = r_pending()
-  r2.secs(3.0, curvature=0.0022, v_ego=slow)            # between open (0.002) and close (0.0025): was never closed, so open
+  r2.secs(3.0, curvature=0.0014, **fast)                # between open and close: was never closed, so open
   assert r2.ab.block is not None
   r3 = r_pending()
-  r3.step(curvature=0.003, v_ego=slow)                  # closes
-  r3.secs(5.0, curvature=0.0022, v_ego=slow)            # inside the hysteresis band: stays closed
+  r3.step(curvature=0.003, **fast)                      # closes
+  r3.secs(5.0, curvature=0.0014, **fast)                # inside the hysteresis band: stays closed
   assert r3.ab.block is None
-  r3.secs(3.0, curvature=0.0019, v_ego=slow)
+  r3.secs(3.0, curvature=0.0011, **fast)
   assert r3.ab.block is not None
 
 
@@ -349,15 +349,37 @@ def test_a_touch_needs_confirming_unless_firm_as_in_the_test_gates():
 def test_a_block_already_running_is_not_cut_by_a_gate_only_a_hard_release_ends_it():
   r = r_pending()
   quiet_until_block_b(r)
+  r.secs(6.0)
   r.secs(2.0, curvature=0.004, steering_pressed=True, lane_change=True)
-  assert r.ab.block is not None and r.ab.block[1] == "B"
+  assert r.ab.block is not None and r.ab.block[1] == "B" and r.outs[-1].s == 1.0
 
 
-def test_no_switch_is_made_near_the_eps_threshold_but_a_running_block_carries_through_it():
-  r = r_pending()
-  quiet_until_block_b(r)
-  r.secs(2.0, v_ego=v_mph(29.5))
-  assert r.outs[-1].arm == "B" and r.outs[-1].s == 1.0
+def test_the_mode_is_active_only_between_35_and_70_mph_with_a_mile_of_hysteresis():
+  assert (ab.ALT_MIN_MPH, ab.ALT_MAX_MPH) == (35.0, 70.0)
+  r = running_b()
+  r.secs(2.0, v_ego=v_mph(34.5))                         # below 35: released by a ramp
+  r.secs(4.0, v_ego=v_mph(34.5))
+  assert r.outs[-1].s == 0.0 and r.ab.mode == "idle"
+  r.secs(5.0, v_ego=v_mph(35.5))                         # a mile of hysteresis: not back yet
+  assert r.ab.mode == "idle"
+  r.secs(2.0, v_ego=v_mph(36.5))
+  assert r.ab.mode == "running"
+  r.secs(2.0, v_ego=v_mph(70.2))
+  assert r.ab.mode == "idle"
+  r.secs(2.0, v_ego=v_mph(69.5))
+  assert r.ab.mode == "idle"
+  r.secs(2.0, v_ego=v_mph(68.5))
+  assert r.ab.mode == "running"
+  for mph in (28.0, 29.5, 31.0):                          # the EPS region is below the band
+    q = r_pending()
+    q.secs(10.0, v_ego=v_mph(mph))
+    assert not any(o.active for o in q.outs)
+
+
+def test_the_first_trial_defaults_are_named_constants():
+  assert (ab.KP_LO, ab.KP_HI, ab.KP_MAX_STEP) == (0.70, 1.00, 0.10)
+  assert ab.MIN_BLOCK_MIN == 4.0 and ab.DEFAULT_BLOCK_MIN == 4.0
+  assert ab.validate(cfg(block_min=3.5), STORED)[0] is None and ab.validate(cfg(block_min=4), STORED)[0] is not None
 
 
 # ---- hard releases, fail-safe -----------------------------------------------------------------------------------------
@@ -421,12 +443,12 @@ def test_a_missing_or_corrupt_config_while_running_releases_and_says_why():
 
 def test_a_changed_configuration_releases_and_needs_the_switch_cycled():
   r = running_b()
-  r.secs(4.0, config=cfg(block_min=3, seed=first_b_seed()))
+  r.secs(4.0, config=cfg(block_min=5, seed=first_b_seed()))
   assert r.outs[-1].s == 0.0 and r.ab.mode == "off" and "off and on again" in r.ab.message
-  r.secs(5.0, config=cfg(block_min=3, seed=first_b_seed()))
+  r.secs(5.0, config=cfg(block_min=5, seed=first_b_seed()))
   assert r.outs[-1].s == 0.0                               # still off: it did not restart by itself
   r.step(on=False)
-  r.secs(5.0, config=cfg(block_min=3, seed=first_b_seed()))
+  r.secs(5.0, config=cfg(block_min=5, seed=first_b_seed()))
   assert r.ab.mode == "running"
 
 
@@ -466,13 +488,20 @@ def test_a_log_callback_that_raises_never_stops_the_controller():
 
 # ---- pins ----------------------------------------------------------------------------------------------------------
 
-def test_pin_b_ramps_in_at_once_stops_alternation_and_release_resumes():
+def test_pin_b_waits_for_the_same_gates_as_an_automatic_switch_and_says_why():
   r = r_pending()
-  r.secs(0.2, curvature=0.003, steering_pressed=True)           # even with the switch gates closed
-  r.secs(0.5, pin="B", curvature=0.003)
-  assert r.outs[-1].arm == "B" and 0 < r.outs[-1].s < 1 and r.ab.mode == "pinned"
+  r.secs(0.2, curvature=0.003, steering_pressed=True)
+  r.secs(5.0, pin="B", curvature=0.003)                           # a bend: no switch
+  assert r.outs[-1].s == 0.0 and not r.outs[-1].active and r.ab.mode == "pinned"
+  w = r.ab.status()["wait"]
+  assert w["reason"] == "curve" and w["why"].startswith("pin waiting: ") and w["pin"] is True
+  assert "curve" in [e["why"] for e in r.kinds("pin_wait")]
+  r.secs(0.5, pin="B")                                            # straight again, but not settled for a second
+  assert r.outs[-1].s == 0.0
+  r.secs(1.0, pin="B")
+  assert 0 < r.outs[-1].s < 1 and r.kinds("switch")[-1]["why"] == "pin"
   r.secs(4.0, pin="B")
-  assert r.outs[-1].s == 1.0
+  assert r.outs[-1].s == 1.0 and r.ab.status()["wait"] is None
   n_blocks = len(r.kinds("block_start"))
   r.secs(40.0, pin="B")
   assert len(r.kinds("block_start")) == n_blocks and r.outs[-1].s == 1.0          # alternation stopped
@@ -481,6 +510,76 @@ def test_pin_b_ramps_in_at_once_stops_alternation_and_release_resumes():
   assert r.kinds("unpin") and r.ab.mode == "running"
   r.secs(30.0)
   assert len(r.kinds("block_start")) > n_blocks
+
+
+def test_pin_a_is_immediate_by_ramp_even_with_the_gates_closed():
+  r = running_b()
+  r.secs(1.0, pin="A", curvature=0.004, steering_pressed=True)
+  assert r.outs[-1].s < 1.0 and r.kinds("switch")[-1]["why"] == "pin"
+  r.secs(3.0, pin="A", curvature=0.004)
+  assert r.outs[-1].s == 0.0
+
+
+def test_a_touch_or_blinker_during_a_ramp_toward_b_turns_it_back_but_a_ramp_toward_a_goes_on():
+  for kw in (dict(steering_pressed=True), dict(blinker=True), dict(lane_change=True), dict(driver_torque=9.0)):
+    r = r_pending()
+    for _ in range(FRAMES(6.0)):
+      r.step()
+      if r.ab.ramp.moving and r.ab.ramp.to == 1.0:
+        break
+    r.secs(0.4)
+    s_before = r.outs[-1].s
+    assert 0.0 < s_before < 1.0
+    r.secs(0.2, **kw)
+    sw = r.kinds("switch")[-1]
+    assert sw["why"].startswith("reverse:") and sw["s_to"] == 0.0
+    r.secs(3.0, **kw)
+    assert r.outs[-1].s == 0.0 and r.ab.ramp.to == 0.0
+    be = r.kinds("block_end")[-1]
+    assert be["reason"] == "reversed" and be["voided"]
+    r.secs(8.0)                                                  # hands off: the block is tried again
+    assert r.ab.block is not None
+    # per-frame slew never exceeds the ramp's own rate, also at the turn
+    ss = [o.s for o in r.outs]
+    assert max(abs(y - x) for x, y in zip(ss, ss[1:])) <= 1.0 / (ab.SETTINGS["LatDamping"].ramp_s / ab.DT) + 1e-12
+  # a ramp toward A is not interrupted
+  r = running_b()
+  r.secs(0.5, engaged=True, pin="A")
+  s1 = r.outs[-1].s
+  r.secs(0.3, pin="A", steering_pressed=True)
+  assert r.outs[-1].s < s1 and not any(e["why"].startswith("reverse") for e in r.kinds("switch"))
+
+
+def test_a_pin_to_b_with_the_touch_during_its_ramp_reverses_and_waits_again():
+  r = r_pending()
+  r.secs(1.2, pin="B")
+  r.secs(0.3, pin="B")
+  assert 0 < r.outs[-1].s < 1
+  r.secs(0.2, pin="B", steering_pressed=True)
+  r.secs(3.0, pin="B", steering_pressed=True)
+  assert r.outs[-1].s == 0.0 and r.ab.status()["wait"]["why"].startswith("pin waiting")
+
+
+def test_the_controls_constructor_failure_leaves_the_mode_off():
+  src = (ROOT / "selfdrive/controls/controlsd.py").read_text(encoding="utf-8")
+  i = src.index("self.ti_ab = None")
+  assert "try:" in src[i:i + 120] and "TiAbRunner(self.params, params_memory, log=ti_ab_log)" in src[i:i + 400]
+  assert "except Exception:" in src[i:i + 500] and "ti_ab disabled" in src[i:i + 600]
+
+
+def test_the_commit_arm_is_scored_only_where_it_can_act_and_the_page_says_so():
+  assert ab.ACTS_ABOVE_LAT == {"LatCommitSetpoint": 1.0}
+  r = Rig(config=cfg(setting="LatCommitSetpoint", b=False, seed=first_b_seed()), block_s=20.0)
+  r.secs(15.0)                                                    # straight: nothing scored
+  assert sum(sum(d.values()) for d in r.ab.progress.values()) == 0.0 and r.ab.arm_in_force == "B"
+  r.secs(10.0, curvature=0.0045, v_ego=v_mph(40.0), saturated=False)   # lateral demand 1.4 m/s^2: scored (gates only delay switches)
+  assert sum(r.ab.progress["B"].values()) > 5.0
+  d = Rig(config=cfg(seed=first_b_seed()), block_s=20.0)
+  d.secs(30.0)
+  assert sum(sum(x.values()) for x in d.ab.progress.values()) > 5.0   # other settings are scored everywhere
+  note = (ROOT / "selfdrive/car/mazda/TI_AB.md").read_text(encoding="utf-8")
+  ui = (ROOT / "selfdrive/ui/qt/sidebar.cc").read_text(encoding="utf-8")
+  assert "acts only in bends" in ui and "only in bends" in note
 
 
 def test_pin_a_returns_the_owners_value_by_a_ramp_and_holds_it():
@@ -519,7 +618,7 @@ def test_progress_counts_engaged_seconds_per_arm_and_window_and_leaves_out_the_w
   r.secs(25.0, v_ego=v_mph(60.0))                              # between windows: "gap"
   p = r.ab.status()["progress"]
   total = sum(sum(d.values()) for d in p.values())
-  assert total > 60 and set(p["A"]) == set(ab.WINDOW_LABELS) and ab.WINDOW_LABELS[-1] == "gap"
+  assert total > 40 and set(p["A"]) == set(ab.WINDOW_LABELS) and ab.WINDOW_LABELS[-1] == "gap"
   assert p["A"]["64-80"] == 0 and p["B"]["64-80"] == 0
   assert p["B"]["35-41"] + p["A"]["35-41"] > 0 and p["B"]["49-56"] + p["A"]["49-56"] + p["A"]["gap"] + p["B"]["gap"] > 0
   # wash-in frames are not in it: total is less than the engaged time by at least the first wash-in
@@ -547,11 +646,11 @@ def test_every_setting_has_a_wash_in_at_least_as_long_as_its_ramp():
 @pytest.mark.parametrize("seed", range(4))
 def test_the_value_in_force_is_rebuilt_exactly_from_the_logged_events_alone(seed):
   rng = random.Random(seed)
-  r = Rig(config=cfg(setting="SteerKP", b=0.95, seed=seed), block_s=8.0)
-  for _ in range(40):
+  r = Rig(config=cfg(setting="SteerKP", b=0.9, seed=seed), block_s=8.0)
+  for _ in range(90):
     r.secs(rng.uniform(1.0, 12.0), engaged=rng.random() > 0.15, steering_pressed=rng.random() < 0.1,
            curvature=rng.choice([0.0003, 0.0003, 0.004]), pin=rng.choice([None, None, None, "A", "B"]),
-           fault=rng.random() < 0.05, v_ego=v_mph(rng.choice([15, 25, 38, 38, 52, 70, 90])))
+           fault=rng.random() < 0.05, v_ego=v_mph(rng.choice([15, 38, 38, 45, 52, 60, 52, 70, 90])))
   r.step(on=False)
   r.secs(5.0, on=False)
   rec = ab.reconstruct(r.events, len(r.outs))
@@ -646,7 +745,7 @@ def test_the_runner_hands_the_controller_the_owners_own_object_whenever_a_is_in_
 
 def test_the_runner_never_writes_the_owners_param_and_publishes_a_status():
   mem = Mem(TiAbOn=True)
-  rn, params = runner(mem, cfg(setting="SteerKP", b=0.95, seed=first_b_seed()))
+  rn, params = runner(mem, cfg(setting="SteerKP", b=0.9, seed=first_b_seed()))
   rn.step(toggles(), **INPUTS)
   mem.d["TiAbOn"] = False
   for _ in range(20):
@@ -657,12 +756,12 @@ def test_the_runner_never_writes_the_owners_param_and_publishes_a_status():
   assert set(params.d) == {"TiAbConfig"}                                # nothing written to the persistent store
   assert set(mem.d) <= {"TiAbOn", "TiAbStatus"}
   st = json.loads(mem.d["TiAbStatus"])
-  assert st["setting"] == "SteerKP" and st["a"] == 0.8 and st["b"] == 0.95 and st["state"] == "running"
+  assert st["setting"] == "SteerKP" and st["a"] == 0.8 and st["b"] == 0.9 and st["state"] == "running"
 
 
 def test_the_steerkp_view_keeps_the_shape_the_controller_expects_and_blends_a_to_b():
   mem = Mem(TiAbOn=False)
-  rn, _ = runner(mem, cfg(setting="SteerKP", b=1.0, seed=first_b_seed()))
+  rn, _ = runner(mem, cfg(setting="SteerKP", b=0.9, seed=first_b_seed()))
   t = toggles()
   for _ in range(20):
     rn.step(t, **INPUTS)
@@ -674,8 +773,8 @@ def test_the_steerkp_view_keeps_the_shape_the_controller_expects_and_blends_a_to
       vals.append(v.steerKp)
   assert vals and all(len(x) == 2 and len(x[1]) == 1 and x[0] == [0] for x in vals)
   ks = [x[1][0] for x in vals]
-  assert min(ks) >= 0.8 and max(ks) == 1.0 and any(0.8 < k < 1.0 for k in ks)
-  rise = ks[:ks.index(1.0) + 1]
+  assert min(ks) >= 0.8 and max(ks) == 0.9 and any(0.8 < k < 0.9 for k in ks)
+  rise = ks[:ks.index(0.9) + 1]
   assert all(y >= x for x, y in zip(rise, rise[1:])) and max(y - x for x, y in zip(rise, rise[1:])) < 0.002   # smooth, no overshoot
 
 
@@ -936,7 +1035,7 @@ def test_the_format_note_names_every_event_and_every_allowed_and_excluded_settin
   note = (ROOT / "selfdrive/car/mazda/TI_AB.md").read_text(encoding="utf-8")
   for name in list(ab.SETTINGS) + list(ab.EXCLUDED):
     assert name in note, name
-  for kind in ("config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "unpin", "release",
+  for kind in ("config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "pin_wait", "unpin", "release",
                "refuse", "error", "hb"):
     assert f"`{kind}`" in note, kind
   r = Rig(config=cfg(seed=first_b_seed()), block_s=6.0)
@@ -945,7 +1044,7 @@ def test_the_format_note_names_every_event_and_every_allowed_and_excluded_settin
   r.secs(5.0, engaged=False)
   r.secs(1.0, config=cfg(setting="SteerKP", b=9.0))
   for e in r.events:
-    assert e["kind"] in {"config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "unpin",
+    assert e["kind"] in {"config", "block_start", "block_end", "wait_start", "wait_end", "skip", "switch", "pin", "pin_wait", "unpin",
                          "release", "refuse", "error", "hb"}, e["kind"]
 
 
@@ -975,7 +1074,7 @@ def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it
 def test_a_cycle_of_the_runner_is_cheap_enough_for_the_100_hz_thread():
   import time
   mem = Mem(TiAbOn=True)
-  rn, _ = runner(mem, cfg(setting="SteerKP", b=0.95, seed=first_b_seed()))
+  rn, _ = runner(mem, cfg(setting="SteerKP", b=0.9, seed=first_b_seed()))
   t = toggles()
   rn.step(t, **INPUTS)
   mem.d["TiAbOn"] = False

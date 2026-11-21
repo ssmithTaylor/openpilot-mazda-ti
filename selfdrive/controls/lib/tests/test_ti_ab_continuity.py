@@ -123,7 +123,7 @@ OWNER_ON = {"LatNoFrictionRelay": True}      # settings whose "off" (A) value is
 
 def b_value(name):
   spec = ab.SETTINGS[name]
-  return 0.8 + 0.2 if spec.kind == "float" else not OWNER_ON.get(name, False)
+  return 0.8 + 0.1 if spec.kind == "float" else not OWNER_ON.get(name, False)
 
 
 def drive(name, mode, n=900, switch_at=300, speed=20.0, scenario=None):
@@ -136,7 +136,7 @@ def drive(name, mode, n=900, switch_at=300, speed=20.0, scenario=None):
   base = owner_toggles(**({} if spec.kind == "float" else {spec.attr: stored}))
   b = b_value(name)
   m = ab.TiAb(block_s=10.0)
-  cfg = {"setting": name, "b": b, "block_min": 2, "seed": next(x for x in range(50) if ab.arm_for(x, 0) == "A")}
+  cfg = {"setting": name, "b": b, "block_min": 4, "seed": next(x for x in range(50) if ab.arm_for(x, 0) == "A")}
   outs, logs, ws = [], [], []
   m_kw = dict(engaged=True, v_ego=V, curvature=0.0, steer=0.0, saturated=False, steering_pressed=False, driver_torque=0.0,
               lane_change=False, blinker=False, ti_ok=True, fault=False, controller_ok=True, tests_active=False,
@@ -189,7 +189,7 @@ def diffs(r):
 
 
 # where a plain step of the setting visibly jumps in these scenarios (counts): the bound below is not vacuous there
-ALIVE = {"SteerKP": 5.0, "LatDamping": 10.0, "LatFrictionComp": 20.0, "LatNoFrictionRelay": 10.0}
+ALIVE = {"SteerKP": 3.0, "LatDamping": 10.0, "LatFrictionComp": 20.0, "LatNoFrictionRelay": 10.0}
 
 
 @pytest.mark.parametrize("name", list(ab.SETTINGS))
@@ -200,7 +200,7 @@ def test_the_switch_adds_no_step_to_the_steering_request(name):
   r = runs(name)
   dab, dsw, dB = diffs(r)
   assert max(abs(x) for x in dab[:300]) == 0.0                           # arm A: bit-identical to the owner's setting
-  window = int(round(ab.SETTINGS[name].wash_in_s / DT))
+  window = min(int(round(ab.SETTINGS[name].wash_in_s / DT)), len(dab) - 301)
   blend = max_step_counts(dab, 300, 300 + window)
   natural = max_step_counts(dB, 300, 300 + window)
   assert blend <= natural + CONTINUITY_COUNTS, (blend, natural)
@@ -213,8 +213,8 @@ def test_steerkp_the_proportional_term_follows_the_blended_gain_and_the_request_
   r = runs("SteerKP")
   dab, dsw, dB = diffs(r)
   kps = [diag(lg).kp for lg in r["lab"]]
-  assert kps[299] == pytest.approx(0.8) and kps[-1] == pytest.approx(1.0) and all(y >= x - 1e-6 for x, y in zip(kps, kps[1:]))
-  assert max(y - x for x, y in zip(kps, kps[1:])) <= 0.2 / (ab.SETTINGS["SteerKP"].ramp_s / DT) + 2e-7   # |B - A| over RAMP frames
+  assert kps[299] == pytest.approx(0.8) and kps[-1] == pytest.approx(0.9) and all(y >= x - 1e-6 for x, y in zip(kps, kps[1:]))
+  assert max(y - x for x, y in zip(kps, kps[1:])) <= 0.1 / (ab.SETTINGS["SteerKP"].ramp_s / DT) + 2e-7   # |B - A| over RAMP frames
   # the output tracks w * (output with B throughout) to a fraction of a count: the term enters linearly through the error
   res = [(dab[k] - dab[k - 1]) - r["w"][k] * (dB[k] - dB[k - 1]) for k in range(1, len(dab))]
   assert max(abs(x) for x in res) / COUNT < 1.0
@@ -253,7 +253,7 @@ def test_the_controllers_own_blend_takes_a_flip_of_the_toggle_without_a_step(nam
   assert max(abs(y - x) for x, y in zip(vals, vals[1:])) <= rate + 1e-9
   assert max(vals[300:]) > 0.5
   dab, dsw, dB = diffs(r)
-  window = int(round(ab.SETTINGS[name].wash_in_s / DT))
+  window = min(int(round(ab.SETTINGS[name].wash_in_s / DT)), len(dab) - 301)
   assert max_step_counts(dsw, 299, 303) <= max_step_counts(dB, 300, 300 + window) + CONTINUITY_COUNTS
 
 
@@ -268,7 +268,7 @@ def test_the_block_path_on_a_straight_adds_no_step_for_any_setting_and_arm_a_is_
     m = ab.TiAb(block_s=8.0)
     kw = dict(engaged=True, v_ego=20.0, curvature=0.0002, steer=0.01, saturated=False, steering_pressed=False, driver_torque=0.0,
               lane_change=False, blinker=False, ti_ok=True, fault=False, controller_ok=True, tests_active=False,
-              stored={name: stored}, config=json_cfg({"setting": name, "b": b_value(name), "block_min": 2, "seed": 3}))
+              stored={name: stored}, config=json_cfg({"setting": name, "b": b_value(name), "block_min": 4, "seed": 3}))
     m.update(on=False, pin=None, **kw)
     cb, VMb, V = make()
     ca, VMa, _ = make()

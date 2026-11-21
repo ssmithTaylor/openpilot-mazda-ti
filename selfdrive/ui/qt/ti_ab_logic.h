@@ -24,14 +24,14 @@ struct Setting {
 
 constexpr int N_SETTINGS = 6;
 constexpr Setting SETTINGS[N_SETTINGS] = {
-  {"SteerKP", "steerKp", false, 0.50, 1.10, 0.25, 0.05},
+  {"SteerKP", "steerKp", false, 0.70, 1.00, 0.10, 0.05},
   {"LatCommitSetpoint", "lat_commit_setpoint", true, 0, 1, 1, 1},
   {"LatDamping", "lat_damping", true, 0, 1, 1, 1},
   {"LatFrictionComp", "lat_friction_comp", true, 0, 1, 1, 1},
   {"LatOutputFilter", "lat_output_filter", true, 0, 1, 1, 1},
   {"LatNoFrictionRelay", "lat_no_friction_relay", true, 0, 1, 1, 1},
 };
-constexpr double MIN_BLOCK_MIN = 2.0;
+constexpr double MIN_BLOCK_MIN = 4.0;
 constexpr double MAX_BLOCK_MIN = 10.0;
 constexpr double DEFAULT_BLOCK_MIN = 4.0;
 constexpr double BLOCK_STEP_MIN = 1.0;
@@ -99,7 +99,20 @@ inline bool canEdit(bool on) {
   return !on;
 }
 
+// PIN B (a change of the value, and the one that matters) needs a second tap within PIN_CONFIRM_S; PIN A and releasing do not
+constexpr double PIN_CONFIRM_S = 3.0;
+
+// Settings whose arms can differ only in bends: the page says so and the car side scores minutes only there
+inline bool bendsOnly(const char *name) {
+  return std::strcmp(name, "LatCommitSetpoint") == 0;
+}
+
 enum class Pin { None, A, B };
+
+// armed_at: when the first tap on PIN B was made (negative: none). True when this tap, at `now`, confirms it
+inline bool pinBConfirmed(double now, double armed_at) {
+  return armed_at >= 0.0 && now >= armed_at && now - armed_at <= PIN_CONFIRM_S;
+}
 
 // What a tap on PIN A or PIN B asks for: the other arm pinned, or alternation again when the tapped arm is already pinned
 inline Pin tapPin(Pin current, Pin tapped) {
@@ -118,7 +131,7 @@ struct Reason {
 constexpr int N_REASONS = 11;
 constexpr Reason REASONS[N_REASONS] = {
   {"input", "bad inputs"}, {"touch", "hands on the wheel"}, {"lane_change", "lane change"},
-  {"holdoff", "after a touch or blinker"}, {"speed", "speed outside 20-79 mph"}, {"eps", "near 28-31 mph"},
+  {"holdoff", "after a touch or blinker"}, {"speed", "speed outside 36-69 mph"}, {"eps", "near 28-31 mph"},
   {"curve", "road bends"}, {"lat", "lateral demand"}, {"request", "steering request large"},
   {"saturated", "steering saturated"}, {"settle", "settling"},
 };

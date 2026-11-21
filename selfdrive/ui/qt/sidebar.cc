@@ -1435,9 +1435,14 @@ void TestsWindow::abAct(int control) {
   } else if (control == 31 || control == 32) {
     if (ab_on) {                                // a pin means nothing while A/B is off
       const ti_ab::Pin next = ti_ab::tapPin(ab_pin, control == 31 ? ti_ab::Pin::A : ti_ab::Pin::B);
-      if (next == ti_ab::Pin::None) {
+      const double now = QDateTime::currentMSecsSinceEpoch() / 1000.0;
+      if (next == ti_ab::Pin::B && !ti_ab::pinBConfirmed(now, ab_pin_b_armed)) {
+        ab_pin_b_armed = now;                       // the first tap on PIN B only arms it
+      } else if (next == ti_ab::Pin::None) {
+        ab_pin_b_armed = -1.0;
         ab_memory.remove(TI_AB_PIN_KEY);
       } else {
+        ab_pin_b_armed = -1.0;
         ab_memory.put(TI_AB_PIN_KEY, ti_ab::pinText(next));
       }
     }
@@ -1481,7 +1486,9 @@ QString TestsWindow::drawAb(QPainter &p) {
           ab_pin == ti_ab::Pin::A ? QString("A PINNED\ntap to release") : QString("PIN A"), 44);
   drawBox(p, abBox(32), ab_pin == ti_ab::Pin::B ? amber : (ab_on ? grey : dim_fill),
           ab_pin == ti_ab::Pin::B ? QColor(0, 0, 0) : (ab_on ? white : dim_ink),
-          ab_pin == ti_ab::Pin::B ? QString("B PINNED\ntap to release") : QString("PIN B"), 44);
+          ab_pin == ti_ab::Pin::B ? QString("B PINNED\ntap to release")
+                                  : (ti_ab::pinBConfirmed(QDateTime::currentMSecsSinceEpoch() / 1000.0, ab_pin_b_armed)
+                                         ? QString("TAP AGAIN\nto pin B") : QString("PIN B")), 44);
 
   // which value is in force, and its number
   const QRect panel(1340, rowTop() + 10, width() - 1340 - 30, 190);
@@ -1580,6 +1587,9 @@ QString TestsWindow::drawAb(QPainter &p) {
   }
   if (ab_on && ab_status.value("msg").toString().size() > 0 && ab_fresh) {
     return ab_status.value("msg").toString();
+  }
+  if (ti_ab::bendsOnly(s.name)) {
+    return QString("%1 acts only in bends: minutes count only there").arg(s.name);
   }
   return edit ? QString("Changes apply when you start A/B") : QString();
 }

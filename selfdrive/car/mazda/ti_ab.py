@@ -78,22 +78,32 @@ class Spec(NamedTuple):
   why: str
 
 
+# First-trial limits (named so that they can be widened later on evidence, never by the screen)
+KP_LO, KP_HI, KP_MAX_STEP = 0.70, 1.00, 0.10
+# After the ramp ends the integrator (time constant about kp/ki, around 4 s) must re-converge for a setting that changes the
+# steady error (gain, friction compensation, relay): wash-in is the ramp plus this; the others settle in a few seconds
+WASH_AFTER_INTEGRATOR_S = 10.0
+# Alternation is active only between these speeds (below about 28 mph the interceptor steers alone with little authority)
+ALT_MIN_MPH, ALT_MAX_MPH = 35.0, 70.0
+# A setting that can act only above this lateral demand (m/s^2): minutes are scored only there
+ACTS_ABOVE_LAT = {"LatCommitSetpoint": 1.0}
+
 # ---- the allowlist -----------------------------------------------------------------------------------------------
 # Each is read LIVE every cycle by the lateral controller (latcontrol_torque.py, plant branch; controlsd for SteerKP),
 # shapes only the command before the unchanged clip / rate limiter / interceptor bounds, and needs no recalibration.
 SETTINGS = {
-  "SteerKP": Spec("SteerKP", "steerKp", "float", 0.50, 1.10, 0.25, 0.05, 2.0, 5.0, False,
+  "SteerKP": Spec("SteerKP", "steerKp", "float", KP_LO, KP_HI, KP_MAX_STEP, 0.05, 2.0, 2.0 + WASH_AFTER_INTEGRATOR_S, False,
                   "proportional gain, written to the PID every cycle; a step in it is a step in the output only through "
                   "the current error, so it is ramped over 2 s"),
-  "LatCommitSetpoint": Spec("LatCommitSetpoint", "lat_commit_setpoint", "bool", 0, 1, 1, 1, 0.0, 4.0, False,
+  "LatCommitSetpoint": Spec("LatCommitSetpoint", "lat_commit_setpoint", "bool", 0, 1, 1, 1, 0.0, 6.0, False,
                             "reference filter, blended in by the controller over 0.5 s with warm state"),
-  "LatDamping": Spec("LatDamping", "lat_damping", "bool", 0, 1, 1, 1, 1.0, 4.0, True,
+  "LatDamping": Spec("LatDamping", "lat_damping", "bool", 0, 1, 1, 1, 1.0, 6.0, True,
                      "rate-feedback term, scaled by the blend weight so it fades in or out over 1 s"),
-  "LatFrictionComp": Spec("LatFrictionComp", "lat_friction_comp", "bool", 0, 1, 1, 1, 1.0, 4.0, True,
+  "LatFrictionComp": Spec("LatFrictionComp", "lat_friction_comp", "bool", 0, 1, 1, 1, 1.0, 1.0 + WASH_AFTER_INTEGRATOR_S, True,
                           "friction compensation, scaled by the blend weight over 1 s (zero on straights anyway)"),
-  "LatOutputFilter": Spec("LatOutputFilter", "lat_output_filter", "bool", 0, 1, 1, 1, 0.0, 3.5, False,
+  "LatOutputFilter": Spec("LatOutputFilter", "lat_output_filter", "bool", 0, 1, 1, 1, 0.0, 4.5, False,
                           "output smoothing, blended by the controller over 0.25 s with the filter tracking the command"),
-  "LatNoFrictionRelay": Spec("LatNoFrictionRelay", "lat_no_friction_relay", "bool", 0, 1, 1, 1, 1.0, 4.0, True,
+  "LatNoFrictionRelay": Spec("LatNoFrictionRelay", "lat_no_friction_relay", "bool", 0, 1, 1, 1, 1.0, 1.0 + WASH_AFTER_INTEGRATOR_S, True,
                              "breakaway relay (value True = relay off), scaled by the blend weight over 1 s"),
 }
 ALLOWED = tuple(SETTINGS)
@@ -116,14 +126,14 @@ assert set(SETTINGS) | set(EXCLUDED) == {
   "TiSteerDeltaUpHigh", "TiSteerThreshold", "ForceAutoTune"}
 
 # ---- blocks, waiting, gates ---------------------------------------------------------------------------------------
-DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN = 4.0, 2.0, 10.0
+DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN = 4.0, 4.0, 10.0
 MAX_WAIT_S = 60.0           # a pending switch waits this long, then is skipped
 SETTLE_S = 1.0              # every gate open this long before a switch
 MIN_BLOCK_KEEP_S = 60.0     # a block cut short under this is voided and run again
 HB_S = 10.0
 H = ti.ZONE_HYSTERESIS_MPH
-SPEED_OFF_LOW, SPEED_ON_LOW = ti.MIN_TEST_MPH, ti.MIN_TEST_MPH + H           # released below 19, ready from 20 mph
-SPEED_OFF_HIGH, SPEED_ON_HIGH = ti.MAX_TEST_MPH, ti.MAX_TEST_MPH - H         # released from 80, ready below 79 mph
+SPEED_OFF_LOW, SPEED_ON_LOW = ALT_MIN_MPH, ALT_MIN_MPH + H                   # released below 35, ready from 36 mph
+SPEED_OFF_HIGH, SPEED_ON_HIGH = ALT_MAX_MPH, ALT_MAX_MPH - H                 # released from 70, ready below 69 mph
 EPS_KEEPOUT = (ti.EPS_LOW_MPH - H, ti.EPS_HIGH_MPH + H)                      # no switch from 27 up to 32 mph
 # (open, close) of each Schmitt gate
 GATES = {"curve": (0.002, 0.0025),       # 1/m, desired curvature
@@ -132,13 +142,13 @@ GATES = {"curve": (0.002, 0.0025),       # 1/m, desired curvature
 WINDOW_LABELS = tuple(w[2] for w in ti.WINDOWS) + ("gap",)
 PRIORITY = ("input", "touch", "lane_change", "holdoff", "speed", "eps", "curve", "lat", "request", "saturated", "settle")
 MESSAGE = {"input": "bad inputs", "touch": "hands on the wheel", "lane_change": "lane change", "holdoff": "after a touch or blinker",
-           "speed": "speed outside 20-79 mph", "eps": "near 28-31 mph", "curve": "road bends", "lat": "lateral demand",
+           "speed": "speed outside 36-69 mph", "eps": "near 28-31 mph", "curve": "road bends", "lat": "lateral demand",
            "request": "steering request large", "saturated": "steering saturated", "settle": "settling"}
 
 
 def _table_hash():
   spec = [[tuple(s) for s in SETTINGS.values()], DEFAULT_BLOCK_MIN, MIN_BLOCK_MIN, MAX_BLOCK_MIN, MAX_WAIT_S, SETTLE_S,
-          MIN_BLOCK_KEEP_S, GATES, EPS_KEEPOUT, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
+          MIN_BLOCK_KEEP_S, GATES, EPS_KEEPOUT, ACTS_ABOVE_LAT, WASH_AFTER_INTEGRATOR_S, [SPEED_OFF_LOW, SPEED_ON_LOW, SPEED_OFF_HIGH, SPEED_ON_HIGH], VERSION]
   return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -347,6 +357,9 @@ class TiAb:
     self.wait_hist = {}
     self.wait_logged = False
     self.pin = None
+    self.pin_wait = None
+    self.pin_wait_logged = None
+    self.reversed_hold = False
     self.pin_error = False
     self.wash_left = 0
     self.progress = {arm: {w: 0.0 for w in WINDOW_LABELS} for arm in "AB"}
@@ -539,7 +552,7 @@ class TiAb:
         self.message = "bad inputs"
       elif not self.speed_ok:
         hard = "speed"
-        self.message = "speed outside 19-80 mph"
+        self.message = "speed outside 35-70 mph"
       else:
         self.message = ""
 
@@ -575,6 +588,12 @@ class TiAb:
     reason = self._gate(finite, touch, lane_change or blinker, steer, saturated, curvature, v_ego, mph)
     self.last_reason = reason
 
+    # ---- a touch, blinker or lane change while the value is moving toward B: back to A (a ramp toward A goes on)
+    if (touch or lane_change or blinker) and self.ramp.moving and self.ramp.to == 1.0:
+      self._end_block("reversed")
+      self._switch(0.0, "reverse:touch" if touch else "reverse:blinker")
+      self.reversed_hold = True
+
     # ---- pin: anything but a clear "A" or "B" that is not empty is an unreadable pin, read as A
     pin_error = pin not in (None, "", b"", "A", "B")
     want_pin = pin if pin in ("A", "B") else ("A" if pin_error else None)
@@ -592,15 +611,27 @@ class TiAb:
       else:
         self._event("unpin", arm=self.pin)
       self.pin = want_pin
+    self.pin_wait = None
     if self.pin is not None:
       self.mode = "pinned"
-      self._switch(0.0 if self.pin == "A" else 1.0, "pin")
+      if self.pin == "A":
+        self._switch(0.0, "pin")                    # A: at once, by ramp
+      elif self.ramp.to == 1.0:
+        pass
+      elif reason is None:                          # B: only when the automatic switch gates are open
+        self._switch(1.0, "pin")
+      else:
+        self.pin_wait = reason
+        if self.pin_wait_logged != reason:
+          self.pin_wait_logged = reason
+          self._event("pin_wait", arm="B", why=reason)
     else:
       self.mode = "running"
       self._blocks(reason, self.block_len)
 
     # ---- scored time
-    if self.wash_left == 0 and not self.ramp.moving:
+    acts = ACTS_ABOVE_LAT.get(self.spec.name)
+    if self.wash_left == 0 and not self.ramp.moving and (acts is None or v_ego * v_ego * abs(curvature) >= acts):
       self.progress[self.arm_in_force][self.window] += DT
     if self.n - self.hb_at >= HB_S / DT:
       self.hb_at = self.n
@@ -703,7 +734,9 @@ class TiAb:
       length = self.block_len
       block = {"idx": self.block[0], "arm": self.block[1], "len_s": length, "left_s": round(max(length - self.block_frames * DT, 0.0), 1)}
     wait = None
-    if self.mode == "running" and self.block is None and self.pending_since is not None:
+    if self.pin_wait is not None:
+      wait = {"reason": self.pin_wait, "why": "pin waiting: " + MESSAGE.get(self.pin_wait, ""), "s": 0.0, "max_s": 0.0, "arm": "B", "pin": True}
+    elif self.mode == "running" and self.block is None and self.pending_since is not None:
       wait = {"reason": self.last_reason or "settle", "why": MESSAGE.get(self.last_reason or "settle", ""),
               "s": round((self.n - self.pending_since) * DT, 1), "max_s": MAX_WAIT_S,
               "arm": arm_for(self.seed, self.idx)}

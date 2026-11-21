@@ -197,6 +197,7 @@ private:
   double ab_block_min = ti_ab::DEFAULT_BLOCK_MIN;
   int ab_setting = 0;
   ti_ab::Pin ab_pin = ti_ab::Pin::None;
+  double ab_pin_b_armed = -1.0;             // seconds (epoch) of the first tap on PIN B; negative: none
   QJsonObject ab_status;
   Params ab_params;
   Params ab_memory{"/dev/shm/params"};

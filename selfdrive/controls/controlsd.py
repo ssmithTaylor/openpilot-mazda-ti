@@ -234,7 +234,12 @@ class Controls:
     self.ab_toggles = self.frogpilot_toggles
     self.ab_last_steer = 0.0
     self.ab_last_saturated = False
-    self.ti_ab = TiAbRunner(self.params, params_memory, log=ti_ab_log) if TiAbRunner is not None and self.CP.carName == "mazda" else None
+    self.ti_ab = None
+    try:
+      if TiAbRunner is not None and self.CP.carName == "mazda":
+        self.ti_ab = TiAbRunner(self.params, params_memory, log=ti_ab_log)
+    except Exception:
+      cloudlog.exception("ti_ab disabled")       # the mode stays off and the controller is unchanged
 
     # Both lateral controllers are built here; self.LaC only points at one of them, so which one is
     # driving can change while the car is moving. Comparing them across separate drives has misled

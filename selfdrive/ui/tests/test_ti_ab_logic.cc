@@ -22,25 +22,25 @@ static void table() {
 
 static void steps() {
   const Setting &kp = SETTINGS[0];
-  // stored 0.80: B walks 0.85, 0.90 .. 1.05 and stops at the largest step (0.25), then at nothing more
+  // stored 0.80: B walks 0.85, 0.90 and stops at the largest step (0.10)
   double b = defaultB(kp, 0.80);
   CHECK(std::fabs(b - 0.85) < 1e-9);
   for (int i = 0; i < 10; i++) {
     b = stepB(kp, 0.80, b, +1);
   }
-  CHECK(std::fabs(b - 1.05) < 1e-9);
-  CHECK(bAllowed(kp, 0.80, b) && !bAllowed(kp, 0.80, 1.06) && !bAllowed(kp, 0.80, 1.10));
-  // downward: it jumps over A (0.80) and stops at 0.55
+  CHECK(std::fabs(b - 0.90) < 1e-9);
+  CHECK(bAllowed(kp, 0.80, b) && !bAllowed(kp, 0.80, 0.95) && !bAllowed(kp, 0.80, 1.10));
+  // downward: it jumps over A (0.80) and stops at 0.70
   for (int i = 0; i < 12; i++) {
     b = stepB(kp, 0.80, b, -1);
   }
-  CHECK(std::fabs(b - 0.55) < 1e-9 && bAllowed(kp, 0.80, b));
+  CHECK(std::fabs(b - 0.70) < 1e-9 && bAllowed(kp, 0.80, b));
   // at the top of the range the first offer is below A
-  CHECK(std::fabs(defaultB(kp, 1.10) - 1.05) < 1e-9);
-  CHECK(!bAllowed(kp, 1.20, 1.0));                // a stored value outside the range is refused by the car side
+  CHECK(std::fabs(defaultB(kp, 1.00) - 0.95) < 1e-9 && !bAllowed(kp, 0.80, 0.65));
+  CHECK(!bAllowed(kp, 1.20, 1.0) && !bAllowed(kp, 0.60, 0.65));                // a stored value outside the range is refused by the car side
   CHECK(!bAllowed(kp, 0.80, 0.80) && !bAllowed(kp, 0.80, 0.82));
   // never offers what the car side refuses
-  for (double a = 0.50; a <= 1.10 + 1e-9; a += 0.05) {
+  for (double a = 0.70; a <= 1.00 + 1e-9; a += 0.05) {
     double x = defaultB(kp, a);
     CHECK(bAllowed(kp, a, x));
     for (int d = -1; d <= 1; d += 2) {
@@ -57,7 +57,7 @@ static void steps() {
 }
 
 static void blocks() {
-  CHECK(stepBlock(4, +1) == 5 && stepBlock(4, -1) == 3 && stepBlock(2, -1) == 2 && stepBlock(10, +1) == 10);
+  CHECK(stepBlock(4, +1) == 5 && stepBlock(5, -1) == 4 && stepBlock(4, -1) == 4 && stepBlock(10, +1) == 10);
   CHECK(DEFAULT_BLOCK_MIN >= MIN_BLOCK_MIN && DEFAULT_BLOCK_MIN <= MAX_BLOCK_MIN);
 }
 
@@ -67,6 +67,9 @@ static void pins() {
   CHECK(tapPin(Pin::A, Pin::A) == Pin::None && tapPin(Pin::B, Pin::B) == Pin::None);
   CHECK(std::strcmp(pinText(Pin::A), "A") == 0 && std::strcmp(pinText(Pin::B), "B") == 0 && pinText(Pin::None)[0] == 0);
   CHECK(canEdit(false) && !canEdit(true));
+  CHECK(!pinBConfirmed(10.0, -1.0) && pinBConfirmed(11.0, 10.0) && pinBConfirmed(13.0, 10.0) && !pinBConfirmed(13.5, 10.0));
+  CHECK(!pinBConfirmed(9.0, 10.0));
+  CHECK(bendsOnly("LatCommitSetpoint") && !bendsOnly("LatDamping") && !bendsOnly("SteerKP"));
 }
 
 static void texts() {
