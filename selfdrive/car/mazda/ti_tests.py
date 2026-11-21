@@ -111,6 +111,7 @@ REASON_TEXT = {
   "regime": "Waiting: steering mode settling",
   "band_done": "Waiting: this speed band is complete",
   "extra": "Running: band complete, collecting extra",
+  "lat": "Waiting: lateral demand above the limit",
   "switch": "Switching to the next test",
 }
 

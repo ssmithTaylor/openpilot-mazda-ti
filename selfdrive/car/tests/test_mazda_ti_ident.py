@@ -289,9 +289,9 @@ def test_a_small_reading_must_persist_like_the_dithers():
 
 @pytest.mark.parametrize('key,step,change,reason', [
   (ti.SWEEP, 0, dict(blinker=True), "blinker"),
-  (ti.SWEEP, 0, dict(curvature=0.011), "curve"), (ti.SWEEP, 0, dict(lat_demand=1.6), "curve"),
+  (ti.SWEEP, 0, dict(curvature=0.011), "curve"), (ti.SWEEP, 0, dict(lat_demand=1.6), "lat"),
   (ti.SWEEP, 0, dict(base_request=451), "command"), (ti.SWEEP, 0, dict(v_ego=85 * MPH), "band"),
-  (ti.LADDER, 3, dict(curvature=0.0045), "curve"), (ti.LADDER, 3, dict(lat_demand=1.1), "curve"),
+  (ti.LADDER, 3, dict(curvature=0.0045), "curve"), (ti.LADDER, 3, dict(lat_demand=1.1), "lat"),
   (ti.LADDER, 3, dict(base_request=301), "command"), (ti.PULSES, 1, dict(base_request=-301), "command"),
 ])
 def test_other_gate_conditions_fade_out(key, step, change, reason):
@@ -814,3 +814,19 @@ def test_a_raising_reset_is_switched_off_too(monkeypatch):
   r = step(h, 0.05, lat_active=False)
   assert h.ti_ident is None and r['sent'] == 0
   assert step(h, 0.05)['ident'] == 0
+
+
+def test_every_pause_reason_has_its_own_screen_text_and_stop_events_name_it():
+  codes = {"off", "touch", "rate", "blinker", "holdoff", "band", "regime", "command", "curve", "lat", "extra", "switch",
+           "ok"}
+  assert codes - {"off"} <= set(tt.REASON_TEXT) and len({tt.REASON_TEXT[c] for c in codes - {"off"}}) == len(codes) - 1
+  logged = []
+  g = TiIdent(log=logged.append)
+  prog = Progress()
+  for change in (dict(blinker=True), dict(curvature=0.02), dict(lat_demand=2.0), dict(base_request=500),
+                 dict(v_ego=85 * MPH), dict(driver_torque=7.0)):
+    drive(g, ti.SWEEP, "31-45", 600, frame0=len(logged) * 1000 + 10 ** 5, prog=prog)
+    drive(g, ti.SWEEP, "31-45", 5, frame0=len(logged) * 1000 + 10 ** 5 + 600, prog=prog, **change)
+  whys = [e.get("why") for e in logged if e["kind"] == "stop"]
+  assert {"blinker", "curve", "lat", "command", "band", "touch"} <= set(whys)
+  assert all("step" in e for e in logged if e["kind"] == "stop")

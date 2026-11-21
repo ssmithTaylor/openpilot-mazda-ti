@@ -442,7 +442,7 @@ class TiIdent:
   def reset(self, frame=None):
     """Lateral control off or TI not in RUN: zero at once."""
     if self.test is not None and frame is not None:
-      self._event(frame, "stop", mode="zero")
+      self._event(frame, "stop", mode="zero", why="inactive", step=self.step)
     self._stop()
     self.loud = 0
     self.touch = False
@@ -482,12 +482,12 @@ class TiIdent:
 
   def _fade(self, frame, why):
     if self.test == PULSES and self.ph >= len(_DOUBLETS[PULSE_AMPS[self.step]]):
-      self._event(frame, "stop", mode="zero", why=why)   # between doublets: the signal is already zero
+      self._event(frame, "stop", mode="zero", why=why, step=self.step)   # between doublets: already zero
       self._stop()
       return
     self.fading = True
     self.clean = False
-    self._event(frame, "stop", mode="fade", env=self.env, why=why)
+    self._event(frame, "stop", mode="fade", env=self.env, why=why, step=self.step)
 
   def update(self, armed, frame, *, v_ego, steering_pressed, driver_torque, blinker, base_request, ti_max,
              lat_demand, curvature, lkas_blocked, room=None, remaining=None):
@@ -541,9 +541,10 @@ class TiIdent:
       reason = "regime"
     elif abs(base_request) > (MAX_BASE_FRACTION_STRICT if strict else MAX_BASE_FRACTION_SMALL) * ti_max:
       reason = "command"
-    elif (abs(lat_demand) > (MAX_LAT_DEMAND if strict else MAX_LAT_DEMAND_SMALL) or
-          abs(curvature) > (MAX_CURVATURE if strict else MAX_CURVATURE_SMALL)):
+    elif abs(curvature) > (MAX_CURVATURE if strict else MAX_CURVATURE_SMALL):
       reason = "curve"
+    elif abs(lat_demand) > (MAX_LAT_DEMAND if strict else MAX_LAT_DEMAND_SMALL):
+      reason = "lat"
     elif step is None:
       reason = "off"              # progress unknown (no accountant): nothing runs
     elif key == LADDER and self.test == key and step_params(key, self.step)[1] > LADDER_CAPS[band]:
@@ -561,7 +562,7 @@ class TiIdent:
       self.counts[slot] = self.counts.get(slot, 0) + 1
 
     if self.test is not None and (touch or (key is not None and reason == "rate")):
-      self._event(frame, "stop", mode="zero")      # a touch or too little rate room: zero at once
+      self._event(frame, "stop", mode="zero", why=reason, step=self.step)   # a touch or too little rate room
       self._stop()
     if self.test is not None and not self.fading and (not open_ or key != self.test):
       self._fade(frame, reason)
