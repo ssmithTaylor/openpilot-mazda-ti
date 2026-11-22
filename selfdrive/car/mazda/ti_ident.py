@@ -1107,6 +1107,46 @@ def frame_scheduler(ident, remaining):
   return rem, can_run, strict
 
 
+_REP = {}
+
+
+def _class_rep():
+  """One (test, step) per step class (small or not): limit_state depends on the step only through small()."""
+  if not _REP:
+    for k in KEYS:
+      for s in range(n_steps(k)):
+        _REP.setdefault(small(k, s), (k, s))
+  return _REP
+
+
+class SchedulerCache:
+  """frame_scheduler's answers kept from frame to frame while nothing they depend on has changed: the window, whether the limit
+  inputs exist and are finite, whether each step class's limits are open in the window, which steps are inside their re-arm dwell,
+  and the progress (the accountant's `version`). Exact: when that key is unchanged every answer is the same, and anything not yet
+  asked is computed on the current frame's state. Without a version (None) it is per frame only (frame_scheduler).
+  `frame(ident, remaining, profile, version)` -> (remaining, can_run, strict)."""
+
+  def __init__(self):
+    self.key = None
+    self.fns = None
+
+  def frame(self, ident, remaining, profile, version):
+    if version is None or version[1] is None:
+      self.key = None
+      return frame_scheduler(ident, remaining)
+    inputs = ident.inputs
+    finite = inputs is None or all(math.isfinite(x) for x in inputs.values())
+    lims = ()
+    if inputs is not None and finite and profile is not None:
+      lims = tuple((c, ident.limit_state(k, s, profile, **inputs)[0] is None) for c, (k, s) in sorted(_class_rep().items()))
+    rearm = REARM_S / DT
+    dwell = frozenset(ks for ks, v in ident.viol_at.items() if not (ident.n - v[0]) > rearm)
+    key = (id(ident), profile, inputs is None, finite, lims, dwell, version)
+    if key != self.key or self.fns is None:
+      self.key, self.fns = key, frame_scheduler(ident, remaining)
+    return self.fns
+
+
 def reconstruct(events, n_frames):
   """The added counts of frames 0..n_frames-1 from the logged events alone (the same state machine, no inputs)."""
   by_frame = {}

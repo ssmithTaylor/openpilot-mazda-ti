@@ -23,6 +23,18 @@ def _ident_tests():
 T = _ident_tests()
 
 
+class VProgress(T.Progress):
+  """The test accountant's `remaining` with its `version` (ti_tests.TestAccountant: +1 on every change of progress)."""
+  def __init__(self):
+    super().__init__()
+    self.version = 0
+
+  def add(self, credit):
+    if credit is not None:
+      self.version += 1
+    super().add(credit)
+
+
 def _loop(rows, prog, new, counter=None):
   """The car controller's run-all loop (carcontroller.py: advance_zone, pick with can_run and strict, update), old or new."""
   g = TiIdent(log=None)
@@ -36,10 +48,14 @@ def _loop(rows, prog, new, counter=None):
       return feas(*a)
     g._feasible = counting
   runner = ti.RunAll(seed=11, emit=g.event_for_pick)
+  cache = ti.SchedulerCache()
   armed_seq, out = [], []
   for k, row in enumerate(rows):
     profile = g.advance_zone(row["v_ego"]).profile
-    if new:
+    if new == "cached":
+      rem, can_run, strict = cache.frame(g, prog.remaining, profile, (id(prog), prog.version))
+      armed = runner.pick(k, profile, rem, can_run, strict)
+    elif new:
       rem, can_run, strict = ti.frame_scheduler(g, prog.remaining)
       armed = runner.pick(k, profile, rem, can_run, strict)
     else:
@@ -59,25 +75,44 @@ def test_the_new_scheduler_is_frame_for_frame_identical_to_the_old_one(seed, don
     for j in range(k, k + 40):
       rows[j] = dict(rows[j], lat_demand=float("nan"))
   res = []
-  for new in (False, True):
-    prog = T.Progress()
+  for new in (False, True, "cached"):
+    prog = VProgress()
     for k, w in done:
       T.complete(prog, k, w)
+    prog.version += 1
     res.append(_loop(rows, prog, new))
-  (a_arm, a_out, a_ev, a_r), (b_arm, b_out, b_ev, b_r) = res
-  assert a_arm == b_arm
-  assert a_out == b_out
-  assert a_ev == b_ev                                   # picks (mode, totals, draw), runs, chunks, stops, credits
-  assert (a_r.draw, a_r.current, a_r.mode, a_r.blocked) == (b_r.draw, b_r.current, b_r.mode, b_r.blocked)
+  (a_arm, a_out, a_ev, a_r) = res[0]
+  for (b_arm, b_out, b_ev, b_r) in res[1:]:
+    assert a_arm == b_arm
+    assert a_out == b_out
+    assert a_ev == b_ev                                 # picks (mode, totals, draw), runs, chunks, stops, credits
+    assert (a_r.draw, a_r.current, a_r.mode, a_r.blocked) == (b_r.draw, b_r.current, b_r.mode, b_r.blocked)
   assert len({x for x in a_arm if x}) >= 2 and any(e["kind"] == "pick" for e in a_ev)
 
 
 def test_the_new_scheduler_checks_each_step_far_fewer_times():
   rows = T._random_rows(3, 4000)
   old, new = [0], [0]
-  _loop(rows, T.Progress(), False, old)
-  _loop(rows, T.Progress(), True, new)
+  _loop(rows, VProgress(), False, old)
+  _loop(rows, VProgress(), True, new)
   assert new[0] * 2 <= old[0], (old[0], new[0])
+
+
+def test_the_cache_reuses_the_answers_across_frames_while_nothing_changes():
+  rows = T._random_rows(4, 3000)
+  calls = [0]
+  real = ti.frame_scheduler
+
+  def counting(*a):
+    calls[0] += 1
+    return real(*a)
+  ti_frame = ti.frame_scheduler
+  try:
+    ti.frame_scheduler = counting
+    _loop(rows, VProgress(), "cached")
+  finally:
+    ti.frame_scheduler = ti_frame
+  assert calls[0] < len(rows) / 2, calls[0]
 
 
 def _plan_tests():

@@ -459,9 +459,11 @@ class TestAccountant:
     self.active_interval = set()  # step_seconds tests that ran clean at any frame since the last publish
     self.all_seen = False        # run all was on at any frame since the last publish
     self.failed = False
+    self.version = 0             # +1 whenever what `remaining` returns can change (a credit, a publish, the first read, a failure)
 
   def _fail(self, where):
     self.failed = True
+    self.version += 1
     _log(f"ti_tests: accountant disabled after an error in {where}")
 
   def update(self, toggles, v_ego, engaged, active_keys, arms=None, credit=None, run_all_forced=False):
@@ -487,6 +489,7 @@ class TestAccountant:
             slot = (credit[1], credit[2])
             counted = self.pending_steps.setdefault(t.id, {})
             counted[slot] = counted.get(slot, 0.0) + credit[3]
+            self.version += 1
           continue
         counting = (not t.keys.isdisjoint(active_keys)) if t.metric == "active_seconds" else bool(engaged)
         if counting:
@@ -507,6 +510,7 @@ class TestAccountant:
     try:
       if self.doc is None:
         self.doc = self._base()[0]
+        self.version += 1
       entry = self.doc.get(t.id, {}).get(band, {})
       have = entry.get(str(step), 0.0) if isinstance(entry, dict) else 0.0
       have = (have if _number(have) else 0.0) + self.pending_steps.get(t.id, {}).get((band, step), 0.0)
@@ -618,6 +622,7 @@ class TestAccountant:
       self.pending, self.pending_steps, self.seen_interval, self.active_interval = {}, {}, set(), set()
       self.all_seen = False
       self.doc = doc
+      self.version += 1
       self.seq += 1
       live = {"seq": self.seq, "t": round(time.time() if wall is None else wall, 1), "on": on, "active": active,
               "status": self._status(on, reasons, notes), "reset_done": dict(self.reset_done)}

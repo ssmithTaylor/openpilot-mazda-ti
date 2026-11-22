@@ -747,7 +747,10 @@ class CarController(CarControllerBase):
                 profile = ident.advance_zone(CS.out.vEgo).profile      # with the speed hysteresis
                 # one frame's answers computed once (ti_ident.frame_scheduler: the same answers as ident.can_run /
                 # ident.next_is_strict on tests.remaining, without re-running the step search for every question)
-                rem, can_run, strict = ti_ident_mod.frame_scheduler(ident, tests.remaining)
+                sched = getattr(self, "ti_sched", None)
+                if sched is None:
+                  sched = self.ti_sched = ti_ident_mod.SchedulerCache()
+                rem, can_run, strict = sched.frame(ident, tests.remaining, profile, (id(tests), getattr(tests, "version", None)))
                 armed = self.ti_run_all.pick(self.frame, profile, rem, can_run, strict)
               else:
                 armed = on[0] if (len(on) == 1 and free and not self.ti_ident_all) else None
