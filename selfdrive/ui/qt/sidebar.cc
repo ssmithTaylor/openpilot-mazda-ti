@@ -2046,7 +2046,7 @@ void TestsWindow::drawSetup(QPainter &p) {
     if (plan.has_alt) {
       const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
       lines << QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
-      lines << QString("Blocks of %1 min, %2 min per side to finish, counted at %3-%4 mph; a block starts at %5-%6 mph")
+      lines << QString("%1-min blocks, %2 min a side; counts at %3-%4 mph, starts %5-%6 mph")
                    .arg((int)ab_block_min).arg((int)plan.target_min).arg((int)ti_ab::PLAN_ALT_MIN_MPH + 1).arg((int)ti_ab::PLAN_ALT_MAX_MPH - 1)
                    .arg((int)(ti_ab::PLAN_ALT_MIN_MPH + ti_ab::START_MARGIN_MPH)).arg((int)(ti_ab::PLAN_ALT_MAX_MPH - ti_ab::START_MARGIN_MPH));
       if (ti_ab::bendsOnly(s.name)) {
