@@ -55,6 +55,9 @@ def _loop(rows, prog, new, counter=None):
                                        (2, tuple((k, w) for k in ti.KEYS for w in ("35-41", "21-27")))])
 def test_the_new_scheduler_is_frame_for_frame_identical_to_the_old_one(seed, done):
   rows = T._random_rows(seed, 12000)
+  for k in range(1500, 12000, 2900):             # a few frames of unusable inputs (non-finite: every limit closed)
+    for j in range(k, k + 40):
+      rows[j] = dict(rows[j], lat_demand=float("nan"))
   res = []
   for new in (False, True):
     prog = T.Progress()
@@ -114,3 +117,27 @@ def test_the_shares_are_not_computed_while_the_tests_do_not_interleave(monkeypat
   called = []
   monkeypatch.setattr(tp, "tests_behind", lambda *a: called.append(a) or True)
   assert r._tests_behind(20.0) is False and r.tests_behind is False and called == []
+
+
+ROOT = HERE.parents[2]
+
+
+def _block(path, start, n_lines):
+  import textwrap
+  lines = (ROOT / path).read_text(encoding="utf-8").splitlines()
+  i = next(k for k, line in enumerate(lines) if line.strip() == start)
+  return textwrap.dedent("\n".join(lines[i:i + n_lines]))
+
+
+@pytest.mark.parametrize("path,start,n", [("selfdrive/controls/controlsd.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 5),
+                                          ("selfdrive/car/card.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 4)])
+def test_the_toggles_are_read_on_both_edges_of_toggles_updated_only(path, start, n):
+  from types import SimpleNamespace as NS
+  code = compile(_block(path, start, n), path, "exec")
+  reads = []
+  host = NS(toggles_updated_last=False, select_lat_control=lambda: None)
+  seq = [False, True, True, True, True, False, False, True, False]
+  for k, flag in enumerate(seq):
+    host.sm = {"frogpilotPlan": NS(togglesUpdated=flag)}
+    exec(code, {"self": host, "get_frogpilot_toggles": lambda k=k: reads.append(k) or k})
+  assert reads == [1, 5, 7, 8]          # each rising edge (written before the flag goes on) and each falling edge (after the last write)

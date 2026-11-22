@@ -1058,7 +1058,10 @@ def frame_scheduler(ident, remaining):
   instead of once per question (pick asks can_run up to four times per test and strict once per test, and every answer re-ran
   the step search). Exact, not rate-limited: nothing that the answers depend on (progress, the generator's limit inputs and frame
   count) changes between pick's questions, which all come before the generator's update. Make a new one every frame."""
-  rem_memo, feas_memo, step_memo = {}, {}, {}
+  rem_memo, feas_memo, step_memo, limit_memo = {}, {}, {}, {}
+  inputs = ident.inputs
+  finite = inputs is None or all(math.isfinite(x) for x in inputs.values())
+  rearm = REARM_S / DT
 
   def rem(k, b, s):
     key = (k, b, s)
@@ -1067,9 +1070,20 @@ def frame_scheduler(ident, remaining):
     return rem_memo[key]
 
   def feasible(k, s, w):
+    # ident._feasible, with its limit check made once per (strict or small step, window): limit_state depends on the step only
+    # through limit_bounds, i.e. through small(k, s) (tested equal frame by frame)
     key = (k, s, w)
     if key not in feas_memo:
-      feas_memo[key] = ident._feasible(k, s, w)
+      if inputs is None:
+        ok = True
+      elif not finite:
+        ok = False
+      else:
+        lk = (small(k, s), w)
+        if lk not in limit_memo:
+          limit_memo[lk] = ident.limit_state(k, s, w, **inputs)[0] is None
+        ok = limit_memo[lk] and (ident.n - ident.viol_at.get((k, s), (-10 ** 9, None))[0]) > rearm
+      feas_memo[key] = ok
     return feas_memo[key]
 
   def next_step(k, w):
@@ -1079,9 +1093,9 @@ def frame_scheduler(ident, remaining):
     return step_memo[key]
 
   def can_run(k, w):
-    if ident.inputs is None or w is None:
+    if inputs is None or w is None:
       return True
-    if not all(math.isfinite(x) for x in ident.inputs.values()):
+    if not finite:
       return False
     step = next_step(k, w)
     return step is not None and feasible(k, step, w)
