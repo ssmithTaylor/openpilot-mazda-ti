@@ -103,8 +103,9 @@ def test_the_qt_page_takes_its_rectangles_and_writes_from_the_header():
   assert "ti_pages::rectOf(" in SIDEBAR and "ti_pages::controlAt(" in SIDEBAR
   assert not re.search(r"QRect TestsWindow::(abBox|abRect|runAllRect)", SIDEBAR)
   # START and STOP, RUN ALL and ALL TESTS OFF go through the tested sequences
-  assert "tests.runOps(startOps(ab_configured)" in SIDEBAR and "tests.runOps(stopOps())" in SIDEBAR
-  assert "runOps(ti_pages::runAllOps())" in SIDEBAR and "runOps(ti_pages::allTestsOffOps())" in SIDEBAR
+  # (a stop always asks for a toggle reload: force_toggles, since 2026-11-22)
+  assert "tests.runOps(startOps(ab_configured)" in SIDEBAR and "tests.runOps(stopOps(), nullptr, true)" in SIDEBAR
+  assert "runOps(ti_pages::runAllOps())" in SIDEBAR and "runOps(ti_pages::allTestsOffOps(), nullptr, true)" in SIDEBAR
   # the controller's params are written through the executor only (no direct write of the plan switch is left on a page)
   assert SIDEBAR.count('TI_PLAN_ON_KEY, true') == 0 and SIDEBAR.count('"TiPlanOn", true') == 0
 
