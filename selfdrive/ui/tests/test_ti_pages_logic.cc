@@ -773,7 +773,8 @@ static void cruiseRules() {
             if (fresh && !cruiseActive(v) && oth[0] == 0) CHECK(k.word == st);
             if (fresh && !cruiseActive(v) && oth[0] != 0) CHECK(k.word == "unavailable" && k.second.find("STOP") != std::string::npos);
             CHECK((k.primary.find("RUNNING") != std::string::npos) == (fresh && std::string(st) == "running"));
-            CHECK(!k.result.empty() == (std::string(st) == "finished"));
+            CHECK(!k.result.empty() == (std::string(st) == "finished" || (std::string(st) == "aborted" && fresh && cruiseNotRestored(v)) ||
+                                        (std::string(st) == "aborted" && !fresh && cruiseNotRestored(v))));
             CHECK(cruiseBusy(v) == (fresh && cruiseActive(v)));
           }
         }
@@ -796,6 +797,13 @@ static void cruiseRules() {
   pt.result = "PARTLY";
   CHECK(pt.a.size() == 3 && pt.a[2].minus_ms == 50 && !pt.a[1].minus);
   CHECK(cruiseLook(pt, "").result == "SET SPEED CAN BE CHANGED: PARTLY (2 of 3)");
+  CruiseView nr = cruiseView("aborted");
+  nr.orig = 45;
+  nr.set = 50;
+  nr.why = "set speed changed to 50 mph (expected 45 or 44)";
+  nr.restore = "Set speed is now 50 mph (was 45). Not restored: set it yourself.";
+  CHECK(cruiseLook(nr, "").result == "SET IT YOURSELF: NOW 50 MPH, WAS 45");
+  CHECK(cruiseLook(nr, "").detail3 == "Set speed is now 50 mph (was 45). Not restored: set it yourself.");
   CruiseView none;
   CHECK(cruiseLook(none, "").word == "noreport" && !cruiseLook(none, "").run_enabled);
   CHECK(cruiseLook(cruiseView("idle"), "").run_enabled && cruiseLook(cruiseView("idle"), "").word == "idle");

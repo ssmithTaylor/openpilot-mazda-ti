@@ -1365,10 +1365,14 @@ inline std::string cruiseDelayLine(const CruiseView &v) {
          (plus.empty() ? std::string("none") : plus + " ms");
 }
 
+inline bool cruiseNotRestored(const CruiseView &v) {
+  return v.restore.rfind("Set speed is now", 0) == 0;
+}
+
 inline std::string cruiseSetLine(const CruiseView &v) {
   char buf[160];
-  if (v.orig <= 0) {
-    return upperFirst(v.restore);
+  if (v.orig <= 0 || cruiseNotRestored(v)) {
+    return upperFirst(v.restore);      // "Set speed is now X mph (was Y). Not restored: set it yourself."
   }
   std::snprintf(buf, sizeof(buf), "Set speed %d mph at the start, %d mph now%s%s", v.orig, v.set, v.restore.empty() ? "" : ". ",
                 upperFirst(v.restore).c_str());
@@ -1383,6 +1387,10 @@ inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
   if (final_state) {
     if (v.state == "finished") {
       k.result = cruiseResultLine(v);
+    } else if (cruiseNotRestored(v)) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "SET IT YOURSELF: NOW %d MPH, WAS %d", v.set, v.orig);
+      k.result = buf;                  // large: the set speed is not where it was and nothing more will be sent
     }
     k.detail1 = cruiseRecipeLine(v);
     k.detail2 = cruiseDelayLine(v);
@@ -1406,7 +1414,7 @@ inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
     k.tone = Tone::Waiting;
     k.second = v.why.empty() ? std::string("Checking the conditions") : upperFirst(v.why);
     k.detail1 = "Needs: engaged, cruise on, steady 30-70 mph, set 25 mph+, no car ahead";
-    k.detail2 = "Gives up after 60 s of waiting";
+    k.detail2 = "Gives up after 60 s of waiting; a run stops itself after 40 s";
     return k;
   }
   if (v.state == "running") {
@@ -1476,7 +1484,7 @@ inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
   k.tone = Tone::Stopped;
   k.second = "Not run since controls started";
   k.detail1 = "Engage with stock cruise on at 30-70 mph, no car ahead, then tap RUN CHECK";
-  k.detail2 = "It taps set-minus then set-plus, 3 times, and puts the set speed back";
+  k.detail2 = "Taps set-minus then set-plus, 3 times; stops itself after 40 s";
   return k;
 }
 

@@ -14,11 +14,15 @@ A run (the car controller calls `step` every 10 ms frame, and sends the button t
              set-plus tap and wait for it to return to the original; pause PAUSE_S. Recipe A (2 pressed frames per tap); only if
              none of recipe A's three rounds was accepted, three more rounds with recipe B (3 pressed frames per tap)
   restore    after the last round or an abort, while cruise is still active and nothing says the driver took over the set speed: at
-             most RESTORE_TAPS single taps toward the original, then stop regardless
+             only when the set speed is exactly 1 mph from the original and the stop was NOT an unexpected set-speed change (a jump,
+             a change the check did not ask for, the driver's button): at most RESTORE_TAPS single taps toward the original, each
+             of which must give exactly the 1 mph step within ACCEPT_WAIT_S, else the restore stops for good. Never a set-plus at or
+             above the original, never a set-minus at or below it. Otherwise nothing is sent and the page says "Set speed is now X
+             mph (was Y). Not restored: set it yourself."
   abort      at once on brake or gas, disengagement, cruise cancelled / off / unavailable, openpilot asking for cancel or resume, a
              set-speed change that is not the step asked for (a jump to a multiple of 5 = read as a hold, or a change the check did
              not ask for), a driver's cruise button, the speed leaving the band, any precondition lost, a stop from the screen, the
-             plan / A/B / a test switched on, or RUN_LIMIT_S elapsed in a recipe
+             plan / A/B / a test switched on, or RUN_LIMIT_S elapsed since the first tap (the whole run, both recipes)
 It never sends CANCEL or RESUME, and sends nothing on a frame where openpilot asks for either (the existing cancel / resume logic of
 the car controller is untouched and always wins).
 
@@ -57,9 +61,9 @@ PHASE_WAIT_S = 0.2              # a tap waits at most this long for a new car bu
 ROUNDS = 3
 ACCEPT_WAIT_S = 1.0             # from the first pressed frame to the set speed reading the expected value
 PAUSE_S = 3.0                   # after each round
-RUN_LIMIT_S = 20.0              # per recipe, from its first tap: abort when exceeded
+RUN_LIMIT_S = 40.0              # the whole run, both recipes, from its first tap: abort when exceeded
 START_WAIT_S = 60.0             # waiting for the preconditions before the first tap; then the run is given up
-RESTORE_TAPS = 3
+RESTORE_TAPS = 2
 SPEED_MIN_MPH, SPEED_MAX_MPH = 30.0, 70.0
 STEADY_TOL_MPH, STEADY_S = 1.5, 3.0      # within this of the set speed for this long before each round
 RUN_TOL_MPH = 3.0               # during a round: the speed may not leave the original set speed by more than this
@@ -228,6 +232,7 @@ class CruiseCheck:
     self.orig = None
     self.armed_at = None
     self.phase_t0 = None
+    self.run_t0 = None                # the first tap's frame: the whole run's time limit counts from here
     self.sub_t0 = None
     self.tap = None
     self.hit = None                   # the frame the expected set speed was first read, during the tap
@@ -329,7 +334,7 @@ class CruiseCheck:
     why = precondition(inp, orig=self.orig)
     if not why and inp.set_mph not in self._expected():
       why = f"set speed changed to {inp.set_mph} mph (expected {' or '.join(str(x) for x in self._expected())})"
-    if not why and (frame - self.phase_t0) * DT > RUN_LIMIT_S:
+    if not why and self.run_t0 is not None and (frame - self.run_t0) * DT > RUN_LIMIT_S:
       why = f"time limit {RUN_LIMIT_S:.0f} s reached"
     if why:
       self._abort(frame, inp, why)
@@ -379,7 +384,21 @@ class CruiseCheck:
   def _since_first(self, frame):
     return (frame - self.tap.first) * DT if self.tap is not None and self.tap.first is not None else 0.0
 
+  def _direction_ok(self, button, set_mph):
+    """A round's minus only from the original, its plus only from 1 below; a restore tap only toward the original from exactly 1
+    away (never a set-plus at or above the original, never a set-minus at or below it)."""
+    o = self.orig
+    if set_mph is None or o is None:
+      return False
+    if self.state == "running":
+      return set_mph == o if button == "SET_MINUS" else set_mph == o - 1
+    return (button == "SET_PLUS" and set_mph == o - 1) or (button == "SET_MINUS" and set_mph == o + 1)
+
   def _start_tap(self, frame, inp, button, sub):
+    if not self._direction_ok(button, inp.set_mph):
+      raise AssertionError(f"{button} refused at {inp.set_mph} mph (original {self.orig})")   # unreachable; never sent
+    if self.run_t0 is None:
+      self.run_t0 = frame
     self.sub, self.sub_t0 = sub, frame
     self.tap = Tap(button, PRESSED_FRAMES[self.phase if self.state == "running" else "A"], frame, inp.counter)
     self.hit = None
@@ -472,10 +491,16 @@ class CruiseCheck:
     self._to_restore(frame, inp)
 
   # ---- restore -------------------------------------------------------------------------------------------------------------------
+  def not_restored_text(self, set_mph):
+    return f"Set speed is now {set_mph} mph (was {self.orig}). Not restored: set it yourself."
+
+  def _unexpected(self):
+    """The stop was an unexpected set-speed change: a jump, a change the check did not ask for, or the driver's button."""
+    return self.abort_why.startswith("set speed changed") or self.abort_why == "a cruise button is pressed"
+
   def _restore_blocked(self, inp):
     """Why no corrective tap may be sent now ("" when one may)."""
-    # the driver's own button (now, or the reason of the abort): the set speed is theirs, never pressed against
-    if inp.driver_button or self.abort_why == "a cruise button is pressed":
+    if inp.driver_button:
       return "the driver is using the cruise buttons"
     if inp.cancel_req or inp.resume_req:
       return "openpilot is using the cruise buttons"
@@ -487,62 +512,59 @@ class CruiseCheck:
       return "brake or gas pressed"
     if inp.counter is None or inp.driver_button is None or inp.set_mph is None:
       return "cruise frames unreadable"
-    # the speed band, a lead, the steering limit or another mode switched on do not stop the check putting back its own change
+    # the speed band, a lead, the steering limit or another mode switched on do not stop the check putting back its own 1 mph step
     return ""
 
   def _to_restore(self, frame, inp):
-    if self.orig is None or inp.set_mph is None or inp.set_mph == self.orig or not inp.cruise_on:
+    if self.orig is None or inp.set_mph is None or inp.set_mph == self.orig:
       self._finish(frame, "nothing to restore" if self.orig is not None else "")
       return
-    blocked = self._restore_blocked(inp)
-    if blocked:
-      self.restore.update(ok=False, why=f"not restored: {blocked}")
-      self._finish(frame, f"not restored: {blocked}")
+    if self._unexpected() or abs(inp.set_mph - self.orig) != 1 or self._restore_blocked(inp):
+      self.restore.update(ok=False, why=self.not_restored_text(inp.set_mph))
+      self._finish(frame, self.restore["why"])
       return
     self.state = "restoring"
     self.sub, self.sub_t0, self.tap = "next", frame, None
     self._ev("restore_start", frame, set_mph=inp.set_mph, orig=self.orig)
 
   def _restoring(self, frame, inp):
-    blocked = self._restore_blocked(inp)
-    if blocked:
-      self._end_restore(frame, f"not restored: {blocked}")
+    if self._restore_blocked(inp):
+      self._end_restore(frame, False, inp.set_mph)
       return None
     if self.sub == "next":
       if inp.set_mph == self.orig:
-        self._end_restore(frame, "restored")
+        self._end_restore(frame, True, inp.set_mph)
         return None
-      if self.restore["taps"] >= RESTORE_TAPS:
-        self._end_restore(frame, f"not restored after {RESTORE_TAPS} taps")
+      button = "SET_PLUS" if inp.set_mph < self.orig else "SET_MINUS"
+      if self.restore["taps"] >= RESTORE_TAPS or not self._direction_ok(button, inp.set_mph):
+        self._end_restore(frame, False, inp.set_mph)
         return None
       self.restore["taps"] += 1
-      self.restore_target = inp.set_mph + (1 if inp.set_mph < self.orig else -1)
+      self.restore_target = self.orig
       self._restore_from = inp.set_mph
-      return self._start_tap(frame, inp, "SET_PLUS" if inp.set_mph < self.orig else "SET_MINUS", "tap")
+      return self._start_tap(frame, inp, button, "tap")
     if self.sub == "tap":
-      out = self._send(frame, inp)
       if inp.set_mph not in (self._restore_from, self.restore_target):
-        self._end_restore(frame, f"not restored: set speed changed to {inp.set_mph} mph")
-      return out
+        self._end_restore(frame, False, inp.set_mph)        # anything but the expected step: stop for good, nothing more sent
+        return None
+      return self._send(frame, inp)
     if self.sub == "wait":
       if inp.set_mph == self.restore_target:
         self._ev("restore_step", frame, set_mph=inp.set_mph, latency_ms=int(round(self._since_first(frame) * 1000)))
-        self.sub = "next"
-        return self._restoring(frame, inp)
-      if inp.set_mph != self._restore_from:
-        self._end_restore(frame, f"not restored: set speed changed to {inp.set_mph} mph")
+        self._end_restore(frame, True, inp.set_mph)
         return None
-      if self._since_first(frame) >= ACCEPT_WAIT_S:
+      if inp.set_mph != self._restore_from or self._since_first(frame) >= ACCEPT_WAIT_S:
         self._ev("restore_step", frame, set_mph=inp.set_mph, accepted=False)
-        self.sub = "next"
+        self._end_restore(frame, False, inp.set_mph)        # the first tap that does not give the step ends the restore
       return None
     return None
 
-  def _end_restore(self, frame, note):
+  def _end_restore(self, frame, ok, set_mph):
     if self.tap is not None:
       self.guard.end()
       self.tap = None
-    self.restore.update(ok=(note == "restored"), why=note)
+    note = "restored" if ok else self.not_restored_text(set_mph)
+    self.restore.update(ok=ok, why=note)
     self._ev("restore_end", frame, note=note, taps=self.restore["taps"])
     self._finish(frame, note)
 

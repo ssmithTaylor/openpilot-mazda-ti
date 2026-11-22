@@ -159,6 +159,10 @@ class Car:
     step = -1 if button == "SET_MINUS" else 1
     if self.mode == "ignore" or (self.mode == "minus_only" and step > 0):
       return
+    if self.mode == "jump5":                  # every press becomes a 5 mph jump
+      if new_press:
+        self.pending.append((f + 4, self.set + 5 * step))
+      return
     if self.mode == "hold":
       if new_press:
         target = (self.set // 5) * 5 if step < 0 else (self.set // 5 + 1) * 5
@@ -258,10 +262,8 @@ def test_a_cruise_that_reads_a_hold_aborts_and_restores_at_most_three_taps():
   ev = []
   chk, _ = run(car, events=ev)
   assert chk.state == "aborted" and "set speed changed to 40" in chk.why
-  rest = [t for t in taps(car)][1:]
-  # the corrective tap is read as a hold too (40 -> 45): not the single step asked for, so the restore stops at once
-  assert 1 <= len(rest) <= cc.RESTORE_TAPS and all(t[0][1] == "SET_PLUS" and len(t) <= 2 for t in rest)
-  assert chk.restore["why"] == "not restored: set speed changed to 45 mph" and car.set == 45
+  assert len(taps(car)) == 1                    # the round's minus tap only: an unexpected change gets no restore tap at all
+  assert chk.restore["why"] == "Set speed is now 40 mph (was 43). Not restored: set it yourself." and car.set == 40
   assert_cap(car)
 
 
@@ -315,12 +317,8 @@ def test_every_abort_path_stops_at_once_and_says_why(name, act, why, when):
   chk, _ = run(car, hook=hook)
   assert state["done"]
   assert chk.state == "aborted" and chk.why.startswith(why), chk.why
-  # nothing more of the rounds after the abort: any later frame is a restore tap toward the original only
-  later = [s for s in car.sent if s[0] > state["at"]]
-  if name in ("brake", "gas", "disengaged", "cruise off", "fault", "cancel", "resume", "driver button"):
-    assert later == []
-  for _, b, _ in later:                         # toward the original set speed (45) only
-    assert b == ("SET_MINUS" if state["set"] > 45 else "SET_PLUS")
+  # nothing after the abort: the set speed was at the original (or moved unexpectedly), so no restore tap either
+  assert [s for s in car.sent if s[0] > state["at"]] == []
   assert_cap(car)
 
 
@@ -329,16 +327,17 @@ def test_a_late_acceptance_after_the_wait_is_an_unasked_change_and_is_restored()
   chk, _ = run(car)
   assert chk.state == "aborted" and "set speed changed to 44" in chk.why
   assert chk.results["A"][0]["minus"] is False
-  assert car.sent[-1][1] == "SET_PLUS"          # a corrective tap toward 45
+  assert [b for _, b, _ in car.sent] == ["SET_MINUS", "SET_MINUS"]   # an unexpected change: no restore tap
+  assert chk.restore["why"] == "Set speed is now 44 mph (was 45). Not restored: set it yourself."
 
 
-def test_set_plus_not_accepted_restores_with_at_most_three_taps_then_stops():
+def test_set_plus_not_accepted_gets_one_restore_tap_and_stops_for_good_when_it_fails():
   car = Car("minus_only")
   chk, _ = run(car)
   assert chk.state == "aborted" and chk.why.startswith("set-plus not accepted")
   ts = taps(car)
-  assert [t[0][1] for t in ts] == ["SET_MINUS", "SET_PLUS"] + ["SET_PLUS"] * cc.RESTORE_TAPS
-  assert chk.restore["why"] == f"not restored after {cc.RESTORE_TAPS} taps" and car.set == 44
+  assert [t[0][1] for t in ts] == ["SET_MINUS", "SET_PLUS", "SET_PLUS"] and len(ts[-1]) == 2   # one single restore tap, no more
+  assert chk.restore["why"] == "Set speed is now 44 mph (was 45). Not restored: set it yourself." and car.set == 44
   assert_cap(car)
 
 
@@ -362,8 +361,78 @@ def test_no_restore_against_the_driver():
       c.driver_button = True              # before the plus tap's first frame
   chk, _ = run(car, hook=hook)
   assert chk.state == "aborted" and chk.why == "a cruise button is pressed"
-  assert chk.restore["why"].startswith("not restored: the driver")
+  assert chk.restore["why"] == "Set speed is now 44 mph (was 45). Not restored: set it yourself."
   assert [b for _, b, _ in car.sent].count("SET_PLUS") <= 1
+
+
+@pytest.mark.parametrize("set_mph", [30, 43, 45, 50, 62])
+def test_a_cruise_that_jumps_5_mph_on_every_tap_gets_only_the_rounds_tap_and_no_restore(set_mph):
+  car = Car("jump5", set_mph=set_mph, mph=float(set_mph))
+  ev = []
+  chk, _ = run(car, events=ev)
+  assert chk.state == "aborted" and chk.why.startswith("set speed changed")
+  ts = taps(car)
+  assert len(ts) == 1 and len(ts[0]) <= cc.PRESSED_FRAMES["A"]     # the minus tap of the round in progress, nothing after
+  assert not [e for e in ev if e["kind"] == "restore_start"] and chk.restore["taps"] == 0
+  assert abs(car.set - set_mph) <= 5
+  assert chk.restore["why"] == f"Set speed is now {set_mph - 5} mph (was {set_mph}). Not restored: set it yourself."
+
+
+def test_a_restore_tap_that_jumps_ends_the_restore_at_once():
+  car = Car("minus_only")
+
+  def hook(f, c, chk):
+    if chk.state == "restoring":
+      c.mode = "jump5"                         # the corrective tap is read as a 5 mph jump
+  chk, _ = run(car, hook=hook)
+  ts = taps(car)
+  assert [t[0][1] for t in ts] == ["SET_MINUS", "SET_PLUS", "SET_PLUS"]
+  assert chk.restore["taps"] == 1 and chk.restore["ok"] is False and car.set == 49
+  assert chk.restore["why"] == "Set speed is now 49 mph (was 45). Not restored: set it yourself."
+
+
+def test_restore_never_presses_away_from_or_past_the_original():
+  chk = cc.CruiseCheck()
+  chk.orig, chk.state = 45, "restoring"
+  assert chk._direction_ok("SET_PLUS", 44) and chk._direction_ok("SET_MINUS", 46)
+  for b, v in (("SET_PLUS", 45), ("SET_PLUS", 46), ("SET_PLUS", 50), ("SET_MINUS", 45), ("SET_MINUS", 44), ("SET_MINUS", 40),
+               ("SET_PLUS", 43), ("SET_MINUS", 47)):
+    assert not chk._direction_ok(b, v)
+  assert cc.RESTORE_TAPS == 2
+
+
+def test_property_restore_taps_only_toward_the_original_and_never_more_than_5_mph_away():
+  for seed in range(12):
+    car, hook = _random_scenario(seed)
+    orig = car.set
+    ev = []
+    chk, _ = run(car, hook=hook, frames=6000, events=ev)
+    rt = [e for e in ev if e["kind"] == "tap" and e["recipe"] == "restore"]
+    assert len(rt) <= cc.RESTORE_TAPS
+    for e in rt:
+      assert abs(e["set_before"] - chk.orig) == 1
+      assert (e["button"] == "SET_PLUS") == (e["set_before"] < chk.orig)
+    if chk.orig is not None and car.mode in ("jump5", "hold"):
+      assert abs(car.set - orig) <= 5
+
+
+def test_one_time_limit_for_the_whole_run():
+  car = Car("ignore")
+  ev = []
+  chk, _ = run(car, events=ev)
+  first = min(e["frame"] for e in ev if e["kind"] == "tap")
+  end = [e for e in ev if e["kind"] == "result"][0]["frame"]
+  assert chk.state == "finished" and (end - first) * cc.DT < cc.RUN_LIMIT_S     # both recipes fit in the one limit
+  car = Car("ignore")
+
+  def hook(f, c, chk):
+    if chk.state == "running" and chk.phase == "B" and chk.sub == "pre":
+      c.mph = 47.5                             # never steady again in recipe B: the run's one limit ends it
+  ev = []
+  chk, _ = run(car, hook=hook, events=ev)
+  first = min(e["frame"] for e in ev if e["kind"] == "tap")
+  ab = [e for e in ev if e["kind"] == "aborted"][0]
+  assert chk.why == "time limit 40 s reached" and abs((ab["frame"] - first) * cc.DT - cc.RUN_LIMIT_S) < 0.25   # counted from the first tap being started (it waits up to 0.2 s for a car frame)
 
 
 def test_time_limit():
@@ -565,7 +634,7 @@ def test_params_are_declared():
 # ---- the screen tells the truth ----------------------------------------------------------------------------------------------------
 def _random_scenario(seed):
   rnd = random.Random(seed)
-  car = Car(rnd.choice(["accept", "ignore", "hold", "minus_only", "late"]), set_mph=rnd.choice([30, 43, 45, 62]))
+  car = Car(rnd.choice(["accept", "ignore", "hold", "minus_only", "late", "jump5"]), set_mph=rnd.choice([30, 43, 45, 62]))
   car.mph = float(car.set)
   acts = [a[1] for a in ABORTS]
   at = rnd.randrange(50, 2500)
