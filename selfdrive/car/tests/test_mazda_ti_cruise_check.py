@@ -139,6 +139,8 @@ class Car:
     self.cancel = self.resume = False
     self.others = ""
     self.steer = 0.0
+    self.read = 4                     # ticks from a press's first frame to the set speed changing
+    self.read_plus = None             # a different delay for SET_PLUS (a late-landing step)
 
   def frame(self, f):
     if f % 10 == self.phase:
@@ -169,7 +171,8 @@ class Car:
         self.pending.append((f + 4, target if target != self.set else self.set + 5 * step))
       return
     if new_press:
-      self.pending.append((f + (150 if self.mode == "late" else 4), self.set + step))
+      delay = 150 if self.mode == "late" else (self.read_plus if (step > 0 and self.read_plus is not None) else self.read)
+      self.pending.append((f + delay, self.set + step))
     if f - self.press_start >= 52:    # a press this long is a hold (never reached: the cap)
       self.pending.append((f + 1, (self.set // 5 + (1 if step > 0 else 0)) * 5))
 
@@ -225,16 +228,76 @@ def test_accepting_cruise_gives_yes_3_of_3_with_two_frame_taps():
   assert chk.n_ok("A") == 3 and chk.results["B"] == []
   ts = taps(car)
   assert [t[0][1] for t in ts] == ["SET_MINUS", "SET_PLUS"] * 3
-  assert all(len(t) == 2 and t[1][0] - t[0][0] == cc.FRAME_SPACING for t in ts)
+  # recipe A is 2 frames, but no frame is sent once the step has landed: this car reads the press 0.04 s after the first frame,
+  # before the second one (0.05 s) is due
+  assert all(len(t) == 1 for t in ts)
   assert all(r["minus_ms"] == 40 and r["plus_ms"] == 40 for r in chk.results["A"])
   assert car.set == 45
   assert_cap(car)
   tap_ev = [e for e in ev if e["kind"] == "tap"]
-  assert len(tap_ev) == 6 and all(len(e["frames"]) == 2 for e in tap_ev)
+  assert len(tap_ev) == 6 and all(len(e["frames"]) == 1 for e in tap_ev)
   for e in tap_ev:                              # each frame logged with the car's counter and the counter sent (car's + 1)
     assert all(fr[2] == (fr[1] + 1) % 16 for fr in e["frames"])
     assert e["set_before"] is not None
   assert [e for e in ev if e["kind"] == "result"][0]["result"] == "YES"
+
+
+def test_a_slower_car_gets_both_frames_of_recipe_a():
+  car = Car("accept")
+  car.read = 8                                  # read after the second frame (0.05 s) is sent
+  chk, _ = run(car)
+  assert chk.result() == "YES" and all(len(t) == 2 and t[1][0] - t[0][0] == cc.FRAME_SPACING for t in taps(car))
+
+
+def _first_sent(car, button):
+  return any(b == button for _, b, _ in car.sent)
+
+
+def test_abort_during_tap_plus_with_the_step_landing_late_never_overshoots():
+  car = Car("accept")
+  car.read_plus = 7
+
+  def hook(f, c, chk):
+    if chk.state == "running" and chk.sub == "tap_plus" and _first_sent(c, "SET_PLUS") and not c.lead:
+      c.lead = True                             # an abort that allows a restore, while the plus is in flight
+  chk, _ = run(car, hook=hook)
+  assert chk.state == "aborted" and chk.why == "cruise is following a car"
+  assert car.set == 45 and [b for _, b, _ in car.sent].count("SET_PLUS") == 1   # the in-flight plus landed; no restore tap
+
+
+@pytest.mark.parametrize("land_ticks", [30, 70, 120, 180])
+def test_abort_during_wait_plus_with_a_late_landing_step_never_overshoots(land_ticks):
+  car = Car("accept")
+  car.read_plus = land_ticks
+
+  def hook(f, c, chk):
+    if chk.state == "running" and chk.sub == "wait_plus" and not c.lead and land_ticks < 100:
+      c.lead = True
+  chk, _ = run(car, hook=hook)
+  assert chk.state == "aborted"
+  assert car.set == 45                          # never 46: whatever is in flight lands before any restore tap
+  plus = [f for f, b, _ in car.sent if b == "SET_PLUS"]
+  assert len(plus) <= 2
+
+
+def test_abort_during_tap_minus_with_the_step_landing_late_never_undershoots():
+  car = Car("accept")
+  car.read = 7
+
+  def hook(f, c, chk):
+    if chk.state == "running" and chk.sub == "tap_minus" and _first_sent(c, "SET_MINUS") and not c.lead:
+      c.lead = True
+  chk, _ = run(car, hook=hook)
+  assert chk.state == "aborted" and car.set in (44, 45)          # never 43
+  assert [b for _, b, _ in car.sent].count("SET_MINUS") <= 2 and not _first_sent(car, "SET_PLUS")
+
+
+def test_the_press_cap_holds_on_real_time_too():
+  g = cc.PressGuard()
+  assert g.begin(0, mono=100.0) and g.allow(0, mono=100.0)
+  assert not g.allow(5, mono=100.2)             # a stalled loop: 5 frames, but 0.2 s of real time
+  g.end()
+  assert not g.begin(30, mono=100.1)            # and the gap between taps on real time
 
 
 def test_taps_start_just_after_a_car_button_frame():

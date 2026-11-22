@@ -64,6 +64,9 @@ PAUSE_S = 3.0                   # after each round
 RUN_LIMIT_S = 40.0              # the whole run, both recipes, from its first tap: abort when exceeded
 START_WAIT_S = 60.0             # waiting for the preconditions before the first tap; then the run is given up
 RESTORE_TAPS = 2
+RESTORE_SETTLE_S = 0.3          # before a restore tap: the set speed unchanged this long (an in-flight press has landed)
+RESTORE_AFTER_PRESS_S = 2.0     # ... and this long since the last pressed frame (the study's read delay is 0.02-0.07 s)
+WAIT_LOG_MIN_S = 1.0            # a "waiting" log event at most this often (a flickering condition does not flood the log)
 SPEED_MIN_MPH, SPEED_MAX_MPH = 30.0, 70.0
 STEADY_TOL_MPH, STEADY_S = 1.5, 3.0      # within this of the set speed for this long before each round
 RUN_TOL_MPH = 3.0               # during a round: the speed may not leave the original set speed by more than this
@@ -93,6 +96,7 @@ class Inputs(NamedTuple):
   resume_req: bool = False
   others_on: str = ""             # why another mode excludes the check ("" when nothing else is on)
   wall: float = 0.0               # wall seconds (only to compare with the trigger's stamp)
+  mono: Optional[float] = None    # monotonic seconds: the press cap is also enforced on real time, not only on frames
 
 
 class Trigger(NamedTuple):
@@ -165,22 +169,29 @@ class PressGuard:
 
   def __init__(self):
     self.tap_first = None
+    self.tap_first_mono = None
     self.tap_count = 0
     self.last_frame = None
+    self.last_mono = None
 
-  def begin(self, frame):
+  def begin(self, frame, mono=None):
     if self.last_frame is not None and (frame - self.last_frame) * DT < MIN_TAP_GAP_S - 1e-9:
       return False
-    self.tap_first, self.tap_count = frame, 0
+    if mono is not None and self.last_mono is not None and mono - self.last_mono < MIN_TAP_GAP_S - 1e-6:
+      return False
+    self.tap_first, self.tap_first_mono, self.tap_count = frame, mono, 0
     return True
 
-  def allow(self, frame):
+  def allow(self, frame, mono=None):
     if self.tap_first is None:
       return False
     if self.tap_count >= MAX_PRESSED_FRAMES or (frame - self.tap_first) * DT > MAX_TAP_SPAN_S + 1e-9:
       return False
+    if mono is not None and self.tap_first_mono is not None and mono - self.tap_first_mono > MAX_TAP_SPAN_S + 1e-6:
+      return False                    # real time, too: a stalled or delayed control loop cannot stretch a tap into a hold
     self.tap_count += 1
     self.last_frame = frame
+    self.last_mono = mono
     return True
 
   def end(self):
@@ -191,8 +202,9 @@ class Tap:
   """One tap being sent: waits for a new car button frame (counter change) for at most PHASE_WAIT_S, then sends `n` pressed frames
   FRAME_SPACING apart. `frames`: [(frame, car counter, counter sent)]."""
 
-  def __init__(self, button, n, frame, counter):
+  def __init__(self, button, n, frame, counter, target=None):
     self.button, self.n = button, n
+    self.target = target              # the set speed this tap is to give: no pressed frame once it reads that (or anything else wrong)
     self.requested = frame
     self.counter0 = counter
     self.first = None
@@ -244,6 +256,9 @@ class CruiseCheck:
     self.abort_why = ""
     self.set_now = None
     self.lat = []
+    self.set_last = None              # the set speed of the previous frame, and the frame it last changed on
+    self.set_changed_at = None
+    self.last_wait_ev = -10 ** 9
 
   # ---- events ------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -252,6 +267,8 @@ class CruiseCheck:
   # ---- the run ---------------------------------------------------------------------------------------------------------------
   def step(self, frame, inp, trigger=None):
     self.set_now = inp.set_mph
+    if inp.set_mph != self.set_last:
+      self.set_last, self.set_changed_at = inp.set_mph, frame
     if trigger is not None and trigger.id not in self.consumed:
       self.consumed.add(trigger.id)
       self._trigger(frame, inp, trigger)
@@ -274,7 +291,7 @@ class CruiseCheck:
       if self.state in ACTIVE_STATES:
         self._ev("stop_pressed", frame)
         if self.state == "restoring":
-          self._end_restore(frame, "stopped on the screen")
+          self._end_restore(frame, False, inp.set_mph)
         else:
           self._abort(frame, inp, "stopped on the screen")
       return
@@ -295,7 +312,8 @@ class CruiseCheck:
 
   def _waiting(self, frame, inp, steady_s):
     why = precondition(inp, steady_s=steady_s, need_steady=True)
-    if why != self.why:
+    if why != self.why and (frame - self.last_wait_ev) * DT >= WAIT_LOG_MIN_S:
+      self.last_wait_ev = frame
       self._ev("waiting", frame, why=why, set_mph=inp.set_mph, mph=round(inp.mph, 1))
     self.why = why
     if why:
@@ -396,11 +414,17 @@ class CruiseCheck:
 
   def _start_tap(self, frame, inp, button, sub):
     if not self._direction_ok(button, inp.set_mph):
-      raise AssertionError(f"{button} refused at {inp.set_mph} mph (original {self.orig})")   # unreachable; never sent
+      # not expected to happen (every caller checks first); handled, never raised: nothing is sent and the screen says why
+      if self.state == "restoring":
+        self._end_restore(frame, False, inp.set_mph)
+      else:
+        self._abort(frame, inp, f"internal: {button} refused at {inp.set_mph} mph")
+      return None
     if self.run_t0 is None:
       self.run_t0 = frame
     self.sub, self.sub_t0 = sub, frame
-    self.tap = Tap(button, PRESSED_FRAMES[self.phase if self.state == "running" else "A"], frame, inp.counter)
+    target = self.orig - 1 if (self.state == "running" and button == "SET_MINUS") else self.orig
+    self.tap = Tap(button, PRESSED_FRAMES[self.phase if self.state == "running" else "A"], frame, inp.counter, target)
     self.hit = None
     self._tap_set_before = inp.set_mph
     return self._send(frame, inp)
@@ -409,16 +433,23 @@ class CruiseCheck:
     """A pressed frame of the tap in progress, or None; moves to the wait once the tap is complete."""
     tap = self.tap
     out = None
-    if tap.due(frame, inp.counter):
+    if tap.due(frame, inp.counter) and (inp.set_mph == tap.target or not self._direction_ok(tap.button, inp.set_mph)):
+      tap.n = len(tap.frames)         # re-checked on this frame's set speed before EVERY pressed frame: the step has landed (or the
+                                      # set speed is not where this press may start from): no further frame of this tap
+    elif tap.due(frame, inp.counter):
       if tap.first is None:
-        if not self.guard.begin(frame):
-          return None                 # too soon after the previous tap: wait (the gap is far shorter than any wait here)
+        if not self.guard.begin(frame, inp.mono):
+          tap.counter0, tap.requested = inp.counter, frame   # too soon after the previous tap: wait, then for the next car frame
+          return None
         tap.first = frame
-      if self.guard.allow(frame):
+      if self.guard.allow(frame, inp.mono):
         tap.frames.append((int(frame), inp.counter, (inp.counter + 1) % 16))
         out = tap.button
       else:
         tap.n = len(tap.frames)       # the cap ends the tap: never a longer press
+    if tap.done and tap.first is None:
+      # refused before its first frame: nothing was sent; the wait that follows sees the set speed as it is
+      self.tap.first = frame
     if tap.done:
       self.guard.end()
       self._ev("tap", frame, button=tap.button, recipe=self.phase if self.state == "running" else "restore",
@@ -532,6 +563,11 @@ class CruiseCheck:
       self._end_restore(frame, False, inp.set_mph)
       return None
     if self.sub == "next":
+      # wait for anything still in flight to land: the set speed unchanged for RESTORE_SETTLE_S, and RESTORE_AFTER_PRESS_S since the
+      # last pressed frame; then decide on the set speed as it reads now
+      last_press = self.guard.last_frame if self.guard.last_frame is not None else -10 ** 9
+      if (frame - max(self.set_changed_at or 0, self.sub_t0)) * DT < RESTORE_SETTLE_S or (frame - last_press) * DT < RESTORE_AFTER_PRESS_S:
+        return None
       if inp.set_mph == self.orig:
         self._end_restore(frame, True, inp.set_mph)
         return None

@@ -659,14 +659,15 @@ class CarController(CarControllerBase):
         brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
         steer_share=abs(ti_apply_steer) / max(1.0, float(self.ccp.TI_STEER_MAX)), driver_button=getattr(CS, "crz_btns_driver", None),
         counter=None if counter is None else int(counter), cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
-        others_on=self.cruise_others_on(), wall=wall)
+        others_on=self.cruise_others_on(), wall=wall, mono=time.monotonic())
       button = chk.step(self.frame, inp, trigger)
       for ev in chk.events:
         ti_cruise_log(ev)
       chk.events.clear()
       st = chk.status(wall)
       key = (st["state"], st["why"], st["phase"], st["round"], len(st["a"]), len(st["b"]), st["set"], st["restore"], st["id"])
-      if key != self.cruise_published or self.frame % mod.STATUS_EVERY == 0:
+      # on change at most every 0.1 s (a flickering condition cannot write at 100 Hz), and once a second
+      if (key != self.cruise_published and self.frame % 10 == 0) or self.frame % mod.STATUS_EVERY == 0:
         self.params_memory.put(mod.PARAM_STATUS, json.dumps(st))
         self.cruise_published = key
       if button is None or inp.cancel_req or inp.resume_req:
