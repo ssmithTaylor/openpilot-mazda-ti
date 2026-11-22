@@ -273,8 +273,19 @@ def steps_in_band(key, label):
   return n_steps(key)
 
 
+_STEP_PARAMS = {}
+
+
 def step_params(key, step):
-  """(period frames or None for pulses, peak counts, unit frames, lead-in frames)."""
+  """(period frames or None for pulses, peak counts, unit frames, lead-in frames). Constant per (test, step): kept once computed
+  (it is asked many times a frame)."""
+  got = _STEP_PARAMS.get((key, step))
+  if got is None:
+    got = _STEP_PARAMS[(key, step)] = _step_params(key, step)
+  return got
+
+
+def _step_params(key, step):
   if key == SWEEP:
     p, a = SWEEP_TONES[step]
     return p, a, p * unit_periods(p), SWEEP_LEAD_IN
@@ -812,6 +823,13 @@ class TiIdent:
         return reason, values[reason], bounds[reason]
     return None, None, None
 
+  def _limit_class(self, key, step, band, memo):
+    """limit_state of this frame for a step, computed once per step class (small or not) and window."""
+    c = (small(key, step), band)
+    if c not in memo:
+      memo[c] = self.limit_state(key, step, band, **self.inputs)
+    return memo[c]
+
   def next_is_strict(self, key, profile, remaining):
     """True when the step this test would run next (one the limits allow now) is a strict-gated one."""
     step, _ = self._pick(key, profile, remaining, None, lambda s: self._feasible(key, s, profile))
@@ -914,10 +932,22 @@ class TiIdent:
                   left=None if left is None else round(left - self.credit[3], 2))
 
     key = armed if armed in KEYS else None
+    # This frame's limit checks, one per step class (limit_state depends on the step only through small(); cost: it ran for every step
+    # of the window two or three times a frame)
+    lim_memo = {}
+    finite_in = all(math.isfinite(x) for x in self.inputs.values())
+
+    def lim(k, s_):
+      return self._limit_class(k, s_, band, lim_memo)
+
+    def feasible_now(k, s_):              # = self._feasible(k, s_, band) on this frame's inputs
+      if not finite_in or lim(k, s_)[0] is not None:
+        return False
+      return (self.n - self.viol_at.get((k, s_), (-10 ** 9, None))[0]) > REARM_S / DT
     # Which steps the limits close right now: when each last did, for the re-arm dwell
     if key is not None and band is not None:
       for st_ in range(steps_in_band(key, band)):
-        why = self.limit_state(key, st_, band, **self.inputs)
+        why = lim(key, st_)
         if why[0] is not None:
           self.viol_at[(key, st_)] = (self.n, why[0])
     # The step whose limits apply: the running one, else the one that would start
@@ -926,13 +956,13 @@ class TiIdent:
       if self.test == key and not self.fading:
         step, extra = self.step, self.extra
       else:
-        step, extra = self._pick(key, band, remaining, self.credit, lambda s: self._feasible(key, s, band))
+        step, extra = self._pick(key, band, remaining, self.credit, lambda s: feasible_now(key, s))
     strict = step is None or not small(key, step)
     touch_hold = (TOUCH_HOLDOFF_S if strict else TOUCH_HOLDOFF_SMALL_S) / DT
     limit = (None, None, None)
     rearming = None
     if step is not None and band is not None:
-      limit = self.limit_state(key, step, band, **self.inputs)
+      limit = lim(key, step)
       # A step about to START (nothing running) waits out the re-arm dwell after a limit closed it; cutting is immediate
       if limit[0] is None and self.test is None:
         last = self.viol_at.get((key, step))
@@ -986,7 +1016,7 @@ class TiIdent:
       for st_ in range(steps_in_band(key, band)):
         left = remaining(key, band, st_)
         if left is not None and left > 1e-6 and required_seconds(key, band, st_) > 0:
-          why = self.limit_state(key, st_, band, **self.inputs)
+          why = lim(key, st_)
           if why[0] is not None:
             what, unit = GATE_WHAT[why[0]]
             self.gate = {"reason": why[0], "what": what, "value": round(why[1], 3), "limit": round(why[2], 3),

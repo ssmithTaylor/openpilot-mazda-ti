@@ -646,6 +646,8 @@ class CarController(CarControllerBase):
     chk = self.cruise_check
     if chk is None:
       return None
+    if not chk.active and self.frame % 10 != 0:
+      return None                      # nothing to do between the 10 Hz trigger reads while no check runs (cost: every frame)
     try:
       mod = cruise_check_mod
       wall = time.time()

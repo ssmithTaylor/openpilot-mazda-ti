@@ -176,3 +176,43 @@ def test_the_toggles_are_read_on_both_edges_of_toggles_updated_only(path, start,
     host.sm = {"frogpilotPlan": NS(togglesUpdated=flag)}
     exec(code, {"self": host, "get_frogpilot_toggles": lambda k=k: reads.append(k) or k})
   assert reads == [1, 5, 7, 8]          # each rising edge (written before the flag goes on) and each falling edge (after the last write)
+
+
+class OldLimits(TiIdent):
+  """The generator as before: every limit check made in full for every step (no per-frame class memo)."""
+  def _limit_class(self, key, step, band, memo):
+    return self.limit_state(key, step, band, **self.inputs)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_the_generator_with_the_per_frame_limit_memo_is_identical_to_the_full_checks(seed):
+  rows = T._random_rows(seed, 12000)
+  for k in range(1500, 12000, 2900):
+    for j in range(k, k + 40):
+      rows[j] = dict(rows[j], base_request=float("nan"))
+  res = []
+  for cls in (OldLimits, TiIdent):
+    g = cls(log=None)
+    logged = []
+    g.log = logged.append
+    prog = VProgress()
+    runner = ti.RunAll(seed=5, emit=g.event_for_pick)
+    out, gates = [], []
+    for k, row in enumerate(rows):
+      profile = g.advance_zone(row["v_ego"]).profile
+      armed = runner.pick(k, profile, prog.remaining, lambda t, w: g.can_run(t, w, prog.remaining),
+                          lambda t, w: g.next_is_strict(t, w, prog.remaining))
+      out.append(g.update(armed, k, **row, remaining=prog.remaining))
+      gates.append((g.reason, None if g.gate is None else dict(g.gate)))
+      prog.add(g.credit)
+    res.append((out, logged, gates, dict(g.viol_at)))
+  assert res[0] == res[1]
+
+
+def test_the_on_device_cost_check_runs_and_a_test_runs_in_its_running_mode():
+  spec = importlib.util.spec_from_file_location("ti_cost_check_for_test", HERE.parents[0] / "mazda" / "ti_cost_check.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  run = mod.run_mode("tests mode, run", "tests", 38.0, 0.0003, 400)
+  idle = mod.run_mode("tests mode, idle", "tests", 38.0, 0.02, 200)
+  assert run["test_running_share"] > 0.2 and idle["test_running_share"] == 0.0 and run["mean_us"] > 0
