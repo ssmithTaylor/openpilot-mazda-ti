@@ -1332,6 +1332,9 @@ inline std::string cruiseResultLine(const CruiseView &v) {
 // "Recipe A (2-frame taps): 3 of 3 rounds accepted. Recipe B not needed"
 inline std::string cruiseRecipeLine(const CruiseView &v) {
   char buf[128];
+  if (v.a.empty() && v.b.empty()) {
+    return "No round completed";
+  }
   if (v.b.empty()) {
     std::snprintf(buf, sizeof(buf), "Recipe A (2-frame taps): %d of %d rounds accepted%s", cruiseOk(v.a), (int)v.a.size(),
                   v.state == "finished" ? ". Recipe B not needed" : "");
@@ -1445,7 +1448,13 @@ inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
     k.word = "finished";
     k.primary = "FINISHED";
     k.tone = Tone::Done;
-    k.second = "Tap RUN CHECK to run it once more";
+    char buf[64];
+    if (v.b.empty()) {
+      std::snprintf(buf, sizeof(buf), "Recipe A (2-frame taps): %d of %d", cruiseOk(v.a), (int)v.a.size());
+    } else {
+      std::snprintf(buf, sizeof(buf), "Recipe A: %d of %d, recipe B: %d of %d", cruiseOk(v.a), (int)v.a.size(), cruiseOk(v.b), (int)v.b.size());
+    }
+    k.second = buf;
     return k;
   }
   if (v.state == "aborted") {

@@ -455,8 +455,11 @@ class CruiseCheck:
     return "YES" if best == ROUNDS else ("NO" if best == 0 else "PARTLY")
 
   def _abort(self, frame, inp, why):
-    if self.cur is not None and self.cur.get("minus") is not None:
-      self.results[self.phase].append(self.cur)
+    if self.cur is not None and (self.cur.get("minus") is not None or self.sub in ("tap_minus", "wait_minus")):
+      if self.cur.get("minus") is None and self.tap is not None and self.tap.frames:
+        self.cur["minus"] = False       # a round cut short after its minus tap was sent: counted as run, not accepted
+      if self.cur.get("minus") is not None:
+        self.results[self.phase].append(self.cur)
     self.cur = None
     if self.tap is not None:
       self.guard.end()

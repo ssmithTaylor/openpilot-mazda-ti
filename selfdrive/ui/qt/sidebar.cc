@@ -2353,8 +2353,20 @@ void TestsWindow::drawCruiseBusy(QPainter &p) {
   if (!cruiseBusy(cruise_view)) {
     return;
   }
-  drawBox2(p, ctlRect(CTL_START), QColor(0x6b, 0x5e, 0x10), QColor(0xff, 0xff, 0xff), QString("CRUISE CHECK RUNNING"), START_PX,
-           QString("START waits until it ends (PROGRESS > CRUISE CHECK)"), START_SUB_PX);
+  const QColor white(0xff, 0xff, 0xff);
+  // the status band says what is running (the plan's own line would say stopped)
+  const QRect band(HOME_PRIMARY.x, HOME_PRIMARY.y, HOME_PRIMARY.w, HOME_SECOND.bottom() - HOME_PRIMARY.y);
+  p.setPen(Qt::NoPen);
+  p.setBrush(toneQColor(Tone::Running));
+  p.drawRoundedRect(band, 24, 24);
+  p.setPen(white);
+  p.setFont(InterFont(PRIMARY_PX, QFont::Bold));
+  p.drawText(qr(HOME_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString("CRUISE CHECK RUNNING"));
+  p.setFont(InterFont(SECOND_PX, QFont::DemiBold));
+  p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString("Plan and tests wait for it"));
+  drawBox2(p, ctlRect(CTL_START), QColor(0x6b, 0x5e, 0x10), white, QString("START WAITS"), START_PX,
+           QString("until the cruise check ends"), START_SUB_PX);
+  drawBox2(p, ctlRect(CTL_STOP), QColor(201, 34, 49), white, QString("STOP"), STOP_PX, QString("stops the cruise check"), START_SUB_PX);
 }
 
 void TestsWindow::paintEvent(QPaintEvent *event) {
