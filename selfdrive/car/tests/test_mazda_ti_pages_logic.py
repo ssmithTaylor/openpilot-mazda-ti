@@ -89,7 +89,7 @@ def test_the_header_mirrors_the_speed_numbers_it_words():
   assert int(re.search(r"SPEED_GATE_HIGH_MPH = (\d+)", HEADER).group(1)) == 69
   assert int(re.search(r"EPS_LOW_MPH = (\d+)", HEADER).group(1)) == 28
   assert int(re.search(r"EPS_HIGH_MPH = (\d+)", HEADER).group(1)) == 31
-  assert tp.PLAN_ALT_MIN_MPH == 35 and tp.PLAN_ALT_MAX_MPH == 56
+  assert tp.PLAN_ALT_MIN_MPH == 35 and tp.PLAN_ALT_MAX_MPH == 64
 
 
 def test_the_param_keys_of_the_writes_are_the_car_side_keys():
@@ -152,7 +152,7 @@ def test_an_invalid_plan_is_refused_with_a_reason_and_the_header_agrees():
     "block length outside 4-10 min": lambda p: p["alternation"].update(block_min=3),
     "target must be 10 min per side": lambda p: p["alternation"].update(target_min_per_side=30),
     "an amount has no reason": lambda p: p["alternation"].update(reason=""),
-    "speed range must be 35-56 mph": lambda p: p["alternation"].update(max_mph=70),
+    "speed range must be 35-64 mph": lambda p: p["alternation"].update(max_mph=56),
     "tests must cover all four windows": lambda p: p["tests"].update(windows=p["tests"]["windows"][:1]),
     "tests must be sweep, pulses, ladder": lambda p: p["tests"].update(ids=["ti_dither"]),
     "no plan name": lambda p: p.update(name=""),

@@ -68,7 +68,7 @@ def test_the_header_mirrors_the_drive_plan_constants():
   for name, value in (("PLAN_TARGET_MIN_DEFAULT", tp.TARGET_MIN_PER_SIDE), ("PLAN_ALT_MIN_MPH", tp.PLAN_ALT_MIN_MPH),
                       ("PLAN_ALT_MAX_MPH", tp.PLAN_ALT_MAX_MPH)):
     assert float(re.search(rf"constexpr double {name} = ([\d.]+);", HEADER).group(1)) == value
-  assert "35-56 mph" in HEADER
+  assert "35-64 mph" in HEADER
 
 
 def test_the_header_words_every_hold_reason_and_none_says_another_test_is_on():

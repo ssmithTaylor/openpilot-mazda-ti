@@ -26,6 +26,11 @@ try:
 except Exception:
   ti_plan_mod = None
 try:
+  # Lag guard (ti_lag.py): the tests stand down by themselves while the control loop is short of time. Optional like the rest.
+  from openpilot.selfdrive.car.mazda import ti_lag as ti_lag_mod
+except Exception:
+  ti_lag_mod = None
+try:
   # Cruise set-speed check (ti_cruise_check.py): started only by its own control on the Tests pages. Optional: without the module
   # nothing here changes (self.cruise_check is None).
   from openpilot.selfdrive.car.mazda import ti_cruise_check as cruise_check_mod
@@ -143,6 +148,9 @@ class CarController(CarControllerBase):
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
     self.ti_ab_switch = False          # TiAbOn as read (the plain A/B switch), for the cruise check's exclusion
+    self.ti_lag = (ti_lag_mod.LagGuard(log=ti_hold_log)
+                   if ti_lag_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
+    self.ti_lag_held = False           # the loop has been short of time: the tests are held (reason "control loop busy")
     # Cruise set-speed check: gen1 with the interceptor only (the car it was studied on). Off after every start of this process: the
     # trigger and the last status are cleared here, and a trigger stamped before this moment is ignored.
     self.cruise_check = (cruise_check_mod.CruiseCheck()
@@ -595,6 +603,8 @@ class CarController(CarControllerBase):
           if not hold and not plan_on and ab_on:
             why = "A/B switch on"
           ab_on = hold if plan_on else (hold or ab_on)
+          if getattr(self, "ti_lag_held", False):
+            ab_on, why = True, ti_lag_mod.WHY      # the loop is short of time: no test or dither signal until it has recovered
           key = (bool(ab_on), why)
           if key != self.ti_hold_key:                 # every change of the hold decision, and why, into the log
             self.ti_hold_key = key
@@ -691,6 +701,12 @@ class CarController(CarControllerBase):
     can_sends = []
 
     if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      lag = getattr(self, "ti_lag", None)
+      if lag is not None:
+        try:
+          self.ti_lag_held = lag.tick(time.monotonic())
+        except Exception:
+          self.ti_lag, self.ti_lag_held = None, False
       self.apply_ti_tuning(frogpilot_toggles)
       # Live TI state, refreshed every frame regardless of engagement. The mode and violation are
       # kept on the CarState object rather than published in cereal, so nothing outside this

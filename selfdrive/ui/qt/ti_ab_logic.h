@@ -152,7 +152,7 @@ inline const char *reasonText(const char *name) {
 // alternation's scored minutes per side against its target. mode: off, hold, ab, tests, dead.
 constexpr double PLAN_TARGET_MIN_DEFAULT = 10.0;
 constexpr double PLAN_ALT_MIN_MPH = 35.0;
-constexpr double PLAN_ALT_MAX_MPH = 56.0;
+constexpr double PLAN_ALT_MAX_MPH = 64.0;
 
 inline std::string planLine(const char *mode, double a_s, double b_s, double target_min, bool complete) {
   char buf[220];
@@ -160,10 +160,10 @@ inline std::string planLine(const char *mode, double a_s, double b_s, double tar
   const char *next = "";
   if (std::strcmp(mode, "ab") == 0) {
     now = "A/B alternation";
-    next = "tests when the speed leaves 35-56 mph or A/B completes";
+    next = "tests when the speed leaves 35-64 mph or A/B completes";
   } else if (std::strcmp(mode, "tests") == 0) {
     now = "identification tests";
-    next = complete ? "tests only: A/B is complete" : "A/B when it is set up and the speed is 35-56 mph";
+    next = complete ? "tests only: A/B is complete" : "A/B when it is set up and the speed is 35-64 mph";
   } else if (std::strcmp(mode, "hold") == 0) {
     now = "handing over";
     next = "waiting for a quiet moment";
@@ -196,6 +196,7 @@ inline const char *holdText(const char *why) {
     {"plan says hold", "Waiting: drive plan is handing over"},
     {"plan says off", "Waiting: drive plan is starting"},
     {"A/B switch on", "Waiting: A/B alternation is on"},
+    {"control loop busy", "Tests paused: control loop busy"},
   };
   for (const Hold &h : HOLDS) {
     if (std::strcmp(h.why, why) == 0) {

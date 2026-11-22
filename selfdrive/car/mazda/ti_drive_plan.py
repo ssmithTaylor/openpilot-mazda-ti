@@ -12,7 +12,7 @@ BOOL_SETTINGS = ("LatNoFrictionRelay", "LatFrictionComp", "LatDamping", "LatOutp
 NUMBER_SETTINGS = ("SteerKP",)
 BLOCK_MIN_RANGE = (4, 10)
 TARGET_MIN = 10          # = ti_plan.TARGET_MIN_PER_SIDE
-RANGE_MPH = (35, 56)     # = ti_plan.PLAN_ALT_MIN_MPH, PLAN_ALT_MAX_MPH
+RANGE_MPH = (35, 64)     # = ti_plan.PLAN_ALT_MIN_MPH, PLAN_ALT_MAX_MPH
 
 
 def _reasons_ok(window_entries, alt):
@@ -57,7 +57,7 @@ def problem(plan):
     if alt.get("target_min_per_side") != TARGET_MIN:
       return "target must be 10 min per side"
     if (alt.get("min_mph"), alt.get("max_mph")) != RANGE_MPH:
-      return "speed range must be 35-56 mph"
+      return "speed range must be 35-64 mph"
     return "" if _reasons_ok(entries, alt) else "an amount has no reason"
   except Exception:
     return "plan unreadable"

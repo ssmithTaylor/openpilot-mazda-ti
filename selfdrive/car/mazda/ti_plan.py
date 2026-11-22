@@ -24,7 +24,7 @@ from typing import NamedTuple
 DT = 0.01
 H = 1.0                              # mph of hysteresis, as ti_ab's own speed gate
 PLAN_ALT_MIN_MPH = 35.0
-PLAN_ALT_MAX_MPH = 56.0              # first trial: replay evidence covers 35-56 mph only
+PLAN_ALT_MAX_MPH = 64.0              # 35-64 mph (36-63 shown) since 2026-11-22: the 57-63 mph gap went to tests that rarely ran (owner: "Sounds good")
 TARGET_MIN_PER_SIDE = 10.0           # engaged, scored minutes per side before the alternation is complete (the owner's plan file gives the reason)
 MIN_DWELL_S = 10.0                   # a speed-driven change of mode waits this long after the last change
 QUIET_SETTLE_S = 1.0                 # the tests' signal has been zero this long before the alternation may start
@@ -34,7 +34,7 @@ PARAM_PLAN_ON, PARAM_PLAN, PARAM_PLAN_ACK = "TiPlanOn", "TiPlan", "TiPlanAck"
 PARAM_HOLD = "TiTestHold"            # tmpfs, car controller: {"held", "why", "t"}: why the tests are held now (the screens' wording is in ti_ab_logic.h)
 # every reason `tests_gate` or the car controller can give for a hold (the screens map each to plain words)
 HOLD_WHYS = ("plan dead", "plan missing", "plan unreadable", "plan stale", "alternation not at A", "plan says ab", "plan says hold",
-             "plan says off", "A/B switch on")
+             "plan says off", "A/B switch on", "control loop busy")
 MODES = ("off", "hold", "ab", "tests")
 
 
@@ -50,13 +50,13 @@ def in_range(prev, mph, ceiling=PLAN_ALT_MAX_MPH):
 
 INTERLEAVE_WINDOWS = ("35-41", "49-56")   # the test windows inside the alternation's speed range
 # The standard plan is the alternation alone and every identification test is optional (ti_drive_plan.json): optional items must not take time
-# from a required one, so inside 35-56 mph the alternation has the speeds until it is complete and the tests get them after. Set True only for a
+# from a required one, so inside 35-64 mph the alternation has the speeds until it is complete and the tests get them after. Set True only for a
 # plan that REQUIRES tests in those windows (then tests_behind below shares them).
 INTERLEAVE_TESTS_IN_RANGE = False
 
 
 def tests_behind(window, tests_share, alt_share, was_behind):
-  """The split inside 35-56 mph, decided per band from what each need has left. The alternation can use any speed from 36 to 55 mph,
+  """The split inside 35-64 mph, decided per band from what each need has left. The alternation can use any speed from 36 to 63 mph,
   the tests only their two windows, so the windows are the scarce time: while a window's tests are incomplete they are served in it
   (the alternation has the gap between the windows and every window whose tests are done). The first interleave, which served the
   need with the lower share, handed the windows back and forth: every hand-over costs about 30 s (the blend returns to A and settles,

@@ -63,7 +63,7 @@ Samples marked `gap` in `hb.progress` are driven between the four speed windows 
 ## Drive plan (ti_plan.py)
 
 `TiPlanOn` (tmpfs, off at every boot, set by START on the Tests first page when an alternation is set up; STOP, or starting a single test, switches it off) sequences the alternation and the tests; with it off nothing here acts.
-The alternation runs where it is configured, incomplete and the speed is 35-56 mph (`PLAN_ALT_MAX_MPH`, 56 because replay evidence covers 35-56 mph only;
+The alternation runs where it is configured, incomplete and the speed is 35-64 mph (`PLAN_ALT_MAX_MPH`, 64 since 2026-11-22: the 57-63 mph gap went to the alternation; earlier 56 because replay evidence covered 35-56 mph only;
 a mile of hysteresis, and `MIN_DWELL_S` = 10 s between speed-driven changes); everywhere else, and everywhere once it is complete, the tests run in run-all
 mode under all their own gates. Complete = `TARGET_MIN_PER_SIDE` (10; the plan file gives the reason) scored minutes on each side, counted at the end of each non-voided block from
 scored (non-wash-in, not ramping, not pinned; for LatCommitSetpoint only in bends) time. On completion: `complete` event, the value returns to A by its

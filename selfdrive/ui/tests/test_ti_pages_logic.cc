@@ -148,7 +148,7 @@ static void checkLines(const HomeState &s, int &count) {
 static void everyStateFits() {
   const char *plan_modes[] = {"", "off", "hold", "ab", "tests", "dead"};
   const char *holds[] = {"", "plan dead", "plan missing", "plan unreadable", "plan stale", "alternation not at A", "plan says ab",
-                         "plan says hold", "plan says off", "A/B switch on", "unknown"};
+                         "plan says hold", "plan says off", "A/B switch on", "control loop busy", "unknown"};
   const char *gates[] = {"", "command", "curve", "lat"};
   const double speeds[] = {0, 10, 19, 22, 25, 29, 33, 38, 45, 52, 60, 72, 85, 120};
   int count = 0;
@@ -238,7 +238,7 @@ static void sampleStates() {
   s = HomeState();
   CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "Nothing is running");
   s.configured = true; s.ab_stored_known = true; s.ab_stored_a_s = 14.7 * 60; s.ab_stored_b_s = 13.2 * 60;
-  CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "A/B 13 of 20 min each side done");
+  CHECK(H(s).primary.text == "STOPPED: TAP START" && H(s).second == "A/B 13.2 of 20 min each side done");
   s.ab_stored_known = false;
   CHECK(H(s).second == "Nothing is running");
   s.run = Run::All;
@@ -303,7 +303,7 @@ static void wordsCoverTheCarSide() {
     CHECK(ti_ab::holdText(HOLD_SHORT[i].why)[0] != 0);
     CHECK((int)std::strlen(HOLD_SHORT[i].text) <= MAX_PRIMARY_CHARS);
   }
-  CHECK(N_HOLD_SHORT == 9 && holdShort("nonsense") == nullptr && ti_ab::holdText("nonsense")[0] == 0);
+  CHECK(N_HOLD_SHORT == 10 && holdShort("nonsense") == nullptr && ti_ab::holdText("nonsense")[0] == 0);
   CHECK(std::strstr(ti_ab::REASONS[4].text, "36-69") != nullptr && SPEED_GATE_LOW_MPH == 36 && SPEED_GATE_HIGH_MPH == 69);
   CHECK(std::strstr(ti_ab::REASONS[5].text, "28-31") != nullptr && EPS_LOW_MPH == 28 && EPS_HIGH_MPH == 31);
   CHECK(EPS_LOW_MPH == (int)ti_logic::EPS_LOW_MPH && EPS_HIGH_MPH == (int)ti_logic::EPS_HIGH_MPH);
@@ -410,9 +410,15 @@ static void startLabels() {
 }
 
 static void progressTexts() {
-  CHECK(abProgressText(14.2 * 60, 13.9 * 60, 20) == "A 14 / 20 min, B 13 / 20 min");
+  CHECK(abProgressText(14.2 * 60, 13.9 * 60, 20) == "A 14.2 / 20 min, B 13.9 / 20 min");
+  CHECK(abProgressText(70, 0, 10) == "A 1.1 / 10 min, B 0.0 / 10 min");          // a block's worth shows, not "0 / 10"
+  CHECK(blockSoFar("B", 25.0) == "block B +0.4 min pending" && blockSoFar("", 25.0).empty());
+  CHECK(detailScored(372, 318, 10, false, "B", 25.0) == "Scored: A 6.2 / B 5.3 of 10 min; block B +0.4 pending");
+  CHECK((int)abLeftText(0, 0, 10, OVERHEAD_ALT, blockSoFar("B", 599)).size() * EXPERIMENT_PX * 0.62 <= PROG_AB_LEFT.w);
+  CHECK((int)detailScored(599, 599, 10, false, "A", 599).size() <= MAX_DETAIL_CHARS);
+  CHECK(OVERHEAD_ALT == 1.8);
   CHECK(abMinutesLeft(14 * 60, 13 * 60, 20) == 13.0 && abMinutesLeft(25 * 60, 21 * 60, 20) == 0.0);
-  CHECK(abLeftText(14 * 60, 13 * 60, 20) == "About 13 min of driving at 36-55 mph left");
+  CHECK(abLeftText(14 * 60, 13 * 60, 20) == "About 13 min at 36-63 mph left");
   CHECK(abLeftText(1200, 1200, 20) == "A/B complete: the tests take over");
   CHECK(fraction(10, 20) == 0.5 && fraction(30, 20) == 1.0 && fraction(-1, 20) == 0.0 && fraction(1, 0) == 1.0);
   CHECK(windowLabel(0, false) == "21-27 mph" && windowRowText(0, 3, 12, 540, false) == "3 of 12 done; hold 24 mph for about 9 min");
@@ -466,7 +472,7 @@ static void setupOrderAndChoice() {
   }
   CHECK((int)experimentLine(-1, false, 0, 0).size() <= MAX_CHOSEN_CHARS);
   // the split of the speed range
-  CHECK(splitNote(true, false) == "A/B has 36-55 mph until done; tests run below 35 and above 56 mph");
+  CHECK(splitNote(true, false) == "A/B has 36-63 mph until done; tests run below 35 and above 64 mph");
   CHECK(splitNote(true, true).size() * DETAIL_PX * 0.62 <= PROG_SPLIT.w && splitNote(false, false).size() * DETAIL_PX * 0.62 <= PROG_SPLIT.w);
   CHECK(PROG_SPLIT.bottom() <= SCREEN_H && PROG_SPLIT.h >= DETAIL_PX + 4);
 }
@@ -477,7 +483,7 @@ static PlanFields goodPlan() {
   p.test_ids = {"ti_sweep", "ti_pulses", "ti_ladder"};
   p.windows = {"21-27", "35-41", "49-56", "64-80"};
   p.has_alt = true; p.setting = "LatNoFrictionRelay"; p.a = "stored"; p.b_text = "other";
-  p.block_min = 4; p.target_min = 10; p.min_mph = 35; p.max_mph = 56;
+  p.block_min = 4; p.target_min = 10; p.min_mph = 35; p.max_mph = 64;
   return p;
 }
 
@@ -492,7 +498,7 @@ static void planAndBands() {
     {"block length outside 4-10 min", [](PlanFields &x) { x.block_min = 3; }},
     {"target must be 10 min per side", [](PlanFields &x) { x.target_min = 30; }},
     {"an amount has no reason", [](PlanFields &x) { x.reasons_ok = false; }},
-    {"speed range must be 35-56 mph", [](PlanFields &x) { x.max_mph = 70; }},
+    {"speed range must be 35-64 mph", [](PlanFields &x) { x.max_mph = 56; }},
     {"tests must cover all four windows", [](PlanFields &x) { x.windows = {"21-27"}; }},
     {"tests must be sweep, pulses, ladder", [](PlanFields &x) { x.test_ids = {"ti_dither"}; }},
     {"no plan name", [](PlanFields &x) { x.named = false; }},
@@ -528,7 +534,7 @@ static void planAndBands() {
   int n = bandsFromState(hs, b);
   CHECK(n == 3 && b[0].target_mph == 24 && b[2].target_mph == 72 && b[1].target_mph == 45 && b[0].minutes == 6 && b[2].minutes == 4);
   CHECK(b[1].minutes == std::ceil(40 * OVERHEAD_ALT + 7.0 - 1e-9));        // alternation 40 min, both sides still open, plus the two windows
-  CHECK(b[1].lo == 35 && b[1].hi == 56 && bandRange(b[1], false) == "36-55 mph" && bandIndexAt(b, n, 35.5) == 1 && bandIndexAt(b, n, 45.0) == 1);
+  CHECK(b[1].lo == 35 && b[1].hi == 64 && bandRange(b[1], false) == "36-63 mph" && bandIndexAt(b, n, 35.5) == 1 && bandIndexAt(b, n, 45.0) == 1);
   hs.configured = false;                                                   // no alternation: the bands are the test windows
   n = bandsFromState(hs, b);
   CHECK(n == 4 && b[1].target_mph == 38 && b[2].target_mph == 52 && b[1].minutes == 4 && b[2].minutes == 3 && bandIndexAt(b, n, 45.0) == -1);
@@ -630,10 +636,10 @@ static void testsOptional() {
   for (int w = 0; w < 4; w++) { s.tests_optional[w] = true; s.tests_left_s[w] = 600; }
   Band b[MAX_BANDS];
   int n = bandsFromState(s, b);
-  CHECK(n == 1 && b[0].target_mph == 45 && b[0].lo == 35 && b[0].hi == 56);
-  CHECK(b[0].minutes == std::ceil(2 * 10 * OVERHEAD_ALT - 1e-9) && b[0].minutes == 28);      // 20 scored minutes, about 28 engaged
-  CHECK(bandText(b[0], false) == "45 mph  28 min" && bandRange(b[0], false) == "36-55 mph");
-  CHECK(bandsTotalMinutes(b, n) == 28);
+  CHECK(n == 1 && b[0].target_mph == 45 && b[0].lo == 35 && b[0].hi == 64);
+  CHECK(b[0].minutes == std::ceil(2 * 10 * OVERHEAD_ALT - 1e-9) && b[0].minutes == 36);      // 20 scored minutes, about 36 engaged (measured)
+  CHECK(bandText(b[0], false) == "45 mph  36 min" && bandRange(b[0], false) == "36-63 mph");
+  CHECK(bandsTotalMinutes(b, n) == 36);
   s.ab_stored_a_s = s.ab_stored_b_s = 300;
   n = bandsFromState(s, b);
   CHECK(n == 1 && b[0].minutes == std::ceil(2 * 5 * OVERHEAD_ALT - 1e-9));
@@ -674,7 +680,7 @@ static void reviewFixes() {
   HomeState s;
   s.configured = true; s.target_min = 10; s.ab_stored_known = true; s.ab_stored_a_s = 13 * 60; s.ab_stored_b_s = 12 * 60;
   for (int w = 0; w < 4; w++) s.tests_optional[w] = true;
-  CHECK(home(s).second == "A/B complete: 10 min each side" && abProgressText(13 * 60, 12 * 60, 10) == "A 10 / 10 min, B 10 / 10 min");
+  CHECK(home(s).second == "A/B complete: 10 min each side" && abProgressText(13 * 60, 12 * 60, 10) == "A 10.0 / 10 min, B 10.0 / 10 min");
   CHECK(detailScored(13 * 60, 12 * 60, 10, true).find("13") == std::string::npos);
   CHECK(planComplete(s));
   CHECK(home(s).primary.text == "STOPPED: PLAN COMPLETE" && home(s).primary.tone == Tone::Stopped);   // never "tap START" for a finished plan

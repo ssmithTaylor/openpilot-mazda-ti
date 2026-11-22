@@ -888,7 +888,8 @@ class TiAb:
     block = None
     if self.block is not None and self.cfg is not None:
       length = self.block_len
-      block = {"idx": self.block[0], "arm": self.block[1], "len_s": length, "left_s": round(max(length - self.block_frames * DT, 0.0), 1)}
+      block = {"idx": self.block[0], "arm": self.block[1], "len_s": length, "left_s": round(max(length - self.block_frames * DT, 0.0), 1),
+               "scored_s": round(self.block_scored * DT, 1)}   # provisional: committed to its side when the block ends (pages show it)
     wait = None
     if self.pin_wait is not None:
       wait = {"reason": self.pin_wait, "why": "pin waiting: " + MESSAGE.get(self.pin_wait, ""), "s": 0.0, "max_s": 0.0, "arm": "B", "pin": True}

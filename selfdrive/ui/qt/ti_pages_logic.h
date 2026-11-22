@@ -419,8 +419,9 @@ constexpr HoldShort HOLD_SHORT[] = {
   {"plan says hold", "WAITING: HAND-OVER", Tone::Waiting},
   {"plan says off", "WAITING: PLAN STARTING", Tone::Waiting},
   {"A/B switch on", "WAITING: A/B SWITCH ON", Tone::Waiting},
+  {"control loop busy", "PAUSED: LOOP BUSY", Tone::Held},
 };
-constexpr int N_HOLD_SHORT = 9;
+constexpr int N_HOLD_SHORT = 10;
 
 inline const HoldShort *holdShort(const char *why) {
   for (const HoldShort &h : HOLD_SHORT) {
@@ -465,11 +466,27 @@ inline double fraction(double have, double need) {
   return need <= 0 ? 1.0 : std::min(1.0, std::max(0.0, have / need));
 }
 
-// "A 14 / 20 min, B 13 / 20 min"
+// Tenths of a minute, never rounded up to a finished target: "13.96" reads 13.9
+inline double tenthsMin(double secs) {
+  return secs > 0 ? std::floor(secs / 6.0 + 1e-9) / 10.0 : 0.0;
+}
+
+// "A 14.2 / 20 min, B 13.9 / 20 min" (tenths: a whole drive's progress was invisible in whole minutes)
 inline std::string abProgressText(double a_s, double b_s, double target_min) {
   char buf[64];
   const double cap = 60.0 * target_min;                 // scored time beyond the target is not shown as more than the target
-  std::snprintf(buf, sizeof(buf), "A %d / %.0f min, B %d / %.0f min", wholeMin(std::min(a_s, cap)), target_min, wholeMin(std::min(b_s, cap)), target_min);
+  std::snprintf(buf, sizeof(buf), "A %.1f / %.0f min, B %.1f / %.0f min", tenthsMin(std::min(a_s, cap)), target_min, tenthsMin(std::min(b_s, cap)),
+                target_min);
+  return buf;
+}
+
+// The block in progress counts toward its side only when it ends: said so, with what it has scored so far. "" outside a block.
+inline std::string blockSoFar(const char *arm, double block_scored_s) {
+  if (arm == nullptr || arm[0] == 0 || block_scored_s < 0.0) {
+    return "";
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "block %s +%.1f min pending", arm, tenthsMin(block_scored_s));
   return buf;
 }
 
@@ -479,14 +496,14 @@ inline double abMinutesLeft(double a_s, double b_s, double target_min) {
   return (std::max(0.0, t - a_s) + std::max(0.0, t - b_s)) / 60.0;
 }
 
-inline std::string abLeftText(double a_s, double b_s, double target_min, double overhead = 1.0) {
+inline std::string abLeftText(double a_s, double b_s, double target_min, double overhead = 1.0, const std::string &block = "") {
   const double left = abMinutesLeft(a_s, b_s, target_min) * overhead;
   if (left <= 0.0) {
     return "A/B complete: the tests take over";
   }
-  char buf[96];
-  std::snprintf(buf, sizeof(buf), "About %d min of driving at %d-%d mph left", (int)std::ceil(left), (int)ti_ab::PLAN_ALT_MIN_MPH + 1,
-                (int)ti_ab::PLAN_ALT_MAX_MPH - 1);
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "About %d min at %d-%d mph left%s%s", (int)std::ceil(left), (int)ti_ab::PLAN_ALT_MIN_MPH + 1,
+                (int)ti_ab::PLAN_ALT_MAX_MPH - 1, block.empty() ? "" : "; ", block.c_str());
   return buf;
 }
 
@@ -500,7 +517,7 @@ inline std::string stoppedSecond(bool known, double a_s, double b_s, double targ
     std::snprintf(buf, sizeof(buf), "A/B complete: %.0f min each side", target_min);
     return buf;
   }
-  std::snprintf(buf, sizeof(buf), "A/B %d of %.0f min each side done", wholeMin(std::min(a_s, b_s)), target_min);
+  std::snprintf(buf, sizeof(buf), "A/B %.1f of %.0f min each side done", tenthsMin(std::min(a_s, b_s)), target_min);
   return buf;
 }
 
@@ -530,7 +547,7 @@ inline std::string windowRowText(int w, int done, int total, double secs_left, b
   return buf;
 }
 
-// What the tests and the alternation each get of the speed range (the plan gives 36-55 mph to the alternation until it is done)
+// What the tests and the alternation each get of the speed range (the plan gives 36-63 mph to the alternation until it is done)
 inline std::string splitNote(bool alternation_open, bool metric) {
   char buf[128];
   if (!alternation_open) {
@@ -574,14 +591,15 @@ inline std::string thisDriveLine(const double win_s[ti_logic::N_WINDOWS], double
 
 // ---- the bands still needed, ONE model for the list and the status line ------------------------------------------------------------
 // A band is a range of speeds with the engaged minutes still needed there. What the tests and the alternation each need is merged into
-// one figure per band. While the alternation is open the range 35-56 mph is ONE band (alternation blocks and the tests' 35-41 and 49-56
+// one figure per band. While the alternation is open the range 35-64 mph is ONE band (alternation blocks and the tests' 35-41 and 49-56
 // windows interleave there, ti_plan.tests_behind); once it is complete the bands are the test windows themselves (38 and 52 mph) and
 // the gap between them counts nothing. Both the list and the primary line are computed from these bands and from what the car reports
 // is counting, so they cannot disagree. Overheads (fades, hand-overs, wash-in, voided time, gate waits) are estimates, named here.
 // MEASURED by replaying the two reference drives through the build (accept harness, ti-acceptance branch; not yet by a drive on the car):
 // alternation 1.16-1.33 engaged minutes per scored minute; tests 1.06-1.75, about 1.4 outside the lowest window (where the gates close most of
 // the time: the released drives 33b/33c show the strict gates open about 29% of the time at 21-27 mph).
-constexpr double OVERHEAD_ALT = 1.4;         // about 1.4 on real roads (the replay's 1.16-1.33 is on its idealised gates): 20 scored min = about 28 engaged min
+constexpr double OVERHEAD_ALT = 1.8;         // MEASURED on the car (drives of 2026-11-22): 53-58 % of engaged A/B-mode time was scored (blocks voided by
+                                             // disengaging, wash-in, waits), so about 1.8 engaged min per scored min (the replay's 1.16-1.33 is on idealised gates)
 constexpr double OVERHEAD_TESTS = 1.4;       // the three higher windows
 constexpr double OVERHEAD_TESTS_LOW = 1.75;  // the lowest window (21-27 mph): the top of the replay's range
 constexpr int MAX_BANDS = 4;
@@ -1053,11 +1071,15 @@ inline std::string individualNote(Run run) {
   return "Diagnostic page. Run everything from the START page.";
 }
 
-inline std::string detailScored(double a_s, double b_s, double target_min, bool complete) {
-  char buf[96];
+inline std::string detailScored(double a_s, double b_s, double target_min, bool complete, const char *block_arm = "", double block_s = -1.0) {
+  char buf[128];
   const double cap = 60.0 * target_min;                 // never "13 of 10"
-  std::snprintf(buf, sizeof(buf), "Scored: A %.1f / B %.1f of %.0f min%s", std::min(a_s, cap) / 60.0, std::min(b_s, cap) / 60.0, target_min,
-                complete ? " COMPLETE" : "");
+  char blk[40] = "";
+  if (!complete && block_arm != nullptr && block_arm[0] != 0 && block_s >= 0.0) {
+    std::snprintf(blk, sizeof(blk), "; block %s +%.1f pending", block_arm, tenthsMin(block_s));
+  }
+  std::snprintf(buf, sizeof(buf), "Scored: A %.1f / B %.1f of %.0f min%s%s", tenthsMin(std::min(a_s, cap)), tenthsMin(std::min(b_s, cap)), target_min,
+                complete ? " COMPLETE" : "", blk);
   return buf;
 }
 
@@ -1115,7 +1137,7 @@ inline std::string planProblem(const PlanFields &p) {
     return "target must be 10 min per side";
   }
   if (p.min_mph != ti_ab::PLAN_ALT_MIN_MPH || p.max_mph != ti_ab::PLAN_ALT_MAX_MPH) {
-    return "speed range must be 35-56 mph";
+    return "speed range must be 35-64 mph";
   }
   return p.reasons_ok ? "" : "an amount has no reason";
 }

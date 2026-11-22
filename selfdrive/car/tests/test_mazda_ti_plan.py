@@ -60,7 +60,7 @@ QUIET = dict(engaged=True, v_ego=v(45.0), curvature=0.0003, steer=0.02, saturate
 # ---- the pure decision and its speed hysteresis ---------------------------------------------------------------------------
 
 def test_the_first_trial_constants_and_defaults():
-  assert (tp.PLAN_ALT_MIN_MPH, tp.PLAN_ALT_MAX_MPH, tp.TARGET_MIN_PER_SIDE) == (35.0, 56.0, 10.0)
+  assert (tp.PLAN_ALT_MIN_MPH, tp.PLAN_ALT_MAX_MPH, tp.TARGET_MIN_PER_SIDE) == (35.0, 64.0, 10.0)   # 64 since 2026-11-22 (was 56)
   assert tp.MIN_DWELL_S > 0 and tp.QUIET_SETTLE_S > 0 and tp.STALE_S > 0
 
 
@@ -76,7 +76,7 @@ def test_decide_is_a_pure_function_of_state(cfg_valid, complete, rng, mode):
 def test_the_range_has_a_mile_of_hysteresis_at_both_ends():
   prev = False
   seen = []
-  for mph in (30, 34.9, 35.5, 35.9, 36.1, 40, 54.9, 55.5, 55.9, 56.0, 55.5, 54.9, 40, 35.5, 34.9, 35.5):
+  for mph in (30, 34.9, 35.5, 35.9, 36.1, 40, 62.9, 63.5, 63.9, 64.0, 63.5, 62.9, 40, 35.5, 34.9, 35.5):
     prev = tp.in_range(prev, mph)
     seen.append(prev)
   assert seen == [False, False, False, False, True, True, True, True, True, False, False, True, True, True, False, False]
@@ -152,11 +152,11 @@ def test_ab_to_tests_the_tests_start_only_when_the_blend_is_at_a_for_its_wash_in
   run(p, 200, mph=45.0, ack_quiet=True)
   assert p.mode == "ab"
   p.dwell = 10 ** 6
-  out = run(p, 3, mph=60.0, ab_at_a=False)                    # speed leaves the range
+  out = run(p, 3, mph=66.0, ab_at_a=False)                    # speed leaves the range
   assert out.mode == "hold" and not out.ab_allowed
-  out = run(p, 500, mph=60.0, ab_at_a=False)                  # the alternation is still ramping back or washing in
+  out = run(p, 500, mph=66.0, ab_at_a=False)                  # the alternation is still ramping back or washing in
   assert out.mode == "hold"
-  out = run(p, 2, mph=60.0, ab_at_a=True)
+  out = run(p, 2, mph=66.0, ab_at_a=True)
   assert out.mode == "tests"
 
 
@@ -165,8 +165,8 @@ def test_a_speed_change_waits_out_the_dwell_but_completion_and_a_lost_configurat
   run(p, 3, mph=45.0)
   run(p, 200, mph=45.0, ack_quiet=True)
   p.dwell = 0
-  assert run(p, 100, mph=60.0).mode == "ab"                    # hovering: no flip inside the dwell
-  assert run(p, F(tp.MIN_DWELL_S) + 5, mph=60.0).mode in ("hold", "tests")
+  assert run(p, 100, mph=66.0).mode == "ab"                    # hovering: no flip inside the dwell
+  assert run(p, F(tp.MIN_DWELL_S) + 5, mph=66.0).mode in ("hold", "tests")
   q = fresh_plan()
   run(q, 3, mph=45.0)
   q.dwell = 0
@@ -384,14 +384,14 @@ def test_voided_blocks_wash_in_and_pinned_time_never_count_toward_completion():
   assert 0 < m3.committed["B"] <= 20.0 - ab.SETTINGS["LatDamping"].wash_in_s + 1e-9
 
 
-def test_the_plan_ceiling_is_56_mph_and_without_the_plan_it_is_70():
+def test_the_plan_ceiling_is_64_mph_and_without_the_plan_it_is_70():
   m, ev, base = rig_ab()
   for _ in range(F(3)):
-    m.update(**{**base, "v_ego": v(57.0)})
-  assert m.mode == "idle" and "56" in m.message
+    m.update(**{**base, "v_ego": v(65.0)})
+  assert m.mode == "idle" and "64" in m.message
   m.clear_plan_limits()
   for _ in range(F(3)):
-    m.update(**{**base, "v_ego": v(57.0)})
+    m.update(**{**base, "v_ego": v(65.0)})
   assert m.mode == "running"
 
 

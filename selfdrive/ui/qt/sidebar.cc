@@ -2016,7 +2016,10 @@ void TestsWindow::drawHome(QPainter &p) {
     bool known = false;
     abDisplay(a_s, b_s, known, target);
     if (known) {
-      detail2 = QString::fromStdString(detailScored(a_s, b_s, target, ab_fresh && ab_status.value("complete").toBool()));
+      const QJsonObject blk = ab_fresh ? ab_status.value("block").toObject() : QJsonObject();
+      const std::string blk_arm = blk.value("arm").toString().toStdString();
+      detail2 = QString::fromStdString(detailScored(a_s, b_s, target, ab_fresh && ab_status.value("complete").toBool(), blk_arm.c_str(),
+                                                    blk.isEmpty() ? -1.0 : blk.value("scored_s").toDouble(0.0)));
     }
   }
   p.setPen(detail_color);
@@ -2042,7 +2045,8 @@ void TestsWindow::drawSetup(QPainter &p) {
     if (plan.has_alt) {
       const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
       lines << QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
-      lines << QString("Blocks of %1 min, %2 min per side to finish, at 36-55 mph (35-56 mph range)").arg((int)ab_block_min).arg((int)plan.target_min);
+      lines << QString("Blocks of %1 min, %2 min per side to finish, at %3-%4 mph").arg((int)ab_block_min).arg((int)plan.target_min)
+                   .arg((int)ti_ab::PLAN_ALT_MIN_MPH + 1).arg((int)ti_ab::PLAN_ALT_MAX_MPH - 1);
       if (ti_ab::bendsOnly(s.name)) {
         lines << QString("%1 acts only in bends: minutes count only there").arg(plainName(s.name));
       }
@@ -2102,7 +2106,10 @@ void TestsWindow::drawProgress(QPainter &p) {
     drawBar(p, qr(PROG_AB_BAR_B), fraction(b_s, 60.0 * target), amber);
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(EXPERIMENT_PX));
-    p.drawText(qr(PROG_AB_LEFT), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(abLeftText(a_s, b_s, target, OVERHEAD_ALT)));
+    const QJsonObject blk = ab_fresh ? ab_status.value("block").toObject() : QJsonObject();
+    const std::string blk_arm = blk.value("arm").toString().toStdString();
+    p.drawText(qr(PROG_AB_LEFT), Qt::AlignLeft | Qt::AlignVCenter,
+               QString::fromStdString(abLeftText(a_s, b_s, target, OVERHEAD_ALT, blk.isEmpty() ? std::string() : blockSoFar(blk_arm.c_str(), blk.value("scored_s").toDouble(0.0)))));
   } else {
     p.drawText(qr(PROG_AB_HEAD), Qt::AlignLeft | Qt::AlignVCenter, QString("A/B relay: not used"));
   }

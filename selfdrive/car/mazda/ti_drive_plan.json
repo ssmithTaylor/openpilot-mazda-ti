@@ -49,13 +49,13 @@
     "block_min": 4,
     "target_min_per_side": 10,
     "min_mph": 35,
-    "max_mph": 56,
+    "max_mph": 64,
     "reason": "The question is whether removing the friction relay reduces steering oscillation (direction reversals per second) at 36-55 mph. Pass-to-pass variation is about 0.12 per second per pass of about 86 s; the one earlier comparison showed a drop of about 0.23 per second, about 1.9 times that variation.",
     "minimum": "About 4-5 passes per side (about 6-7 minutes per side) give 80 percent power for an effect of that size. It cannot show an effect as small as closed-loop replay predicted (about 0.05 per second): that would need well over an hour per side and is out of reach of any single drive.",
     "buffer": "10 minutes per side is that minimum plus about half again, so a second drive is unlikely to be needed."
   },
   "priority": [
-    "the alternation has 35-56 mph until it is complete: nothing optional takes time from it",
+    "the alternation has 35-64 mph (36-63 shown) until it is complete: nothing optional takes time from it; 57-63 mph was a gap where nothing counted (2026-11-22 drive)",
     "the optional tests run everywhere else from the start, and everywhere once it is complete"
   ]
 }
