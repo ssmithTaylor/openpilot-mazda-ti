@@ -870,6 +870,19 @@ class TiAb:
     """The blend is exactly A, not moving, and has been for the wash-in time."""
     return self.ramp.s == 0.0 and not self.ramp.moving and self.ramp.to == 0.0 and self.wash_left == 0
 
+  def status_key(self):
+    """(state, msg, arm, pin, block idx, wait reason, complete) exactly as status() holds them, without building it."""
+    block_idx = self.block[0] if (self.block is not None and self.cfg is not None) else None
+    if self.pin_wait is not None:
+      wait_reason = self.pin_wait
+    elif self.mode == "running" and self.block is None and self.pending_since is not None:
+      wait_reason = self.last_reason or "settle"
+    else:
+      wait_reason = None
+    return ("error" if self.dead else self.mode,
+            (f"A/B stopped after an error: {self.reason_dead}" if self.dead else self.message),
+            self.arm_in_force if self.spec is not None else None, self.pin, block_idx, wait_reason, self.complete)
+
   def status(self, now=None):
     """The block the A/B page reads (param TiAbStatus)."""
     block = None
@@ -1006,6 +1019,9 @@ class TiAbRunner:
     4 minutes, so only counting them at their end made the alternation look behind for most of the time). A visit that credits nothing
     (the gates are closed, the road is not straight) is ended after VISIT_PATIENCE_S so the alternation is not starved by it.
     False on any doubt."""
+    if not ti_plan.INTERLEAVE_TESTS_IN_RANGE:
+      self.tests_behind = False        # ti_plan.tests_behind is False whatever the shares: the shares are not computed (cost)
+      return False
     try:
       window = ti.zone_for(v_ego).window
       now = self.k * DT
@@ -1146,14 +1162,17 @@ class TiAbRunner:
         pass
 
   def _publish(self):
-    st = self.ab.status()
     po = self.plan_out
-    st["plan"] = None if (po is None or not self.plan_on) and not self.plan_dead else {
+    plan = None if (po is None or not self.plan_on) and not self.plan_dead else {
       "on": self.plan_on, "mode": "dead" if self.plan_dead else po.mode, "why": "" if po is None else po.why,
       "next": "" if po is None else po.next, "target_min": self.plan_target_s / 60.0}
-    key = (st["state"], st["msg"], st["arm"], st["pin"], st["block"] and st["block"]["idx"], st["wait"] and st["wait"]["reason"],
-           st["plan"] and st["plan"]["mode"], st["complete"])
-    if key != self.published or self.k - self.published_k >= (self.STATUS_EVERY if st["state"] != "off" else 4 * self.STATUS_EVERY):
+    # the key from the same fields status() would hold (TiAb.status_key), so the full status is built only on the cycles it is
+    # published (cost: it was built and thrown away on most cycles)
+    state, msg, arm, pin, block_idx, wait_reason, complete = self.ab.status_key()
+    key = (state, msg, arm, pin, block_idx, wait_reason, plan and plan["mode"], complete)
+    if key != self.published or self.k - self.published_k >= (self.STATUS_EVERY if state != "off" else 4 * self.STATUS_EVERY):
+      st = self.ab.status()
+      st["plan"] = plan
       try:
         self.memory.put(PARAM_STATUS, json.dumps(st))
         self.published, self.published_k = key, self.k

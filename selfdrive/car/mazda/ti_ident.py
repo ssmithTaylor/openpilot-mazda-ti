@@ -1052,6 +1052,47 @@ class TiIdent:
     return ok / total if total else None
 
 
+def frame_scheduler(ident, remaining):
+  """(remaining, can_run, strict) for ONE frame of run all's pick: the same answers as `remaining`, `ident.can_run` and
+  `ident.next_is_strict`, with each progress lookup, each test's next step and each step's feasibility computed once in the frame
+  instead of once per question (pick asks can_run up to four times per test and strict once per test, and every answer re-ran
+  the step search). Exact, not rate-limited: nothing that the answers depend on (progress, the generator's limit inputs and frame
+  count) changes between pick's questions, which all come before the generator's update. Make a new one every frame."""
+  rem_memo, feas_memo, step_memo = {}, {}, {}
+
+  def rem(k, b, s):
+    key = (k, b, s)
+    if key not in rem_memo:
+      rem_memo[key] = remaining(k, b, s)
+    return rem_memo[key]
+
+  def feasible(k, s, w):
+    key = (k, s, w)
+    if key not in feas_memo:
+      feas_memo[key] = ident._feasible(k, s, w)
+    return feas_memo[key]
+
+  def next_step(k, w):
+    key = (k, w)
+    if key not in step_memo:
+      step_memo[key] = ident._pick(k, w, rem, None, lambda s: feasible(k, s, w))[0]
+    return step_memo[key]
+
+  def can_run(k, w):
+    if ident.inputs is None or w is None:
+      return True
+    if not all(math.isfinite(x) for x in ident.inputs.values()):
+      return False
+    step = next_step(k, w)
+    return step is not None and feasible(k, step, w)
+
+  def strict(k, w):
+    step = next_step(k, w)
+    return step is not None and not small(k, step)
+
+  return rem, can_run, strict
+
+
 def reconstruct(events, n_frames):
   """The added counts of frames 0..n_frames-1 from the logged events alone (the same state machine, no inputs)."""
   by_frame = {}
