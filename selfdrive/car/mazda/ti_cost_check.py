@@ -10,7 +10,8 @@ the device's params, no CAN is sent, no message queue is opened):
   plan on, ab        the plan in its A/B mode: the tests held
   tests mode, idle   the plan in its tests mode, the car in a test window, the road too curved for any test: the scheduler runs, no signal
   tests mode, run    the plan in its tests mode on a straight road in a window: a test signal runs
-Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
+Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
+with a block running, plan on in its tests mode. Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
 budget on average (default 300 us per cycle), 2 when the measurement is not valid (the running mode never ran a test).
 
 Budget: the drives of 2026-11-22 left about 1.5 ms per 10 ms cycle free on the controls core with the plan off (card about 32 % of the
@@ -125,6 +126,50 @@ def run_mode(name, plan_mode, mph, curvature, cycles):
           "max_us": round(times[-1], 1), "test_running_share": round(ran / len(times), 3)}
 
 
+def run_controls(name, plan_on, mph, cycles):
+  """controlsd's side: TiAbRunner.step per cycle (the A/B alternation and the plan), with the friction relay set up."""
+  from openpilot.selfdrive.car.mazda import ti_ab, ti_plan as tp
+  clock = [time.time()]
+  fake = NS(time=lambda: clock[0], monotonic=lambda: clock[0], perf_counter=time.perf_counter, perf_counter_ns=time.perf_counter_ns)
+  real = (ti_ab.time, getattr(tp, "time", None))
+  ti_ab.time = fake                                     # the plan's dwell and hand-over run on simulated 10 ms cycles, not this loop's speed
+  if real[1] is not None:
+    tp.time = fake
+  try:
+    return _run_controls(name, plan_on, mph, cycles, clock)
+  finally:
+    ti_ab.time = real[0]
+    if real[1] is not None:
+      tp.time = real[1]
+
+
+def _run_controls(name, plan_on, mph, cycles, clock):
+  from openpilot.selfdrive.car.mazda import ti_ab, ti_plan as tp
+  warm = 2000
+  disk = MemParams({"TiAbConfig": json.dumps({"setting": "LatNoFrictionRelay", "b": True, "block_min": 4})})
+  mem = MemParams({"TiPlanOn": b"0"})
+  rn = ti_ab.TiAbRunner(disk, mem)                     # controls starts with the plan off; START comes after it is running
+  toggles = NS(lat_no_friction_relay=False, steerKp=[[0.0], [1.0]])
+  times = []
+  for k in range(cycles + warm):
+    clock[0] += 0.01
+    if k == 50:
+      mem.put_bool("TiPlanOn", plan_on)
+    if plan_on and k % 10 == 0:                         # the car side's acknowledgement: quiet, as when no test signal runs
+      raw = mem.get("TiPlan", encoding="utf8")
+      if raw:
+        nonce, seq = tp.plan_ident(raw)
+        mem.put("TiPlanAck", json.dumps(tp.make_ack(nonce, seq, False, 0, 0.0, clock[0])))
+    t0 = time.perf_counter_ns()
+    rn.step(toggles, engaged=True, v_ego=mph * 0.44704, curvature=0.0003, steer=0.03, saturated=False, steering_pressed=False,
+            driver_torque=0.0, lane_change=False, blinker=False, ti_ok=True, fault=False, controller_ok=True, mono_ns=k * 10_000_000)
+    if k >= warm:
+      times.append((time.perf_counter_ns() - t0) / 1000.0)
+  times.sort()
+  return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
+          "max_us": round(times[-1], 1), "ab_state": rn.ab.mode, "plan_mode": rn.plan.mode, "why": (rn.ab.message or rn.plan.why)[:80]}
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("--cycles", type=int, default=3000)
@@ -143,7 +188,16 @@ def main():
           f"  test running {100 * r['test_running_share']:.0f} %")
     if r["mode"].startswith("tests") and r["added_mean_us"] > a.budget_us:
       bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
-  print(json.dumps({"results": res, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
+  ctl = [run_controls("controls: plan off", False, 45.0, a.cycles),
+         run_controls("controls: plan on, ab", True, 45.0, a.cycles),
+         run_controls("controls: plan on, tests", True, 70.0, a.cycles)]
+  for r in ctl:
+    r["added_mean_us"] = round(r["mean_us"] - ctl[0]["mean_us"], 1)
+    print(f"{r['mode']:26s} mean {r['mean_us']:8.1f} us  p99 {r['p99_us']:8.1f} us  added {r['added_mean_us']:7.1f} us"
+          f"  (A/B {r['ab_state']}, plan {r['plan_mode']})")
+    if r["added_mean_us"] > a.budget_us:
+      bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
+  print(json.dumps({"results": res, "controls": ctl, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
   if res[3]["test_running_share"] < 0.2:
     print("NOT VALID: no test signal ran in the running mode")
     return 2

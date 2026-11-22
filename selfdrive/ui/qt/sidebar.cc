@@ -710,10 +710,11 @@ void TiTests::startAll() {
 }
 
 // The ordered writes of ti_pages_logic.h (START, STOP, RUN ALL, ALL TESTS OFF), executed one by one in that order
-void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config) {
+void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config, bool force_toggles) {
   // UpdateToggles makes controlsd and the car controller re-read every toggle: only when a toggle key was actually changed here
-  // (START or STOP with nothing to switch writes only the tmpfs switches, which both read directly)
-  bool toggles_changed = false;
+  // (START with nothing to switch writes only the tmpfs switches, which both read directly). A stop (STOP, ALL TESTS OFF) always asks:
+  // the live toggles can differ from the stored params, and a stop must reach both processes
+  bool toggles_changed = force_toggles;
   for (const ti_pages::Op &op : ops) {
     switch (op.kind) {
       case ti_pages::OpKind::MemBool:
@@ -781,7 +782,7 @@ void TiTests::toggleAll() {
 
 // ALL TESTS OFF: the plan off and every allow-listed key to "off"
 void TiTests::allOff() {
-  runOps(ti_pages::allTestsOffOps());
+  runOps(ti_pages::allTestsOffOps(), nullptr, true);
 }
 
 // Reset = the test's entry deleted from both copies (ti_tests.py); the car side only ever adds to what is there
@@ -1364,7 +1365,7 @@ void TestsWindow::homeAct(int control) {
     progress_page = false;
   } else if (control == CTL_STOP) {
     ab_pin_b_armed = -1.0;
-    tests.runOps(stopOps());
+    tests.runOps(stopOps(), nullptr, true);
     abPoll();
   } else if (control == CTL_START) {
     abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
@@ -2045,8 +2046,9 @@ void TestsWindow::drawSetup(QPainter &p) {
     if (plan.has_alt) {
       const ti_ab::Setting &s = ti_ab::SETTINGS[ab_setting];
       lines << QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
-      lines << QString("Blocks of %1 min, %2 min per side to finish, at %3-%4 mph").arg((int)ab_block_min).arg((int)plan.target_min)
-                   .arg((int)ti_ab::PLAN_ALT_MIN_MPH + 1).arg((int)ti_ab::PLAN_ALT_MAX_MPH - 1);
+      lines << QString("Blocks of %1 min, %2 min per side to finish, counted at %3-%4 mph; a block starts at %5-%6 mph")
+                   .arg((int)ab_block_min).arg((int)plan.target_min).arg((int)ti_ab::PLAN_ALT_MIN_MPH + 1).arg((int)ti_ab::PLAN_ALT_MAX_MPH - 1)
+                   .arg((int)(ti_ab::PLAN_ALT_MIN_MPH + ti_ab::START_MARGIN_MPH)).arg((int)(ti_ab::PLAN_ALT_MAX_MPH - ti_ab::START_MARGIN_MPH));
       if (ti_ab::bendsOnly(s.name)) {
         lines << QString("%1 acts only in bends: minutes count only there").arg(plainName(s.name));
       }

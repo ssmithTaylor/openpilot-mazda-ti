@@ -4,6 +4,7 @@ work it saves. The time-per-simulated-second regression against d20104c is measu
 tools/mazda_ti_accept (see the cost report); here only machine-independent counts are asserted."""
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import pytest
 
@@ -164,18 +165,24 @@ def _block(path, start, n_lines):
   return textwrap.dedent("\n".join(lines[i:i + n_lines]))
 
 
-@pytest.mark.parametrize("path,start,n", [("selfdrive/controls/controlsd.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 5),
-                                          ("selfdrive/car/card.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 4)])
-def test_the_toggles_are_read_on_both_edges_of_toggles_updated_only(path, start, n):
-  from types import SimpleNamespace as NS
+@pytest.mark.parametrize("path,start,n", [("selfdrive/controls/controlsd.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 6),
+                                          ("selfdrive/car/card.py", "toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)", 5)])
+def test_the_toggles_are_read_on_the_edges_and_once_a_second_while_the_flag_is_on(path, start, n):
   code = compile(_block(path, start, n), path, "exec")
-  reads = []
-  host = NS(toggles_updated_last=False, select_lat_control=lambda: None)
-  seq = [False, True, True, True, True, False, False, True, False]
-  for k, flag in enumerate(seq):
-    host.sm = {"frogpilotPlan": NS(togglesUpdated=flag)}
-    exec(code, {"self": host, "get_frogpilot_toggles": lambda k=k: reads.append(k) or k})
-  assert reads == [1, 5, 7, 8]          # each rising edge (written before the flag goes on) and each falling edge (after the last write)
+
+  def run(seq, value_at=lambda k: k):
+    host = NS(toggles_updated_last=False, toggles_on_cycles=0, select_lat_control=lambda: None, frogpilot_toggles=None)
+    reads = []
+    for k, flag in enumerate(seq):
+      host.sm = {"frogpilotPlan": NS(togglesUpdated=flag)}
+      exec(code, {"self": host, "get_frogpilot_toggles": lambda k=k: reads.append(k) or value_at(k)})
+    return reads, host
+  # an ordinary window (the flag on for about a second): its two edges and at most one more
+  reads, _ = run([False] * 5 + [True] * 100 + [False] * 50)
+  assert reads[0] == 5 and reads[-1] == 105 and len(reads) <= 3
+  # the flag stuck on (a clock step, a stalled plan): a toggle changed underneath is picked up within about a second
+  reads, host = run([False] * 5 + [True] * 1000, value_at=lambda k: "new" if k >= 400 else "old")
+  assert host.frogpilot_toggles == "new" and any(400 <= r <= 505 for r in reads) and len(reads) <= 12
 
 
 class OldLimits(TiIdent):
@@ -216,3 +223,93 @@ def test_the_on_device_cost_check_runs_and_a_test_runs_in_its_running_mode():
   run = mod.run_mode("tests mode, run", "tests", 38.0, 0.0003, 400)
   idle = mod.run_mode("tests mode, idle", "tests", 38.0, 0.02, 200)
   assert run["test_running_share"] > 0.2 and idle["test_running_share"] == 0.0 and run["mean_us"] > 0
+
+
+# ---- against the literal pre-change code (95e17e3), with the real test accountant and every kind of progress change ------------------
+def _ref_module():
+  spec = importlib.util.spec_from_file_location("ti_ident_ref_95e17e3", HERE / "ti_ident_ref_95e17e3.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+REF = _ref_module()
+
+
+class DictParams:
+  def __init__(self):
+    self.d = {}
+
+  def get(self, k, encoding=None):
+    v = self.d.get(k)
+    return v if (v is None or encoding) else (v.encode() if isinstance(v, str) else v)
+
+  def put(self, k, v):
+    self.d[k] = v.decode() if isinstance(v, bytes) else v
+
+  put_nonblocking = put
+
+  def get_bool(self, k):
+    return self.d.get(k) in ("1", True)
+
+  def remove(self, k):
+    self.d.pop(k, None)
+
+
+def _accountant_pipeline(mod, mode, rows, actions):
+  """The car controller's loop (advance_zone, pick, update, the accountant's update and publish) with `mod`'s generator; mode: "old"
+  (the 95e17e3 calls on the 95e17e3 generator), "cached" (SchedulerCache with the accountant's version) or "noversion"."""
+  import json
+  from openpilot.selfdrive.car.mazda import ti_tests as tt
+  params, mem = DictParams(), DictParams()
+  acc = tt.make_accountant(params, mem)
+  g = mod.TiIdent(log=None)
+  logged = []
+  g.log = logged.append
+  runner = mod.RunAll(seed=7, emit=g.event_for_pick)
+  cache = ti.SchedulerCache()
+  toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
+  armed_seq, out, versions = [], [], set()
+  for k, row in enumerate(rows):
+    act = actions.get(k)
+    if act == "publish":
+      acc.publish(1000.0 + k * 0.01)
+    elif act == "reload":
+      acc.doc = None                                   # the next read re-reads the stored progress
+    elif act == "reset":                               # a progress reset: one test's stored entry gone, then re-read
+      acc.publish(1000.0 + k * 0.01)
+      doc = json.loads(params.get(tt.PROGRESS_KEY, encoding="utf8") or "{}")
+      doc.pop(next(iter(acc.step_tests.values())).id, None)
+      params.put(tt.PROGRESS_KEY, json.dumps(doc))
+      mem.remove(tt.PROGRESS_KEY)
+      acc.doc = None
+    elif act == "fail":
+      acc._fail("test")
+    profile = g.advance_zone(row["v_ego"]).profile
+    if mode == "old":
+      armed = runner.pick(k, profile, acc.remaining, lambda t, w: g.can_run(t, w, acc.remaining),
+                          lambda t, w: g.next_is_strict(t, w, acc.remaining))
+    else:
+      rem, can_run, strict = cache.frame(g, acc.remaining, profile, (id(acc), None if mode == "noversion" else acc.version))
+      armed = runner.pick(k, profile, rem, can_run, strict)
+    armed_seq.append(armed)
+    out.append(g.update(armed, k, **row, remaining=acc.remaining))
+    acc.update(toggles, row["v_ego"], True, (), credit=g.credit, run_all_forced=True)
+    versions.add(getattr(acc, "version", None))
+  return armed_seq, out, logged, (runner.draw, runner.current, runner.mode), versions
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_the_current_code_is_frame_for_frame_the_95e17e3_code_through_publish_reload_reset_and_failure(seed):
+  rows = T._random_rows(seed, 14000)
+  for k in range(2500, 14000, 3100):
+    for j in range(k, k + 40):
+      rows[j] = dict(rows[j], lat_demand=float("nan"))
+  actions = {k: "publish" for k in range(500, 14000, 500)}
+  actions.update({3333: "reload", 7777: "reset", 12500: "fail"})
+  old = _accountant_pipeline(REF, "old", rows, actions)
+  for mode in ("cached", "noversion"):
+    new = _accountant_pipeline(ti, mode, rows, actions)
+    assert new[0] == old[0] and new[1] == old[1] and new[2] == old[2] and new[3] == old[3], mode
+  assert len(new[4]) > 10                              # the version moved (credits, publishes, the reload, the reset, the failure)
+  assert any(a is not None for a in old[0][:12000]) and all(a is None for a in old[0][12501:])   # ran, and nothing after the failure

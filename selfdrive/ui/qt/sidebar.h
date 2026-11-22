@@ -93,7 +93,7 @@ public:
   void closeOverview(int to);
   void startAll();
   // The ordered writes of START, STOP, RUN ALL and ALL TESTS OFF (ti_pages_logic.h): one executor for every page
-  void runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config = nullptr);
+  void runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config = nullptr, bool force_toggles = false);
   bool singleTestOn() const;   // a test other than run-all is on (an individual test from the individual pages)
   bool locked();
   void setLocked(bool on);

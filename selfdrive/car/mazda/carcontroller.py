@@ -151,6 +151,7 @@ class CarController(CarControllerBase):
     self.ti_lag = (ti_lag_mod.LagGuard(log=ti_hold_log)
                    if ti_lag_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None)
     self.ti_lag_held = False           # the loop has been short of time: the tests are held (reason "control loop busy")
+    self.ti_lag_ctl = None             # (log time s, cumLagMs) of the latest controlsState, set by card before each update
     # Cruise set-speed check: gen1 with the interceptor only (the car it was studied on). Off after every start of this process: the
     # trigger and the last status are cleared here, and a trigger stamped before this moment is ignored.
     self.cruise_check = (cruise_check_mod.CruiseCheck()
@@ -616,7 +617,7 @@ class CarController(CarControllerBase):
               self.ti_hold_published = key
             except Exception:
               pass
-        self.ti_ab_on = ab_on
+        self.ti_ab_on = ab_on or bool(getattr(self, "ti_lag_held", False))   # held by the lag guard whatever else (also without ti_plan)
       except Exception:
         if self.ti_plan_on:                  # an unreadable plan allows no test
           self.ti_ab_on, self.ti_plan_allowed = True, False
@@ -706,7 +707,7 @@ class CarController(CarControllerBase):
       lag = getattr(self, "ti_lag", None)
       if lag is not None:
         try:
-          self.ti_lag_held = lag.tick(time.monotonic())
+          self.ti_lag_held = lag.tick(time.monotonic(), getattr(self, "ti_lag_ctl", None))
         except Exception:
           self.ti_lag, self.ti_lag_held = None, False
       self.apply_ti_tuning(frogpilot_toggles)

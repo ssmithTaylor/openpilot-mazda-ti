@@ -110,7 +110,8 @@ class Car:
     self.frogpilot_card = FrogPilotCard(self)
 
     self.frogpilot_toggles = get_frogpilot_toggles()
-    self.toggles_updated_last = False   # togglesUpdated as last seen: re-read on its edges only (see controlsd)
+    self.toggles_updated_last = False   # togglesUpdated as last seen: re-read on its edges and once a second while on (see controlsd)
+    self.toggles_on_cycles = 0
 
     if self.frogpilot_toggles.always_on_lateral:
       self.CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL
@@ -213,6 +214,10 @@ class Car:
     if self.sm.all_alive(['carControl']):
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
+      # Mazda TI lag guard (selfdrive/car/mazda/ti_lag.py): controlsd's own lag, the quantity its soft-disable is decided on
+      ti_cc = getattr(self.CI, "CC", None)
+      if ti_cc is not None and hasattr(ti_cc, "ti_lag_ctl"):
+        ti_cc.ti_lag_ctl = (self.sm.logMonoTime['controlsState'] * 1e-9, self.sm['controlsState'].cumLagMs)
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, self.frogpilot_toggles)
       self.last_applied_car_control_mono = self.sm.logMonoTime['carControl']
       self.last_apply_mono = now_nanos
@@ -243,9 +248,11 @@ class Car:
       self.step()
       self.rk.monitor_time()
 
-      # Update FrogPilot variables: on the rising and the falling edge of togglesUpdated, not on every cycle while it is on
+      # Update FrogPilot variables: on the rising and the falling edge of togglesUpdated and once a second while it stays on (a stuck
+      # flag still picks up a change), not on every cycle while it is on
       toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)
-      if toggles_updated != self.toggles_updated_last:
+      self.toggles_on_cycles = self.toggles_on_cycles + 1 if toggles_updated else 0
+      if toggles_updated != self.toggles_updated_last or (toggles_updated and self.toggles_on_cycles % 100 == 0):
         self.toggles_updated_last = toggles_updated
         self.frogpilot_toggles = get_frogpilot_toggles()
 

@@ -153,6 +153,7 @@ inline const char *reasonText(const char *name) {
 constexpr double PLAN_TARGET_MIN_DEFAULT = 10.0;
 constexpr double PLAN_ALT_MIN_MPH = 35.0;
 constexpr double PLAN_ALT_MAX_MPH = 64.0;
+constexpr double START_MARGIN_MPH = 3.0;   // ti_ab.MARGIN_MPH: a block starts only this far inside the range (it counts across all of it)
 
 inline std::string planLine(const char *mode, double a_s, double b_s, double target_min, bool complete) {
   char buf[220];

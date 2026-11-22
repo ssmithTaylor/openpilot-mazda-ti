@@ -68,7 +68,7 @@ def test_a_single_spike_does_not_hold_and_a_pause_clears_the_window():
   t, held2 = feed(g, t, 100, 0.0100)
   assert not any(held + held2)
   t, _ = feed(g, t, 1, 5.0)                      # the process paused: not one long cycle
-  assert not g.held and g.count == 0
+  assert not g.held and len(g.card.q) == 0
 
 
 def test_the_cost_of_a_tick_is_constant():
@@ -142,6 +142,69 @@ def test_the_pages_word_the_reason_plainly():
 
 def test_the_guard_runs_every_cycle_before_the_hold_decision():
   src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
-  i_tick = src.index("self.ti_lag_held = lag.tick(time.monotonic())")
+  i_tick = src.index("self.ti_lag_held = lag.tick(time.monotonic(), getattr(self, \"ti_lag_ctl\", None))")
   i_apply = src.index("      self.apply_ti_tuning(frogpilot_toggles)")
   assert i_tick < i_apply
+
+
+def test_one_stall_however_long_never_holds_but_three_do():
+  g = tl.LagGuard()
+  t, _ = feed(g, 0.0, 300, 0.0100)
+  for stall in (0.031, 0.2, 0.9):
+    t, held = feed(g, t, 1, stall)
+    t, held2 = feed(g, t, 150, 0.0100)
+    assert not any(held + held2), stall
+  for _ in range(4):
+    t, _ = feed(g, t, 1, 0.040)
+    t, _ = feed(g, t, 5, 0.0100)
+  assert g.held
+
+
+def test_controlsd_lag_holds_while_card_is_on_time():
+  g = tl.LagGuard()
+  t, lag, stamp = 0.0, 50.0, 0.0
+  for k in range(300):                                  # controlsd on time: its lag stays flat
+    t += 0.01
+    stamp += 0.01
+    g.tick(t, (stamp, lag + (0.3 if k % 2 else -0.3)))
+  assert not g.held
+  for k in range(60):                                   # controlsd 1 ms late every cycle: a mean period of 11 ms
+    t += 0.01
+    stamp += 0.011
+    lag += 1.0
+    g.tick(t, (stamp, lag))
+  assert g.held and g.signal == "controls" and g.card_ms < 10.1
+  assert g.ctl_ms > tl.HOLD_MS
+
+
+def test_the_resume_wait_doubles_on_a_quick_re_trigger_up_to_a_minute_and_resets_after_a_quiet_minute():
+  g = tl.LagGuard()
+  t, _ = feed(g, 0.0, 200, 0.0100)
+  waits = []
+  for _ in range(4):
+    t, _ = feed(g, t, 120, 0.0130)                      # busy: held
+    assert g.held
+    waits.append(g.wait_s)
+    t, held = feed(g, t, int((g.wait_s + 3.0) / 0.01), 0.0100)
+    assert not held[-1]                                 # released after its wait
+  assert waits == [10.0, 20.0, 40.0, 60.0]
+  t, _ = feed(g, t, 7000, 0.0100)                       # a quiet minute
+  t, _ = feed(g, t, 120, 0.0130)
+  assert g.held and g.wait_s == 10.0
+
+
+def test_a_gap_clears_the_release_timer():
+  g = tl.LagGuard()
+  t, _ = feed(g, 0.0, 200, 0.0130)
+  assert g.held
+  t, _ = feed(g, t, 900, 0.0100)                        # 9 s under
+  assert g.under_since is not None
+  t, _ = feed(g, t, 1, 3.0)                             # the process paused
+  assert g.under_since is None and g.held
+
+
+def test_card_hands_controlsd_lag_to_the_car_controller_and_the_hold_holds_without_the_plan_module():
+  card = (ROOT / "selfdrive/car/card.py").read_text(encoding="utf-8")
+  assert "ti_cc.ti_lag_ctl = (self.sm.logMonoTime['controlsState'] * 1e-9, self.sm['controlsState'].cumLagMs)" in card
+  src = (ROOT / "selfdrive/car/mazda/carcontroller.py").read_text(encoding="utf-8")
+  assert 'self.ti_ab_on = ab_on or bool(getattr(self, "ti_lag_held", False))' in src

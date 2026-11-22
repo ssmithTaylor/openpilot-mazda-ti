@@ -228,7 +228,8 @@ class Controls:
     self.frogpilot_events = Events(frogpilot=True)
 
     self.frogpilot_toggles = get_frogpilot_toggles()
-    self.toggles_updated_last = False   # togglesUpdated as last seen: the toggles are re-read on its edges, not on every cycle
+    self.toggles_updated_last = False   # togglesUpdated as last seen: the toggles are re-read on its edges and once a second while it is on
+    self.toggles_on_cycles = 0
 
     # A/B alternation: the toggles the lateral controller reads. The owner's own object unless a blend toward value B is in
     # force; ti_ab.py never writes the owner's stored value.
@@ -907,10 +908,12 @@ class Controls:
 
     # Update FrogPilot variables. togglesUpdated stays on for about a second after the toggles were written (frogpilot_process), so
     # re-reading and re-parsing them on every cycle of that second cost about a second of overrun on a shared core. They are read
-    # on the rising edge (written before the flag goes on) and once more on the falling edge (which follows the last write of the
-    # window by a second, so a second write inside the window is never missed).
+    # on the rising edge (written before the flag goes on), once more on the falling edge (which follows the last write of the
+    # window by a second, so a second write inside the window is never missed), and once a second while it stays on (the flag comes
+    # from frogpilot_process's wall clock and its republishing: a clock step or a stalled plan can hold it on with no edge).
     toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)
-    if toggles_updated != self.toggles_updated_last:
+    self.toggles_on_cycles = self.toggles_on_cycles + 1 if toggles_updated else 0
+    if toggles_updated != self.toggles_updated_last or (toggles_updated and self.toggles_on_cycles % 100 == 0):
       self.toggles_updated_last = toggles_updated
       self.frogpilot_toggles = get_frogpilot_toggles()
       self.select_lat_control()
