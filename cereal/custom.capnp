@@ -142,7 +142,7 @@ struct FrogPilotCarState @0xda96579883444c35 {
   lkasEffective @17 :Float32; # torque the EPS is applying from the stock request, counts, signed (clips at +-308)
   tiActive @18 :Bool;         # interceptor in RUN and not ramping down, i.e. its command reaches the wheel
   # NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
-  # lateral acceleration sensor, about 72 counts per m/s^2 (so 202 counts is roughly 2.8 m/s^2), and it includes road
+  # lateral acceleration sensor, about 96-103 counts per m/s^2 (so 202 counts is roughly 2.1 m/s^2), and it includes road
   # banking. Checked on recorded drives: parked, it does not move with driver torque; moving, it follows speed x yaw
   # rate. The names and the thresholds below are kept as tuned; read "column torque" / "column load" as lateral
   # acceleration. No motor-current or unsaturated torque signal has been found on the bus.
