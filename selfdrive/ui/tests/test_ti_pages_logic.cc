@@ -552,7 +552,14 @@ static void planAndBands() {
   }
   hs.ab_stored_a_s = hs.ab_stored_b_s = 0;
   n = bandsFromState(hs, b);
-  CHECK(budgetLine(b, n, false).rfind("PLAN NEEDS ABOUT ", 0) == 0);
+  CHECK(budgetLine(b, n, false).rfind("Plan needs about ", 0) == 0 && budgetLine(b, n, false).find(" min: ") != std::string::npos);
+  {                                                                          // plain words: one open band says its speeds; a finished plan says so
+    Band one[1] = {Band{45, 35, 56, 36, 55, 12, false}};
+    CHECK(budgetLine(one, 1, false) == "Plan needs about 12 min at 36-55 mph");
+    one[0].minutes = 0; one[0].done = true;
+    CHECK(budgetLine(one, 1, false) == "Plan complete: nothing more is needed");
+    CHECK(budgetLine(one, 0, false).find("0 MIN") == std::string::npos && budgetLine(one, 0, false).back() != ':');
+  }
 }
 
 // One model for the list and the status line, over every state: what is highlighted is a band where time is counting, "NO COUNT" never
@@ -660,6 +667,39 @@ static void setup() {
   CHECK((int)detailScored(1199.9, 1200, 20, true).size() <= MAX_DETAIL_CHARS);
 }
 
+// Fixes of the review of bf7da45: the first page never shows a finished plan as startable, a dead plan as running, a single test as the
+// plan, or minutes beyond the target ("13 of 10")
+static void reviewFixes() {
+  HomeState s;
+  s.configured = true; s.target_min = 10; s.ab_stored_known = true; s.ab_stored_a_s = 13 * 60; s.ab_stored_b_s = 12 * 60;
+  for (int w = 0; w < 4; w++) s.tests_optional[w] = true;
+  CHECK(home(s).second == "A/B complete: 10 min each side" && abProgressText(13 * 60, 12 * 60, 10) == "A 10 / 10 min, B 10 / 10 min");
+  CHECK(detailScored(13 * 60, 12 * 60, 10, true).find("13") == std::string::npos);
+  CHECK(planComplete(s));
+  CHECK(home(s).primary.text == "STOPPED: PLAN COMPLETE" && home(s).primary.tone == Tone::Stopped);   // never "tap START" for a finished plan
+  CHECK(!startLook(true, Run::Stopped, true, true, true, planComplete(s), false).enabled && startLook(true, Run::Stopped, true, true, true, true, false).label == "PLAN COMPLETE");
+  CHECK(startLook(true, Run::Stopped, true, true, true, true, false).label.find("START") == std::string::npos);
+  s.ab_stored_a_s = s.ab_stored_b_s = 6 * 60;
+  CHECK(!planComplete(s) && startLook(true, Run::Stopped, true, true, true, planComplete(s), false).enabled);
+  // a plan that stopped itself is not "running", and the bands are not its business
+  s = HomeState(); s.run = Run::Plan; s.engaged = true; s.plan_mode = "dead"; s.ab_fresh = true; s.configured = true; s.have_speed = true; s.mph = 24;
+  CHECK(planDead(s) && carRunning(s) && home(s).primary.text == "HELD: PLAN ERROR");
+  const StartLook dead = startLook(true, Run::Plan, true, true, true, false, true);
+  CHECK(!dead.enabled && dead.label.find("RUNNING") == std::string::npos && dead.label.find("STOPPED") != std::string::npos);
+  // a single test is on: the page says so, START says what it replaces
+  s = HomeState(); s.run = Run::Single; s.engaged = true; s.have_speed = true; s.mph = 24; s.configured = true; s.live_fresh = true; s.live_tests_on = true;
+  s.tests_active = true;
+  CHECK(otherModeOn(s) && otherModeLine(s) == "A SINGLE TEST IS ON, NOT THE PLAN" && home(s).primary.text == "SINGLE TEST: RUNNING");
+  s.tests_active = false;
+  CHECK(home(s).primary.text == "SINGLE TEST: WAITING" && home(s).second == "Not the plan: START replaces it");
+  CHECK(startLook(true, Run::Single, true, true, true, false, false).sub == "Replaces the single test now on");
+  // done states say plainly that nothing more is needed
+  s = HomeState(); s.configured = true; s.target_min = 10; s.ab_stored_a_s = s.ab_stored_b_s = 600; s.engaged = true;
+  for (int w = 0; w < 4; w++) s.tests_optional[w] = true;
+  const std::vector<std::string> msg = completeLines(s);
+  CHECK(msg.size() == 4 && msg[0] == "PLAN COMPLETE" && msg[1] == "Nothing more is needed" && msg[3].find("Optional tests may continue") == 0);
+}
+
 int main() {
   layoutRules();
   homeRules();
@@ -677,6 +717,7 @@ int main() {
   testsOptional();
   listAndStatusAgree();
   setup();
+  reviewFixes();
   if (failures == 0) {
     std::printf("ok\n");
     return 0;

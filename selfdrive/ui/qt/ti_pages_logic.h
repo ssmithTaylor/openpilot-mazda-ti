@@ -29,7 +29,8 @@ constexpr int SCREEN_H = 1080;
 constexpr int MIN_GAP = 40;        // between any two controls
 constexpr int STOP_GAP = 80;       // around STOP / ALL TESTS OFF / A/B OFF, to any other control
 constexpr int BIG_MIN = 180;       // smaller dimension of LOCK, PIN A and PIN B
-constexpr int ROW_TOP = 500;       // where the content of the individual pages starts (under two rows of large controls)
+constexpr int ROW_TOP = 490;       // where the content of the individual pages starts (under two rows of large controls)
+constexpr int BOTTOM_STRIP = 74;   // the foot of the individual pages: the plan line and the ENGAGED badge, never under content
 
 // Font sizes in pixels (InterFont(px), the device's own font; bold for the status lines and every control label)
 constexpr int PRIMARY_PX = 100;    // the primary status line
@@ -117,7 +118,7 @@ struct Control {
 constexpr int MAX_CONTROLS = 16;
 
 inline int footerHeight(int error_lines) {
-  return error_lines > 0 ? 30 + 50 * std::min(2, error_lines) : 0;
+  return BOTTOM_STRIP + (error_lines > 0 ? 30 + 50 * std::min(2, error_lines) : 0);
 }
 
 inline int rowHeight(int error_lines) {
@@ -456,7 +457,8 @@ inline double fraction(double have, double need) {
 // "A 14 / 20 min, B 13 / 20 min"
 inline std::string abProgressText(double a_s, double b_s, double target_min) {
   char buf[64];
-  std::snprintf(buf, sizeof(buf), "A %d / %.0f min, B %d / %.0f min", wholeMin(a_s), target_min, wholeMin(b_s), target_min);
+  const double cap = 60.0 * target_min;                 // scored time beyond the target is not shown as more than the target
+  std::snprintf(buf, sizeof(buf), "A %d / %.0f min, B %d / %.0f min", wholeMin(std::min(a_s, cap)), target_min, wholeMin(std::min(b_s, cap)), target_min);
   return buf;
 }
 
@@ -483,6 +485,10 @@ inline std::string stoppedSecond(bool known, double a_s, double b_s, double targ
     return "Nothing is running";
   }
   char buf[64];
+  if (std::min(a_s, b_s) >= 60.0 * target_min) {
+    std::snprintf(buf, sizeof(buf), "A/B complete: %.0f min each side", target_min);
+    return buf;
+  }
   std::snprintf(buf, sizeof(buf), "A/B %d of %.0f min each side done", wholeMin(std::min(a_s, b_s)), target_min);
   return buf;
 }
@@ -629,6 +635,48 @@ inline double bandsTotalMinutes(const Band *b, int n) {
   return sum;
 }
 
+// The plan has nothing left to collect (the alternation is set up and its minutes are done; the tests that are optional never count)
+inline bool planComplete(const HomeState &s) {
+  if (!s.configured) {
+    return false;
+  }
+  Band bands[MAX_BANDS];
+  const int n = bandsFromState(s, bands);
+  return bandsTotalMinutes(bands, n) <= 0.0;
+}
+
+// The plan is running and its own report says it stopped after an error
+inline bool planDead(const HomeState &s) {
+  return s.run == Run::Plan && std::strcmp(s.plan_mode, "dead") == 0;
+}
+
+// A mode that is not the plan is on (a single test, the plain A/B switch, run-all beside an alternation): START would replace it
+inline bool otherModeOn(const HomeState &s) {
+  return s.run == Run::Single || s.run == Run::AbPlain || (s.run == Run::All && s.configured);
+}
+
+// The first page's line that says what is on when it is not the plan
+inline std::string otherModeLine(const HomeState &s) {
+  switch (s.run) {
+    case Run::Single: return "A SINGLE TEST IS ON, NOT THE PLAN";
+    case Run::AbPlain: return "THE A/B SWITCH IS ON, NOT THE PLAN";
+    case Run::All: return s.configured ? "RUN-ALL IS ON, NOT THE PLAN" : "";
+    default: return "";
+  }
+}
+
+// What the middle of the first page says when the plan is complete and still running: plainly, nothing more is needed
+inline std::vector<std::string> completeLines(const HomeState &s) {
+  bool any_optional = false;
+  for (int w = 0; w < ti_logic::N_WINDOWS; w++) {
+    any_optional = any_optional || s.tests_optional[w];
+  }
+  char ab[64];
+  std::snprintf(ab, sizeof(ab), "A/B: %.0f min on each side, done", s.target_min);
+  return {"PLAN COMPLETE", "Nothing more is needed", ab,
+          any_optional ? "Optional tests may continue: they count if they happen" : "More data still helps, but you can stop"};
+}
+
 // The still-needed band that contains `mph` (time counts there), else -1
 inline int bandIndexAt(const Band *b, int n, double mph) {
   for (int i = 0; i < n; i++) {
@@ -693,20 +741,42 @@ inline std::string nearestBands(const Band *b, int n, double mph, bool metric) {
   return buf;
 }
 
-// The stopped page: what the whole plan needs of one drive, "PLAN NEEDS ABOUT 76 MIN: 24 mph 7, 45 mph 64, 72 mph 5"
+// The stopped page: what the whole plan needs of one drive, in plain words: "Plan needs about 12 min at 36-55 mph" or, with more
+// than one band, "Plan needs about 20 min: 12 at 36-55, 8 at 64-80 mph". A finished plan says so (no minutes, no colon).
 inline std::string budgetLine(const Band *b, int n, bool metric) {
-  std::string out = "PLAN NEEDS ABOUT " + std::to_string((int)bandsTotalMinutes(b, n)) + " MIN:";
-  for (int i = 0; i < n; i++) {
-    out += (i ? ", " : " ") + std::to_string(speedValue(b[i].target_mph, metric)) + (metric ? " km/h " : " mph ") + std::to_string((int)b[i].minutes);
+  const int total = (int)bandsTotalMinutes(b, n);
+  if (total <= 0) {
+    return "Plan complete: nothing more is needed";
   }
-  return out;
+  const char *unit = metric ? " km/h" : " mph";
+  auto range = [&](const Band &x) { return std::to_string(speedValue(x.show_lo, metric)) + "-" + std::to_string(speedValue(x.show_hi, metric)) + unit; };
+  int open = 0, last = -1;
+  for (int i = 0; i < n; i++) {
+    if ((int)b[i].minutes > 0) {
+      open++;
+      last = i;
+    }
+  }
+  if (open == 1) {
+    return "Plan needs about " + std::to_string(total) + " min at " + range(b[last]);
+  }
+  std::string out = "Plan needs about " + std::to_string(total) + " min: ";
+  bool first = true;
+  for (int i = 0; i < n; i++) {
+    if ((int)b[i].minutes > 0) {
+      out += std::string(first ? "" : ", ") + std::to_string((int)b[i].minutes) + " at " + std::to_string(speedValue(b[i].show_lo, metric)) + "-" +
+             std::to_string(speedValue(b[i].show_hi, metric));
+      first = false;
+    }
+  }
+  return out + unit;
 }
 
 // The primary line and the second line of the first page.
 inline HomeLines home(const HomeState &s) {
   HomeLines h;
   if (s.run == Run::Stopped) {
-    h.primary = line("STOPPED: TAP START", Tone::Stopped);   // off after every stop and restart, said plainly
+    h.primary = line(planComplete(s) ? "STOPPED: PLAN COMPLETE" : "STOPPED: TAP START", Tone::Stopped);   // off after every stop and restart, said plainly; a finished plan is not asked to start
     h.second = s.configured ? stoppedSecond(s.ab_stored_known, s.ab_stored_a_s, s.ab_stored_b_s, s.target_min) : std::string("Nothing is running");
     return h;
   }
@@ -731,6 +801,12 @@ inline HomeLines home(const HomeState &s) {
   if (hold != nullptr && hold->tone == Tone::Held) {
     h.primary = line(hold->text, Tone::Held);
     h.second = "Tests wait for the car";
+    return h;
+  }
+  if (s.run == Run::Single) {
+    // a single test from the individual pages: not the plan, and its time is not the plan's bands
+    h.primary = s.tests_active ? line("SINGLE TEST: RUNNING", Tone::Running) : line("SINGLE TEST: WAITING", Tone::Waiting);
+    h.second = "Not the plan: START replaces it";
     return h;
   }
   if (plan && std::strcmp(s.plan_mode, "hold") == 0) {
@@ -900,7 +976,8 @@ struct StartLook {
 };
 
 // What the primary control says and whether a tap does anything. Running already: it says RUNNING and a tap does nothing.
-inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool plan_ok = true, bool tests_optional = false) {
+inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool plan_ok = true, bool tests_optional = false,
+                           bool plan_complete = false, bool plan_dead = false) {
   StartLook k;
   if (!plan_ok) {                               // nothing runs from an invalid plan
     k.label = "PLAN INVALID";
@@ -909,7 +986,27 @@ inline StartLook startLook(bool configured, Run run, bool confirmed = true, bool
     k.tone = Tone::Held;
     return k;
   }
+  if (plan_dead) {                              // the plan stopped itself: it is not running, whatever the switch says
+    k.label = "PLAN STOPPED: ERROR";
+    k.sub = "Tap STOP, then START";
+    k.enabled = false;
+    k.tone = Tone::Held;
+    return k;
+  }
   const std::string what = configured ? (tests_optional ? "A/B relay" : "tests + A/B relay") : "tests";
+  if (plan_complete) {                          // a finished plan is not started again
+    k.label = "PLAN COMPLETE";
+    k.sub = "Nothing more is needed";
+    switch (run) {
+      case Run::Single: k.sub += "; a single test is on"; break;
+      case Run::AbPlain: k.sub += "; the A/B switch is on"; break;
+      case Run::All: k.sub += "; run-all is on"; break;
+      default: break;
+    }
+    k.enabled = false;
+    k.tone = Tone::Done;
+    return k;
+  }
   if (!confirmed && run != Run::Stopped) {      // the switch says on, the car is not running it: START starts it cleanly
     k.label = "START: " + what;
     k.sub = "The switch shows on but nothing is running";
@@ -947,7 +1044,9 @@ inline std::string individualNote(Run run) {
 
 inline std::string detailScored(double a_s, double b_s, double target_min, bool complete) {
   char buf[96];
-  std::snprintf(buf, sizeof(buf), "Scored: A %.1f / B %.1f of %.0f min%s", a_s / 60.0, b_s / 60.0, target_min, complete ? " COMPLETE" : "");
+  const double cap = 60.0 * target_min;                 // never "13 of 10"
+  std::snprintf(buf, sizeof(buf), "Scored: A %.1f / B %.1f of %.0f min%s", std::min(a_s, cap) / 60.0, std::min(b_s, cap) / 60.0, target_min,
+                complete ? " COMPLETE" : "");
   return buf;
 }
 

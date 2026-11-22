@@ -1354,7 +1354,7 @@ void TestsWindow::homeAct(int control) {
     abOpen();   // the stored set-up as it is now (the plan runs the alternation from it)
     TiHomeStrings keep;
     const HomeState hs = homeState(keep);
-    if (!plan_ok || !startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]).enabled) {
+    if (!plan_ok || !startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3], planComplete(hs), planDead(hs)).enabled) {
       return;                   // the car side reports it is running what the label says already
     }
     ab_pin_b_armed = -1.0;
@@ -1673,8 +1673,8 @@ void TestsWindow::abDisplay(double &a_s, double &b_s, bool &known, double &targe
     b_s = std::max(b_s, scored.value("B").toDouble());
     known = true;
     const double t = ab_status.value("target_s").toDouble(0.0);
-    const QJsonObject plan = ab_status.value("plan").toObject();
-    target_min = plan.value("target_min").toDouble(t > 0 ? t / 60.0 : ti_ab::PLAN_TARGET_MIN_DEFAULT);
+    const QJsonObject car_plan = ab_status.value("plan").toObject();
+    target_min = car_plan.value("target_min").toDouble(t > 0 ? t / 60.0 : ti_ab::PLAN_TARGET_MIN_DEFAULT);
   }
 }
 
@@ -1736,18 +1736,18 @@ void TestsWindow::abAct(int control) {
 
 // One line at the bottom of both pages: what the drive plan runs now, what is next, the alternation's minutes against target
 void TestsWindow::drawPlanLine(QPainter &p) {
-  const QJsonObject plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
-  const QString mode = (ab_plan_on && !plan.isEmpty()) ? plan.value("mode").toString() : QString("off");
+  const QJsonObject car_plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
+  const QString mode = (ab_plan_on && !car_plan.isEmpty()) ? car_plan.value("mode").toString() : QString("off");
   const QJsonObject scored = ab_status.value("scored").toObject();
   const std::string line = ti_ab::planLine(mode.toStdString().c_str(), scored.value("A").toDouble(), scored.value("B").toDouble(),
-                                           plan.value("target_min").toDouble(ti_ab::PLAN_TARGET_MIN_DEFAULT),
+                                           car_plan.value("target_min").toDouble(ti_ab::PLAN_TARGET_MIN_DEFAULT),
                                            ab_status.value("complete").toBool());
   p.setPen(QColor(0xc9, 0xc9, 0xc9));
   p.setFont(InterFont(34));
-  p.drawText(QRect(30, height() - 84, width() - 580, 64), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(line));
+  p.drawText(QRect(30, height() - ti_pages::BOTTOM_STRIP, width() - 580, 64), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(line));
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
     p.setPen(QColor(218, 202, 37));                         // why the tests are not running now, on both pages
-    p.drawText(QRect(30, height() - 134, width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter,
+    p.drawText(QRect(30, height() - ti_pages::BOTTOM_STRIP - 50, width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter,
                QString(ti_ab::holdText(ab_hold_why.toStdString().c_str())));
   }
 }
@@ -1792,8 +1792,8 @@ ti_pages::HomeState TestsWindow::homeState(TiHomeStrings &keep) {
   h.have_speed = have_speed;
   h.mph = speed_mph;
 
-  const QJsonObject plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
-  keep.mode = (ab_plan_on && !plan.isEmpty()) ? plan.value("mode").toString().toStdString() : std::string();
+  const QJsonObject car_plan = ab_fresh ? ab_status.value("plan").toObject() : QJsonObject();
+  keep.mode = (ab_plan_on && !car_plan.isEmpty()) ? car_plan.value("mode").toString().toStdString() : std::string();
   keep.why = ab_hold_why.toStdString();
   keep.state = ab_fresh ? ab_status.value("state").toString().toStdString() : std::string();
   keep.arm = ab_fresh ? ab_status.value("arm").toString().toStdString() : std::string();
@@ -1885,16 +1885,37 @@ void TestsWindow::drawHome(QPainter &p) {
   p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.second));
 
   // What will run, in plain words
-  p.setPen(plan_ok ? white : QColor(218, 202, 37));
+  const std::string other_mode = (carRunning(hs) && otherModeOn(hs)) ? otherModeLine(hs) : std::string();
+  p.setPen((plan_ok && other_mode.empty()) ? white : QColor(218, 202, 37));
   p.setFont(InterFont(CHOSEN_PX, QFont::DemiBold));
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
+             !other_mode.empty() ? QString::fromStdString(other_mode) :
              QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "", !(plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]))));
 
   // The bands still needed: one speed and the minutes left, tests and alternation merged. The same model as the status line above.
   Band bands[MAX_BANDS];
   const int n_bands = bandsFromState(hs, bands);
   const int counting = countingBand(hs, bands, n_bands);
-  const bool show_bands = carRunning(hs);
+  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3], planComplete(hs), planDead(hs));
+  // The middle of the page: START while nothing runs, while the plan has stopped itself, or while another mode is on (START replaces
+  // it); the plan's complete message when it is done; otherwise the bands still needed. A stopped plan never lists bands.
+  const bool show_box = !carRunning(hs) || planDead(hs) || otherModeOn(hs);
+  const bool show_complete = !show_box && planComplete(hs);
+  const bool show_bands = !show_box && !show_complete;
+  if (show_complete) {
+    const QRect area = ctlRect(CTL_START);
+    const std::vector<std::string> msg = completeLines(hs);
+    p.setPen(QColor(0x33, 0xcc, 0x66));
+    p.setFont(InterFont(BAND_PX + 16, QFont::Bold));
+    p.drawText(QRect(area.x(), area.y(), area.width(), 90), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[0]));
+    p.setPen(white);
+    p.setFont(InterFont(BAND_PX, QFont::Bold));
+    p.drawText(QRect(area.x(), area.y() + 96, area.width(), 76), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[1]));
+    p.setPen(QColor(0xc9, 0xc9, 0xc9));
+    p.setFont(InterFont(EXPERIMENT_PX));
+    p.drawText(QRect(area.x(), area.y() + 180, area.width(), 56), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[2]));
+    p.drawText(QRect(area.x(), area.y() + 236, area.width(), 56), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[3]));
+  }
   if (show_bands) {
     const QRect area = ctlRect(CTL_START);
     for (int i = 0; i < n_bands; i++) {
@@ -1921,9 +1942,8 @@ void TestsWindow::drawHome(QPainter &p) {
   }
 
   // START (what it will run, and what it replaces), STOP
-  const StartLook look = startLook(ab_configured, hs.run, carRunning(hs), plan_ok, plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]);
-  if (!show_bands) {
-    drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : (plan_ok ? QColor(0x0f, 0x4d, 0x28) : QColor(0x6b, 0x4a, 0x1d)), white,
+  if (show_box) {
+    drawBox2(p, ctlRect(CTL_START), look.enabled ? toneQColor(Tone::Done) : (plan_ok && look.tone != Tone::Held ? QColor(0x0f, 0x4d, 0x28) : QColor(0x6b, 0x4a, 0x1d)), white,
              QString::fromStdString(look.label), START_PX, QString::fromStdString(look.sub), START_SUB_PX);
   }
   const bool any = hs.run != Run::Stopped;
@@ -1932,7 +1952,7 @@ void TestsWindow::drawHome(QPainter &p) {
 
   // Navigation at the screen edge
   drawBox(p, ctlRect(CTL_BACK), locked ? QColor(0x1a, 0x1a, 0x1a) : grey, locked ? QColor(0x55, 0x55, 0x55) : white, QString("< EXIT"), NAV_PX);
-  drawBox(p, ctlRect(CTL_NAV_SETUP), grey, white, QString("SET UP A/B >"), NAV_PX);
+  drawBox(p, ctlRect(CTL_NAV_SETUP), grey, white, QString("PLAN\nDETAILS >"), NAV_PX);
   drawBox(p, ctlRect(CTL_NAV_PROGRESS), grey, white, QString("PROGRESS >"), NAV_PX);
   drawEngagedBadge(p, qr(HOME_BADGE));
 
@@ -2070,7 +2090,7 @@ void TestsWindow::drawProgress(QPainter &p) {
     const int y = PROG_ROWS_TOP + w * PROG_ROW_H;
     p.setPen(white);
     p.setFont(InterFont(PROGRESS_PX, QFont::Bold));
-    p.drawText(QRect(480, y, 1660, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)) + ((plan_ok && plan.optional_win[w]) ? QString("  (optional: counts if it happens)") : QString()));
+    p.drawText(QRect(480, y, 400, 50), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(windowLabel(w, is_metric)));   // short: the bar starts at x=900 on the same row; "optional" is said in the line below
     drawBar(p, QRect(900, y + 8, 1240, 36), total > 0 ? double(done) / total : 1.0, done >= total ? green : blue);
     p.setPen(QColor(0xc9, 0xc9, 0xc9));
     p.setFont(InterFont(EXPERIMENT_PX));
@@ -2238,7 +2258,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   lockBorder();
 
   // Whether the system is engaged, always visible here: this page hides the road view and its engaged border.
-  drawEngagedBadge(p, QRect(width() - 520, height() - 84, 490, 64));
+  drawEngagedBadge(p, QRect(width() - 520, height() - ti_pages::BOTTOM_STRIP, 490, 64));
 
   drawPlanLine(p);
   const int n = tests.queueSize();
@@ -2305,7 +2325,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     if (k == 1 && tests.errors.size() > 2) {
       line = QString("... and %1 more ignored definitions (see the log)").arg(tests.errors.size() - 1);
     }
-    p.drawText(QRect(30, height() - 20 - 50 * (shown - k), width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
+    p.drawText(QRect(30, height() - ti_pages::BOTTOM_STRIP - 50 * (shown - k), width() - 580, 50), Qt::AlignLeft | Qt::AlignVCenter, line);
   }
 }
 
@@ -2473,13 +2493,13 @@ void TestsWindow::drawTest(QPainter &p, int i) {
   int y = top + 122;
   if (def.metric == "step_seconds") {
     y = drawGuidance(p, x0, y, x1 - x0, std::vector<int>{i});
-    drawGate(p, x0, y, x1 - x0, def.settings.empty() ? QString() : def.settings[0].first);
+    y = drawGate(p, x0, y, x1 - x0, def.settings.empty() ? QString() : def.settings[0].first);
   }
 
   // One bar per bin (or one for a test without bins), then "other speeds"; the current bin outlined
   const int lines = def.bins.empty() ? 1 : (int)def.bins.size() + 1;
-  const int area_top = top + 270;
-  const int lh = std::max(30, std::min(90, (top + row_h - 20 - area_top) / lines));
+  const int area_top = y + 10;                                  // under the guidance and any limit line
+  const int lh = std::max(30, std::min(90, (top + row_h - area_top) / lines));
   const int px = std::max(24, std::min(46, lh * 55 / 100));
   const QString current = have_speed ? TiTests::binFor(def, speed_mph) : QString();
   const int label_w = 360;
@@ -2597,12 +2617,12 @@ void TestsWindow::drawAll(QPainter &p) {
   }
 
   int y = drawGuidance(p, x0, top + 122, x1 - x0, shown);
-  drawGate(p, x0, y, x1 - x0, QString());
+  y = drawGate(p, x0, y, x1 - x0, QString());
 
   // One row per window, the one the car is inside outlined, the target marked; the test running now in bold with a bullet
   const int lines = (int)bands->bins.size();
-  const int area_top = top + 270;
-  const int lh = std::max(30, std::min(90, (top + row_h - 20 - area_top) / lines));
+  const int area_top = y + 10;                                  // under the guidance and any limit line
+  const int lh = std::max(30, std::min(90, (top + row_h - area_top) / lines));
   const int px = std::max(24, std::min(46, lh * 55 / 100));
   const int item_px = std::min(36, px);
   const QString current = (have_speed && ti_logic::zoneFor(speed_mph).state == ti_logic::ZoneState::Inside) ? TiTests::binFor(*bands, speed_mph) : QString();
