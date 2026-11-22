@@ -94,6 +94,11 @@ DAMP_FLAG = 2048           # added to plantState while the toggle is on (for the
 OUT_FILTER_TAU = 0.25      # s
 OUT_FILTER_FLAG = 8        # added to plantState while active, so a drive can be split on it
 
+# NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
+# lateral acceleration sensor, about 72 counts per m/s^2 (so 202 counts is roughly 2.8 m/s^2), and it includes road
+# banking. Checked on recorded drives: parked, it does not move with driver torque; moving, it follows speed x yaw
+# rate. The names and the thresholds below are kept as tuned; read "column torque" / "column load" as lateral
+# acceleration. No motor-current or unsaturated torque signal has been found on the bus.
 # Breakaway prediction, from the unsaturated column torque on 0x75. Across 23 recorded stalls
 # (demand over 3.0 m/s^2, command at the clip, wheel stopped for at least 0.30 s) this separates
 # the ones that free themselves from the ones that do not, with no overlap: 123-202 counts broke

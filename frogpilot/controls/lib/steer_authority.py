@@ -32,6 +32,13 @@ So the advisory here is the conservative one: the speed at which the car can act
 plan. Expect it to ask for more slowing than strictly needed until the margin model earns its place;
 `TARGET_MARGIN` is the knob, and the logged prediction-versus-outcome is what should move it.
 """
+
+# NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
+# lateral acceleration sensor, about 72 counts per m/s^2 (so 202 counts is roughly 2.8 m/s^2), and it includes road
+# banking. Checked on recorded drives: parked, it does not move with driver torque; moving, it follows speed x yaw
+# rate. The names and the thresholds below are kept as tuned; read "column torque" / "column load" as lateral
+# acceleration. No motor-current or unsaturated torque signal has been found on the bus.
+
 from collections import deque
 
 import numpy as np
