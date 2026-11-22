@@ -123,7 +123,7 @@ public:
 
 private:
   void setTest(int i, bool on);
-  void setAll(bool on);
+  bool setAll(bool on);   // true when the stored value changed
 
   QStringList logged_errors;
   QMap<QString, qint64> pending_resets;  // test id -> reset token, until the car side echoes it

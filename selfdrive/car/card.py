@@ -110,6 +110,7 @@ class Car:
     self.frogpilot_card = FrogPilotCard(self)
 
     self.frogpilot_toggles = get_frogpilot_toggles()
+    self.toggles_updated_last = False   # togglesUpdated as last seen: re-read on its edges only (see controlsd)
 
     if self.frogpilot_toggles.always_on_lateral:
       self.CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL
@@ -242,8 +243,10 @@ class Car:
       self.step()
       self.rk.monitor_time()
 
-      # Update FrogPilot variables
-      if self.sm['frogpilotPlan'].togglesUpdated:
+      # Update FrogPilot variables: on the rising and the falling edge of togglesUpdated, not on every cycle while it is on
+      toggles_updated = bool(self.sm['frogpilotPlan'].togglesUpdated)
+      if toggles_updated != self.toggles_updated_last:
+        self.toggles_updated_last = toggles_updated
         self.frogpilot_toggles = get_frogpilot_toggles()
 
 def main():

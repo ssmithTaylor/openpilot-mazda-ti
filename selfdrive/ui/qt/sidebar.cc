@@ -692,11 +692,15 @@ void TiTests::toggle(int i) {
   updateFrogPilotToggles();
 }
 
-void TiTests::setAll(bool on) {
+bool TiTests::setAll(bool on) {
   const TiTestAllowed *allowed = tiTestAllowed(QString(TESTS_ALL_KEY));
   if (allowed != nullptr && tests_params.checkKey(TESTS_ALL_KEY)) {
-    tests_params.putBool(TESTS_ALL_KEY, on ? allowed->on : !allowed->on);
+    const bool value = on ? allowed->on : !allowed->on;
+    const bool changed = tests_params.getBool(TESTS_ALL_KEY) != value;
+    tests_params.putBool(TESTS_ALL_KEY, value);
+    return changed;
   }
+  return false;
 }
 
 // The run-all mode on, written as toggle() writes a test's settings: one injection at a time, so the single
@@ -707,6 +711,9 @@ void TiTests::startAll() {
 
 // The ordered writes of ti_pages_logic.h (START, STOP, RUN ALL, ALL TESTS OFF), executed one by one in that order
 void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<void()> &save_config) {
+  // UpdateToggles makes controlsd and the car controller re-read every toggle: only when a toggle key was actually changed here
+  // (START or STOP with nothing to switch writes only the tmpfs switches, which both read directly)
+  bool toggles_changed = false;
   for (const ti_pages::Op &op : ops) {
     switch (op.kind) {
       case ti_pages::OpKind::MemBool:
@@ -717,7 +724,7 @@ void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<v
         break;
       case ti_pages::OpKind::AllowedOff:   // every allow-listed key to "off", whatever the definitions say (works with a broken file too)
         for (const TiTestAllowed &a : TI_TEST_ALLOWED) {
-          tiTestSwitchOff(tests_params, QString(a.key), a.on);
+          toggles_changed = tiTestSwitchOff(tests_params, QString(a.key), a.on) || toggles_changed;
         }
         for (TiTestView &view : views) {
           view.mismatch_ticks = 0;
@@ -725,13 +732,14 @@ void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<v
         all_view.mismatch_ticks = 0;
         break;
       case ti_pages::OpKind::RunAllOn:
-        setAll(true);
+        toggles_changed = setAll(true) || toggles_changed;
         all_view.mismatch_ticks = 0;
         break;
       case ti_pages::OpKind::SingleStepTestsOff:   // the dither stays as it is and, while on, holds everything else
         for (size_t i = 0; i < defs.size() && i < views.size(); i++) {
           if (defs[i].metric == "step_seconds" && views[i].any_on) {
             setTest((int)i, false);
+            toggles_changed = true;
             views[i].mismatch_ticks = 0;
           }
         }
@@ -742,7 +750,10 @@ void TiTests::runOps(const std::vector<ti_pages::Op> &ops, const std::function<v
         }
         break;
       case ti_pages::OpKind::UpdateToggles:
-        updateFrogPilotToggles();
+        if (toggles_changed) {
+          updateFrogPilotToggles();
+          toggles_changed = false;
+        }
         break;
     }
   }
@@ -2997,7 +3008,9 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
   }
 
   update();
-  updateFrogPilotToggles();
+  if (!tests_pressed) {
+    updateFrogPilotToggles();   // opening the Tests page changes no setting: no toggle reload for it
+  }
 }
 
 void Sidebar::mouseReleaseEvent(QMouseEvent *event) {
