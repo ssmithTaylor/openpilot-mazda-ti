@@ -13,7 +13,7 @@ using namespace ti_pages;
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { if (failures < 40) std::printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
-static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress};
+static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress, Page::Cruise};
 
 static int minDim(const Rect &r) { return std::min(r.w, r.h); }
 
@@ -32,7 +32,8 @@ static void layoutRules() {
           CHECK(c[i].id != c[j].id);
           CHECK(!overlaps(c[i].r, c[j].r));
           CHECK(gapBetween(c[i].r, c[j].r) >= MIN_GAP);
-          const bool stop = c[i].id == CTL_STOP || c[j].id == CTL_STOP || c[i].id == CTL_ALLOFF || c[j].id == CTL_ALLOFF;
+          const bool stop = c[i].id == CTL_STOP || c[j].id == CTL_STOP || c[i].id == CTL_ALLOFF || c[j].id == CTL_ALLOFF ||
+                           c[i].id == CTL_CRUISE_STOP || c[j].id == CTL_CRUISE_STOP;
           if (stop) {
             CHECK(gapBetween(c[i].r, c[j].r) >= STOP_GAP);
           }
@@ -700,7 +701,108 @@ static void reviewFixes() {
   CHECK(msg.size() == 4 && msg[0] == "PLAN COMPLETE" && msg[1] == "Nothing more is needed" && msg[3].find("Optional tests may continue") == 0);
 }
 
+// The cruise set-speed check's page: its own page and controls (never the first page's START), boxes clear of controls, every
+// state's lines fit, RUN CHECK only when the car's fresh report says it is free and nothing else is on, "running" only from the car
+static CruiseView cruiseView(const char *state, bool fresh = true) {
+  CruiseView v;
+  v.have = true;
+  v.fresh = fresh;
+  v.state = state;
+  v.orig = 45;
+  v.set = 45;
+  return v;
+}
+
+static void cruiseRules() {
+  Control c[MAX_CONTROLS];
+  const int n = layout(Page::Cruise, 0, c);
+  Rect run{}, stop{};
+  for (int i = 0; i < n; i++) {
+    CHECK(c[i].id != CTL_START && c[i].id != CTL_STOP);
+    CHECK(minDim(c[i].r) >= BIG_MIN);
+    if (c[i].id == CTL_CRUISE_RUN) run = c[i].r;
+    if (c[i].id == CTL_CRUISE_STOP) stop = c[i].r;
+    for (const Rect &b : {CRUISE_TITLE, CRUISE_BAND, CRUISE_RESULT, CRUISE_DETAIL1, CRUISE_DETAIL2, CRUISE_DETAIL3, HOME_BADGE}) {
+      CHECK(!overlaps(b, c[i].r));
+    }
+  }
+  CHECK(run.w >= 900 && stop.w >= 900 && run.h >= 220 && gapBetween(run, stop) >= STOP_GAP);
+  for (const Rect &b : {CRUISE_DETAIL1, CRUISE_DETAIL2, CRUISE_DETAIL3}) {
+    CHECK(!overlaps(b, HOME_BADGE) && b.bottom() <= SCREEN_H);
+  }
+  // the first page has no cruise control; the progress page leads to it
+  Control h[MAX_CONTROLS];
+  const int hn = layout(Page::Home, 0, h);
+  for (int i = 0; i < hn; i++) CHECK(h[i].id != CTL_CRUISE_RUN && h[i].id != CTL_NAV_CRUISE);
+  Rect nav{};
+  CHECK(rectOf(Page::Progress, CTL_NAV_CRUISE, 0, nav));
+  CHECK(MAX_CRUISE_PRIMARY_CHARS * CRUISE_PRIMARY_PX * 0.75 <= CRUISE_PRIMARY.w);
+  CHECK(MAX_CRUISE_SECOND_CHARS * CRUISE_SECOND_PX * 0.62 <= CRUISE_SECOND.w);
+  CHECK(MAX_CRUISE_RESULT_CHARS * CRUISE_RESULT_PX * 0.62 <= CRUISE_RESULT.w);
+  CHECK(CRUISE_PRIMARY_PX >= 100 && CRUISE_RESULT_PX >= 70);
+
+  const char *states[] = {"idle", "refused", "waiting", "running", "restoring", "finished", "aborted"};
+  const char *whys[] = {"", "speed not steady at the set speed", "no cruise button frames from the car", "the drive plan is on",
+                        "set speed changed to 40 mph (expected 43 or 42)", "set-plus not accepted: set speed left 1 mph low",
+                        "not started: speed outside 30-70 mph", "time limit 20 s reached"};
+  const char *others[] = {"", "the drive plan is on", "the A/B switch is on", "a test is on", "the dither test is on"};
+  for (const char *st : states) {
+    for (const char *why : whys) {
+      for (const char *oth : others) {
+        for (bool fresh : {true, false}) {
+          for (int ra = 0; ra <= 3; ra++) {
+            CruiseView v = cruiseView(st, fresh);
+            v.why = why;
+            for (int k = 0; k < 3; k++) v.a.push_back(CruiseRound{k < ra, k < ra, 40, 60});
+            if (ra == 0) for (int k = 0; k < 3; k++) v.b.push_back(CruiseRound{false, false, 0, 0});
+            v.result = std::string(st) == "finished" ? (ra == 3 ? "YES" : (ra == 0 ? "NO" : "PARTLY")) : "";
+            v.restore = "not restored after 3 taps";
+            const CruiseLook k = cruiseLook(v, oth);
+            CHECK((int)k.primary.size() <= MAX_CRUISE_PRIMARY_CHARS);
+            if ((int)k.second.size() > MAX_CRUISE_SECOND_CHARS) std::printf("long second: %s\n", k.second.c_str());
+            CHECK((int)k.second.size() <= MAX_CRUISE_SECOND_CHARS);
+            CHECK((int)k.result.size() <= MAX_CRUISE_RESULT_CHARS);
+            for (const std::string *d : {&k.detail1, &k.detail2, &k.detail3}) {
+              if (d->size() * DETAIL_PX * 0.62 > CRUISE_DETAIL1.w) std::printf("long detail: %s\n", d->c_str());
+              CHECK(d->size() * DETAIL_PX * 0.62 <= CRUISE_DETAIL1.w);
+            }
+            // the truth rules
+            if (!fresh) CHECK(k.word == "noreport" && !k.run_enabled && !k.stop_enabled);
+            if (fresh && cruiseActive(v)) CHECK(k.word == st && !k.run_enabled && k.stop_enabled);
+            if (fresh && !cruiseActive(v)) CHECK(!k.stop_enabled && (k.run_enabled == (oth[0] == 0)));
+            if (fresh && !cruiseActive(v) && oth[0] == 0) CHECK(k.word == st);
+            if (fresh && !cruiseActive(v) && oth[0] != 0) CHECK(k.word == "unavailable" && k.second.find("STOP") != std::string::npos);
+            CHECK((k.primary.find("RUNNING") != std::string::npos) == (fresh && std::string(st) == "running"));
+            CHECK(!k.result.empty() == (std::string(st) == "finished"));
+            CHECK(cruiseBusy(v) == (fresh && cruiseActive(v)));
+          }
+        }
+      }
+    }
+  }
+  CruiseView y = cruiseView("finished");
+  for (int k = 0; k < 3; k++) y.a.push_back(CruiseRound{true, true, 40, 60});
+  y.result = "YES";
+  CHECK(cruiseLook(y, "").result == "SET SPEED CAN BE CHANGED: YES (3 of 3)");
+  CHECK(cruiseLook(y, "").detail2 == "Delay to the change: minus 40, 40, 40 ms; plus 60, 60, 60 ms");
+  CruiseView no = cruiseView("finished");
+  for (int k = 0; k < 3; k++) no.a.push_back(CruiseRound{});
+  for (int k = 0; k < 3; k++) no.b.push_back(CruiseRound{});
+  no.result = "NO";
+  CHECK(cruiseLook(no, "").result == "SET SPEED CAN BE CHANGED: NO (0 of 3)");
+  CHECK(cruiseLook(no, "").detail1 == "Recipe A (2-frame taps): 0 of 3. Recipe B (3-frame taps): 0 of 3");
+  CruiseView pt = cruiseView("finished");
+  pt.a = parseCruiseRounds("1,1,40,40;0,0,0,0;1,1,50,40");
+  pt.result = "PARTLY";
+  CHECK(pt.a.size() == 3 && pt.a[2].minus_ms == 50 && !pt.a[1].minus);
+  CHECK(cruiseLook(pt, "").result == "SET SPEED CAN BE CHANGED: PARTLY (2 of 3)");
+  CruiseView none;
+  CHECK(cruiseLook(none, "").word == "noreport" && !cruiseLook(none, "").run_enabled);
+  CHECK(cruiseLook(cruiseView("idle"), "").run_enabled && cruiseLook(cruiseView("idle"), "").word == "idle");
+}
+
 int main() {
+  cruiseRules();
   layoutRules();
   homeRules();
   fontsFit();

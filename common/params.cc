@@ -605,6 +605,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiPlan", CLEAR_ON_MANAGER_START},      // tmpfs: which of the two the plan allows now (controlsd -> car controller)
     {"TiTestHold", CLEAR_ON_MANAGER_START},  // tmpfs: why the car controller holds the tests now (car controller, on change and 1 Hz)
     {"TiPlanAck", CLEAR_ON_MANAGER_START},   // tmpfs: the car controller's acknowledgement that the tests are quiet
+    {"TiCruiseCheck", CLEAR_ON_MANAGER_START},        // tmpfs: the cruise set-speed check's trigger (the Tests pages; one press = one run)
+    {"TiCruiseCheckStatus", CLEAR_ON_MANAGER_START},  // tmpfs: what the check is doing and its result (car controller, on change and 1 Hz)
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

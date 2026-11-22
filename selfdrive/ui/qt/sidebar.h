@@ -197,6 +197,14 @@ private:
   void abSetOn(bool on);
   bool abStoredValue(int i, double &value) const;
   QString drawAb(QPainter &p);
+  // The cruise set-speed check's own page (selfdrive/car/mazda/ti_cruise_check.py; logic in ti_pages_logic.h cruiseLook)
+  void cruiseOpen();
+  void cruisePoll();
+  void cruiseAct(int control);
+  void cruiseWrite(const char *cmd);
+  std::string cruiseOthers() const;
+  void drawCruise(QPainter &p);
+  void drawCruiseBusy(QPainter &p);
   int controlAt(const QPoint &pos) const;
   void drawBox(QPainter &p, const QRect &r, const QColor &fill, const QColor &ink, const QString &text, int px) const;
   void drawToggle(QPainter &p, const TiTestView &view, bool off_at_ignition_off) const;
@@ -215,6 +223,8 @@ private:
   bool home_page = true;         // the first page: START / STOP (ti_pages_logic.h); the test pages are the individual tests
   bool setup_page = false;       // the A/B set-up page
   bool progress_page = false;    // the progress page: the alternation's sides against their target, each test window
+  bool cruise_page = false;      // the cruise set-speed check's page (from the progress page)
+  ti_pages::CruiseView cruise_view;   // what the car controller last published (TiCruiseCheckStatus, tmpfs)
   bool drive_base_set = false;   // what the counters were when START was last pressed (the "since START" line)
   double drive_base_win[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
   double drive_base_a = 0;

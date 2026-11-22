@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -75,7 +76,7 @@ inline int gapBetween(const Rect &a, const Rect &b) {
   return std::max(gx, gy);
 }
 
-enum class Page { Home, Setup, Tests, Overview, Ab, Progress };
+enum class Page { Home, Setup, Tests, Overview, Ab, Progress, Cruise };
 
 // Control ids (also the ids the mouse handler works with)
 enum Ctl {
@@ -107,6 +108,9 @@ enum Ctl {
   CTL_SETUP_BLOCK_MINUS = 55,
   CTL_SETUP_BLOCK_PLUS = 56,
   CTL_SETUP_RESET = 57,  // RESET PROGRESS (asks first)
+  CTL_NAV_CRUISE = 45,   // on the progress page: the cruise set-speed check's own page
+  CTL_CRUISE_RUN = 60,   // the cruise check's page: RUN CHECK (one press arms one run)
+  CTL_CRUISE_STOP = 61,  // ... STOP CHECK
 };
 
 struct Control {
@@ -172,6 +176,13 @@ inline int layout(Page pg, int error_lines, Control *out) {
       add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
       add(CTL_NAV_INDIV, 20, 330, 360, 180, "INDIVIDUAL TESTS");
+      add(CTL_NAV_CRUISE, 20, 590, 360, 180, "CRUISE CHECK");
+      break;
+    case Page::Cruise:                        // the cruise set-speed check: its own page and its own two controls, never START
+      add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
+      add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
+      add(CTL_CRUISE_RUN, 20, 270, 1020, 230, "RUN CHECK");
+      add(CTL_CRUISE_STOP, 1120, 270, 1020, 230, "STOP CHECK");
       break;
     case Page::Tests:
       add(CTL_BACK, 20, 10, 300, 180, "< START PAGE");
@@ -1208,6 +1219,256 @@ inline std::vector<Op> stopOps() {
 // Which sequence a START tap is: the label says "A/B relay" exactly when the plan is what runs
 inline bool startRunsPlan(bool configured) {
   return configured;
+}
+
+// ---- the cruise set-speed check's page (selfdrive/car/mazda/ti_cruise_check.py) ------------------------------------------------
+// Everything on it comes from what the car controller publishes (TiCruiseCheckStatus): the state, why, the rounds and their delays.
+// RUN CHECK writes the trigger (TiCruiseCheck) and nothing else; it is offered only while the car reports it is free and no other mode
+// is on. The page never shows "running" unless the car controller says so in a fresh report.
+constexpr Rect CRUISE_TITLE = {400, 10, 1340, 180};
+constexpr Rect CRUISE_BAND = {20, 520, 2120, 240};       // the status band: primary line and second line
+constexpr Rect CRUISE_PRIMARY = {20, 520, 2120, 130};
+constexpr Rect CRUISE_SECOND = {20, 650, 2120, 100};
+constexpr Rect CRUISE_RESULT = {20, 775, 2120, 105};     // the answer, in large type
+constexpr Rect CRUISE_DETAIL1 = {480, 890, 1660, 50};    // the rounds and the delays (not needed while driving)
+constexpr Rect CRUISE_DETAIL2 = {480, 942, 1660, 50};
+constexpr Rect CRUISE_DETAIL3 = {480, 994, 1660, 50};
+constexpr int CRUISE_PRIMARY_PX = 100;
+constexpr int CRUISE_SECOND_PX = 60;
+constexpr int CRUISE_RESULT_PX = 76;
+constexpr int MAX_CRUISE_PRIMARY_CHARS = 26;
+constexpr int MAX_CRUISE_SECOND_CHARS = 56;
+constexpr int MAX_CRUISE_RESULT_CHARS = 42;
+constexpr double CRUISE_STALE_S = 3.0;                    // a report older than this is no report
+
+struct CruiseRound {
+  bool minus = false, plus = false;
+  int minus_ms = 0, plus_ms = 0;
+};
+
+struct CruiseView {
+  bool have = false;                // a status block could be read
+  bool fresh = false;               // ... and it is recent (CRUISE_STALE_S)
+  std::string state;                // idle refused waiting running restoring finished aborted (the controller's own word)
+  std::string why;
+  std::string phase = "A";          // the recipe being run
+  int round = 0;
+  std::vector<CruiseRound> a, b;    // rounds run with recipe A (2 frames) and recipe B (3 frames)
+  int orig = 0, set = 0;            // the set speed at the start, and now (mph)
+  std::string result;               // YES PARTLY NO once finished
+  std::string restore;              // what the restore did
+};
+
+inline bool cruiseActive(const CruiseView &v) {
+  return v.state == "waiting" || v.state == "running" || v.state == "restoring";
+}
+
+// The check is running by the car's own fresh report: START, the A/B switch and the tests wait while it is
+inline bool cruiseBusy(const CruiseView &v) {
+  return v.have && v.fresh && cruiseActive(v);
+}
+
+inline int cruiseOk(const std::vector<CruiseRound> &r) {
+  int n = 0;
+  for (const CruiseRound &x : r) {
+    n += (x.minus && x.plus) ? 1 : 0;
+  }
+  return n;
+}
+
+// "1,1,40,40;0,0,0,0" (the CLI's form of the status rows) into rounds
+inline std::vector<CruiseRound> parseCruiseRounds(const std::string &text) {
+  std::vector<CruiseRound> out;
+  if (text.empty() || text == "-") {
+    return out;
+  }
+  size_t pos = 0;
+  while (pos <= text.size()) {
+    const size_t end = std::min(text.find(';', pos), text.size());
+    const std::string item = text.substr(pos, end - pos);
+    int v[4] = {0, 0, 0, 0};
+    size_t p = 0;
+    for (int k = 0; k < 4 && p <= item.size(); k++) {
+      const size_t e = std::min(item.find(',', p), item.size());
+      v[k] = std::atoi(item.substr(p, e - p).c_str());
+      p = e + 1;
+    }
+    out.push_back(CruiseRound{v[0] != 0, v[1] != 0, v[2], v[3]});
+    pos = end + 1;
+  }
+  return out;
+}
+
+struct CruiseLook {
+  std::string word;                 // the screen's state: idle refused waiting running restoring finished aborted unavailable noreport
+  std::string primary;              // the status band, very large
+  Tone tone = Tone::Stopped;
+  std::string second;
+  std::string result;               // the answer in large type ("" when there is none yet)
+  std::string detail1, detail2, detail3;
+  std::string run_sub;
+  bool run_enabled = false;
+  std::string stop_sub;
+  bool stop_enabled = false;
+};
+
+inline std::string upperFirst(const std::string &t) {
+  std::string out = t;
+  if (!out.empty() && out[0] >= 'a' && out[0] <= 'z') {
+    out[0] = (char)(out[0] - 'a' + 'A');
+  }
+  return out;
+}
+
+// "SET SPEED CAN BE CHANGED: YES (3 of 3)"
+inline std::string cruiseResultLine(const CruiseView &v) {
+  const int best = std::max(cruiseOk(v.a), cruiseOk(v.b));
+  const char *word = v.result == "YES" ? "YES" : (v.result == "NO" ? "NO" : "PARTLY");
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "SET SPEED CAN BE CHANGED: %s (%d of 3)", word, best);
+  return buf;
+}
+
+// "Recipe A (2-frame taps): 3 of 3 rounds accepted. Recipe B not needed"
+inline std::string cruiseRecipeLine(const CruiseView &v) {
+  char buf[128];
+  if (v.b.empty()) {
+    std::snprintf(buf, sizeof(buf), "Recipe A (2-frame taps): %d of %d rounds accepted%s", cruiseOk(v.a), (int)v.a.size(),
+                  v.state == "finished" ? ". Recipe B not needed" : "");
+  } else {
+    std::snprintf(buf, sizeof(buf), "Recipe A (2-frame taps): %d of %d. Recipe B (3-frame taps): %d of %d", cruiseOk(v.a), (int)v.a.size(),
+                  cruiseOk(v.b), (int)v.b.size());
+  }
+  return buf;
+}
+
+// "Delay to the change: minus 40, 40, 40 ms; plus 40, 40, 40 ms"
+inline std::string cruiseDelayLine(const CruiseView &v) {
+  std::string minus, plus;
+  for (const std::vector<CruiseRound> *rs : {&v.a, &v.b}) {
+    for (const CruiseRound &r : *rs) {
+      if (r.minus) {
+        minus += (minus.empty() ? "" : ", ") + std::to_string(r.minus_ms);
+      }
+      if (r.plus) {
+        plus += (plus.empty() ? "" : ", ") + std::to_string(r.plus_ms);
+      }
+    }
+  }
+  if (minus.empty() && plus.empty()) {
+    return v.a.empty() && v.b.empty() ? std::string("No round finished yet") : std::string("No press changed the set speed");
+  }
+  return "Delay to the change: minus " + (minus.empty() ? std::string("none") : minus + " ms") + "; plus " +
+         (plus.empty() ? std::string("none") : plus + " ms");
+}
+
+inline std::string cruiseSetLine(const CruiseView &v) {
+  char buf[160];
+  if (v.orig <= 0) {
+    return upperFirst(v.restore);
+  }
+  std::snprintf(buf, sizeof(buf), "Set speed %d mph at the start, %d mph now%s%s", v.orig, v.set, v.restore.empty() ? "" : ". ",
+                upperFirst(v.restore).c_str());
+  return buf;
+}
+
+// The page, from the car's report and from what else is on (others: "" when nothing else is switched on, else why the check cannot run)
+inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
+  CruiseLook k;
+  k.stop_sub = "or press the brake";
+  const bool final_state = v.have && (v.state == "finished" || v.state == "aborted");
+  if (final_state) {
+    if (v.state == "finished") {
+      k.result = cruiseResultLine(v);
+    }
+    k.detail1 = cruiseRecipeLine(v);
+    k.detail2 = cruiseDelayLine(v);
+    k.detail3 = cruiseSetLine(v);
+  }
+  if (!v.have || !v.fresh) {
+    k.word = "noreport";
+    k.primary = "NO REPORT FROM THE CAR";
+    k.tone = Tone::Held;
+    k.second = final_state ? "Last result below; kept until controls restart" : "The check runs only while driving";
+    k.run_sub = "Needs the car's report: drive first";
+    return k;
+  }
+  if (cruiseActive(v)) {
+    k.stop_enabled = true;
+    k.run_sub = "Running now: one press is one run";
+  }
+  if (v.state == "waiting") {
+    k.word = "waiting";
+    k.primary = "WAITING";
+    k.tone = Tone::Waiting;
+    k.second = v.why.empty() ? std::string("Checking the conditions") : upperFirst(v.why);
+    k.detail1 = "Needs: engaged, cruise on, steady 30-70 mph, set 25 mph+, no car ahead";
+    k.detail2 = "Gives up after 60 s of waiting";
+    return k;
+  }
+  if (v.state == "running") {
+    k.word = "running";
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), v.phase == "B" ? "RUNNING: B ROUND %d OF 3" : "RUNNING: ROUND %d OF 3", std::max(1, v.round));
+    k.primary = buf;
+    k.tone = Tone::Running;
+    k.second = v.why.empty() ? std::string("Hands off the cruise buttons. Brake stops it.") : "Holding: " + v.why;
+    k.detail1 = cruiseRecipeLine(v);
+    k.detail2 = cruiseDelayLine(v);
+    k.detail3 = cruiseSetLine(v);
+    return k;
+  }
+  if (v.state == "restoring") {
+    k.word = "restoring";
+    k.primary = "PUTTING SET SPEED BACK";
+    k.tone = Tone::Waiting;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "To %d mph: at most 3 taps", v.orig);
+    k.second = buf;
+    k.detail1 = cruiseRecipeLine(v);
+    k.detail2 = cruiseDelayLine(v);
+    k.detail3 = cruiseSetLine(v);
+    return k;
+  }
+  // not running: RUN CHECK is offered when nothing else is on
+  if (!others.empty()) {
+    k.word = "unavailable";
+    k.primary = "UNAVAILABLE";
+    k.tone = Tone::Held;
+    k.second = upperFirst(others) + ": tap STOP on the START page";
+    k.run_sub = "Not while another mode is on";
+    return k;
+  }
+  k.run_enabled = true;
+  k.run_sub = "One run: 3 rounds of set-minus, set-plus";
+  if (v.state == "finished") {
+    k.word = "finished";
+    k.primary = "FINISHED";
+    k.tone = Tone::Done;
+    k.second = "Tap RUN CHECK to run it once more";
+    return k;
+  }
+  if (v.state == "aborted") {
+    k.word = "aborted";
+    k.primary = "ABORTED";
+    k.tone = Tone::Held;
+    k.second = upperFirst(v.why);
+    return k;
+  }
+  if (v.state == "refused") {
+    k.word = "refused";
+    k.primary = "REFUSED";
+    k.tone = Tone::Held;
+    k.second = upperFirst(v.why);
+    return k;
+  }
+  k.word = "idle";
+  k.primary = "READY: TAP RUN CHECK";
+  k.tone = Tone::Stopped;
+  k.second = "Not run since controls started";
+  k.detail1 = "Engage with stock cruise on at 30-70 mph, no car ahead, then tap RUN CHECK";
+  k.detail2 = "It taps set-minus then set-plus, 3 times, and puts the set speed back";
+  return k;
 }
 
 }  // namespace ti_pages

@@ -131,20 +131,24 @@ def create_button_cmd(packer, CP, counter, button):
 
   can = int(button == Buttons.CANCEL)
   res = int(button == Buttons.RESUME)
+  # SET_PLUS / SET_MINUS: only the cruise set-speed check (ti_cruise_check.py) sends them. CANCEL and RESUME frames are byte for
+  # byte what they were (test_mazda_ti_cruise_check.py compares every button with the recorded real-press templates).
+  setp = int(button == Buttons.SET_PLUS)
+  setm = int(button == Buttons.SET_MINUS)
 
   if CP.flags & MazdaFlags.GEN1:
     values = {
       "CAN_OFF": can,
       "CAN_OFF_INV": (can + 1) % 2,
 
-      "SET_P": 0,
-      "SET_P_INV": 1,
+      "SET_P": setp,
+      "SET_P_INV": (setp + 1) % 2,
 
       "RES": res,
       "RES_INV": (res + 1) % 2,
 
-      "SET_M": 0,
-      "SET_M_INV": 1,
+      "SET_M": setm,
+      "SET_M_INV": (setm + 1) % 2,
 
       "DISTANCE_LESS": 0,
       "DISTANCE_LESS_INV": 1,

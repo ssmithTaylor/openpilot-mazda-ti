@@ -17,6 +17,8 @@ class CarState(CarStateBase):
       self.shifter_values = can_define.dv["MANUAL_GEAR"]["GEAR"]
 
     self.crz_btns_counter = 0
+    self.crz_btns_driver = None   # the car's own 0x09D frame shows a cruise button pressed (gen1); None until read
+    self.crz_lead = None          # the stock cruise is following a lead (CRZ_CTRL 0x21C RADAR_HAS_LEAD, gen1); None until read
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -152,6 +154,13 @@ class CarState(CarStateBase):
     self.acc_active_last = ret.cruiseState.enabled
 
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
+    # For the cruise set-speed check (ti_cruise_check.py), read only: whether the driver is pressing any cruise button on the car's
+    # own button frame (the comma's own frames are not read back on this bus), and whether the stock cruise follows a lead.
+    btns = cp.vl["CRZ_BTNS"]
+    self.crz_btns_driver = bool(btns["SET_P"] or btns["SET_M"] or btns["RES"] or btns["CAN_OFF"] or btns["DISTANCE_LESS"] or
+                                btns["DISTANCE_MORE"] or btns["MODE_X"] or btns["MODE_Y"])
+    if not (self.CP.flags & MazdaFlags.RADAR_INTERCEPTOR) and not (self.CP.flags & MazdaFlags.NO_MRCC):
+      self.crz_lead = bool(cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"])
 
     # camera signals
     if not self.CP.flags & MazdaFlags.NO_FSC:

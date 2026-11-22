@@ -1178,6 +1178,7 @@ void TestsWindow::refresh() {
   speed_mph = have_speed ? sm["carState"].getCarState().getVEgo() * MS_TO_MPH : 0.0;
   tests.poll(frogpilotUIState()->frogpilot_toggles);
   abPoll();                  // the plan line is on both pages
+  cruisePoll();              // the cruise check: its page, and whether START and the switches wait for it
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
     // the tests are held for a reason of the plan or the alternation: say it, not "another test is on"
     const QString text = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
@@ -1221,6 +1222,9 @@ int TestsWindow::rowHeight() const {
 }
 
 ti_pages::Page TestsWindow::pageNow() const {
+  if (cruise_page) {
+    return ti_pages::Page::Cruise;
+  }
   if (progress_page) {
     return ti_pages::Page::Progress;
   }
@@ -1318,6 +1322,7 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
 // The first page again (from the set-up page and the individual tests). Nothing is switched by going there.
 void TestsWindow::goHome() {
   abOpen();                // the set-up page's unconfirmed draft is dropped: the first page shows, and START runs, what is saved
+  cruise_page = false;
   home_page = true;
   setup_page = false;
   progress_page = false;
@@ -1414,6 +1419,20 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     goHome();                               // the other pages: back to the first page (allowed while locked: the page stays)
     refresh();
     return;
+  }
+  if (control == CTL_NAV_CRUISE || control == CTL_CRUISE_RUN || control == CTL_CRUISE_STOP) {
+    cruiseAct(control);
+    refresh();
+    return;
+  }
+  // While the car reports the cruise check running, nothing else starts: START, the A/B switch and the test switches wait (the
+  // car side also aborts the check if one comes on). STOP and the off controls still act, and STOP stops the check too.
+  if (cruiseBusy(cruise_view) && (control == CTL_START || control == CTL_AB_SWITCH || (control >= 10 && control < 20))) {
+    refresh();
+    return;
+  }
+  if (control == CTL_STOP && cruiseBusy(cruise_view)) {
+    cruiseWrite("stop");
   }
   if (control == CTL_START || control == CTL_STOP || control == CTL_NAV_SETUP || control == CTL_NAV_PROGRESS || control == CTL_NAV_INDIV) {
     homeAct(control);
@@ -2210,6 +2229,134 @@ QString TestsWindow::drawAb(QPainter &p) {
   return QString::fromStdString(experimentLine(ab_setting, ab_a_known, ab_a, ab_b));
 }
 
+// ---- the cruise set-speed check's page ---------------------------------------------------------------------------------------
+// RUN CHECK writes one trigger (TiCruiseCheck, tmpfs) that the car controller consumes; STOP CHECK writes a stop. Everything shown
+// comes from the car controller's report (TiCruiseCheckStatus); nothing here decides that the check runs.
+const char *const TI_CRUISE_TRIGGER_KEY = "TiCruiseCheck";
+const char *const TI_CRUISE_STATUS_KEY = "TiCruiseCheckStatus";
+
+void TestsWindow::cruiseOpen() {
+  home_page = false;
+  setup_page = false;
+  progress_page = false;
+  ab_page = false;
+  cruise_page = true;
+}
+
+void TestsWindow::cruisePoll() {
+  ti_pages::CruiseView v;
+  const QJsonObject st = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(TI_CRUISE_STATUS_KEY))).object();
+  v.have = st.value("state").isString();
+  if (v.have) {
+    const double age = QDateTime::currentMSecsSinceEpoch() / 1000.0 - st.value("t").toDouble(-1e9);
+    v.fresh = age > -ti_pages::CRUISE_STALE_S && age < ti_pages::CRUISE_STALE_S;
+    v.state = st.value("state").toString().toStdString();
+    v.why = st.value("why").toString().toStdString();
+    v.phase = st.value("phase").toString("A").toStdString();
+    v.round = st.value("round").toInt();
+    v.orig = st.value("orig").toInt();
+    v.set = st.value("set").toInt();
+    v.result = st.value("result").toString().toStdString();
+    v.restore = st.value("restore").toString().toStdString();
+    for (const char *key : {"a", "b"}) {
+      std::vector<ti_pages::CruiseRound> &rows = key[0] == 'a' ? v.a : v.b;
+      for (const QJsonValue &rv : st.value(key).toArray()) {
+        const QJsonArray r = rv.toArray();
+        rows.push_back(ti_pages::CruiseRound{r.at(0).toInt() != 0, r.at(1).toInt() != 0, r.at(2).toInt(), r.at(3).toInt()});
+      }
+    }
+  }
+  cruise_view = v;
+}
+
+// Why another mode keeps the check from starting, as the screen knows it ("" when nothing else is on); the car side checks again
+std::string TestsWindow::cruiseOthers() const {
+  if (ab_plan_on) {
+    return "the drive plan is on";
+  }
+  if (ab_on) {
+    return "the A/B switch is on";
+  }
+  if (tests.all_view.requested || tests.singleTestOn()) {
+    return "a test is on";
+  }
+  return "";
+}
+
+void TestsWindow::cruiseWrite(const char *cmd) {
+  QJsonObject t;
+  const qint64 ms = QDateTime::currentMSecsSinceEpoch();
+  t["cmd"] = QString(cmd);
+  t["id"] = QString("%1-%2").arg(cmd).arg(ms);
+  t["t"] = ms / 1000.0;
+  ab_memory.put(TI_CRUISE_TRIGGER_KEY, QJsonDocument(t).toJson(QJsonDocument::Compact).toStdString());
+}
+
+void TestsWindow::cruiseAct(int control) {
+  using namespace ti_pages;
+  if (control == CTL_NAV_CRUISE) {
+    cruiseOpen();
+    return;
+  }
+  cruisePoll();
+  const CruiseLook look = cruiseLook(cruise_view, cruiseOthers());
+  if (control == CTL_CRUISE_RUN && look.run_enabled) {
+    cruiseWrite("run");          // one press, one run: the car controller consumes the trigger
+  } else if (control == CTL_CRUISE_STOP && look.stop_enabled) {
+    cruiseWrite("stop");
+  }
+}
+
+void TestsWindow::drawCruise(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  const QColor dim(0xc9, 0xc9, 0xc9);
+  const CruiseLook look = cruiseLook(cruise_view, cruiseOthers());
+  drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< START\nPAGE"), NAV_PX);
+  drawTitle(p, qr(CRUISE_TITLE), QString("CRUISE SET-SPEED\nCHECK"), 64);
+  drawBox2(p, ctlRect(CTL_CRUISE_RUN), look.run_enabled ? toneQColor(Tone::Done) : QColor(0x1a, 0x1a, 0x1a),
+           look.run_enabled ? white : QColor(0x77, 0x77, 0x77), QString("RUN CHECK"), START_PX, QString::fromStdString(look.run_sub), START_SUB_PX);
+  drawBox2(p, ctlRect(CTL_CRUISE_STOP), look.stop_enabled ? QColor(201, 34, 49) : QColor(0x6b, 0x1d, 0x25),
+           look.stop_enabled ? white : QColor(0xc9, 0xc9, 0xc9), QString("STOP CHECK"), START_PX, QString::fromStdString(look.stop_sub), START_SUB_PX);
+
+  // the status band: its colour is the state, its words say the same
+  const ToneColor tc = toneColor(look.tone);
+  const QColor ink = tc.light ? QColor(0, 0, 0) : white;
+  p.setPen(Qt::NoPen);
+  p.setBrush(toneQColor(look.tone));
+  p.drawRoundedRect(qr(CRUISE_BAND), 24, 24);
+  p.setPen(ink);
+  p.setFont(InterFont(CRUISE_PRIMARY_PX, QFont::Bold));
+  p.drawText(qr(CRUISE_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.primary));
+  p.setFont(InterFont(CRUISE_SECOND_PX, QFont::DemiBold));
+  p.drawText(qr(CRUISE_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.second));
+
+  // the answer, large and plain
+  if (!look.result.empty()) {
+    const std::string &r = cruise_view.result;
+    p.setPen(r == "YES" ? QColor(0x33, 0xcc, 0x66) : (r == "NO" ? QColor(0xff, 0x6b, 0x6b) : QColor(218, 202, 37)));
+    p.setFont(InterFont(CRUISE_RESULT_PX, QFont::Bold));
+    p.drawText(qr(CRUISE_RESULT).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.result));
+  }
+  p.setPen(dim);
+  p.setFont(InterFont(DETAIL_PX));
+  p.drawText(qr(CRUISE_DETAIL1), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail1));
+  p.drawText(qr(CRUISE_DETAIL2), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail2));
+  p.drawText(qr(CRUISE_DETAIL3), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail3));
+  drawEngagedBadge(p, qr(HOME_BADGE));
+}
+
+// The first page while the check runs: START is covered by what it waits for (the car's report decides, never this page)
+void TestsWindow::drawCruiseBusy(QPainter &p) {
+  using namespace ti_pages;
+  if (!cruiseBusy(cruise_view)) {
+    return;
+  }
+  drawBox2(p, ctlRect(CTL_START), QColor(0x6b, 0x5e, 0x10), QColor(0xff, 0xff, 0xff), QString("CRUISE CHECK RUNNING"), START_PX,
+           QString("START waits until it ends (PROGRESS > CRUISE CHECK)"), START_SUB_PX);
+}
+
 void TestsWindow::paintEvent(QPaintEvent *event) {
   using namespace ti_pages;
   QPainter p(this);
@@ -2236,8 +2383,14 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     }
   };
 
+  if (cruise_page) {
+    drawCruise(p);
+    lockBorder();
+    return;
+  }
   if (home_page) {
     drawHome(p);
+    drawCruiseBusy(p);         // START waits while the cruise check runs: said where START is
     lockBorder();
     return;
   }
@@ -2248,6 +2401,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   }
   if (progress_page) {
     drawProgress(p);
+    drawBox(p, ctlRect(CTL_NAV_CRUISE), grey, white, QString("CRUISE\nCHECK >"), NAV_PX);   // the cruise check's own page
     lockBorder();
     return;
   }
@@ -2309,6 +2463,10 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
                         : (all_done ? QString("All queued tests are complete.") : QString("Complete. This is the last queued test."));
     }
     drawTest(p, queue_pos);
+  }
+  if (cruiseBusy(cruise_view)) {
+    banner = QString("Cruise check running: the switches wait for it");
+    banner_color = amber;
   }
   if (!banner.isEmpty()) {
     p.setPen(banner_color);

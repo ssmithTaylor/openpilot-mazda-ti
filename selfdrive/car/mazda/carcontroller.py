@@ -25,9 +25,16 @@ try:
   from openpilot.selfdrive.car.mazda import ti_plan as ti_plan_mod
 except Exception:
   ti_plan_mod = None
+try:
+  # Cruise set-speed check (ti_cruise_check.py): started only by its own control on the Tests pages. Optional: without the module
+  # nothing here changes (self.cruise_check is None).
+  from openpilot.selfdrive.car.mazda import ti_cruise_check as cruise_check_mod
+except Exception:
+  cruise_check_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
+from openpilot.common.conversions import Conversions as CV
 
 # Below this the bias-to-command ratio is dominated by sensor quantisation -- both torque sensors
 # are 8-bit -- so accumulating it would only add noise to the slope estimate.
@@ -67,6 +74,15 @@ def ti_ident_log(event):
     cloudlog.event("ti_ident", **event)
   except Exception:
     pass
+
+def ti_cruise_log(event):
+  """The cruise set-speed check's steps (armed, waiting, tap with its frames and counters, accepted, aborted, result) into the log."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_cruise", **event)
+  except Exception:
+    pass
+
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -126,6 +142,20 @@ class CarController(CarControllerBase):
     self.ti_ab_on = False              # the A/B alternation switch (TiAbOn, tmpfs, read at 10 Hz): while on, no test runs
     self.ti_gate_published = None      # the last gate block written to TiTestGate (screen: reason, value, limit)
     self.ti_gate_frame = 0
+    self.ti_ab_switch = False          # TiAbOn as read (the plain A/B switch), for the cruise check's exclusion
+    # Cruise set-speed check: gen1 with the interceptor only (the car it was studied on). Off after every start of this process: the
+    # trigger and the last status are cleared here, and a trigger stamped before this moment is ignored.
+    self.cruise_check = (cruise_check_mod.CruiseCheck()
+                         if cruise_check_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CP.flags & MazdaFlags.GEN1 else None)
+    self.cruise_started_wall = time.time()
+    self.cruise_trigger = None
+    self.cruise_published = None
+    if self.cruise_check is not None:
+      for key in (cruise_check_mod.PARAM_TRIGGER, cruise_check_mod.PARAM_STATUS):
+        try:
+          self.params_memory.remove(key)
+        except Exception:
+          pass
     self.reset_ti_stats()
 
   def reset_ti_stats(self):
@@ -555,6 +585,7 @@ class CarController(CarControllerBase):
       # switch keeps the last value read; the A/B side independently refuses to run while any test toggle is on.
       try:
         ab_on = bool(self.params_memory.get_bool("TiAbOn"))
+        self.ti_ab_switch = ab_on
         if ti_plan_mod is not None:
           plan_on = bool(self.params_memory.get_bool("TiPlanOn"))
           raw_plan = self.params_memory.get("TiPlan")
@@ -585,6 +616,75 @@ class CarController(CarControllerBase):
       self.ti_ident_all = getattr(frogpilot_toggles, ti_ident_mod.RUN_ALL_TOGGLE, False) is True
       if self.ti_plan_allowed:
         self.ti_ident_all, self.ti_ident_on = True, ()    # the plan runs the tests in run-all mode, under all their own gates
+
+  def cruise_others_on(self):
+    """Why another mode excludes the cruise check ("" when none is on)."""
+    if self.ti_plan_on:
+      return "the drive plan is on"
+    if self.ti_ab_switch:
+      return "the A/B switch is on"
+    if self.ti_ident_all or self.ti_ident_on:
+      return "a test is on"
+    if self.ti_dither_enabled:
+      return "the dither test is on"
+    return ""
+
+  def cruise_check_step(self, CC, CS, ti_apply_steer):
+    """One frame of the cruise set-speed check: the button frame to send, or None. Reads the trigger at 10 Hz (and consumes it),
+    publishes the status on change and every second, logs every step. Never raises: after an error the check is off for the rest of
+    this process and says so."""
+    chk = self.cruise_check
+    if chk is None:
+      return None
+    try:
+      mod = cruise_check_mod
+      wall = time.time()
+      trigger = None
+      if self.frame % 10 == 0:
+        raw = self.params_memory.get(mod.PARAM_TRIGGER)
+        if raw:
+          self.params_memory.remove(mod.PARAM_TRIGGER)        # one press arms one run: the trigger is consumed
+          trigger = mod.parse_trigger(raw)
+          if trigger is not None and trigger.t and trigger.t < self.cruise_started_wall:
+            ti_cruise_log({"kind": "trigger_before_start", "frame": self.frame, "id": trigger.id})
+            trigger = None                                     # written before this process started: never acted on
+      out = CS.out
+      cruise = getattr(out, "cruiseState", None)
+      speed = float(getattr(cruise, "speed", 0.0) or 0.0)
+      set_mph = int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None
+      counter = getattr(CS, "crz_btns_counter", None)
+      inp = mod.Inputs(
+        engaged=bool(getattr(CC, "enabled", False)), cruise_on=bool(getattr(cruise, "enabled", False)),
+        cruise_available=bool(getattr(cruise, "available", False)), mph=float(out.vEgo) * CV.MS_TO_MPH, set_mph=set_mph,
+        brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
+        steer_share=abs(ti_apply_steer) / max(1.0, float(self.ccp.TI_STEER_MAX)), driver_button=getattr(CS, "crz_btns_driver", None),
+        counter=None if counter is None else int(counter), cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
+        others_on=self.cruise_others_on(), wall=wall)
+      button = chk.step(self.frame, inp, trigger)
+      for ev in chk.events:
+        ti_cruise_log(ev)
+      chk.events.clear()
+      st = chk.status(wall)
+      key = (st["state"], st["why"], st["phase"], st["round"], len(st["a"]), len(st["b"]), st["set"], st["restore"], st["id"])
+      if key != self.cruise_published or self.frame % mod.STATUS_EVERY == 0:
+        self.params_memory.put(mod.PARAM_STATUS, json.dumps(st))
+        self.cruise_published = key
+      if button is None or inp.cancel_req or inp.resume_req:
+        return None
+      return mazdacan.create_button_cmd(self.packer, self.CP, inp.counter, Buttons.SET_MINUS if button == "SET_MINUS" else Buttons.SET_PLUS)
+    except Exception:
+      self.cruise_check = None
+      try:
+        self.params_memory.put(cruise_check_mod.PARAM_STATUS, json.dumps({"t": round(time.time(), 1), "v": 1, "state": "aborted",
+                                                                          "why": "internal error: check off until restart"}))
+      except Exception:
+        pass
+      try:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.exception("ti_cruise disabled")
+      except Exception:
+        pass
+      return None
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
@@ -717,6 +817,13 @@ class CarController(CarControllerBase):
           # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
           # Send Resume button when planner wants car to move
           can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+
+      # Cruise set-speed check: SET_M / SET_P only, never CANCEL or RESUME, and nothing on a frame where openpilot asks for either
+      # (checked again inside). After the existing cancel / resume logic, which it never changes.
+      if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+        cruise_msg = self.cruise_check_step(CC, CS, ti_apply_steer)
+        if cruise_msg is not None:
+          can_sends.append(cruise_msg)
 
       # send HUD alerts
       if self.frame % 50 == 0:
