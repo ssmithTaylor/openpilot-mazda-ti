@@ -1071,7 +1071,8 @@ def test_the_page_switches_the_tests_off_before_it_starts_and_a_test_switches_it
   assert 'TI_AB_ON_KEY = "TiAbOn"' in ui and 'TI_AB_PIN_KEY = "TiAbPin"' in ui and 'TI_AB_CONFIG_KEY = "TiAbConfig"' in ui
   # the page writes no tuning setting: its only writes are the three keys
   writes = set(__import__("re").findall(r"ab_(?:memory|params)\.(?:put|putBool|remove)\((\w+)", ui))
-  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY", "TI_AB_PROGRESS_KEY", "TI_PLAN_ON_KEY"}, writes
+  # TI_CRUISE_TRIGGER_KEY: the cruise set-speed check's trigger (TiCruiseCheck, tmpfs), not a tuning setting
+  assert writes <= {"TI_AB_ON_KEY", "TI_AB_PIN_KEY", "TI_AB_CONFIG_KEY", "TI_AB_PROGRESS_KEY", "TI_PLAN_ON_KEY", "TI_CRUISE_TRIGGER_KEY"}, writes
   # the lock is the Tests page's own (the A/B page is a page of the same window)
   assert "class TestsWindow" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
   assert "bool abStoredValue" in (ROOT / "selfdrive/ui/qt/sidebar.h").read_text(encoding="utf-8")
