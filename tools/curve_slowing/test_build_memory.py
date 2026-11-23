@@ -305,3 +305,22 @@ def test_kap_med_and_loader_fallback(tmp_path):
   M.save(f, arrays, {'lat0': 0.0, 'lon0': 0.0, 'kx': 1.0, 'ky': 1.0})
   m = M.load(f)
   assert m.kap_med.dtype == np.float64 and np.array_equal(m.kap_med, m.kap)
+
+
+def test_trouble_points_keep_their_curvature():
+  # two passes of the arc; the sharper one hit the steering limit at 300 m with the blinker on and the driver's hand on the wheel
+  calm = make_pass('d0', CURVE)
+  hot = make_pass('d1', CURVE, kap_bias=0.004, sats=[300.0])
+  hot['blink'] = np.ones(len(hot['s']))                       # every sample of this pass would be excluded
+  hot['pressed'] = np.ones(len(hot['s']))
+  arrays, _ = B.build([calm, hot])
+  i = int(round(300 / M.SPACING_M))
+  assert abs(arrays['kap'][i] - 0.014) < 3e-4                  # the event pass's own (sharper) curvature, exclusions ignored
+  assert arrays['flags'][i] & M.FLAG_LIMIT and not arrays['flags'][i] & M.FLAG_NOKAP
+  assert abs(arrays['kap_med'][i] - 0.010) < 3e-4             # the median of the usable passes is unchanged
+  # hand steering near the event is not excluded
+  p = make_pass('d2', CURVE, sats=[300.0])
+  p['pressed'] = np.ones(len(p['s']))
+  xb = B.excl_bits(p)
+  e = p['sat_i'][0]
+  assert not (xb[e - 50:e + 50] & B.EX_HAND).any() and (xb[:e - 70] & B.EX_HAND).all()

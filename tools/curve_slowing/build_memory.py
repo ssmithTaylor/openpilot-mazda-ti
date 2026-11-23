@@ -25,7 +25,9 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
     after it joins one (from a road that is not its predecessor, or from its start). kap is ROBUST (meta kap_rule "second<="):
     one usable pass -> its value; two or more -> the SECOND sharpest |kap|, signed by the median's sign, and the LOWEST |kap| where
     the usable passes disagree by more than DISAGREE x (phantom corners at traffic lights, swerves and lane changes cannot set a
-    corner on a straight road). No usable pass -> kap = 0 and FLAG_NOKAP; kap_med = the plain median of the same usable passes
+    corner on a straight road). No usable pass -> kap = 0 and FLAG_NOKAP. EXCEPT where a pass had a steering-limit event or a
+    real takeover near the point (within the flag windows): there kap is the sharpest of those event passes, from all their samples,
+    exclusions not applied (the trouble is the evidence), and hand steering within +-3 s of such an event is never excluded; kap_med = the plain median of the same usable passes
     (0 where none), for the planner's road-change check;
     v_proven = the highest speed of a pass through the point with lateral control active, not braking to a stop or pulling away,
     and no steering-limit event, firm takeover or lane-line touch from PROVEN_M before to PROVEN_M after it (nan where none);
@@ -276,7 +278,8 @@ def build_library(passes):
 
 
 # rows columns (one per road point covered by a pass)
-C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART = range(11)
+C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART, C_EVENT = range(12)
+EVENT_PROTECT_S = 3.0          # hand steering within this of a steering-limit event or a real takeover is never excluded
 EX_BLINK, EX_HAND, EX_SLOW, EX_LEAVE, EX_STOP, EX_JOIN = 1, 2, 4, 8, 16, 32
 EX_NAMES = {EX_BLINK: 'blinker +-5 s', EX_HAND: 'steering by hand +-2 s', EX_SLOW: 'below 19 mph', EX_LEAVE: 'last 150 m before leaving',
             EX_STOP: 'slowing to a stop / pulling away', EX_JOIN: 'first 150 m after joining'}
@@ -343,7 +346,12 @@ def excl_bits(p):
     hand |= np.abs(np.asarray(p['drv'])) >= TK_DRV
   if 'lat_act' in p:
     hand &= np.asarray(p['lat_act']) > .5      # only while openpilot steers: manual driving is the car's real path
-  out |=np.where(dilate(hand, int(HAND_PAD_S / DT)), EX_HAND, 0).astype(np.uint8)
+  ev = np.zeros(n, bool)
+  for k in ('sat_i', 'tk_i'):
+    idx = np.asarray(p.get(k, ()), int)
+    ev[idx[(idx >= 0) & (idx < n)]] = True
+  hand = dilate(hand, int(HAND_PAD_S / DT)) & ~dilate(ev, int(EVENT_PROTECT_S / DT))   # the trouble is the evidence: never excluded near it
+  out |= np.where(hand, EX_HAND, 0).astype(np.uint8)
   out |= np.where(np.asarray(p['v']) < SLOW_MPH * 0.44704, EX_SLOW, 0).astype(np.uint8)
   out |= np.where(stop_mask(p['v'], p['s'], p.get('aego')), EX_STOP, 0).astype(np.uint8)
   return out
@@ -436,8 +444,13 @@ def collect(passes, lib, aligns):
           else:
             clean = la[i20].copy()
           clean &= (xb[i20] & EX_STOP) == 0            # never proven while braking to a stop or pulling away
+          evt = np.zeros(len(q), bool)                   # this pass had a steering-limit event / real takeover near the point
+          for ix, w in ((sats, max(LIMIT_BEFORE_M, LIMIT_AFTER_M)), (tks, TK_M)):
+            if len(ix):
+              es = np.sort(s[ix])
+              evt |= np.searchsorted(es, sr + w, side='right') > np.searchsorted(es, sr - w, side='left')
           rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr, xb[i20], np.full(len(q), piece),
-                            (q1 - q) * SP, clean, (q - q0) * SP])
+                            (q1 - q) * SP, clean, (q - q0) * SP, evt])
           for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M),
                                   (lns, M.FLAG_LANE, LANE_M, LANE_M)):
             for e in evs:
@@ -445,7 +458,7 @@ def collect(passes, lib, aligns):
                 ge = float(np.interp(s[e], sr, g)) if len(sr) > 1 else float(g[0])
                 flags.append((rd, ge - lo, ge + hi, fl, float(p['v'][e])))
       k = k2 + 1
-  rows = np.concatenate(rows) if rows else np.zeros((0, 11))
+  rows = np.concatenate(rows) if rows else np.zeros((0, 12))
   return rows, flags, cuts, trans, pieces
 
 
@@ -499,6 +512,15 @@ def merge(rows, NL, usable=None):
   pt = rows[:, C_PT].astype(np.int64)
   kap = robust_kap(pt[usable], rows[usable, C_KAP], NL)
   kap_med = group_median(pt[usable], rows[usable, C_KAP], NL)
+  # where a pass had a steering-limit event or a real takeover near the point, the curvature comes from ALL passes' samples there
+  # (exclusions do not apply): the sharpest of the passes that had the event
+  ev = rows[:, C_EVENT] > .5
+  if ev.any():
+    pe, ke = pt[ev], rows[ev, C_KAP]
+    o = np.lexsort((np.abs(ke), pe))
+    pe, ke = pe[o], ke[o]
+    uk, start, cnt = np.unique(pe, return_index=True, return_counts=True)
+    kap[uk] = ke[start + cnt - 1]
   v = group_median(pt, rows[:, C_V], NL)
   bank = group_median(pt, rows[:, C_BANK], NL)
   grade = group_median(pt, rows[:, C_GRADE], NL)
@@ -705,6 +727,12 @@ def build(passes, info=None):
   carry_flags(arrays, flags, lib, tid)
   if info is not None:
     info['rows'] = int(len(rows))
+    if len(rows):                                   # per output point (private diagnostics, never written to the file)
+      stp = (excl & EX_STOP) > 0
+      key = np.unique(rows[stp, C_PT].astype(np.int64) * 100000 + rows[stp, C_PASS].astype(np.int64))
+      nstop = np.bincount((key // 100000).astype(np.int64), minlength=NL)[:NL]
+      info['_n_stop_pass'] = nstop[order]
+    info['event_points'] = int(np.isin(np.arange(NL), rows[rows[:, C_EVENT] > .5, C_PT].astype(np.int64)).sum()) if len(rows) else 0
     info['excluded_rows'] = int((excl > 0).sum())
     info['excluded_by_reason'] = {nm: int(((excl & b) > 0).sum()) for b, nm in EX_NAMES.items()}
     info['pieces_leaving'] = int(leaving.sum())
@@ -1163,7 +1191,7 @@ def write_memory(passes, path, meta_extra):
   org = origin()
   info = {}
   arrays, stats = build(passes, info)
-  stats.update(info)
+  stats.update({k: v for k, v in info.items() if not k.startswith('_')})
   meta = dict(version=M.VERSION, spacing_m=SP, lat0=org['lat0'], lon0=org['lon0'], kx=org['kx'], ky=org['ky'],
               built=time.strftime('%Y-%m-%d %H:%M'), builder='tools/curve_slowing/build_memory.py', **meta_extra,
               params=dict(tol_m=TOL_M, hdg_tol_deg=math.degrees(HDG_TOL), min_trace_m=MIN_TRACE_M, limit_before_m=LIMIT_BEFORE_M,
