@@ -44,18 +44,16 @@ abort reason, result.
 """
 from typing import NamedTuple, Optional
 
-DT = 0.01                       # the car controller's frame
+# The tap machinery and its caps live in ti_cruise_taps.py (shared with curve slowing), unchanged; re-exported here by name.
+from openpilot.selfdrive.car.mazda.ti_cruise_taps import (DT, FRAME_SPACING, MAX_PRESSED_FRAMES, MAX_TAP_SPAN_S, MIN_TAP_GAP_S,  # noqa: F401
+                                                          PHASE_WAIT_S, PressGuard, Tap)
+
 PARAM_TRIGGER = "TiCruiseCheck"            # tmpfs, the page: {"cmd": "run" | "stop", "id": text, "t": wall seconds}
 PARAM_STATUS = "TiCruiseCheckStatus"       # tmpfs, the car controller: what the page shows (`status`), on change and every second
 STATUS_EVERY = 100              # frames between status writes when nothing changed (the page calls a status older than 3 s stale)
 
 # ---- the tap recipe (see the module docstring for where each number comes from) --------------------------------------------------
 PRESSED_FRAMES = {"A": 2, "B": 3}   # pressed frames per tap: A = a real tap; B = the fallback (still well under the hold)
-FRAME_SPACING = 5               # control frames between pressed frames: 50 ms (the module itself sends at 10 Hz)
-MAX_PRESSED_FRAMES = 3          # hard cap per tap, enforced by PressGuard whatever the recipe says
-MAX_TAP_SPAN_S = 0.15           # hard cap, first to last pressed frame of a tap (a hold is read at 0.52 s; 0.31 s never was one)
-MIN_TAP_GAP_S = 0.25            # last pressed frame of one tap to the first of the next
-PHASE_WAIT_S = 0.2              # a tap waits at most this long for a new car button frame to start after (else it starts anyway)
 
 # ---- the sequence ----------------------------------------------------------------------------------------------------------------
 ROUNDS = 3
@@ -160,67 +158,6 @@ def precondition(inp, orig=None, steady_s=None, need_steady=False):
   if need_steady and (steady_s is None or steady_s < STEADY_S):
     return "speed not steady at the set speed"
   return ""
-
-
-class PressGuard:
-  """The hard cap on a tap, independent of the recipe: at most MAX_PRESSED_FRAMES pressed frames, at most MAX_TAP_SPAN_S from the
-  first to the last, and a new tap only MIN_TAP_GAP_S after the last pressed frame of the previous one. `allow` is called for every
-  pressed frame before it is sent; a refused frame is not sent."""
-
-  def __init__(self):
-    self.tap_first = None
-    self.tap_first_mono = None
-    self.tap_count = 0
-    self.last_frame = None
-    self.last_mono = None
-
-  def begin(self, frame, mono=None):
-    if self.last_frame is not None and (frame - self.last_frame) * DT < MIN_TAP_GAP_S - 1e-9:
-      return False
-    if mono is not None and self.last_mono is not None and mono - self.last_mono < MIN_TAP_GAP_S - 1e-6:
-      return False
-    self.tap_first, self.tap_first_mono, self.tap_count = frame, mono, 0
-    return True
-
-  def allow(self, frame, mono=None):
-    if self.tap_first is None:
-      return False
-    if self.tap_count >= MAX_PRESSED_FRAMES or (frame - self.tap_first) * DT > MAX_TAP_SPAN_S + 1e-9:
-      return False
-    if mono is not None and self.tap_first_mono is not None and mono - self.tap_first_mono > MAX_TAP_SPAN_S + 1e-6:
-      return False                    # real time, too: a stalled or delayed control loop cannot stretch a tap into a hold
-    self.tap_count += 1
-    self.last_frame = frame
-    self.last_mono = mono
-    return True
-
-  def end(self):
-    self.tap_first = None
-
-
-class Tap:
-  """One tap being sent: waits for a new car button frame (counter change) for at most PHASE_WAIT_S, then sends `n` pressed frames
-  FRAME_SPACING apart. `frames`: [(frame, car counter, counter sent)]."""
-
-  def __init__(self, button, n, frame, counter, target=None):
-    self.button, self.n = button, n
-    self.target = target              # the set speed this tap is to give: no pressed frame once it reads that (or anything else wrong)
-    self.requested = frame
-    self.counter0 = counter
-    self.first = None
-    self.frames = []
-
-  def due(self, frame, counter):
-    """True when a pressed frame is to be sent on this frame."""
-    if self.first is None:
-      if counter != self.counter0 or (frame - self.requested) * DT >= PHASE_WAIT_S - 1e-9:
-        return True
-      return False
-    return len(self.frames) < self.n and (frame - self.first) % FRAME_SPACING == 0
-
-  @property
-  def done(self):
-    return len(self.frames) >= self.n
 
 
 class CruiseCheck:
