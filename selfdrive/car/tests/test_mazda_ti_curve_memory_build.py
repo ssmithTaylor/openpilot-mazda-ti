@@ -131,3 +131,21 @@ def test_flag_carried_across_link():
   assert u >= 0
   lim = (arrays['flags'][ts[u]:ts[u + 1]] & M.FLAG_LIMIT) > 0
   assert lim[:3].all()
+
+
+def test_grade_median_and_optional_key(tmp_path):
+  passes = []
+  for i, gr in enumerate((0.02, 0.03, 0.05)):
+    pp = make_pass(f'd{i}', CURVE)
+    pp['grade'] = np.full(len(pp['s']), gr)
+    passes.append(pp)
+  arrays, _ = B.build(passes)
+  assert np.allclose(arrays['grade'][5:-5], 0.03)
+  p = tmp_path / 'g.npz'
+  M.save(p, arrays, {'lat0': 0.0, 'lon0': 0.0, 'kx': 1.0, 'ky': 1.0})
+  assert np.allclose(M.load(p).grade[5:-5], 0.03, atol=1e-4)
+  del arrays['grade']
+  M.save(p, arrays, {'lat0': 0.0, 'lon0': 0.0, 'kx': 1.0, 'ky': 1.0})
+  m = M.load(p)
+  assert m.grade.dtype == np.float64 and np.all(m.grade == 0.0)
+  assert np.isnan(B.build(passes[:1] + [make_pass('d9', CURVE)])[0]['grade']).sum() == 0     # one pass with grade is enough

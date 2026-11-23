@@ -38,8 +38,12 @@ MPH = 0.44704
 DT = 0.01
 REC_DT = 0.05
 READ_S = 0.08
+GRADE_CAP_MS2 = 1.25     # ASSUMPTION: the most deceleration the cruise can produce on the flat (engine and any brake use together); with
+                         # gravity along the slope taken from it, the measured 0.7 m/s^2 is unaffected within +-3 degrees (as measured)
+                         # and falls short beyond about 3 degrees downhill; nothing is known beyond +-3 degrees
 REACT_S = 0.5
 ACCEL_MPH_S = 0.7
+DRIVER_ACCEL_MPH_S = 3.0   # the recorded driver on the gas or with the cruise off (they were not reacting to this feature)
 
 
 def low_priority():
@@ -86,7 +90,7 @@ class SimCruise:
       raise AssertionError("a press was held long enough to be read as a hold")
 
 
-def replay_drive(drive, max_rate=1.5, feature_on=True):
+def replay_drive(drive, max_rate=2.0, feature_on=True):
   cache = np.load(f'{DATA_DIR}/cache/drive_{drive}.npz', allow_pickle=False)
   mem = M.load(f'{DATA_DIR}/loo/{drive}.npz')
   R = {k: cache[k] for k in cache.files}
@@ -108,6 +112,7 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
     cr_en, cr_set = R['cr_en'][sl] > 0.5, R['cr_set'][sl].astype(float)
     lead, en, brk, gas = R['lead'][sl] > 0.5, R['en'][sl] > 0.5, R['brk'][sl] > 0.5, R['gas'][sl] > 0.5
     mla = R['model_la5'][sl].astype(float)
+    grade = R['grade'][sl].astype(float) if 'grade' in R else np.zeros(b - a)
     n = b - a
     xs, ys = mem.to_local(lat, lon)
     rec_set_mph = np.where(cr_set > 0.5, np.round(cr_set / MPH), np.nan)
@@ -127,6 +132,8 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
     events = collections.Counter()
     seq = 0
     last_btn_k = -10 ** 9
+    state_time = collections.Counter()
+    loss_by_state = collections.Counter()
     while p < n - 1:
       # recorded index for the simulated distance (by time while stopped)
       if v_rec[p] < 0.5 and v_sim < 0.5:
@@ -160,13 +167,16 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
         pl = planner.step(t, fix, v_sim, set_mph=cru.set, yaw_k=float(kap[p]), model_k=None)
         plan_times.append(time.perf_counter() - t0)
         d = P.plan_json(pl, t, seq, "act")
-        d["model_la"] = float(mla[p]) if np.isfinite(mla[p]) else None    # the model's preview (5 s) for the restore check
+        d["model_k"] = float(mla[p]) / max(float(v_rec[p]), 5.0) ** 2 if np.isfinite(mla[p]) else None   # the model's sharpest bend (5 s)
         plan, plan_t, seq = d, t, seq + 1
       inp = C.Inputs(on=feature_on, engaged=bool(en[p]), cruise_on=bool(cr_en[p]) and cru.set is not None, cruise_available=True,
                      mph=v_sim / MPH, set_mph=cru.set, brake=bool(brk[p]), gas=bool(gas[p]), lead=bool(lead[p]),
                      driver_button=t < btn_until, counter=cru.counter, plan=plan,
                      plan_age=None if plan_t is None else t - plan_t, mono=t)
       btn = curve.step(k, inp)
+      state_time[(curve.state, curve.why if curve.state in ('restoring', 'holding', 'stopped', 'paused', 'waiting') else '')] += DT
+      if v_rec[p] > 2.0:
+        loss_by_state[(curve.state, curve.why if curve.state in ('restoring', 'holding', 'stopped', 'paused', 'waiting') else '')] +=           DT * max(0.0, 1.0 - v_sim / float(v_rec[p]))
       for ev in curve.events:
         events['ev_' + ev['kind'] + ('_' + ev.get('why', '').split(' ')[0] if ev['kind'] == 'stop' else '')] += 1
       curve.events.clear()
@@ -186,22 +196,28 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
       if v_sim > target:
         if cap is not None and target == cap:
           gap = (v_sim - target) / MPH
-          v_sim = max(target, v_sim - min(max_rate, 0.6 + 0.25 * gap) * MPH * DT)     # the cruise slowing to the lowered set speed
+          dec = min(max_rate, P.decel_mph_s(gap)) * MPH                                 # measured: weak under 3 mph, flat from 6 mph
+          g = float(grade[p]) if np.isfinite(grade[p]) else 0.0
+          avail = GRADE_CAP_MS2 + 9.81 * math.sin(g)                                   # downhill takes from what the cruise can do
+          v_sim = max(target, v_sim - max(0.0, min(dec, avail)) * DT)
         else:
           v_sim = target                                                               # the recording is slower (lead, brake): follow
       elif target - v_sim > 0.3 * MPH:
-        v_sim = min(target, v_sim + ACCEL_MPH_S * MPH * DT)                            # catching up after a release
+        # catching up: the cruise at its measured rate; the driver (gas, or driving with the cruise off) at DRIVER_ACCEL_MPH_S
+        acc = ACCEL_MPH_S if (cr_en[p] and not gas[p] and cru.set is not None) else DRIVER_ACCEL_MPH_S
+        v_sim = min(target, v_sim + acc * MPH * DT)
       else:
         v_sim = target
       s_sim += v_sim * DT
       if not hist or hist[-1][0] != p:
         hist.append((p, t, v_sim, cru.set, curve.state, plan.get("ceil") if plan else None, bool(plan.get("trusted")) if plan else False,
-                     curve.target, curve.why, curve.needs_more))
+                     curve.shown, curve.why, curve.needs_more, float(grade[p]) if np.isfinite(grade[p]) else 0.0))
       t += DT
       k += 1
     rec_T = n * REC_DT
     runs.append(dict(run=r, rec_s=rec_T, sim_s=t, taps_down=taps["SET_MINUS"], taps_up=taps["SET_PLUS"], taps_untrusted=taps_untrusted,
-                     events=dict(events)))
+                     events=dict(events), state_time={f'{a_}|{b_}': round(v_, 1) for (a_, b_), v_ in state_time.items()},
+                     loss={f'{a_}|{b_}': round(v_, 2) for (a_, b_), v_ in loss_by_state.items()}))
     # corners
     H = {h[0]: h for h in hist}
     hp = np.array([h[0] for h in hist])
@@ -232,6 +248,8 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
         late=bool(started is not None and tgt is not None and v_c > tgt + 1.0),
         over_target=None if tgt is None else round(v_c - tgt, 1), state_at=h[4], why_at=h[8], needs_more=bool(h[9]),
         paused_or_stopped_before=any(x[4] in ('paused', 'stopped') for x in before),
+        grade_deg=round(float(np.degrees(np.mean([x[10] for x in before[-60:]]))) if before else 0.0, 2),
+        grade_min_deg=round(float(np.degrees(np.min([x[10] for x in before[-60:]]))) if before else 0.0, 2),
         fits_raw=bool(kc * (v_c * MPH) ** 2 <= P.envelope(v_c)), fits_raw_rec=bool(kc * (float(R['c_v_mph'][j]) * MPH) ** 2 <= P.envelope(float(R['c_v_mph'][j]))),
         fits_margin=bool(P.fits(kc, v_c)), shed=round(max(0.0, float(R['c_v_mph'][j]) - v_c), 1),
         restored_s_after=None if restored is None else round(restored[1] - tc, 1)))
@@ -241,7 +259,9 @@ def replay_drive(drive, max_rate=1.5, feature_on=True):
 
 def _work(args):
   low_priority()
-  d, rate, on = args
+  d, rate, on, buf = args
+  if buf is not None:
+    P.BUFFER_S = buf
   try:
     return replay_drive(d, rate, on)
   except Exception:
@@ -252,40 +272,65 @@ def _work(args):
 def summarise(res):
   C_ = [c for r in res if 'corners' in r for c in r['corners']]
   sat = [c for c in C_ if c['sat'] and c['cruise']]
-  known = [c for c in sat if c['trusted']]
   acted = [c for c in sat if c['started_s_before'] is not None]
-  cov = [c for c in sat if c['trusted'] and c['shed'] >= 1.0 and c['fits_raw']]
+  clean = [c for c in acted if not c['paused_or_stopped_before']]
+  covered = lambda c: c['trusted'] and c['shed'] >= 1.0 and c['fits_raw']
   famil = [c for c in sat if c['nprev'] >= 3]
-  cov_f = [c for c in famil if c in cov]
+  artefact = lambda c: c['paused_or_stopped_before']          # the recorded driver's own button / pedal: not reacting to this feature
   runs = [x for r in res if 'runs' in r for x in r['runs']]
   rec_h = sum(x['rec_s'] for x in runs) / 3600
   pct = lambda xs, q: None if not xs else round(float(np.percentile(xs, q)), 1)
-  early = [c['at_reduced_s'] for c in acted if c['at_reduced_s'] is not None]
-  starts = [c['started_s_before'] for c in acted]
+  early = [c['at_reduced_s'] for c in clean if c['at_reduced_s'] is not None]
+  starts = [c['started_s_before'] for c in clean]
   rest = [c['restored_s_after'] for c in acted if c['restored_s_after'] is not None]
+  over = [c['over_target'] for c in clean if c['over_target'] is not None]
+  st = collections.Counter()
   ev = collections.Counter()
+  lo = collections.Counter()
   for x in runs:
+    for k_, v_ in x.get('loss', {}).items():
+      lo[k_] += v_
     ev.update(x['events'])
+    for k_, v_ in x['state_time'].items():
+      st[k_] += v_
+  steep = [c for c in clean if c['grade_min_deg'] <= -3.0 or c['grade_min_deg'] >= 3.0 or abs(c['grade_deg']) >= 2.0]
+
+  def reason(c):
+    if covered(c):
+      return 'covered'
+    if not c['trusted']:
+      return 'road not trusted at the corner (unknown / trust not yet established)'
+    if artefact(c):
+      return "recording artefact: the recorded driver's own button / pedal / stop"
+    if c['started_s_before'] is None:
+      return 'not started'
+    if c['needs_more']:
+      return 'needs more than 15 mph below (designed limit)'
+    if (c['over_target'] or 0) > 1.0:
+      return 'arrived late'
+    return 'slowed to target but still outside the raw envelope (memory understated or target too high)'
   return dict(
     drives=len([r for r in res if 'runs' in r]), errors=[r['drive'] for r in res if 'error' in r], recorded_hours=round(rec_h, 2),
-    saturating_cruise_corners=len(sat), on_trusted_known_road_at_corner=len(known), slowing_started_for=len(acted),
-    covered_inside_envelope=len(cov), familiar_3plus=len(famil), covered_familiar=len(cov_f),
+    saturating_cruise_corners=len(sat), slowing_started_for=len(acted), uninterrupted_interventions=len(clean),
+    covered=sum(covered(c) for c in sat), covered_excluding_artefacts=f"{sum(covered(c) for c in sat if not artefact(c))} of {sum(not artefact(c) for c in sat)}",
+    covered_familiar=f"{sum(covered(c) for c in famil)} of {len(famil)}",
+    covered_familiar_excluding_artefacts=f"{sum(covered(c) for c in famil if not artefact(c))} of {sum(not artefact(c) for c in famil)}",
     inside_envelope_without_feature=sum(c['fits_raw_rec'] for c in sat),
-    late_arrivals=sum(c['late'] for c in acted), late_over_2mph=sum(1 for c in acted if (c['over_target'] or 0) > 2.0),
-    over_target_mph=dict(p50=pct([c['over_target'] for c in acted if c['over_target'] is not None], 50),
-                         p90=pct([c['over_target'] for c in acted if c['over_target'] is not None], 90)),
-    not_covered_reasons=dict(collections.Counter(
-      'not on trusted known road' if not c['trusted'] else 'driver button / pedal / stop before it' if c['paused_or_stopped_before']
-      else 'needs more than 15 mph below' if c['needs_more'] else 'not started' if c['started_s_before'] is None
-      else 'still too fast for the envelope' for c in sat if not (c['trusted'] and c['shed'] >= 1.0 and c['fits_raw']))), seconds_started_before=dict(p10=pct(starts, 10), p50=pct(starts, 50), p90=pct(starts, 90)),
-    seconds_at_reduced_speed_before_corner=dict(p10=pct(early, 10), p50=pct(early, 50), p90=pct(early, 90), n=len(early)),
-    restored_seconds_after_corner=dict(p50=pct(rest, 50), p90=pct(rest, 90), n=len(rest)),
+    reasons_all=dict(collections.Counter(reason(c) for c in sat)), reasons_familiar=dict(collections.Counter(reason(c) for c in famil)),
+    arrival_within_1mph=f"{sum(1 for x in over if x <= 1.0)} of {len(over)} uninterrupted", arrival_over_target_mph=dict(p50=pct(over, 50), p90=pct(over, 90), max=pct(over, 100)),
+    seconds_started_before_peak=dict(p10=pct(starts, 10), p50=pct(starts, 50), p90=pct(starts, 90)),
+    seconds_at_reduced_speed_before_peak=dict(p10=pct(early, 10), p50=pct(early, 50), p90=pct(early, 90), n=len(early)),
+    restored_seconds_after_peak=dict(p50=pct(rest, 50), p90=pct(rest, 90), n=len(rest)),
     mph_shed_at_corner=dict(p50=pct([c['shed'] for c in acted], 50), p90=pct([c['shed'] for c in acted], 90)),
-    time_cost_s=round(sum(x['sim_s'] - x['rec_s'] for x in runs), 1),
     time_cost_s_per_hour=round(sum(x['sim_s'] - x['rec_s'] for x in runs) / max(rec_h, 1e-9), 1),
-    taps_down=sum(x['taps_down'] for x in runs), taps_up=sum(x['taps_up'] for x in runs),
     taps_down_per_hour=round(sum(x['taps_down'] for x in runs) / max(rec_h, 1e-9), 1),
-    minus_taps_without_trusted_ceiling=sum(x['taps_untrusted'] for x in runs), events=dict(ev),
+    taps_up_per_hour=round(sum(x['taps_up'] for x in runs) / max(rec_h, 1e-9), 1),
+    interventions_per_hour=round(ev.get('ev_start', 0) / max(rec_h, 1e-9), 1),
+    minus_taps_without_trusted_ceiling=sum(x['taps_untrusted'] for x in runs),
+    time_lost_s_per_hour_by_state={k_: round(v_ / max(rec_h, 1e-9), 1) for k_, v_ in lo.most_common(12)},
+    seconds_by_state={k_: round(v_) for k_, v_ in st.most_common(14) if not k_.startswith('ready|') and not k_.startswith('off|')},
+    steep_approaches=[dict(grade=c['grade_deg'], grade_min=c['grade_min_deg'], over=c['over_target']) for c in steep],
+    events=dict(ev),
     planner_ms_mean=round(float(np.mean([r['plan_ms'][0] for r in res if r.get('plan_ms') and r['plan_ms'][0]])), 3),
     planner_ms_p99_max=round(float(np.max([r['plan_ms'][1] for r in res if r.get('plan_ms') and r['plan_ms'][1]])), 3))
 
@@ -295,20 +340,22 @@ def main():
   ap.add_argument('--drives', nargs='*')
   ap.add_argument('--workers', type=int, default=8)
   ap.add_argument('--out', default='E:/openpilot-mazda-ti-data/curve-slowing/replay')
-  ap.add_argument('--max-rate', type=float, default=1.5)
+  ap.add_argument('--max-rate', type=float, default=2.0)
   ap.add_argument('--off', action='store_true', help='feature OFF: asserts nothing is ever sent')
+  ap.add_argument('--buffer', type=float, default=None, help='planner BUFFER_S override (the buffer sweep)')
   a = ap.parse_args()
   drives = a.drives or sorted(os.path.basename(p)[6:-4] for p in glob.glob(f'{DATA_DIR}/cache/drive_*.npz'))
   os.makedirs(a.out, exist_ok=True)
   from multiprocessing import Pool
   t0 = time.time()
   with Pool(a.workers) as pool:
-    res = pool.map(_work, [(d, a.max_rate, not a.off) for d in drives], chunksize=1)
+    res = pool.map(_work, [(d, a.max_rate, not a.off, a.buffer) for d in drives], chunksize=1)
   s = summarise(res)
   s['wall_s'] = round(time.time() - t0)
   s['max_rate'] = a.max_rate
   s['feature_on'] = not a.off
-  tag = ('off' if a.off else 'on') + f'_r{a.max_rate}'
+  tag = ('off' if a.off else 'on') + f'_r{a.max_rate}' + ('' if a.buffer is None else f'_b{a.buffer}')
+  s['buffer_s'] = P.BUFFER_S if a.buffer is None else a.buffer
   json.dump(res, open(f'{a.out}/replay_{tag}.json', 'w'), indent=0)       # position-free
   json.dump(s, open(f'{a.out}/summary_{tag}.json', 'w'), indent=1)
   print(json.dumps(s, indent=1))

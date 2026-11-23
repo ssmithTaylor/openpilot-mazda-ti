@@ -16,8 +16,10 @@ process and the tests feed it one tick at a time.
    checked over +-0.75 mph; where a remembered pass reached the steering limit or had a firm takeover, at least FLAGGED_DROP_MPH below
    the speed that pass was driven at. The driving model's own preview (when it shows a sharper bend than memory in the next few
    seconds) gives a second figure; the lower wins.
-3. A point is "due" at the LATEST distance that still sheds the speed by ENTRY_M before it with the measured response (SHED_TIME,
-   REACTION_S) plus BUFFER_S; only the speed the point needs is shed (no extra beyond MARGIN). The ceiling is the lowest due speed; it holds through the
+3. Slowing for a corner starts at the LATEST moment that still arrives at its speed ENTRY_M before it, given the measured response
+   (see the constants below); closed loop every tick against the planned approach (push / let off / behind plan); held through the
+   corner and released HOLD_AFTER_M past it. Between corners the output is a "hold" ceiling: the highest set speed a restore may reach
+   from which the NEXT corner can still be made, so chained corners keep only what the next one needs. The ceiling is the lowest due speed; it holds through the
    corner and is released HOLD_AFTER_M after the last tight point has been passed.
 
 Output (`Plan`): ceiling in whole mph (None: no ceiling), confidence, trusted, known road, reason, distance to the limiting point, and the
@@ -45,17 +47,110 @@ MAX_MPH = 90
 
 # ---- when to start: as LATE as still reaches the corner speed (owner, 2026-11-23: "we should ensure that we're not slowing down
 # further ahead than we need to ... We only want to do what we need to, speed change wise, and speed of speed change wise.")
-# Measured from the first set-speed press (cruise-slowing-20261122 and the corner design's response table): reaction ~0.5 s;
-# 5 mph shed in ~4.4 s (planning allowance 5.2 s), 10 mph 7.5-9 s (8.5), 15 mph 12-14 s (13.5); peak ~1.35-1.5 mph/s for 5 mph, cap
-# ~2 mph/s. SHED_TIME is the planning allowance (the slower end of the measurements: no more deceleration than measured is assumed);
-# beyond 15 mph it continues at 1 mph/s. The set speed goes straight to the corner speed when due: the car's own response to that step
-# is what the allowance measures (its deceleration grows with the gap only up to ~6 mph, so a smaller step would be slower, not gentler).
+# The stock cruise's measured response to a lower set speed (cruise-slowing-20261122): reaction ~0.5 s, then a deceleration that
+# depends on the gap between speed and set speed: ~0.34 m/s^2 (0.76 mph/s) for a gap up to 3 mph, rising to ~0.9-1.0 m/s^2 (cap ~2 mph/s)
+# at 6 mph and more. So the approach is: PUSH (set DRIVE_GAP_MPH below the corner speed, never below the floor) so the car slows at the
+# rate it can, then set the corner speed itself once within RAISE_AT_MPH of it (no undershoot). The start is the latest moment that
+# still arrives by ENTRY_M before the corner with RESP_FACTOR of the measured deceleration and BUFFER_S of margin. CLOSED LOOP every
+# tick: the car's speed is compared with the highest speed from which it can still make it (`v_allow`); a car slowing less than planned
+# (downhill or anything else) is pushed to the floor; one slowing more (uphill) is let off to the corner speed (with hysteresis).
 REACTION_S = 0.5
-SHED_TIME = ((0.0, 0.5), (5.0, 5.2), (10.0, 8.5), (15.0, 13.5))   # (mph shed, seconds from the first press)
-BUFFER_S = 1.0                  # the small stated buffer on top (to be chosen from the replay's "late" and "early" figures)
+TAP_S = 0.3                     # one set-speed tap per this (2 pressed frames + the reviewed 0.25 s gap)
+DRIVE_GAP_MPH = 6                # a gap of 6 mph or more gives the most deceleration the cruise has; more does nothing
+RAISE_AT_MPH = 1.5
+RESP_FACTOR = 0.9               # plan with 90 % of the measured deceleration
+BUFFER_S = 1.0                  # extra seconds of start-early margin (chosen from the replay's buffer / early / late curve)
 ENTRY_M = 10.0                  # be at the corner speed this far before the first point that needs it
+COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
+REPUSH_MPH = 1.0                # ... and push again when back within this of v_allow
+BEHIND_MPH = 1.0                # above v_allow by this: behind plan (the gap is already at its most useful: nothing more to ask of the
+                                # set speed; the corner is flagged "needs more than I can slow" and logged)
+MIN_SWITCH_S = 3.0              # no push / let-off reversal within this unless behind plan
+GRADE_STEEP_DEG = 3.0           # remembered approach steeper downhill than this: start earlier
+GRADE_BUFFER_S_PER_DEG = 0.5    # ... by this per degree beyond GRADE_STEEP_DEG (no data beyond +-3 degrees: a guess, logged)
 MIN_DROP_MPH = 2                # a point needing less than this below the speed is ignored (the car can hold it at its speed)
 HOLD_AFTER_M = 30.0             # keep the ceiling this far past the last tight point
+
+
+SAT_MPH_S = 1.6                 # the saturated rate at a 6+ mph gap: ~0.7 m/s^2 mean (peaks 0.9-1.0)
+
+
+def decel_mph_s(gap):
+  """The stock cruise's measured deceleration (mph/s) for a gap (mph) between speed and set speed."""
+  if gap <= 0.0:
+    return 0.0
+  if gap < 1.0:
+    return 0.76 * gap
+  if gap <= 3.0:
+    return 0.76
+  if gap >= 6.0:
+    return SAT_MPH_S
+  return 0.76 + (SAT_MPH_S - 0.76) * (gap - 3.0) / 3.0
+
+
+_APPROACH = {}
+
+
+def approach_m(u, T, S1, dt=0.05):
+  """Metres from the first press until the speed is within 0.5 mph of T, starting at u mph with the set speed at u, tapping down to S1
+  (one tap per TAP_S), raising to T once within RAISE_AT_MPH of it; the cruise acts REACTION_S after the set speed changes, with
+  RESP_FACTOR of the measured deceleration. Cached by whole mph."""
+  key = (int(u), int(T), int(S1))
+  r = _APPROACH.get(key)
+  if r is not None:
+    return r
+  v = float(key[0])
+  T, S1 = key[1], key[2]
+  hist = []                       # set speed by step, for the reaction delay
+  setn = v
+  t = dist = 0.0
+  tap_t = 0.0
+  raised = False
+  lag = int(round(REACTION_S / dt))
+  while v > T + 0.5 and t < 90.0:
+    if not raised and v <= T + RAISE_AT_MPH:
+      raised = True
+    goal = T if raised else S1
+    if t >= tap_t and setn != goal:
+      setn += 1 if goal > setn else -1
+      tap_t = t + TAP_S
+    hist.append(setn)
+    eff = hist[-1 - lag] if len(hist) > lag else float(key[0])
+    v = max(0.0, v - RESP_FACTOR * decel_mph_s(v - eff) * dt)
+    dist += v * MPH * dt
+    t += dt
+  _APPROACH[key] = dist
+  return dist
+
+
+def v_allow(D, T, S1, buf_s):
+  """The highest speed (mph, fractional) from which the car can still be at T by distance D with the push approach and buf_s of
+  margin at that speed; T when even T + 1 cannot."""
+  def need(u):
+    return approach_m(u, T, S1) + buf_s * u * MPH
+  lo = int(T)
+  if need(lo + 1) > D:
+    return float(T)
+  hi = MAX_MPH
+  if need(hi) <= D:
+    return float(hi)
+  while hi - lo > 1:
+    mid = (lo + hi) // 2
+    if need(mid) <= D:
+      lo = mid
+    else:
+      hi = mid
+  a, b = need(lo), need(hi)
+  return lo + (0.0 if b <= a else min(1.0, max(0.0, (D - a) / (b - a))))
+
+
+def slow_distance_m(from_mph, to_mph, floor_mph=CAR_MIN_MPH):
+  """Metres before the corner at which slowing from `from_mph` to `to_mph` must start (approach + buffer + ENTRY_M)."""
+  if from_mph - to_mph <= 0:
+    return ENTRY_M
+  S1 = max(floor_mph, to_mph - DRIVE_GAP_MPH)
+  return approach_m(from_mph, to_mph, S1) + BUFFER_S * from_mph * MPH + ENTRY_M
+
 
 # ---- look-ahead (long-horizon study: warning beyond 25-30 s stops helping) -----------------------------------------------------
 LOOKAHEAD_S = 45.0
@@ -133,29 +228,6 @@ def needed_mph(kap, flags, v_flag):
   return np.minimum(need, np.maximum(cap, CAR_MIN_MPH))
 
 
-def shed_time_s(drop_mph):
-  """Seconds from the first press until `drop_mph` has been shed (the measured planning allowance; 1 mph/s beyond 15 mph)."""
-  d = max(0.0, float(drop_mph))
-  pts = SHED_TIME
-  if d >= pts[-1][0]:
-    return pts[-1][1] + (d - pts[-1][0]) / 1.0
-  for (d0, t0), (d1, t1) in zip(pts, pts[1:]):
-    if d <= d1:
-      return t0 + (t1 - t0) * (d - d0) / (d1 - d0)
-  return pts[-1][1]
-
-
-def slow_distance_m(from_mph, to_mph):
-  """Metres driven from the first press until the speed is down from `from_mph` to `to_mph` (speed falls roughly linearly after the
-  reaction), plus BUFFER_S at the start speed and ENTRY_M: the latest distance at which slowing may start."""
-  drop = max(0.0, from_mph - to_mph)
-  if drop <= 0.0:
-    return ENTRY_M
-  t = shed_time_s(drop)
-  avg = 0.5 * (from_mph + to_mph)
-  return from_mph * MPH * (REACTION_S + BUFFER_S) + avg * MPH * max(0.0, t - REACTION_S) + ENTRY_M
-
-
 class Fix(NamedTuple):
   valid: bool
   x: float = 0.0                  # local metres (Memory.to_local)
@@ -175,6 +247,8 @@ class Plan(NamedTuple):
   model_la: Optional[float]       # largest |predicted lateral accel| in the model's next MODEL_LOOK_S (None: no model)
   capped: bool                    # the corner wants more than the car side may shed (logged for the owner)
   limit_mph: Optional[int] = None # the road's known speed limit (frogpilotPlan.slcMapSpeedLimit), None when unknown
+  model_k: Optional[float] = None # the sharpest |curvature| in the model's next MODEL_LOOK_S (the car side's restore check)
+  kind: str = ""                  # "corner": slow to the ceiling; "hold": the highest set speed a restore may reach (never slows)
   trace: int = -1
   point: int = -1
 
@@ -208,7 +282,10 @@ class Planner:
     self.cmp_next = 0.0
     self.distrust_until = -1.0
     self.distrust_why = ""
-    self.committed = {}                 # point -> (speed it allows, odometer where it is): corners slowing has started for
+    self.active = {}                    # point -> corner in progress: T (corner speed), at (odometer of the point), mode, since
+    self.int_floor = None
+    self.int_base = None
+    self.model_k = None
     self.events = []
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
@@ -233,7 +310,7 @@ class Planner:
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
     self.trace = -1
     self.cmp = []
-    self.committed = {}
+    self.active = {}
 
   def _advance(self, dist):
     """Move along the trace by `dist` metres; follows the continuation link at the end, or loses the lock."""
@@ -345,6 +422,7 @@ class Planner:
       a = 1.0 if dt <= 0 else min(1.0, dt / LIVE_K_TAU_S)
       self.live_k += a * (yaw_k - self.live_k)
     model_la, model_need, model_dist = None, None, None
+    self.model_k = None
     if model_k is not None:
       ts, ks = model_k
       ts, ks = np.asarray(ts, np.float64), np.asarray(ks, np.float64)
@@ -353,6 +431,7 @@ class Planner:
         kk = np.abs(ks[sel])
         j = int(np.argmax(kk))
         model_la = float(kk[j] * max(v, 1.0) ** 2)
+        self.model_k = float(kk[j])
         model_need, model_dist = float(corner_mph(kk[j])[0]), float(ts[sel][j] * v)
     if self.mem is None:
       return self._out(None, 0.0, False, False, "no road memory on the device", None, None, model_la)
@@ -391,36 +470,101 @@ class Planner:
         idx = np.r_[idx, -1]
         dist = np.r_[dist, model_dist]
         need = np.r_[need, model_need]
-    # what the car side will actually shed: never below its floor (the known limit, else the speed now, minus MAX_SHED_MPH), so the
-    # timing is for the drop that will really be asked for (a corner needing more is flagged, not started earlier)
-    floor = max(self.ABS_FLOOR_MPH, (self.limit if self.limit else int(round(mph))) - self.MAX_SHED_MPH)
+    # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
+    # (kept from the first corner of a chain until the car is back near the speed it started from, as the car side does)
+    if self.active or (self.int_base is not None and mph < self.int_base - 2.0):
+      floor = self.int_floor
+    else:
+      floor = max(self.ABS_FLOOR_MPH, (self.limit if self.limit else int(round(mph))) - self.MAX_SHED_MPH)
+      self.int_floor, self.int_base = floor, None
     shed_to = np.maximum(need, floor)
-    tight = (u - shed_to) >= MIN_DROP_MPH
-    if tight.any():
-      ti = np.nonzero(tight)[0]
-      dd = np.array([slow_distance_m(u, n) for n in shed_to[ti]])
-      for j in ti[dist[ti] <= dd]:
-        # due: committed until HOLD_AFTER_M past it (a corner once started is held, never dropped because the car has slowed)
-        key = int(idx[j])
-        at = self.odo + float(dist[j])
-        old = self.committed.get(key)
-        if old is None or need[j] < old[0]:
-          self.committed[key] = (float(need[j]), at if old is None else old[1])
-    for key in [k for k, (_, at) in self.committed.items() if self.odo > at + HOLD_AFTER_M]:
-      del self.committed[key]
-    ceil, cdist, cpt = None, None, -1
-    if self.committed:
-      key, (n_, at) = min(self.committed.items(), key=lambda kv: (kv[1][0], kv[1][1]))
-      ceil, cdist, cpt = int(n_), round(at - self.odo, 1), key
+    grade = getattr(self.mem, "grade", None)
+    # tight against the speed now, the set speed, and (within a chain) the speed the chain started from, so a corner just after one
+    # already slowed for still bounds the way back up (a "hold")
+    u_ref = max(u, self.int_base or 0.0)
+    tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
+    # corners: runs of consecutive tight points; per run, its first point and its lowest-speed point
+    cands = {}
+    if len(tight):
+      breaks = np.nonzero(np.diff(tight) > 1)[0]
+      starts = np.r_[0, breaks + 1]
+      ends = np.r_[breaks, len(tight) - 1]
+      for s0, s1 in zip(starts, ends):
+        run = tight[s0:s1 + 1]
+        lowest = run[int(np.argmin(need[run]))]
+        key = int(idx[lowest])
+        for j in {int(run[0]), int(lowest)}:
+          T = int(shed_to[j])
+          D = float(dist[j]) - ENTRY_M
+          buf = BUFFER_S
+          if grade is not None and dist[j] > 0:
+            sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
+            g = float(np.degrees(np.nanmean(grade[sel]))) if len(sel) else 0.0
+            if math.isfinite(g) and g < -GRADE_STEEP_DEG:
+              buf += GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
+          va = v_allow(D, T, max(floor, T - DRIVE_GAP_MPH), buf)
+          c = cands.get(key)
+          if c is None or va < c["va"]:
+                cands[key] = {"T": T, "need": int(need[j]), "va": va, "D": D, "at": self.odo + float(dist[run[-1]])}
+    # start: the car is at or above the highest speed from which it can still make it
+    for key, c in cands.items():
+      if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
+        if not self.active and self.int_base is None:
+          self.int_base = mph
+        self.active[key] = {"T": c["T"], "need": c["need"], "at": c["at"], "mode": "push", "since": t}
+        self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
+                            "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
+    for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
+      self.events.append({"kind": "passed", "point": key, "T": self.active[key]["T"], "mph": round(mph, 1)})
+      del self.active[key]
+    ceil, cdist, cpt, kind, corner = None, None, -1, "", None
+    behind = False
+    for key, a_ in self.active.items():
+      c = cands.get(key)
+      va = c["va"] if c is not None else float(a_["T"])
+      if c is not None:
+        a_["T"] = min(a_["T"], c["T"])
+      T = a_["T"]
+      S1 = max(floor, T - DRIVE_GAP_MPH)
+      mode = a_["mode"]
+      if mode != "target":
+        if mph <= T + RAISE_AT_MPH:
+          mode = "target"
+        elif mph > va + BEHIND_MPH:
+          mode = "behind"
+        elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
+          mode = "coast"
+        elif mode == "behind" and mph <= va:
+          mode = "push"
+        elif mode == "coast" and mph >= va - REPUSH_MPH:
+          mode = "push"
+      if mode != a_["mode"]:
+        self.events.append({"kind": "mode", "point": key, "mode": mode, "mph": round(mph, 1), "planned": round(va, 1), "T": T})
+        a_["mode"], a_["since"] = mode, t
+      cc = S1 if mode in ("push", "behind") else T
+      if mode == "behind":
+        behind = True
+      if ceil is None or cc < ceil:
+        ceil, cdist, cpt, kind, corner = cc, round(a_["at"] - self.odo, 1), key, "corner", T
+    if not self.active:
+      # no corner in progress: the highest set speed a restore may reach so the NEXT corner can still be made (chained corners hold
+      # only what the next one needs; a corner far enough away lets the speed come back fully)
+      hold = None
+      for key, c in cands.items():
+        if hold is None or c["va"] < hold[0]:
+          hold = (c["va"], key, c)
+      if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
+        ceil, cdist, cpt, kind, corner = int(math.floor(hold[0])), round(hold[2]["D"], 1), hold[1], "hold", hold[2]["T"]
     if ceil is None:
       return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
-    capped = ceil < floor
-    why = "model preview: sharper bend" if cpt == -1 else ("corner ahead" if cdist > 0 else "in the corner")
-    return self._out(ceil, conf, True, True, why, cdist, ceil, model_la, capped=capped, point=cpt)
+    capped = (bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor) or behind
+    why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if cdist > 0 else "in the corner")
+    return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
+                     past=kind == "hold")
 
-  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1):
+  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind=""):
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
-                self.limit, self.trace, point)
+                self.limit, self.model_k, kind, self.trace, point)
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -428,4 +572,5 @@ def plan_json(plan, t_mono, seq, mode):
   return {"m": round(t_mono, 2), "seq": seq, "mode": mode, "ceil": plan.ceil, "conf": plan.conf, "trusted": plan.trusted,
           "known": plan.known, "why": plan.why, "dist": plan.dist_m, "past": plan.past,
           "model_la": None if plan.model_la is None else round(plan.model_la, 2), "capped": plan.capped,
-          "limit": plan.limit_mph}
+          "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
+          "corner": plan.corner_mph}

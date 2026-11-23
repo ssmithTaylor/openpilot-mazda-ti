@@ -20,7 +20,9 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
     distance); each pass's curvature is smoothed along the road (~10 m Gaussian) first, then kap is CONSERVATIVE (meta kap_rule
     "max<3,p90>=3"): with 1-2 passes the sharpest pass (largest |kap|, its sign), with 3+ passes the 90th percentile of |kap| signed
     by the median's sign (a stored pass that understated the corner was the biggest avoidable miss in the long-horizon study);
-    v = median speed, bank = median (nan where unknown), npass = passes;
+    v = median speed, bank = median (nan where unknown), npass = passes; grade = median over passes of the road grade (radians,
+    + uphill in the direction of travel; nan where unknown): liveLocationKalman calibratedOrientationNED.value[1] (pitch in the
+    calibrated car frame, nose up +, so no further calibration), low-passed with a Gaussian of sigma GRADE_SIGMA_S (~3 s window);
   * flags: FLAG_LIMIT where a pass had the steering at its limit (study's run_events: |ti_cmd| >= 590 for >= 0.3 s, lateral active,
     driver not pressing), spread from LIMIT_BEFORE_M before to LIMIT_AFTER_M after the event; FLAG_TAKEOVER for a FIRM takeover
     (lateral active, |driver torque| >= TK_DRV counts for >= 0.5 s, then within 2 s lateral control inactive or openpilot disengaged;
@@ -32,8 +34,9 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
   All leave-one-out files share one local frame (lat0/lon0 from the FULL default drive set, kept in DATA_DIR/cache/origin.json).
 
 Private caches (DATA_DIR/cache, positions allowed there only):
-  pos/<tag>.npz        per segment, raw liveLocationKalman rows: llk[:, 0..5] = t (s from the segment's first carState), latitude,
-                       longitude, positionGeodetic.valid, gpsOK, calibratedOrientationNED.value[2] (rad, NED yaw = bearing)
+  pos/<tag>.npz        per segment, raw liveLocationKalman rows: llk[:, 0..7] = t (s from the segment's first carState), latitude,
+                       longitude, positionGeodetic.valid, gpsOK, calibratedOrientationNED.value[2] (rad, NED yaw = bearing),
+                       calibratedOrientationNED.value[1] (rad, pitch, nose up +), positionGeodetic.value[2] (altitude, m)
   passes.pkl           the prepared runs (local x/y on the 20 Hz grid + the per-run signals) used by the builds
   origin.json          lat0, lon0, kx, ky
   drive_<drive>.npz    REPLAY cache, one per drive. 20 Hz arrays, all runs of the drive concatenated:
@@ -41,7 +44,8 @@ Private caches (DATA_DIR/cache, positions allowed there only):
                          and gpsOK), bearing_deg (deg clockwise from north, from calibratedOrientationNED.value[2]), v (m/s),
                          kap (1/m, yaw-based, left +), cr_en, cr_set (as logged, m/s), lead, en (openpilot enabled),
                          lat_act (lateral active; named lat_act because `lat` is the latitude), brk, gas, pressed, blink,
-                         ti (ti_cmd), model_la5 (max |predicted lateral accel| over the model forecast up to 5 s, m/s^2)
+                         ti (ti_cmd), model_la5 (max |predicted lateral accel| over the model forecast up to 5 s, m/s^2),
+                         grade (rad, + uphill, the same low-passed pitch as the memory; nan where unknown)
                        run_off int64 [n_runs + 1]: run r is samples run_off[r] .. run_off[r+1]-1
                        seg_tags str [n_segs], seg_off int64 [n_segs] (sample index where each segment starts), seg_run int [n_segs]
                        corners (position-free, the study's corners.pkl entries of this drive): c_id str, c_run, c_i20 (sample index
@@ -96,6 +100,8 @@ EVENT_SLACK = 20               # 20 Hz samples: an event belongs to a piece with
 LINK_DIST_M = 20.0
 LINK_HDG = math.radians(30.0)
 KAP_SIGMA_M = 10.0
+GRADE_SIGMA_S = 1.0            # Gaussian sigma of the grade low-pass (about a 3 s window)
+LLK_COLS = 8
 SAT_TI = 590.0
 SAT_MIN = 6
 
@@ -285,14 +291,15 @@ def collect(passes, lib, aligns):
           sr = np.interp(g, s_lib, s[idx20[ks]])
           i20 = np.clip(np.searchsorted(s, sr), 0, len(s) - 1)
           kap = gauss(np.interp(sr, s, p['kap']), KAP_SIGMA_M / SP)     # ~10 m along the road, per pass
-          rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20]])
+          gr = p['grade'][i20] if 'grade' in p else np.full(len(q), np.nan)
+          rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr])
           for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M)):
             for e in evs:
               if i20[0] - EVENT_SLACK <= e <= i20[-1] + EVENT_SLACK:
                 ge = float(np.interp(s[e], sr, g)) if len(sr) > 1 else float(g[0])
                 flags.append((rd, ge - lo, ge + hi, fl, float(p['v'][e])))
       k = k2 + 1
-  rows = np.concatenate(rows) if rows else np.zeros((0, 5))
+  rows = np.concatenate(rows) if rows else np.zeros((0, 6))
   return rows, flags, cuts, trans
 
 
@@ -342,8 +349,9 @@ def merge(rows, NL):
   kap = conservative_kap(pt, rows[:, 2] if len(rows) else np.zeros(0), NL)
   v = group_median(pt, rows[:, 3] if len(rows) else np.zeros(0), NL)
   bank = group_median(pt, rows[:, 4] if len(rows) else np.zeros(0), NL)
+  grade = group_median(pt, rows[:, 5] if len(rows) else np.zeros(0), NL)
   npass = np.bincount(pt, minlength=NL)[:NL]
-  return kap, v, bank, npass
+  return kap, v, bank, npass, grade
 
 
 def spread_flags(flags, lib):
@@ -445,7 +453,7 @@ def build(passes):
   lib, aligns = build_library(passes)
   rows, flags, cuts, trans = collect(passes, lib, aligns)
   NL = len(lib['x'])
-  kap, v, bank, npass = merge(rows, NL)
+  kap, v, bank, npass, grade = merge(rows, NL)
   fl, vf = spread_flags(flags, lib)
   out = collections.defaultdict(list)
   starts = [0]
@@ -466,6 +474,7 @@ def build(passes):
       out['x'].append(lib['x'][sl][a:c]); out['y'].append(lib['y'][sl][a:c]); out['hdg'].append(h[a:c])
       out['kap'].append(k_s[a:c]); out['v'].append(v_s[a:c]); out['flags'].append(fl[sl][a:c]); out['v_flag'].append(vf[sl][a:c])
       out['npass'].append(npass[sl][a:c]); out['bank'].append(bank[sl][a:c])
+      out['grade'].append(grade[sl][a:c])
       tid[(rd, a)] = len(starts) - 1
       tid[(rd, c - 1, 'end')] = len(starts) - 1
       starts.append(starts[-1] + c - a)
@@ -517,10 +526,10 @@ def select_tags(drives=None, exclude=()):
 
 
 def read_positions(args):
-  """one rlog -> raw liveLocationKalman rows (t, lat, lon, valid, gpsOK, yaw), saved to the private cache"""
+  """one rlog -> raw liveLocationKalman rows (t, lat, lon, valid, gpsOK, yaw, pitch, altitude), saved to the private cache"""
   tag, path = args
   outp = _p('cache', 'pos', tag + '.npz')
-  if os.path.exists(outp):
+  if pos_cached(tag):
     return tag, 'cached'
   from cereal import log as clog
   with open(path, 'rb') as f:
@@ -539,14 +548,23 @@ def read_positions(args):
         o = lk.calibratedOrientationNED.value
         if len(p.value) < 2:
           continue
-        rows.append(((e.logMonoTime - t0) * 1e-9, p.value[0], p.value[1], float(p.valid), float(lk.gpsOK), o[2] if len(o) > 2 else np.nan))
-  np.savez_compressed(outp, llk=np.array(rows, float).reshape(-1, 6))
+        rows.append(((e.logMonoTime - t0) * 1e-9, p.value[0], p.value[1], float(p.valid), float(lk.gpsOK), o[2] if len(o) > 2 else np.nan,
+                     o[1] if len(o) > 2 else np.nan, p.value[2] if len(p.value) > 2 else np.nan))
+  np.savez_compressed(outp, llk=np.array(rows, float).reshape(-1, LLK_COLS))
   return tag, 'read'
+
+
+def pos_cached(tag):
+  f = _p('cache', 'pos', tag + '.npz')
+  if not os.path.exists(f):
+    return False
+  with np.load(f) as z:
+    return z['llk'].ndim == 2 and z['llk'].shape[1] >= LLK_COLS
 
 
 def ensure_positions(tags, workers):
   os.makedirs(_p('cache', 'pos'), exist_ok=True)
-  todo = [(t, p) for t, p in tags.items() if not os.path.exists(_p('cache', 'pos', t + '.npz'))]
+  todo = [(t, p) for t, p in tags.items() if not pos_cached(t)]
   if todo:
     t0 = time.time()
     from multiprocessing import Pool
@@ -577,12 +595,13 @@ def origin():
 
 
 def seg_grid(tag, n):
-  """positions of one segment on its 20 Hz grid: lat, lon (nan where not ok), pos_ok, bearing_deg"""
+  """positions of one segment on its 20 Hz grid: lat, lon (nan where not ok), pos_ok, bearing_deg, pitch (rad), altitude (m)"""
   l = np.load(_p('cache', 'pos', tag + '.npz'))['llk']
   tg = np.arange(n) * DT
   lat = np.full(n, np.nan); lon = np.full(n, np.nan); pok = np.zeros(n, bool); brg = np.full(n, np.nan)
+  pit = np.full(n, np.nan); alt = np.full(n, np.nan)
   if len(l) < 2:
-    return lat, lon, pok, brg
+    return lat, lon, pok, brg, pit, alt
   l = l[np.argsort(l[:, 0])]
   ok = (l[:, 3] > .5) & (l[:, 4] > .5) & (np.abs(l[:, 1]) > 1)
   j = np.clip(np.searchsorted(l[:, 0], tg), 1, len(l) - 1)
@@ -597,7 +616,27 @@ def seg_grid(tag, n):
   if yo.sum() >= 2:
     yaw = np.interp(tg, l[yo, 0], np.unwrap(l[yo, 5]))
     brg = np.where(np.abs(l[nn, 0] - tg) < 0.2, np.degrees(yaw) % 360.0, np.nan)
-  return lat, lon, pok, brg
+  near = np.abs(l[nn, 0] - tg) < 0.2
+  po = np.isfinite(l[:, 6])
+  if po.sum() >= 2:
+    pit = np.where(near & po[nn], np.interp(tg, l[po, 0], l[po, 6]), np.nan)
+  if ok.sum() >= 2:
+    ao = ok & np.isfinite(l[:, 7])
+    if ao.sum() >= 2:
+      alt = np.where(pok, np.interp(tg, l[ao, 0], l[ao, 7]), np.nan)
+  return lat, lon, pok, brg, pit, alt
+
+
+def lowpass_nan(a, sigma_samples):
+  """Gaussian low-pass that ignores nan (normalised convolution); nan stays nan"""
+  from scipy.ndimage import gaussian_filter1d
+  a = np.asarray(a, float)
+  ok = np.isfinite(a)
+  if not ok.any():
+    return a.copy()
+  num = gaussian_filter1d(np.where(ok, a, 0.0), sigma_samples, mode='nearest')
+  den = gaussian_filter1d(ok.astype(float), sigma_samples, mode='nearest')
+  return np.where(ok & (den > 0.2), num / np.maximum(den, 1e-9), np.nan)
 
 
 def runs_of(tags):
@@ -630,6 +669,8 @@ def prepare_runs(tags, org, replay=False):
     p = dict(drive=d, tags=list(ts), off=off, v=v.astype(np.float32), kap=cat(lambda z, q: q['kap']).astype(np.float32),
              bank=cat(lambda z, q: q['bank']).astype(np.float32))
     p['s'] = np.r_[0, np.cumsum(v[:-1].astype(float) * DT)]
+    p['grade'] = lowpass_nan(np.concatenate([g[4] for g in grids]), GRADE_SIGMA_S / DT).astype(np.float32)
+    p['alt'] = np.concatenate([g[5] for g in grids]).astype(np.float32)
     p['X'] = (lon - org['lon0']) * org['kx']
     p['Y'] = (lat - org['lat0']) * org['ky']
     sig = {nm: cat(lambda z, q, f=f: z[f]).astype(np.float32) for nm, f in (('en', 'enabled'), ('lat_act', 'lat_act'), ('ti', 'ti_cmd'),
@@ -746,7 +787,8 @@ def read_rlog_seg(args):
         pg = lk.positionGeodetic
         o = lk.calibratedOrientationNED.value
         if len(pg.value) >= 2:
-          llk.append((t, pg.value[0], pg.value[1], float(pg.valid), float(lk.gpsOK), o[2] if len(o) > 2 else np.nan))
+          llk.append((t, pg.value[0], pg.value[1], float(pg.valid), float(lk.gpsOK), o[2] if len(o) > 2 else np.nan,
+                      o[1] if len(o) > 2 else np.nan, pg.value[2] if len(pg.value) > 2 else np.nan))
       elif w == 'can':
         for fr in e.can:
           if fr.src == 0 and fr.address == 0x75 and len(fr.dat) >= 8:
@@ -777,7 +819,7 @@ def read_rlog_seg(args):
       d['yaw_raw'] = ((dat[:, 4] << 8) | dat[:, 5])[k].astype(np.float32)
     with open(f20, 'wb') as fh:
       np.savez_compressed(fh, **{k: np.asarray(v, np.float32) for k, v in d.items()})
-    llk = np.array(llk, float).reshape(-1, 6)
+    llk = np.array(llk, float).reshape(-1, LLK_COLS)
     llk[:, 0] = (llk[:, 0] - t0) * 1e-9
     with open(fpos, 'wb') as fh:
       np.savez_compressed(fh, llk=llk)
@@ -873,7 +915,7 @@ def write_replay_caches(tags, workers):
   for t in tags:
     by_drive.setdefault(t.split('-')[0], []).append(t)
   F = ('v', 'kap', 'cr_en', 'cr_set', 'lead', 'en', 'lat_act', 'brk', 'gas', 'pressed', 'blink', 'ti', 'model_la5', 'lat', 'lon', 'pos_ok',
-       'bearing_deg')
+       'bearing_deg', 'grade')
   for d, ts in by_drive.items():
     runs = prepare_runs(ts, org, replay=True)
     tag_pos = {}

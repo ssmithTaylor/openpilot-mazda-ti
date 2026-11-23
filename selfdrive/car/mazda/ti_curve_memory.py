@@ -18,6 +18,8 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
   v_flag       float16 m/s, the lowest speed of a pass that set a flag here (nan where no flag)
   npass        uint8, passes behind the point
   bank         float16 m/s^2 (nan where unknown); informational only
+  grade        OPTIONAL float16 radians, road grade, positive = uphill in the direction of travel (median over passes of the
+               liveLocationKalman calibrated pitch, low-passed ~3 s); nan where unknown; read as zeros when the file has none
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
   trace_next   int32 [n_traces]: the trace that continues this one past its last point (-1: none or ambiguous)
 """
@@ -32,6 +34,7 @@ FLAG_LIMIT = 1
 FLAG_TAKEOVER = 2
 CELL_M = 50.0                    # grid cell of the nearest-point index
 KEYS = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next")
+OPTIONAL_KEYS = ("bank", "grade")
 
 
 def wrap(a):
@@ -52,6 +55,7 @@ class Memory:
     self.v_flag = np.asarray(arrays["v_flag"], np.float64)
     self.npass = np.asarray(arrays["npass"], np.int32)
     self.bank = np.asarray(arrays.get("bank", np.full(len(self.x), np.nan)), np.float64)
+    self.grade = np.asarray(arrays.get("grade", np.zeros(len(self.x))), np.float64)
     self.trace_start = np.asarray(arrays["trace_start"], np.int64)
     self.trace_next = np.asarray(arrays["trace_next"], np.int64)
     self.n = len(self.x)
@@ -72,7 +76,7 @@ class Memory:
 
   def _check(self):
     n = self.n
-    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank"):
+    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade"):
       if len(getattr(self, name)) != n:
         raise ValueError(f"memory: {name} has {len(getattr(self, name))} points, x has {n}")
     if len(self.trace_start) < 1 or self.trace_start[0] != 0 or self.trace_start[-1] != n or np.any(np.diff(self.trace_start) < 1):
@@ -145,8 +149,8 @@ def load(path):
     meta = json.loads(str(z["meta"]))
     if int(meta.get("version", -1)) != VERSION:
       raise ValueError(f"memory: version {meta.get('version')} (expected {VERSION})")
-    arrays = {k: z[k] for k in KEYS if k in z.files}
-  missing = [k for k in KEYS if k not in arrays and k != "bank"]
+    arrays = {k: z[k] for k in KEYS + ("grade",) if k in z.files}
+  missing = [k for k in KEYS if k not in arrays and k not in OPTIONAL_KEYS]
   if missing:
     raise ValueError(f"memory: missing {missing}")
   return Memory(arrays, meta)
@@ -166,6 +170,8 @@ def save(path, arrays, meta):
     "bank": np.asarray(arrays.get("bank", np.full(len(arrays["x"]), np.nan)), np.float16),
     "trace_start": np.asarray(arrays["trace_start"], np.int32), "trace_next": np.asarray(arrays["trace_next"], np.int32),
   }
+  if "grade" in arrays:
+    out["grade"] = np.asarray(arrays["grade"], np.float16)
   with open(path, "wb") as f:
     np.savez_compressed(f, **out)
 

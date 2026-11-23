@@ -15,17 +15,24 @@ def road(*segments, **kw):
   return M.synthetic_trace(list(segments), **kw)
 
 
-def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph=None, planner=None, model_fn=None):
-  """Drive along `trace` (a synthetic_trace dict) at constant speed; returns [(t, along m, Plan)]."""
+def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph=None, planner=None, model_fn=None, closed=False,
+          rate=1.0):
+  """Drive along `trace` (a synthetic_trace dict); returns [(t, along m, Plan, mph)]. Open loop: constant speed. closed=True: the set
+  speed follows the plan's ceiling at once (a corner ceiling lowers it, a hold ceiling caps the way back up to the driver's v_mph), the
+  speed answers it REACTION_S later with `rate` times the measured deceleration and speeds back up at 0.7 mph/s."""
   pl = planner or P.Planner(mem)
-  v = v_mph * MPH
+  v = float(v_mph)
+  ref = set_mph if set_mph is not None else v_mph
   xs, ys, hs, ks = trace["x"], trace["y"], trace["hdg"], trace["kap"]
   s_road = np.arange(len(xs)) * M.SPACING_M
   out = []
+  hist = []
+  s = float(start)
+  setv = ref
   n = int(seconds / DT)
+  lag = int(round(P.REACTION_S / DT))
   for k in range(n):
     t = k * DT
-    s = start + v * t
     if s > s_road[-1]:
       break
     x, y = np.interp(s, s_road, xs), np.interp(s, s_road, ys)
@@ -36,8 +43,18 @@ def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph
       fix = fix_fn(t, s, fix)
     yk = kap if yaw_fn is None else yaw_fn(t, s, kap)
     mk = model_fn(t, s) if model_fn is not None else None
-    out.append((t, s, pl.step(t, fix, v, set_mph=set_mph if set_mph is not None else v_mph, yaw_k=yk, model_k=mk)))
-  return out
+    p = pl.step(t, fix, v * MPH, set_mph=setv, yaw_k=yk, model_k=mk)
+    out.append((t, s, p, v))
+    if closed:
+      setv = ref if p.ceil is None else min(ref, p.ceil)
+      hist.append(setv)
+      eff = hist[-1 - lag] if len(hist) > lag else ref
+      if v > eff:
+        v = max(eff - 0.0, v - rate * P.decel_mph_s(v - eff) * DT)
+      else:
+        v = min(eff, v + 0.7 * DT)
+    s += v * MPH * DT
+  return [(t, s_, p) for t, s_, p, _ in out] if not closed else out
 
 
 # ---- the speed law -------------------------------------------------------------------------------------------------------------
@@ -77,17 +94,22 @@ def test_flagged_point_at_least_10_below():
 def test_slow_distance_grows_with_drop():
   d = [P.slow_distance_m(55, x) for x in (54, 50, 45, 40)]
   assert all(b > a for a, b in zip(d, d[1:]))
-  # 15 mph from 55: 13.5 s measured allowance at ~47 mph average plus 1.5 s at 55: about 320 m, and not much more (as late as possible)
-  assert 280 < d[-1] < 360
 
 
-def test_shed_time_matches_measurements():
-  assert abs(P.shed_time_s(5) - 5.2) < 1e-9 and abs(P.shed_time_s(10) - 8.5) < 1e-9 and abs(P.shed_time_s(15) - 13.5) < 1e-9
-  ts = [P.shed_time_s(x) for x in np.linspace(0, 25, 60)]
-  assert all(b >= a for a, b in zip(ts, ts[1:]))
-  # never assumes more than ~2 mph/s after the reaction
-  for d in (1, 3, 5, 8, 12, 15, 20):
-    assert d / (P.shed_time_s(d) - P.REACTION_S) <= 2.0 + 1e-9
+def test_response_model_saturates_at_6_mph():
+  assert P.decel_mph_s(0) == 0 and P.decel_mph_s(2) == P.decel_mph_s(3) == 0.76
+  assert P.decel_mph_s(6) == P.decel_mph_s(12) == P.SAT_MPH_S
+  assert P.SAT_MPH_S * MPH <= 0.75                     # ~0.7 m/s^2 mean: never assumes more
+  assert P.DRIVE_GAP_MPH >= 6
+
+
+def test_v_allow_inverts_approach():
+  for T in (30, 40, 50):
+    for D in (100.0, 250.0, 500.0):
+      va = P.v_allow(D, T, T - 6, P.BUFFER_S)
+      u = int(math.floor(va))
+      if u > T:
+        assert P.approach_m(u, T, T - 6) + P.BUFFER_S * u * MPH <= D + 1e-6
 
 
 def test_no_ceiling_for_corner_holdable_at_current_speed():
@@ -120,7 +142,7 @@ def test_straight_road_no_ceiling():
   mem = M.synthetic([tr])
   res = drive(mem, tr, 55, 50)
   assert all(p.ceil is None for _, _, p in res)
-  assert any(p.trusted for _, _, p in res)
+  assert any(p.trusted for _, _, p in res)  # straight
   assert all(p.why in ("no known corner ahead", "matching the remembered road", "road not known here") for _, _, p in res)
 
 
@@ -131,22 +153,43 @@ def test_trust_needs_stable_match():
   assert first >= P.STABLE_S - 1e-6
 
 
-def test_single_corner_slows_early_and_releases():
+def test_single_corner_arrives_on_target_just_in_time_and_releases():
   tr, mem = single_corner()
-  res = drive(mem, tr, 55, 120)
-  need = P.corner_mph(CORNER_K)[0]
-  on = [(t, s, p) for t, s, p in res if p.ceil is not None]
-  assert on, "no ceiling before a corner that needs slowing"
-  assert all(p.ceil == need for _, _, p in on)
-  start_s = on[0][1]
-  shed_to = max(need, 55 - 15)                          # the car side never sheds more than 15 mph below the speed (no known limit)
-  d = P.slow_distance_m(55, shed_to)
-  assert d - 2 * 55 * MPH * DT - 1 <= 1500 - start_s <= d + 1   # as late as possible, not earlier
-  # held through the corner, released after it
-  in_corner = [p for t, s, p in res if 1500 <= s <= 1650]
-  assert all(p.ceil == need for p in in_corner)
-  after = [p for t, s, p in res if s > 1650 + P.HOLD_AFTER_M + 15]
-  assert after and all(p.ceil is None and p.past for p in after)
+  res = drive(mem, tr, 55, 160, closed=True)
+  need = max(P.corner_mph(CORNER_K)[0], 55 - 15)       # never more than 15 mph below the speed (no known limit)
+  at_entry = [v for t, s, p, v in res if s >= 1500 - P.ENTRY_M][0]
+  assert at_entry <= need + 1.0, at_entry
+  t_entry = [t for t, s, p, v in res if s >= 1500][0]
+  reached = [t for t, s, p, v in res if v <= need + 1.0][0]
+  assert t_entry - reached < 6.0, "slowed much earlier than needed"
+  first = [t for t, s, p, v in res if p.ceil is not None and p.kind == "corner"][0]
+  assert t_entry - first < 25.0
+  in_corner = [p for t, s, p, v in res if 1500 <= s <= 1650]
+  assert all(p.ceil is not None and p.ceil <= need and p.kind == "corner" for p in in_corner)
+  after = [p for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 15]
+  assert after and all(p.ceil is None or p.kind == "hold" for p in after)
+  assert [v for t, s, p, v in res][-1] > need + 5, "speed never came back"
+
+
+def test_push_opens_the_gap_then_raises_to_target():
+  tr, mem = single_corner()
+  res = drive(mem, tr, 55, 160, closed=True)
+  res = drive(mem, tr, 65, 160, closed=True, set_mph=65)
+  need = P.corner_mph(CORNER_K)[0]                     # 36: floor 50 binds at 65 mph; use a faster start to see the push
+  ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
+  T = max(need, 50)
+  assert min(ceils) == max(T - P.DRIVE_GAP_MPH, 50) and ceils[-1] == T
+  res = drive(mem, tr, 50, 160, closed=True)
+  ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
+  assert min(ceils) == max(need - P.DRIVE_GAP_MPH, 35) and ceils[-1] == need   # pushed 1 below, then raised to the target
+
+
+def test_downhill_slow_car_is_flagged_not_pushed_lower():
+  tr, mem = single_corner()
+  res = drive(mem, tr, 55, 160, closed=True, rate=0.5)
+  corner = [p for t, s, p, v in res if p.kind == "corner"]
+  assert any(p.capped for p in corner)
+  assert min(p.ceil for p in corner) >= 40             # never below the floor, never "more push" than the 6 mph gap
 
 
 def test_corner_right_after_long_straight_is_seen_far_ahead():
@@ -154,18 +197,21 @@ def test_corner_right_after_long_straight_is_seen_far_ahead():
   tr = road((2500, 0.0), (80, 1 / 60.0), (500, 0.0))
   mem = M.synthetic([tr])
   res = drive(mem, tr, 70, 120)
-  on = [s for t, s, p in res if p.ceil is not None]
-  assert on and 2500 - on[0] >= P.slow_distance_m(70, 55) - 10
+  on = [s for t, s, p in res if p.ceil is not None and p.kind == "corner"]
+  assert on and 2500 - on[0] >= P.approach_m(70, 55, 55) - 10
 
 
-def test_s_bends_ceiling_is_the_lowest_due():
+def test_s_bends_both_on_target():
   tr = road((1500, 0.0), (100, 1 / 200.0), (60, 0.0), (100, -1 / 120.0), (800, 0.0))
   mem = M.synthetic([tr])
-  res = drive(mem, tr, 60, 60)
-  need2 = P.corner_mph(1 / 120.0)[0]
-  in_bends = [p.ceil for t, s, p in res if 1500 <= s <= 1660]
-  assert in_bends and all(c is not None and c <= P.corner_mph(1 / 200.0)[0] for c in in_bends)
-  assert min(in_bends) == need2
+  res = drive(mem, tr, 60, 200, closed=True)
+  n1, n2 = P.corner_mph(1 / 200.0)[0], P.corner_mph(1 / 120.0)[0]
+  v1 = [v for t, s, p, v in res if s >= 1500 - P.ENTRY_M][0]
+  v2 = [v for t, s, p, v in res if s >= 1660 - P.ENTRY_M][0]
+  assert v1 <= max(n1, 45) + 1.0 and v2 <= max(n2, 45) + 1.0
+  # no restore between the two bends (the second is too close)
+  between = [p for t, s, p, v in res if 1600 <= s <= 1650]
+  assert all(p.ceil is not None for p in between)
 
 
 def test_unknown_road_no_ceiling():
@@ -243,11 +289,11 @@ def test_model_preview_sharper_wins():
   tr, mem = single_corner()
   # memory corner needs ~39 mph; the model shows a 1/80 bend 4 s ahead while in the corner region -> lower ceiling
   def model(t, s):
-    if 1300 <= s <= 1600:
+    if 900 <= s <= 1150:
       return (np.array([0.0, 2.0, 4.0, 6.0]), np.array([0.0, 0.002, 1 / 80.0, 0.002]))
     return (np.array([0.0, 2.0, 4.0]), np.zeros(3))
-  res = drive(mem, tr, 55, 60, model_fn=model)
-  ceils = [p.ceil for t, s, p in res if p.ceil is not None]
+  res = drive(mem, tr, 50, 80, model_fn=model)
+  ceils = [p.corner_mph for t, s, p in res if p.ceil is not None and p.kind == "corner"]
   assert min(ceils) < P.corner_mph(CORNER_K)[0]
   assert any(p.model_la is not None for t, s, p in res)
 
@@ -262,7 +308,7 @@ def test_plan_json_has_no_position():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 30)
   d = P.plan_json(res[-1][2], 12.0, 7, "shadow")
-  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit"}
+  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner"}
 
 
 def test_memory_roundtrip(tmp_path):

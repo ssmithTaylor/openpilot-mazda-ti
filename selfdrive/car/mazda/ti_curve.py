@@ -9,16 +9,19 @@ would have done: shadow mode).
 
 Every frame (the car controller calls `step`, 100 Hz; the planner's output is read at 10 Hz by the car controller and passed in):
   ready      no intervention. The driver's set speed (`ref`) is adopted whenever it changes (any change while idle is the driver's).
-  slowing    the planner's ceiling is below the set speed: SET_MINUS taps toward the target, one at a time, each read back exactly 1 mph
-             lower before the next. The target is the ceiling, but never below the FLOOR of this intervention:
+  slowing    the planner's corner ceiling is below the set speed: SET_MINUS taps toward it, one at a time, each read back exactly 1 mph
+             lower before the next; the planner first asks for a set speed up to 6 mph below the corner speed (the gap at which the
+             cruise slows fastest), then for the corner speed itself as the car reaches it (SET_PLUS taps, never above `ref`). The
+             target is never below the FLOOR of this intervention:
                floor = max(ABS_FLOOR_MPH, (the road's known speed limit, else the speed when the intervention started) - MAX_SHED_MPH)
              (owner, 2026-11-23: "never shed more than about 15 miles per hour beneath the known speed limit of a road. If the speed
              limit is unknown, we should just use current speed."). A corner that needs more: the set speed goes to the floor and the
              page says so ("CORNER NEEDS MORE THAN I MAY SLOW: be ready"); logged.
   holding    at the target through the corner.
-  restoring  the planner says past the corner AND the driving model's own preview ahead is gentle (model_la below MODEL_LA_RESTORE)
+  restoring  the planner says past the corner (or gives a "hold" ceiling: back up only to what the NEXT corner allows, in steps of at
+             least RESTORE_MIN_MPH) AND the driving model's sharpest predicted bend ahead fits at the restored speed (ti_curve_plan.fits)
              AND the lead flag is readable AND the speed has settled near the set speed (a lead car does not block it: the stock cruise
-             keeps its gap, and staying lowered behind a lead that speeds up only opens a gap for following traffic): SET_PLUS taps, at most one per RESTORE_GAP_S,
+             keeps its gap, and staying lowered behind a lead that speeds up only opens a gap for following traffic): SET_PLUS taps at the tap machinery's pace,
              never above `ref` (never on memory alone: a fresh planner output with the model's preview is required).
   paused     the driver pressed a cruise button: the intervention ends at once, nothing is restored, their new set speed becomes `ref`,
              and nothing is done for PAUSE_S.
@@ -39,6 +42,7 @@ Pure: no clock, no params; the car controller does the I/O (carcontroller.py `cu
 """
 from typing import NamedTuple, Optional
 
+from openpilot.selfdrive.car.mazda import ti_curve_plan as P
 from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, PressGuard, Tap
 
 PARAM_ON = "TiCurveOn"           # tmpfs, the page: "1" on for this drive, "0" / absent off
@@ -56,9 +60,8 @@ PAUSE_S = 30.0                   # after the driver's own cruise button
 CLEAR_S = 2.0
 PLAN_STALE_S = 1.0               # planner output older than this is not used (it publishes at 5 Hz)
 PLAN_DEAD_S = 3.0                # ... older than this: the planner is taken as dead
-MODEL_LA_RESTORE = 1.0           # m/s^2: the model's largest predicted lateral acceleration ahead must be below this to restore
 SETTLED_MPH = 3.0                # restore only with the speed within this of the set speed
-RESTORE_GAP_S = 1.0              # at most one SET_PLUS per this (the car speeds up 5 mph in 7-9 s)
+RESTORE_MIN_MPH = 2              # a restore toward a "hold" ceiling only for 2 mph or more (no dithering)
 TEXT_STALE_S = 3.0               # the page calls a status older than this stale
 
 STATES = ("off", "ready", "slowing", "holding", "restoring", "paused", "stopped", "waiting")
@@ -111,6 +114,7 @@ class Curve:
     self.set_last = None
     self.set_stable_since = None
     self.lowered_from = None      # ref at the start of the intervention, for the page
+    self.shown = None             # the corner speed shown on the page (the target may be the push below it)
     self.line1, self.line2 = "OFF", ""
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
@@ -291,7 +295,8 @@ class Curve:
     plan = inp.plan if plan_ok else None
     ceil = plan.get("ceil") if plan else None
     trusted = bool(plan.get("trusted")) if plan else False
-    if ceil is not None and trusted and inp.mph >= MIN_MPH:
+    kind = plan.get("kind", "corner") if plan else ""
+    if ceil is not None and trusted and kind != "hold" and inp.mph >= MIN_MPH:
       if not self.intervening():
         if ceil >= inp.set_mph:
           return self._idle_text(plan)
@@ -300,37 +305,52 @@ class Curve:
         base = int(lim) if lim else int(round(inp.mph))
         self.floor = max(ABS_FLOOR_MPH, base - MAX_SHED_MPH)
         self.lowered_from = self.ref
-        self._ev("start", frame, ceil=ceil, floor=self.floor, limit=lim, mph=round(inp.mph, 1), set_mph=inp.set_mph, ref=self.ref,
-                 dist=plan.get("dist"), lead=inp.lead)
-      self.target = max(int(ceil), self.floor)
-      needs_more = int(ceil) < self.floor
+        self._ev("start", frame, ceil=ceil, corner=plan.get("corner"), floor=self.floor, limit=lim, mph=round(inp.mph, 1),
+                 set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
+      # the set speed the planner asks for now (the push below the corner speed, then the corner speed), within the floor and
+      # never above the driver's own set speed
+      self.target = min(max(int(ceil), self.floor), self.ref)
+      corner = plan.get("corner") if plan.get("corner") is not None else ceil
+      self.shown = min(max(int(corner), self.floor), self.ref)
+      needs_more = bool(plan.get("capped")) or int(corner) < self.floor
       if needs_more and not self.needs_more:
-        self._ev("needs_more", frame, ceil=ceil, floor=self.floor)
+        self._ev("needs_more", frame, ceil=ceil, corner=corner, floor=self.floor, mph=round(inp.mph, 1))
       self.needs_more = needs_more
       if inp.set_mph > self.target:
         self._to(frame, "slowing")
         self._lines(inp)
         return self._start(frame, inp, "SET_MINUS")
-      self._to(frame, "holding")
+      if inp.set_mph < self.target:
+        # the planned raise from the push back to the corner speed as the car reaches it (never above `ref`)
+        self._to(frame, "slowing" if inp.mph > self.shown + 1.0 else "holding")
+        self._lines(inp)
+        return self._start(frame, inp, "SET_PLUS")
+      self._to(frame, "slowing" if inp.mph > self.shown + 1.0 else "holding")
       self._lines(inp)
       return None
 
-    # no ceiling (past the corner, or planner not trusted): restore if lowered, else idle
+    # no corner ceiling (past the corner, a "hold" for the next one, or the planner not trusted): restore if lowered, else idle
     if self.intervening() or (self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and self.lowered_from is not None):
       if inp.set_mph >= self.ref:
         self._ev("restored", frame, set_mph=inp.set_mph, taps_down=self.taps_down, taps_up=self.taps_up)
         self._end_intervention(frame)
         self._to(frame, "ready")
         return self._idle_text(plan)
-      self.target = self.ref
+      cap = self.ref
+      if plan is not None and trusted and ceil is not None and kind == "hold":
+        cap = min(self.ref, int(ceil))           # the next corner is close: come back up only to what it allows
+      if cap <= inp.set_mph or (cap - inp.set_mph < RESTORE_MIN_MPH and cap != self.ref and self.state != "restoring"):
+        self.target = self.shown = inp.set_mph
+        self._to(frame, "holding", "next corner close")
+        self.line1 = f"HOLDING FOR THE NEXT CORNER: {inp.set_mph} mph"
+        self.line2 = f"back to {self.ref} mph after it"
+        return None
+      self.target = self.shown = cap
       ok, wait = self._restore_ok(inp, plan)
       self._to(frame, "restoring", wait)
       self._lines(inp, wait)
-      if ok and (frame - self.last_plus) * DT >= RESTORE_GAP_S:
-        out = self._start(frame, inp, "SET_PLUS")
-        if out is not None:
-          self.last_plus = frame
-        return out
+      if ok:
+        return self._start(frame, inp, "SET_PLUS")
       return None
     self._to(frame, "ready")
     return self._idle_text(plan, dead=dead)
@@ -338,13 +358,13 @@ class Curve:
   def _restore_ok(self, inp, plan):
     if plan is None:
       return False, "planner output late"
-    if plan.get("model_la") is None:
+    if plan.get("model_k") is None:
       return False, "no model preview"
-    if plan["model_la"] >= MODEL_LA_RESTORE:
+    if not P.fits(float(plan["model_k"]), inp.set_mph + 1):
       return False, "the model sees a bend ahead"
     if inp.lead is None:
       return False, "lead flag unreadable"
-    if abs(inp.mph - inp.set_mph) > SETTLED_MPH:
+    if inp.mph - inp.set_mph > SETTLED_MPH:
       return False, "speed settling"
     return True, ""
 
@@ -357,7 +377,7 @@ class Curve:
   def _lines(self, inp, wait=""):
     if self.state == "slowing" or self.state == "holding":
       word = "SLOWING FOR A CORNER" if self.state == "slowing" else "HOLDING FOR A CORNER"
-      self.line1 = f"{word}: {self.lowered_from} -> {self.target} mph"
+      self.line1 = f"{word}: {self.lowered_from} -> {self.shown} mph"
       self.line2 = "CORNER NEEDS MORE THAN I MAY SLOW: be ready" if self.needs_more else f"set speed now {inp.set_mph} mph"
     else:
       self.line1 = f"RESTORING: {inp.set_mph} -> {self.ref} mph"
