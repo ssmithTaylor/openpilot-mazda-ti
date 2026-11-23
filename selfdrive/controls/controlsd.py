@@ -950,8 +950,13 @@ class Controls:
     hudControl.leftLaneVisible = True
 
     recent_blinker = (self.sm.frame - self.last_blinker_frame) * DT_CTRL < 5.0  # 5s blinker cooldown
+    # PROPOSAL (owner's decision): lane departure is also allowed while steering is active when the steering command was at or near
+    # its limit within the last second (the car is being carried wide by a corner it cannot hold, 2026-11-23 drive)
+    if abs(CC.actuators.steer) >= 0.96:
+      self.last_steer_at_limit_frame = self.sm.frame
+    near_limit = (self.sm.frame - getattr(self, "last_steer_at_limit_frame", -10 ** 9)) * DT_CTRL < 1.0
     ldw_allowed = self.is_ldw_enabled and CS.vEgo > LDW_MIN_SPEED and not recent_blinker \
-                  and not CC.latActive and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
+                  and (not CC.latActive or near_limit) and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
 
     model_v2 = self.sm['modelV2']
     desire_prediction = model_v2.meta.desirePrediction
