@@ -765,7 +765,9 @@ class CarController(CarControllerBase):
       now = time.monotonic()
       if read:
         self.curve_on = self.params_memory.get(mod.PARAM_ON) in (b"1", "1")
-        raw = self.params_memory.get(mod.PARAM_PLAN) if (self.curve_on or cv.state != "off") else None
+        # while OFF the planner's output is read once a second, only for the page ("OFF. Corner in 0.4 mi: would slow ...")
+        off_idle = not self.curve_on and cv.state == "off"
+        raw = self.params_memory.get(mod.PARAM_PLAN) if (not off_idle or self.frame % 100 == 5) else None
         plan = None
         if raw:
           try:
@@ -775,10 +777,14 @@ class CarController(CarControllerBase):
         if isinstance(plan, dict) and isinstance(plan.get("m"), (int, float)):
           self.curve_plan, self.curve_plan_read = plan, now
           self.curve_plan_age = max(0.0, now - float(plan["m"]))
-        elif raw is None:
+        elif raw is None and not off_idle:
           self.curve_plan = None
       if not self.curve_on and cv.state == "off":
         if read and (self.curve_published is None or self.frame % 100 == 5):
+          age = None if self.curve_plan_read is None else self.curve_plan_age + (now - self.curve_plan_read)
+          out = CS.out
+          speed = float(out.cruiseState.speed or 0.0)
+          cv.off_view(self.curve_plan, age, int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None, float(out.vEgo) * CV.MS_TO_MPH)
           self._curve_publish(cv, force=True)
         return None
       age = None
@@ -796,7 +802,7 @@ class CarController(CarControllerBase):
         driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
         cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
         check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
-        standstill=bool(out.standstill or getattr(cruise, "standstill", False)))
+        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_res=bool(getattr(CS, "crz_btns_res", False)))
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:

@@ -44,3 +44,7 @@ def test_speed_limit_only_when_known_and_plausible():
 def pytest_approx(x):
   import pytest
   return pytest.approx(x, abs=1e-6)
+
+
+def test_speed_limit_far_above_the_speed_is_not_used():
+  assert D.fresh_limit(True, 70 * D.MPH, 45 * D.MPH, True, 0.0, {"t": None}) is None

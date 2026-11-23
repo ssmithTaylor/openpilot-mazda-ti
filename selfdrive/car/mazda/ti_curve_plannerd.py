@@ -48,7 +48,7 @@ def model_curvature(m):
 
 
 LIMIT_MAX_AGE_S = 2.0           # frogpilotPlan must have been received within this (it is published at 20 Hz)
-LIMIT_MAX_BELOW_MPH = 15.0      # a limit more than this below the car's speed is implausible (a stale or wrong value)
+LIMIT_MAX_BELOW_MPH = 15.0      # a limit more than this below OR above the car's speed is implausible (a stale or wrong value)
 
 
 def fresh_limit(alive, limit_ms, v_ms, position_ok, t, state):
@@ -59,8 +59,8 @@ def fresh_limit(alive, limit_ms, v_ms, position_ok, t, state):
     state["t"] = None
     return None
   mph = limit_ms / MPH
-  if mph < v_ms / MPH - LIMIT_MAX_BELOW_MPH:
-    return None
+  if abs(mph - v_ms / MPH) > LIMIT_MAX_BELOW_MPH:
+    return None                   # more than 15 mph from the car's speed, either way: stale or wrong, not used
   state["t"] = t
   return mph
 

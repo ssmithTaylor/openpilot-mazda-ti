@@ -249,6 +249,7 @@ class Plan(NamedTuple):
   limit_mph: Optional[int] = None # the road's known speed limit (frogpilotPlan.slcMapSpeedLimit), None when unknown
   model_k: Optional[float] = None # the sharpest |curvature| in the model's next MODEL_LOOK_S (the car side's restore check)
   kind: str = ""                  # "corner": slow to the ceiling; "hold": the highest set speed a restore may reach (never slows)
+  end_m: Optional[float] = None   # a corner in progress: metres to the END of its tight stretch (dist_m is to its start)
   trace: int = -1
   point: int = -1
 
@@ -285,6 +286,7 @@ class Planner:
     self.active = {}                    # point -> corner in progress: T (corner speed), at (odometer of the point), mode, since
     self.int_floor = None
     self.int_base = None
+    self.end_m = None
     self.model_k = None
     self.events = []
 
@@ -507,19 +509,21 @@ class Planner:
           va = v_allow(D, T, max(floor, T - DRIVE_GAP_MPH), buf)
           c = cands.get(key)
           if c is None or va < c["va"]:
-                cands[key] = {"T": T, "need": int(need[j]), "va": va, "D": D, "at": self.odo + float(dist[run[-1]])}
+                cands[key] = {"T": T, "need": int(need[j]), "va": va, "D": D, "at": self.odo + float(dist[run[-1]]),
+                              "entry": self.odo + float(dist[run[0]])}
     # start: the car is at or above the highest speed from which it can still make it
     for key, c in cands.items():
       if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
         if not self.active and self.int_base is None:
           self.int_base = mph
-        self.active[key] = {"T": c["T"], "need": c["need"], "at": c["at"], "mode": "push", "since": t}
+        self.active[key] = {"T": c["T"], "need": c["need"], "at": c["at"], "entry": c["entry"], "mode": "push", "since": t}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
                             "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
       self.events.append({"kind": "passed", "point": key, "T": self.active[key]["T"], "mph": round(mph, 1)})
       del self.active[key]
     ceil, cdist, cpt, kind, corner = None, None, -1, "", None
+    cend = None
     behind = False
     for key, a_ in self.active.items():
       c = cands.get(key)
@@ -547,7 +551,8 @@ class Planner:
       if mode == "behind":
         behind = True
       if ceil is None or cc < ceil:
-        ceil, cdist, cpt, kind, corner = cc, round(a_["at"] - self.odo, 1), key, "corner", T
+        ceil, cdist, cpt, kind, corner = cc, round(max(0.0, a_["entry"] - self.odo), 1), key, "corner", T
+        cend = round(a_["at"] - self.odo, 1)
     if not self.active:
       # no corner in progress: the highest set speed a restore may reach so the NEXT corner can still be made (chained corners hold
       # only what the next one needs; a corner far enough away lets the speed come back fully)
@@ -560,13 +565,15 @@ class Planner:
     if ceil is None:
       return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
     capped = (bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor) or behind
-    why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if cdist > 0 else "in the corner")
+    why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if (cdist or 0) > 0 else "in the corner")
+    self.end_m = cend
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold")
 
   def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind=""):
+    end, self.end_m = self.end_m, None
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
-                self.limit, self.model_k, kind, self.trace, point)
+                self.limit, self.model_k, kind, end, self.trace, point)
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -575,4 +582,4 @@ def plan_json(plan, t_mono, seq, mode):
           "known": plan.known, "why": plan.why, "dist": plan.dist_m, "past": plan.past,
           "model_la": None if plan.model_la is None else round(plan.model_la, 2), "capped": plan.capped,
           "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
-          "corner": plan.corner_mph}
+          "corner": plan.corner_mph, "end": plan.end_m}

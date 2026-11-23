@@ -557,3 +557,129 @@ def test_controller_restart_mid_intervention_says_check_the_set_speed():
     ccm.Params = orig
   st = cc.curve.status(0.0)
   assert st["state"] == "off" and "may be lowered" in st["line2"]
+
+
+# ---- second review (2026-11-23): no ratchet across stops and resumes ----------------------------------------------------------
+def _cycle(c, car, start, corner_ceil, f0, n=3000):
+  return run(c, car, n, lambda f, car: plan(corner_ceil, corner=corner_ceil), start=f0)
+
+
+def test_brake_and_resume_cannot_walk_the_set_speed_down():
+  c, car = C.Curve(), Car(60, 60)
+  f = 0
+  for k in range(4):
+    run(c, car, 2500, lambda f_, car: plan(30, corner=30), start=f)                  # a corner wanting 30: floor 45
+    f += 2500
+    run(c, car, 50, lambda f_, car: plan(None), start=f, brake=True, cruise_on=False)  # brake: the cruise cancels
+    f += 50
+
+    def res(f_, car, f1=f):
+      return f_ < f1 + 10                                  # the driver's RES: back to the stored (lowered) set speed
+    run(c, car, 200, lambda f_, car: plan(None), start=f, driver_button=res, driver_res=True)
+    f += 200
+    assert min(h[1] for h in car.history) >= 45, (k, min(h[1] for h in car.history))
+    assert c.ref == 60
+  # and with no corner, the set speed comes back to the driver's 60
+  run(c, car, 9000, lambda f_, car: plan(None), start=f)
+  assert car.history[-1][1] == 60
+
+
+def test_own_press_after_a_stop_is_a_new_choice():
+  c, car = C.Curve(), Car(60, 60)
+  run(c, car, 2500, lambda f, car: plan(30, corner=30))
+  run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+
+  def setm(f, car):
+    if f == 2560:
+      car.set = 44                                          # the driver's SET-: a new choice
+    return 2555 <= f < 2565
+  run(c, car, 4000, lambda f, car: plan(None), start=2550, driver_button=setm)
+  assert c.ref == 44 and car.history[-1][1] == 44          # adopted, never restored above it
+
+
+def test_lead_held_car_floor_uses_the_car_speed():
+  c, car = C.Curve(), Car(45, 60)
+  run(c, car, 3000, lambda f, car: plan(25, corner=25), lead=True)
+  assert min(h[1] for h in car.history) == 30              # min(60, 45) - 15
+
+
+def test_high_stale_limit_is_not_used():
+  c, car = C.Curve(), Car(45, 45)
+  run(c, car, 3000, lambda f, car: plan(30, corner=30, limit=70))
+  assert min(h[1] for h in car.history) == 30              # a 70 limit at 45 mph is implausible: the corner target is honoured
+
+
+def test_property_never_more_than_15_below_the_drivers_last_choice():
+  rng = random.Random(23)
+  for trial in range(150):
+    c = C.Curve()
+    start = rng.choice([45, 55, 65, 75])
+    car = Car(start, start)
+    choice = [start]
+    seen_max = [start]
+    f = 0
+    for _ in range(rng.randint(3, 8)):
+      e = rng.choice(["corner", "corner", "brake_res", "press", "nothing"])
+      if e == "corner":
+        ce = rng.randint(25, start)
+        run(c, car, rng.randint(500, 3000), lambda f_, car, ce=ce: plan(ce, corner=ce), start=f)
+        f = car.k
+      elif e == "brake_res":
+        run(c, car, 40, lambda f_, car: plan(None), start=f, brake=True, cruise_on=False)
+        f = car.k
+        f1 = f
+        run(c, car, 100, lambda f_, car: plan(None), start=f, driver_button=lambda f_, car, f1=f1: f_ < f1 + 10, driver_res=True)
+        f = car.k
+      elif e == "press":
+        f1 = f
+        new = max(25, car.set + rng.choice([-5, -2, 3]))
+
+        def press(f_, car, f1=f1, new=new):
+          if f_ == f1 + 5:
+            car.set = new
+          return f1 <= f_ < f1 + 10
+        run(c, car, 3500, lambda f_, car: plan(None), start=f, driver_button=press)
+        choice[0] = new
+        seen_max[0] = max(seen_max[0], new)
+        f = car.k
+      else:
+        run(c, car, rng.randint(200, 2000), lambda f_, car: plan(None), start=f)
+        f = car.k
+      lo = max(C.ABS_FLOOR_MPH, choice[0] - C.MAX_SHED_MPH)
+      assert all(h[1] >= min(lo, choice[0]) for h in car.history[-50:]), (trial, choice[0], car.set)
+      assert all(h[1] <= choice[0] for h in car.history[-50:]), (trial, choice[0], car.set)   # never above their last choice
+    assert min(h[1] for h in car.history) >= max(C.ABS_FLOOR_MPH, min(start, choice[0]) - C.MAX_SHED_MPH) - 0, trial
+    assert max(h[1] for h in car.history) <= seen_max[0]
+
+
+
+# ---- the OFF page shows what the planner sees, and never implies a press --------------------------------------------------------
+@pytest.mark.parametrize("p,age,want", [
+  (None, None, "OFF. Planner not running"),
+  (dict(plan(None, trusted=False, known=False), why="road not known here"), 0.1, "OFF. Road not known here"),
+  (dict(plan(None, trusted=False, known=True), why="position uncertain"), 0.1, "OFF. No position yet"),
+  (plan(None), 0.1, "OFF. Road known here: no slowdown needed ahead"),
+  (plan(41, corner=41, dist=640.0), 0.1, "OFF. Corner in 0.4 mi: would slow 48 -> 41 mph"),
+  (plan(44, kind="hold", dist=800.0), 0.1, "OFF. Corner in 0.5 mi: would slow 48 -> 44 mph"),
+  (plan(52, corner=52), 0.1, "OFF. Road known here: no slowdown needed ahead"),
+])
+def test_off_page_shows_what_the_planner_sees(p, age, want):
+  c = C.Curve()
+  c.off_view(p, age, 48, 50.0)
+  st = c.status(0.0)
+  assert st["state"] == "off" and st["line1"] == "CURVE SLOWING OFF" and st["line2"] == want
+
+
+def test_off_page_never_implies_a_press():
+  rng = random.Random(5)
+  c, car = C.Curve(), Car(55, 55)
+  for f0 in range(0, 6000, 300):
+    ce = rng.choice([None, 30, 45, 50])
+    run(c, car, 300, lambda f, car, ce=ce: plan(ce, corner=ce, kind=rng.choice(["corner", "hold"]),
+                                               trusted=rng.random() > 0.2, known=rng.random() > 0.1), start=f0, on=False)
+    st = c.status(0.0)
+    text = (st["line1"] + " " + st["line2"]).upper()
+    assert st["state"] == "off" and not car.sent
+    for word in ("SLOWING FOR", "RESTORING", "HOLDING", "LOWERING", "PAUSED", "STOPPED"):
+      assert word not in text, text
+    assert st["line2"].startswith("OFF.") and len(st["line2"]) <= 52
