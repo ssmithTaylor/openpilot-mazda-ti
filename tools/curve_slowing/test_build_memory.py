@@ -41,13 +41,16 @@ def test_second_sharpest_kap_and_npass():
 
 
 def test_flag_spreading_and_v_flag():
-  passes = [make_pass('d0', CURVE), make_pass('d1', CURVE, sats=[300.0], tks=[500.0])]
+  # the arc is 200-350 m; a takeover on the straight at 500 m flags nothing, one at 260 m only the arc's points
+  passes = [make_pass('d0', CURVE), make_pass('d1', CURVE, sats=[300.0], tks=[500.0]), make_pass('d2', CURVE, tks=[260.0])]
   arrays, _ = B.build(passes)
   g = np.arange(len(arrays['x'])) * M.SPACING_M
   lim = (arrays['flags'] & M.FLAG_LIMIT) > 0
   tk = (arrays['flags'] & M.FLAG_TAKEOVER) > 0
   assert lim[np.abs(g - 300) <= 70].all() and not lim[np.abs(g - 300) >= 90].any()
-  assert tk[np.abs(g - 500) <= 50].all() and not tk[g <= 430].any()
+  assert not tk[g >= 400].any()
+  assert tk[(g >= 215) & (g <= 315)].all() and not tk[g <= 190].any()
+  assert np.all(np.abs(arrays['kap'][tk]) >= B.BEND_KAP)
   assert np.allclose(arrays['v_flag'][lim | tk], V, atol=0.01)
   assert np.isnan(arrays['v_flag'][~(lim | tk)]).all()
 
@@ -270,7 +273,35 @@ def test_lane_flag_and_v_proven():
   arrays, _ = B.build([a, b])
   g = np.arange(len(arrays['x'])) * M.SPACING_M
   lane = (arrays['flags'] & M.FLAG_LANE) > 0
-  assert lane[np.abs(g - 300) <= 55].all() and not lane[np.abs(g - 300) >= 70].any()
+  assert lane[np.abs(g - 300) <= 40].all() and not lane[np.abs(g - 300) >= 70].any() and not lane[g >= 365].any()
   assert np.allclose(arrays['v_flag'][lane], 20.0, atol=0.01)
   assert np.allclose(arrays['v_proven'][np.abs(g - 300) <= 75], V, atol=0.01)     # the faster pass touched the line: not proven
   assert np.allclose(arrays['v_proven'][(g >= 400) & (g <= 550)], 20.0, atol=0.01)
+
+
+def test_takeover_not_a_brake_to_a_stop():
+  n = 400
+  lat = np.ones(n); en = np.ones(n); ti = np.zeros(n); pressed = np.zeros(n); drv = np.zeros(n); brk = np.zeros(n)
+  drv[100:120] = 8.0; lat[125:] = 0.0
+  v = np.full(n, 15.0)
+  s = np.r_[0, np.cumsum(v[:-1] * B.DT)]
+  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s)[1]) == [100]
+  brk2 = brk.copy(); brk2[125] = 1.0                            # disengaged by the brake
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v, s=s)[1]) == 0
+  v2 = v.copy(); v2[150:] = 2.0                                  # stops within 150 m (onset at 75 m, stop from ~111 m)
+  s2 = np.r_[0, np.cumsum(v2[:-1] * B.DT)]
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v2, s=s2)[1]) == 0
+
+
+def test_kap_med_and_loader_fallback(tmp_path):
+  passes = [make_pass(f'd{i}', CURVE, y0=dy, kap_bias=b) for i, (dy, b) in enumerate([(0.0, 0.002), (2.0, 0.0), (-2.0, -0.001)])]
+  arrays, _ = B.build(passes)
+  i_arc = int(round(275 / M.SPACING_M))
+  assert abs(arrays['kap_med'][i_arc] - 0.010) < 3e-4
+  f = tmp_path / 'k.npz'
+  M.save(f, arrays, {'lat0': 0.0, 'lon0': 0.0, 'kx': 1.0, 'ky': 1.0})
+  assert abs(M.load(f).kap_med[i_arc] - 0.010) < 3e-4
+  del arrays['kap_med']
+  M.save(f, arrays, {'lat0': 0.0, 'lon0': 0.0, 'kx': 1.0, 'ky': 1.0})
+  m = M.load(f)
+  assert m.kap_med.dtype == np.float64 and np.array_equal(m.kap_med, m.kap)

@@ -43,7 +43,7 @@ def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph
       fix = fix_fn(t, s, fix)
     yk = kap if yaw_fn is None else yaw_fn(t, s, kap)
     mk = model_fn(t, s) if model_fn is not None else None
-    p = pl.step(t, fix, v * MPH, set_mph=setv, yaw_k=yk, model_k=mk)
+    p = pl.step(t, fix, v * MPH, set_mph=setv, yaw_k=yk, model_k=mk, ref_mph=ref)    # the car side's reference, as the daemon passes it
     out.append((t, s, p, v))
     if closed:
       setv = ref if p.ceil is None else min(ref, p.ceil)
@@ -413,3 +413,41 @@ def test_same_road_with_offset_and_sharper_memory_is_not_a_change():
   mem = M.synthetic([mem_tr])
   res = drive(mem, tr, 45, 200)
   assert not any(p.why == "road differs from memory" for _, _, p in res)
+
+
+# ---- drive of 2026-11-23 (log analysis): regressions ----------------------------------------------------------------------------
+def test_h1_floor_follows_the_drivers_current_set_speed_not_an_old_episode():
+  # two corners needing ~33 mph; first driven with the driver's set speed 55 (floor 40), then with 45 (floor 30): the second corner's
+  # target must be its own speed (33), not the 40 left over from the first episode (installed 23bdf89 kept the planner's floor)
+  k = 1 / 95.0
+  tr = road((1500, 0.0), (120, k), (1500, 0.0), (120, k), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  first = drive(mem, tr, 55, 200, planner=pl, closed=True)
+  need = P.corner_mph(k)[0]
+  assert need < 40
+  later = [p for t, s, p, v in first if 3000 <= s <= 3150 and p.kind == "corner"]
+  pl2 = P.Planner(mem)
+  res = drive(mem, tr, 55, 70, planner=pl2, closed=True)                  # the first episode at 55 ...
+  t_end = res[-1][0]
+  s_end = res[-1][1]
+  res2 = drive(mem, tr, 45, 200, planner=pl2, closed=True, start=s_end)   # ... then the driver's own 45 (the same planner object)
+  c2 = [p for t, s, p, v in res2 if 3000 <= s <= 3150 and p.kind == "corner"]
+  assert c2 and min(p.corner_mph for p in c2) == max(need, 45 - 15)
+
+
+def test_h3_an_ordinary_start_is_never_behind_and_never_warns():
+  for v in (45, 55, 65):
+    tr, mem = single_corner()
+    res = drive(mem, tr, v, 200, closed=True)
+    assert not any(p.behind for t, s, p, vv in res), v
+    assert not any(p.alert_mph for t, s, p, vv in res if not p.capped), v
+
+
+def test_h6_change_check_uses_the_median_not_the_conservative_figure():
+  tr = road((600, 0.0), (120, 1 / 150.0), (300, 0.0), (120, -1 / 180.0), (600, 0.0))
+  mem = M.synthetic([dict(tr, kap=tr["kap"] * 3.0)])        # the conservative figure, 3x sharper than this road
+  mem.kap_med = tr["kap"].copy()                             # the median pass: this road
+  res = drive(mem, tr, 45, 150, yaw_fn=lambda t, s, k: k * 1.0 + 0.0003)
+  assert not any(p.why == "road differs from memory" for _, _, p in res)
+  assert P.CHANGE_HOLDOFF_M <= 150.0

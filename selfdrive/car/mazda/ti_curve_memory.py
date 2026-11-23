@@ -22,6 +22,8 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
   bank         float16 m/s^2 (nan where unknown); informational only
   grade        OPTIONAL float16 radians, road grade, positive = uphill in the direction of travel (median over passes of the
                liveLocationKalman calibrated pitch, low-passed ~3 s); nan where unknown; read as zeros when the file has none
+  kap_med      OPTIONAL float16 1/m, left positive: the plain MEDIAN curvature of the same usable passes as kap (for the road-change
+               check); read as a copy of kap when the file has none
   v_proven     OPTIONAL float16 m/s: the highest speed of a pass through the point with lateral control active and no steering-limit
                event or firm takeover from 80 m before to 80 m after it; nan where none, and read as nan when the file has none
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
@@ -40,7 +42,7 @@ FLAG_NOKAP = 4                   # no representative pass: kap is 0 here, not a 
 FLAG_LANE = 8                    # with lateral control active the car touched or crossed a lane line here on some pass
 CELL_M = 50.0                    # grid cell of the nearest-point index
 KEYS = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next")
-OPTIONAL_KEYS = ("bank", "grade", "v_proven")
+OPTIONAL_KEYS = ("bank", "grade", "v_proven", "kap_med")
 
 
 def wrap(a):
@@ -56,6 +58,7 @@ class Memory:
     self.y = np.asarray(arrays["y"], np.float64)
     self.hdg = np.asarray(arrays["hdg"], np.float64)
     self.kap = np.asarray(arrays["kap"], np.float64)
+    self.kap_med = np.asarray(arrays["kap_med"], np.float64) if "kap_med" in arrays else self.kap.copy()
     self.v = np.asarray(arrays["v"], np.float64)
     self.flags = np.asarray(arrays["flags"], np.uint8)
     self.v_flag = np.asarray(arrays["v_flag"], np.float64)
@@ -83,7 +86,7 @@ class Memory:
 
   def _check(self):
     n = self.n
-    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade", "v_proven"):
+    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade", "v_proven", "kap_med"):
       if len(getattr(self, name)) != n:
         raise ValueError(f"memory: {name} has {len(getattr(self, name))} points, x has {n}")
     if len(self.trace_start) < 1 or self.trace_start[0] != 0 or self.trace_start[-1] != n or np.any(np.diff(self.trace_start) < 1):
@@ -156,7 +159,7 @@ def load(path):
     meta = json.loads(str(z["meta"]))
     if int(meta.get("version", -1)) != VERSION:
       raise ValueError(f"memory: version {meta.get('version')} (expected {VERSION})")
-    arrays = {k: z[k] for k in KEYS + ("grade", "v_proven") if k in z.files}
+    arrays = {k: z[k] for k in KEYS + ("grade", "v_proven", "kap_med") if k in z.files}
   missing = [k for k in KEYS if k not in arrays and k not in OPTIONAL_KEYS]
   if missing:
     raise ValueError(f"memory: missing {missing}")
@@ -181,6 +184,8 @@ def save(path, arrays, meta):
     out["grade"] = np.asarray(arrays["grade"], np.float16)
   if "v_proven" in arrays:
     out["v_proven"] = np.asarray(arrays["v_proven"], np.float16)
+  if "kap_med" in arrays:
+    out["kap_med"] = np.asarray(arrays["kap_med"], np.float16)
   with open(path, "wb") as f:
     np.savez_compressed(f, **out)
 

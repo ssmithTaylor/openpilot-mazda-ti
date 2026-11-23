@@ -65,3 +65,41 @@ def test_frogpilot_reads_the_curve_warning_only_when_on_and_fresh():
   assert read_curve_alert(P_({"mode": "act", "alert": 35, "m": 10.0}), 12.0)[0] is None      # stale
   assert read_curve_alert(P_({"mode": "act", "alert": None, "m": 10.0}), 10.5)[0] is None
   assert read_curve_alert(P_(None), 10.5)[0] is None
+
+
+def test_h2_every_planner_log_call_with_real_events_does_not_raise():
+  import json
+  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P
+  calls = []
+
+  def event(name, **kw):                     # cloudlog.event's signature: a duplicate keyword would raise TypeError at the call
+    json.dumps(kw)
+    calls.append(kw)
+  tr = M.synthetic_trace([(1500, 0.0), (150, 1 / 150.0), (800, 0.0)])
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  s_road = np.arange(len(tr["x"])) * M.SPACING_M
+  kinds = set()
+  for k in range(500):
+    s = 55 * D.MPH * k * 0.2
+    if s > s_road[-1]:
+      break
+    x, y = np.interp(s, s_road, tr["x"]), np.interp(s, s_road, tr["y"])
+    plan = pl.step(k * 0.2, P.Fix(True, float(x), float(y), float(tr["hdg"][int(s // 5)])), 55 * D.MPH, set_mph=55, yaw_k=0.0,
+                   ref_mph=55)
+    d = P.plan_json(plan, k * 0.2, k, "act")
+    for ev in pl.events:
+      kinds.add(ev["kind"])
+      event("ti_curve_plan", **D.log_payload(ev, feature=d["mode"]))
+    pl.events.clear()
+    event("ti_curve_plan", **D.log_payload(d, kind="decision", feature=d["mode"], mph=55.0, set_mph=55, trace=plan.trace,
+                                           point=plan.point))
+  assert {"lock", "start", "mode"} <= kinds and calls
+  # the installed pattern raised on every mode event (a duplicate "mode" keyword)
+  ev = {"kind": "mode", "mode": "target"}
+  import pytest
+  with pytest.raises(TypeError):
+    event("ti_curve_plan", mode="act", **ev)
+
+
+import numpy as np  # noqa: E402

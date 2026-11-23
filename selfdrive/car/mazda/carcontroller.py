@@ -805,7 +805,8 @@ class CarController(CarControllerBase):
         driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
         cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
         check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
-        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)))
+        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
+        driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)))
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:

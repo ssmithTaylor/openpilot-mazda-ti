@@ -20,6 +20,7 @@ class CarState(CarStateBase):
     self.crz_btns_driver = None   # the car's own 0x09D frame shows a cruise button pressed (gen1); None until read
     self.crz_lead = None          # the stock cruise is following a lead (CRZ_CTRL 0x21C RADAR_HAS_LEAD, gen1); None until read
     self.crz_btns_set = False     # the driver presses SET+ or SET- (curve slowing; gen1)
+    self.crz_btns_set_plus = False
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -162,6 +163,7 @@ class CarState(CarStateBase):
                                 btns["DISTANCE_MORE"] or btns["MODE_X"] or btns["MODE_Y"])
     # curve slowing (ti_curve.py): only SET+ / SET- choose a speed (RES, DISTANCE, MODE and CANCEL never do)
     self.crz_btns_set = bool(btns["SET_P"] or btns["SET_M"])
+    self.crz_btns_set_plus = bool(btns["SET_P"]) and not btns["SET_M"]
     if not (self.CP.flags & MazdaFlags.RADAR_INTERCEPTOR) and not (self.CP.flags & MazdaFlags.NO_MRCC):
       self.crz_lead = bool(cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"])
 

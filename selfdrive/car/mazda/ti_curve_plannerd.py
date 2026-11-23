@@ -65,6 +65,31 @@ def fresh_limit(alive, limit_ms, v_ms, position_ok, t, state):
   return mph
 
 
+def log_payload(*parts, **extra):
+  """One dict for cloudlog.event from several dicts: later keys win, so a planner event's own "kind" / "mode" can never collide with
+  ours (2026-11-23: duplicate keywords raised on every call; 7,268 error lines and 4 planner log lines in the drive)."""
+  out = {}
+  for d in parts:
+    out.update(d)
+  out.update(extra)
+  return out
+
+
+def car_side(params_memory, now_wall, tc):
+  """(ref, floor) from the car side's published status (TiCurveStatus) when fresh: its reference (the driver's own set speed) always,
+  its floor only while it intervenes. (None, None) when stale or unreadable."""
+  try:
+    raw = params_memory.get(tc.PARAM_STATUS)
+    st = json.loads(raw) if raw else None
+    if not isinstance(st, dict) or now_wall - float(st.get("t", 0.0)) > 3.0:
+      return None, None
+    ref = st.get("ref")
+    floor = st.get("floor") if st.get("state") in ("slowing", "holding", "restoring") else None
+    return (int(ref) if ref else None), (int(floor) if floor else None)
+  except Exception:
+    return None, None
+
+
 def keep_off_control_core():
   """Cores 0-3 only (never the control core 4, nor 5-7 where plannerd / radard / modeld run real-time), a little below normal
   priority: a slow tick of this process can never delay a process the communication checks watch (it publishes no message)."""
@@ -143,22 +168,25 @@ def main():
         limit = fresh_limit(sm.alive["frogpilotPlan"], float(sm["frogpilotPlan"].slcMapSpeedLimit), v, ok, t, lim_state)
       except Exception:
         limit = None
-      plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit)
+      ref_mph, floor_mph = car_side(params_memory, time.time(), tc)
+      plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit,
+                          ref_mph=ref_mph, floor_mph=floor_mph)
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")
       params_memory.put(tc.PARAM_PLAN, json.dumps(d))
       seq += 1
       for ev in planner.events:
-        cloudlog.event("ti_curve_plan", mode=d["mode"], **ev)
+        cloudlog.event("ti_curve_plan", **log_payload(ev, feature=d["mode"]))
       planner.events.clear()
       key = (d["ceil"], d["kind"], d["trusted"], d["why"], d["capped"])
       if key != last_key:
-        cloudlog.event("ti_curve_plan", kind="decision", **d, mph=round(v / MPH, 1), set_mph=set_mph, trace=plan.trace, point=plan.point)
+        cloudlog.event("ti_curve_plan", **log_payload(d, kind="decision", feature=d["mode"], mph=round(v / MPH, 1), set_mph=set_mph,
+                                                       trace=plan.trace, point=plan.point))
         last_key = key
       cpu.append(time.process_time() - c0)
       if t - last_summary >= SUMMARY_S:
         cpu.sort()
-        cloudlog.event("ti_curve_plan", kind="summary", mode=d["mode"], trusted=d["trusted"], known=d["known"], why=d["why"],
+        cloudlog.event("ti_curve_plan", kind="summary", feature=d["mode"], trusted=d["trusted"], known=d["known"], why=d["why"],
                        cpu_ms_mean=round(1000 * sum(cpu) / max(1, len(cpu)), 3), cpu_ms_max=round(1000 * cpu[-1], 3) if cpu else None,
                        yaw_source="car" if (yaw is not None and t - yaw_t < 0.5) else "locationd")
         cpu, last_summary = [], t

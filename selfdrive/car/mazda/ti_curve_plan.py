@@ -76,7 +76,9 @@ BUFFER_S = 1.0                  # extra seconds of start-early margin (chosen fr
 ENTRY_M = 10.0                  # be at the corner speed this far before the first point that needs it
 COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
 REPUSH_MPH = 1.0                # ... and push again when back within this of v_allow
-BEHIND_MPH = 1.0                # above v_allow by this: behind plan (the gap is already at its most useful: nothing more to ask of the
+BEHIND_GRACE_S = 3.0            # not "behind" in the first seconds of a start: a start fires AT the latest-start speed and the cruise
+                                # needs its reaction plus the taps before the speed falls (2026-11-23: "behind" at 6 of 10 starts)
+BEHIND_MPH = 2.0                # above v_allow by this: behind plan (the gap is already at its most useful: nothing more to ask of the
                                 # set speed; the corner is flagged "needs more than I can slow" and logged)
 MIN_SWITCH_S = 3.0              # no push / let-off reversal within this unless behind plan
 GRADE_STEEP_DEG = 3.0           # remembered approach steeper downhill than this: start earlier
@@ -188,7 +190,7 @@ CHANGE_BEND_K = 0.0015          # rms curvature (1/m) below which the window is 
 CHANGE_SHIFT_M = 50.0           # the comparison allows the two curvature traces to be offset by up to this along the road
 CHANGE_MIN_CORR = 0.3           # their best correlation below this: the road's shape differs
 CHANGE_STRIKES = 20             # ... on this many consecutive planner ticks (4 s at 5 Hz) before trust is dropped
-CHANGE_HOLDOFF_M = 500.0
+CHANGE_HOLDOFF_M = 150.0        # a distrust costs this much road (was 500 m: 16.5 % of a drive lost to false changes)
 LIVE_K_TAU_S = 0.5              # smoothing of the live curvature (the memory is smoothed over ~10 m)
 
 # ---- the model's own preview -----------------------------------------------------------------------------------------------------
@@ -294,6 +296,8 @@ class Planner:
       self.proven = np.where(trouble, 0.0, self.proven)
       self.single = np.asarray(memory.npass) <= 1
       self.kabs = np.abs(memory.kap)
+      # the road-change check compares shape with the MEDIAN pass (memory kap_med), never with the conservative figure
+      self.kmed = np.asarray(getattr(memory, "kap_med", memory.kap), np.float64)
     self.skipped = set()
     self.limit = None
     self.reset()
@@ -430,7 +434,7 @@ class Planner:
     while self.odo >= self.cmp_next:
       i = int(round(self.pos))
       i = min(max(i, 0), self.mem.n - 1)
-      self.cmp.append((self.odo, self.live_k, float(self.mem.kap[i])))
+      self.cmp.append((self.odo, self.live_k, float(self.kmed[i])))
       self.cmp_next += self.mem.spacing
     while self.cmp and self.odo - self.cmp[0][0] > CHANGE_WINDOW_M:
       self.cmp.pop(0)
@@ -459,7 +463,7 @@ class Planner:
     return self.change_strikes >= CHANGE_STRIKES
 
   # ---- one tick ------------------------------------------------------------------------------------------------------------------
-  def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None):
+  def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None, ref_mph=None, floor_mph=None):
     """t: seconds (monotonic); fix: Fix; v: m/s; set_mph: the cruise set speed or None; yaw_k: live curvature (1/m, left +, from the
     car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview, or None. -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
@@ -521,11 +525,16 @@ class Planner:
         need = np.r_[need, model_need]
     # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
     # (kept from the first corner of a chain until the car is back near the speed it started from, as the car side does)
-    if self.active or (self.int_base is not None and mph < self.int_base - 2.0):
-      floor = self.int_floor
+    # ONE source with the car side (2026-11-23 drive: a floor kept here from an earlier 55 mph episode clamped every corner for 11 min
+    # while the driver's set speed was 45): the car side's published floor while it intervenes, else the floor it WOULD use now from
+    # the driver's own set speed (`ref_mph`, its published reference); nothing is kept here between ticks
+    if floor_mph is not None:
+      floor = int(floor_mph)
     else:
-      floor = max(self.ABS_FLOOR_MPH, int(round(mph)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
-      self.int_floor, self.int_base = floor, None
+      base_ = ref_mph if ref_mph else (set_mph if set_mph else round(mph))
+      floor = max(self.ABS_FLOOR_MPH, int(round(base_)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
+    self.int_floor = floor
+    self.int_base = float(ref_mph) if ref_mph else None
     shed_to = np.maximum(need, floor)
     mem_pt = idx >= 0
     u_ref0 = max(u, self.int_base or 0.0)
@@ -588,10 +597,8 @@ class Planner:
     # start: the car is at or above the highest speed from which it can still make it
     for key, c in cands.items():
       if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
-        if not self.active and self.int_base is None:
-          self.int_base = mph
         self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
-                            "since": t}
+                            "since": t, "start_t": t}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
                             "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
@@ -611,7 +618,7 @@ class Planner:
       if mode != "target":
         if mph <= T + RAISE_AT_MPH:
           mode = "target"
-        elif mph > va + BEHIND_MPH:
+        elif mph > va + BEHIND_MPH and t - a_["start_t"] >= BEHIND_GRACE_S:
           mode = "behind"
         elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
           mode = "coast"

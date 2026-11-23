@@ -785,3 +785,27 @@ def test_brake_then_res_with_a_real_corner_ahead_keeps_it_low():
 
 def test_pause_after_a_driver_button_is_10_s():
   assert C.PAUSE_S == 10.0
+
+
+def test_h5_set_plus_from_a_lowered_speed_never_becomes_a_lower_choice():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 2500, lambda f, car: plan(30, corner=30))                     # lowered to 40
+  run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+  f0 = car.k
+
+  def res_then_setplus(f, car):
+    if f == f0 + 300:
+      car.set = car.set + 5                                                   # SET+ from 40 gives 45, still below their 55
+    return f < f0 + 10 or f0 + 295 <= f < f0 + 305
+  run(c, car, 3000, lambda f, car: plan(None), start=f0, driver_button=res_then_setplus,
+      driver_set=lambda f, car: f0 + 295 <= f < f0 + 305, driver_set_plus=lambda f, car: f0 + 295 <= f < f0 + 305)
+  assert c.ref == 55 and car.history[-1][1] == 55                           # their 55 stands, and comes back
+  # SET- below is a real new choice
+  c2, car2 = C.Curve(), Car(55, 55)
+
+  def setm(f, car):
+    if f == 205:
+      car.set = 48
+    return 200 <= f < 210
+  run(c2, car2, 2000, lambda f, car: plan(None), driver_button=setm, driver_set=True)
+  assert c2.ref == 48

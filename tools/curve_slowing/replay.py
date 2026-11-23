@@ -166,7 +166,8 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
         fix = P.Fix(bool(pos_ok[p]) and np.isfinite(xs[p]), float(xs[p]) if pos_ok[p] else 0.0, float(ys[p]) if pos_ok[p] else 0.0,
                     P.bearing_to_hdg(float(brg[p])) if np.isfinite(brg[p]) else 0.0)
         t0 = time.perf_counter()
-        pl = planner.step(t, fix, v_sim, set_mph=cru.set, yaw_k=float(kap[p]), model_k=None)
+        pl = planner.step(t, fix, v_sim, set_mph=cru.set, yaw_k=float(kap[p]), model_k=None, ref_mph=curve.ref,
+                          floor_mph=curve.floor if curve.intervening() else None)     # the car side's reference and floor (one source)
         if en[p] and v_sim > 9.0:
           why_ticks[pl.why] += 1
         for pev in planner.events:

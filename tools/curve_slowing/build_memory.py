@@ -25,7 +25,8 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
     after it joins one (from a road that is not its predecessor, or from its start). kap is ROBUST (meta kap_rule "second<="):
     one usable pass -> its value; two or more -> the SECOND sharpest |kap|, signed by the median's sign, and the LOWEST |kap| where
     the usable passes disagree by more than DISAGREE x (phantom corners at traffic lights, swerves and lane changes cannot set a
-    corner on a straight road). No usable pass -> kap = 0 and FLAG_NOKAP;
+    corner on a straight road). No usable pass -> kap = 0 and FLAG_NOKAP; kap_med = the plain median of the same usable passes
+    (0 where none), for the planner's road-change check;
     v_proven = the highest speed of a pass through the point with lateral control active, not braking to a stop or pulling away,
     and no steering-limit event, firm takeover or lane-line touch from PROVEN_M before to PROVEN_M after it (nan where none);
     v = median speed, bank = median (nan where unknown), npass = passes; grade = median over passes of the road grade (radians,
@@ -34,10 +35,12 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
   * flags: FLAG_LIMIT where a pass had the steering at its limit (study's run_events: |ti_cmd| >= 590 for >= 0.3 s, lateral active,
     driver not pressing), spread from LIMIT_BEFORE_M before to LIMIT_AFTER_M after the event; FLAG_TAKEOVER for a FIRM takeover
     (lateral active, |driver torque| >= TK_DRV counts for >= 0.5 s, then within 2 s lateral control inactive or openpilot disengaged;
-    steeringPressed alone is not enough) +-TK_M; v_flag = lowest speed at the event of a pass that set the flag; a flag window that
+    steeringPressed alone is not enough; never a brake to a stop: not counted with the brake pressed in that window or a stop below
+    10 mph within 150 m after it) +-TK_M, spread only over points of a real bend (stored |kap| >= BEND_KAP); v_flag = lowest speed at the event of a pass that set the flag; a flag window that
     runs past a road's end / start is carried onto the first / last points of the linked next / previous trace (one hop);
     FLAG_LANE (+-LANE_M) where, with lateral control active, the nearest modelV2 lane line (laneLineProbs > 0.5) came within
-    LANE_HALF_W of the car's centre at x = 0 for >= 0.3 s with no blinker within +-5 s (cache lane/<tag>.npz, position-free);
+    LANE_HALF_W of the car's centre at x = 0 for >= 0.3 s with no blinker within +-5 s (cache lane/<tag>.npz, position-free),
+    spread only over points of a real bend like FLAG_TAKEOVER;
   * roads shorter than MIN_TRACE_M are dropped; roads are then cut where a pass moved from one road to another (so a trace starts or
     ends at every join and fork, cuts at least MIN_CUT_PTS apart) and trace_next links a trace to the single trace whose first point is
     within LINK_DIST_M / LINK_HDG of its last point and ahead of it (-1 if none or several).
@@ -108,6 +111,8 @@ TK_M = 60.0
 TK_DRV = 5.0                   # driver-torque counts
 TK_SUSTAIN = 10               # 0.5 s at 20 Hz
 TK_FOLLOW = 40                # 2 s
+TK_STOP_MPH, TK_STOP_M = 10.0, 150.0
+BEND_KAP = 0.002               # takeover and lane-line flags are spread only over points of a real bend (stored |kap| >= this)
 EVENT_SLACK = 20               # 20 Hz samples: an event belongs to a piece within 1 s of it (s5_pieces)
 LINK_DIST_M = 20.0
 LINK_HDG = math.radians(30.0)
@@ -138,10 +143,11 @@ def gauss(a, sigma_pts):
 
 
 # ---- events (s5_pieces.run_events) --------------------------------------------------------------------------------------------------
-def run_events(ti, lat_act, pressed, en, drv):
+def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None):
   """steering-limit events (request at the clamp >= 0.3 s, lateral active, driver not pressing; s5_pieces) and firm takeovers
   (lateral active at the onset of |driver torque| >= TK_DRV sustained >= 0.5 s, then within 2 s of its end lateral control inactive
-  or openpilot disengaged) as 20 Hz indices (the onset)."""
+  or openpilot disengaged) as 20 Hz indices (the onset). A brake to a stop is never a takeover: not counted when the brake is
+  pressed in that window (openpilot disengaged by the brake) or the car is below TK_STOP_MPH within TK_STOP_M after the onset."""
   sat = (np.abs(ti) >= SAT_TI) & (lat_act > .5) & (pressed < .5)
   m = np.r_[0, sat.astype(np.int8), 0]
   ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
@@ -155,8 +161,15 @@ def run_events(ti, lat_act, pressed, en, drv):
     if b - a < TK_SUSTAIN or not la[a]:
       continue
     w = slice(a, min(len(la), b + TK_FOLLOW))
-    if (~la[w]).any() or (~e[w]).any():
-      tk.append(int(a))
+    if not ((~la[w]).any() or (~e[w]).any()):
+      continue
+    if brk is not None and (np.asarray(brk)[w] > .5).any():
+      continue
+    if v is not None and s is not None:
+      ahead = (np.asarray(s) >= s[a]) & (np.asarray(s) <= s[a] + TK_STOP_M)
+      if (np.asarray(v)[ahead] < TK_STOP_MPH * 0.44704).any():
+        continue
+    tk.append(int(a))
   return np.array(sats, int), np.array(tk, int)
 
 
@@ -485,6 +498,7 @@ def merge(rows, NL, usable=None):
     usable = np.zeros(0, bool)
   pt = rows[:, C_PT].astype(np.int64)
   kap = robust_kap(pt[usable], rows[usable, C_KAP], NL)
+  kap_med = group_median(pt[usable], rows[usable, C_KAP], NL)
   v = group_median(pt, rows[:, C_V], NL)
   bank = group_median(pt, rows[:, C_BANK], NL)
   grade = group_median(pt, rows[:, C_GRADE], NL)
@@ -492,21 +506,25 @@ def merge(rows, NL, usable=None):
   v_proven = np.full(NL, np.nan)
   cl = rows[:, C_CLEAN] > .5
   np.fmax.at(v_proven, pt[cl], rows[cl, C_V])
-  return kap, v, bank, npass, grade, v_proven
+  return kap, v, bank, npass, grade, v_proven, kap_med
 
 
-def spread_flags(flags, lib):
+def spread_flags(flags, lib, kap=None):
+  """flag windows onto road points; takeover and lane-line flags only onto points of a real bend (|kap| >= BEND_KAP)"""
   NL = len(lib['x'])
   fl = np.zeros(NL, np.uint8)
   vf = np.full(NL, np.nan)
+  bend = np.abs(kap) >= BEND_KAP if kap is not None else np.ones(NL, bool)
   for rd, lo, hi, f, v in flags:
     b, L = int(lib['base'][rd]), int(lib['len'][rd])
     q0, q1 = max(0, int(math.ceil(lo / SP - 1e-9))), min(L - 1, int(math.floor(hi / SP + 1e-9)))
     if q1 < q0:
       continue
-    sl = slice(b + q0, b + q1 + 1)
-    fl[sl] |= np.uint8(f)
-    vf[sl] = np.fmin(vf[sl], v)
+    idx = np.arange(b + q0, b + q1 + 1)
+    if f & (M.FLAG_TAKEOVER | M.FLAG_LANE):
+      idx = idx[bend[idx]]
+    fl[idx] |= np.uint8(f)
+    vf[idx] = np.fmin(vf[idx], v)
   return fl, vf
 
 
@@ -577,13 +595,17 @@ def carry_flags(arrays, flags, lib, tid):
     if t_last is not None and hi > end_m + SP / 2 and nx[t_last] >= 0:
       u = int(nx[t_last])
       k = min(int(ts[u + 1] - ts[u]), int(math.floor((hi - end_m) / SP)))
-      sl = slice(int(ts[u]), int(ts[u]) + k)
+      sl = np.arange(int(ts[u]), int(ts[u]) + k)
+      if f & (M.FLAG_TAKEOVER | M.FLAG_LANE):
+        sl = sl[np.abs(arrays['kap'][sl]) >= BEND_KAP]
       arrays['flags'][sl] |= np.uint8(f)
       arrays['v_flag'][sl] = np.fmin(arrays['v_flag'][sl], v)
     if t_first is not None and lo < -SP / 2:
       for u in prev.get(t_first, []):
         k = min(int(ts[u + 1] - ts[u]), int(math.floor(-lo / SP)))
-        sl = slice(int(ts[u + 1]) - k, int(ts[u + 1]))
+        sl = np.arange(int(ts[u + 1]) - k, int(ts[u + 1]))
+        if f & (M.FLAG_TAKEOVER | M.FLAG_LANE):
+          sl = sl[np.abs(arrays['kap'][sl]) >= BEND_KAP]
         arrays['flags'][sl] |= np.uint8(f)
         arrays['v_flag'][sl] = np.fmin(arrays['v_flag'][sl], v)
 
@@ -668,17 +690,18 @@ def build(passes, info=None):
     excl = excl | np.where(leaving[pc] & (rows[:, C_TOEND] <= LEAVE_M), EX_LEAVE, 0).astype(np.uint8)
     excl = excl | np.where(joining[pc] & (rows[:, C_FROMSTART] <= LEAVE_M), EX_JOIN, 0).astype(np.uint8)
   usable = excl == 0
-  kap, v, bank, npass, grade, v_proven = merge(rows, NL, usable)
+  kap, v, bank, npass, grade, v_proven, kap_med = merge(rows, NL, usable)
   nokap = ~np.isfinite(kap)
   kap = np.where(nokap, 0.0, kap)
-  fl, vf = spread_flags(flags, lib)
+  kap_med = np.where(np.isfinite(kap_med), kap_med, 0.0)
+  fl, vf = spread_flags(flags, lib, kap)
   fl = fl | np.where(nokap, M.FLAG_NOKAP, 0).astype(np.uint8)
   v_f = np.zeros(NL)
   for t in range(len(ts) - 1):
     idx = order[ts[t]:ts[t + 1]]
     v_f[idx] = fill_nan(v[idx])
   arrays = dict(x=x, y=y, hdg=hdg, kap=kap[order], v=v_f[order], flags=fl[order], v_flag=vf[order], npass=npass[order],
-                bank=bank[order], grade=grade[order], v_proven=v_proven[order], trace_start=ts, trace_next=nxt)
+                bank=bank[order], grade=grade[order], v_proven=v_proven[order], kap_med=kap_med[order], trace_start=ts, trace_next=nxt)
   carry_flags(arrays, flags, lib, tid)
   if info is not None:
     info['rows'] = int(len(rows))
@@ -687,6 +710,8 @@ def build(passes, info=None):
     info['pieces_leaving'] = int(leaving.sum())
     info['pieces_joining'] = int(joining.sum())
     info['lane_events'] = int(sum(len(p.get('lane_i', ())) for p in passes))
+    info['takeover_events'] = int(sum(len(p['tk_i']) for p in passes))
+    info['limit_events'] = int(sum(len(p['sat_i']) for p in passes))
     info['pieces'] = len(pieces)
   stats = dict(passes=len(passes), library_points=NL, roads=len(lib['base']), roads_kept=n_roads, traces=len(ts) - 1, points=len(x))
   return arrays, stats
@@ -934,7 +959,8 @@ def prepare_runs(tags, org, replay=False):
     p['Y'] = (lat - org['lat0']) * org['ky']
     sig = {nm: cat(lambda z, q, f=f: z[f]).astype(np.float32) for nm, f in (('en', 'enabled'), ('lat_act', 'lat_act'), ('ti', 'ti_cmd'),
                                                                            ('pressed', 'pressed'), ('drv', 'drv_trq'))}
-    p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'])
+    brk = cat(lambda z, q: z['brk']).astype(np.float32)
+    p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'], brk=brk, v=v, s=p['s'])
     p['blink'] = cat(lambda z, q: z['blink']).astype(np.float32)
     for nm in ('pressed', 'drv', 'lat_act'):
       p[nm] = sig[nm]
