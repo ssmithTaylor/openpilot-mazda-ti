@@ -261,7 +261,7 @@ def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   unit_speed = sm['frogpilotPlan'].steerAdvisorySpeed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
   shown = max(5 * int(unit_speed // 5), 5)
   return Alert(
-    f"Slow to {shown} {'km/h' if metric else 'mph'} for the corner ahead",
+    f"SLOW DOWN: corner ahead needs {shown} {'km/h' if metric else 'mph'}",
     "The steering cannot hold it at this speed",
     AlertStatus.userPrompt, AlertSize.mid,
     Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.4)

@@ -14,12 +14,16 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
                the sharpest pass where there are 1-2 passes, the 90th percentile of |kap| (signed as the median) with 3 or more
                (a stored pass that understated the corner was the largest avoidable miss in the remembered-roads study)
   v            float16 m/s, the median speed driven
-  flags        uint8: FLAG_LIMIT (the steering reached its limit here on some pass), FLAG_TAKEOVER (a firm takeover here on some pass)
+  flags        uint8: FLAG_LIMIT (the steering reached its limit here on some pass), FLAG_TAKEOVER (a firm takeover here on some pass),
+               FLAG_NOKAP (every pass's curvature here was excluded as unrepresentative; kap is 0, not measured),
+               FLAG_LANE (with lateral control active the car touched or crossed a lane line here on some pass, no blinker)
   v_flag       float16 m/s, the lowest speed of a pass that set a flag here (nan where no flag)
   npass        uint8, passes behind the point
   bank         float16 m/s^2 (nan where unknown); informational only
   grade        OPTIONAL float16 radians, road grade, positive = uphill in the direction of travel (median over passes of the
                liveLocationKalman calibrated pitch, low-passed ~3 s); nan where unknown; read as zeros when the file has none
+  v_proven     OPTIONAL float16 m/s: the highest speed of a pass through the point with lateral control active and no steering-limit
+               event or firm takeover from 80 m before to 80 m after it; nan where none, and read as nan when the file has none
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
   trace_next   int32 [n_traces]: the trace that continues this one past its last point (-1: none or ambiguous)
 """
@@ -32,9 +36,11 @@ VERSION = 1
 SPACING_M = 5.0
 FLAG_LIMIT = 1
 FLAG_TAKEOVER = 2
+FLAG_NOKAP = 4                   # no representative pass: kap is 0 here, not a measured straight
+FLAG_LANE = 8                    # with lateral control active the car touched or crossed a lane line here on some pass
 CELL_M = 50.0                    # grid cell of the nearest-point index
 KEYS = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next")
-OPTIONAL_KEYS = ("bank", "grade")
+OPTIONAL_KEYS = ("bank", "grade", "v_proven")
 
 
 def wrap(a):
@@ -56,6 +62,7 @@ class Memory:
     self.npass = np.asarray(arrays["npass"], np.int32)
     self.bank = np.asarray(arrays.get("bank", np.full(len(self.x), np.nan)), np.float64)
     self.grade = np.asarray(arrays.get("grade", np.zeros(len(self.x))), np.float64)
+    self.v_proven = np.asarray(arrays.get("v_proven", np.full(len(self.x), np.nan)), np.float64)
     self.trace_start = np.asarray(arrays["trace_start"], np.int64)
     self.trace_next = np.asarray(arrays["trace_next"], np.int64)
     self.n = len(self.x)
@@ -76,7 +83,7 @@ class Memory:
 
   def _check(self):
     n = self.n
-    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade"):
+    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade", "v_proven"):
       if len(getattr(self, name)) != n:
         raise ValueError(f"memory: {name} has {len(getattr(self, name))} points, x has {n}")
     if len(self.trace_start) < 1 or self.trace_start[0] != 0 or self.trace_start[-1] != n or np.any(np.diff(self.trace_start) < 1):
@@ -149,7 +156,7 @@ def load(path):
     meta = json.loads(str(z["meta"]))
     if int(meta.get("version", -1)) != VERSION:
       raise ValueError(f"memory: version {meta.get('version')} (expected {VERSION})")
-    arrays = {k: z[k] for k in KEYS + ("grade",) if k in z.files}
+    arrays = {k: z[k] for k in KEYS + ("grade", "v_proven") if k in z.files}
   missing = [k for k in KEYS if k not in arrays and k not in OPTIONAL_KEYS]
   if missing:
     raise ValueError(f"memory: missing {missing}")
@@ -172,6 +179,8 @@ def save(path, arrays, meta):
   }
   if "grade" in arrays:
     out["grade"] = np.asarray(arrays["grade"], np.float16)
+  if "v_proven" in arrays:
+    out["v_proven"] = np.asarray(arrays["v_proven"], np.float16)
   with open(path, "wb") as f:
     np.savez_compressed(f, **out)
 

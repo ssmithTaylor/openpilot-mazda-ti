@@ -66,10 +66,16 @@ def fresh_limit(alive, limit_ms, v_ms, position_ok, t, state):
 
 
 def keep_off_control_core():
+  """Cores 0-3 only (never the control core 4, nor 5-7 where plannerd / radard / modeld run real-time), a little below normal
+  priority: a slow tick of this process can never delay a process the communication checks watch (it publishes no message)."""
   try:
-    cores = [c for c in os.sched_getaffinity(0) if c != CONTROL_CORE]
+    cores = [c for c in os.sched_getaffinity(0) if c in (0, 1, 2, 3)]
     if cores:
       os.sched_setaffinity(0, cores)
+  except Exception:
+    pass
+  try:
+    os.nice(5)
   except Exception:
     pass
 

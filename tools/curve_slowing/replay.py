@@ -133,6 +133,7 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
     seq = 0
     last_btn_k = -10 ** 9
     state_time = collections.Counter()
+    why_ticks = collections.Counter()
     correction_taps = 0
     loss_by_state = collections.Counter()
     while p < n - 1:
@@ -166,6 +167,15 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
                     P.bearing_to_hdg(float(brg[p])) if np.isfinite(brg[p]) else 0.0)
         t0 = time.perf_counter()
         pl = planner.step(t, fix, v_sim, set_mph=cru.set, yaw_k=float(kap[p]), model_k=None)
+        if en[p] and v_sim > 9.0:
+          why_ticks[pl.why] += 1
+        for pev in planner.events:
+          events['plan_' + pev['kind']] += 1
+          if pev['kind'] == 'alert':
+            events['plan_alert_' + ('behind' if pev.get('behind') else 'floor')] += 1
+            if pev.get('npass') == 1:
+              events['plan_alert_single'] += 1
+        planner.events.clear()
         plan_times.append(time.perf_counter() - t0)
         d = P.plan_json(pl, t, seq, "act")
         d["model_k"] = float(mla[p]) / max(float(v_rec[p]), 5.0) ** 2 if np.isfinite(mla[p]) else None   # the model's sharpest bend (5 s)
@@ -218,7 +228,7 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
       k += 1
     rec_T = n * REC_DT
     runs.append(dict(run=r, rec_s=rec_T, sim_s=t, taps_down=taps["SET_MINUS"], taps_up=taps["SET_PLUS"], taps_untrusted=taps_untrusted, correction_taps=correction_taps,
-                     events=dict(events), state_time={f'{a_}|{b_}': round(v_, 1) for (a_, b_), v_ in state_time.items()},
+                     events=dict(events), state_time={f'{a_}|{b_}': round(v_, 1) for (a_, b_), v_ in state_time.items()}, why_ticks=dict(why_ticks),
                      loss={f'{a_}|{b_}': round(v_, 2) for (a_, b_), v_ in loss_by_state.items()}))
     # corners
     H = {h[0]: h for h in hist}
@@ -289,6 +299,10 @@ def summarise(res):
   st = collections.Counter()
   ev = collections.Counter()
   lo = collections.Counter()
+  wt = collections.Counter()
+  for x in runs:
+    wt.update(x.get('why_ticks', {}))
+  nwt = max(1, sum(wt.values()))
   for x in runs:
     for k_, v_ in x.get('loss', {}).items():
       lo[k_] += v_
@@ -328,6 +342,13 @@ def summarise(res):
     taps_down_per_hour=round(sum(x['taps_down'] for x in runs) / max(rec_h, 1e-9), 1),
     taps_up_per_hour=round(sum(x['taps_up'] for x in runs) / max(rec_h, 1e-9), 1),
     interventions_per_hour=round(ev.get('ev_start', 0) / max(rec_h, 1e-9), 1),
+    planner_state_share_engaged={k_: round(v_ / nwt, 3) for k_, v_ in wt.most_common(8)},
+    matched_share_engaged=round(sum(v_ for k_, v_ in wt.items() if k_ not in ("road not known here", "matching the remembered road",
+                                    "road differs from memory", "position uncertain")) / nwt, 3),
+    trusted_share_of_known_road=round(sum(v_ for k_, v_ in wt.items() if k_ not in ("road not known here", "matching the remembered road",
+                                      "road differs from memory", "position uncertain")) / max(1, nwt - wt.get("road not known here", 0)), 3),
+    warnings_per_hour=round(ev.get('plan_alert', 0) / max(rec_h, 1e-9), 2),
+    chose_not_to_slow_per_hour=round(ev.get('plan_not_slowing', 0) / max(rec_h, 1e-9), 1),
     minus_taps_without_trusted_ceiling=sum(x['taps_untrusted'] for x in runs),
     correction_taps_down_to_reference=sum(x.get('correction_taps', 0) for x in runs),
     time_lost_s_per_hour_by_state={k_: round(v_ / max(rec_h, 1e-9), 1) for k_, v_ in lo.most_common(12)},

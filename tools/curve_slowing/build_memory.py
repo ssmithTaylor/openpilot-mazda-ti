@@ -17,9 +17,17 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
   * a chronological library of roads: drive by drive, a pass point joins the existing road point within TOL_M whose heading is within
     HDG_TOL; runs of unmatched points start a new road (direction-specific); later passes project onto the roads (continuous distance);
   * every pass contributes, on each road point it covers, the yaw-based curvature (left +), the speed and the bank (interpolated by
-    distance); each pass's curvature is smoothed along the road (~10 m Gaussian) first, then kap is CONSERVATIVE (meta kap_rule
-    "max<3,p90>=3"): with 1-2 passes the sharpest pass (largest |kap|, its sign), with 3+ passes the 90th percentile of |kap| signed
-    by the median's sign (a stored pass that understated the corner was the biggest avoidable miss in the long-horizon study);
+    distance); each pass's curvature is smoothed along the road (~10 m Gaussian) first. Curvature samples from unrepresentative
+    stretches are EXCLUDED (they still count for position, speed and npass): blinker on +-5 s, the driver steering by hand
+    (steeringPressed or |driver torque| >= TK_DRV counts) while lateral control is active +-2 s, below 19 mph, slowing to a stop (from a sustained aEgo < -0.8 m/s^2
+    when the speed falls below 10 mph within 150 m) through the stop and the pull-away (back above 19 mph), the last 150 m before
+    the pass leaves the trace (moves onto a road that is not this trace's trace_next continuation, or stops) and the first 150 m
+    after it joins one (from a road that is not its predecessor, or from its start). kap is ROBUST (meta kap_rule "second<="):
+    one usable pass -> its value; two or more -> the SECOND sharpest |kap|, signed by the median's sign, and the LOWEST |kap| where
+    the usable passes disagree by more than DISAGREE x (phantom corners at traffic lights, swerves and lane changes cannot set a
+    corner on a straight road). No usable pass -> kap = 0 and FLAG_NOKAP;
+    v_proven = the highest speed of a pass through the point with lateral control active, not braking to a stop or pulling away,
+    and no steering-limit event, firm takeover or lane-line touch from PROVEN_M before to PROVEN_M after it (nan where none);
     v = median speed, bank = median (nan where unknown), npass = passes; grade = median over passes of the road grade (radians,
     + uphill in the direction of travel; nan where unknown): liveLocationKalman calibratedOrientationNED.value[1] (pitch in the
     calibrated car frame, nose up +, so no further calibration), low-passed with a Gaussian of sigma GRADE_SIGMA_S (~3 s window);
@@ -28,6 +36,8 @@ How the memory is built (reusing the remembered-roads study, s2_build / s5_piece
     (lateral active, |driver torque| >= TK_DRV counts for >= 0.5 s, then within 2 s lateral control inactive or openpilot disengaged;
     steeringPressed alone is not enough) +-TK_M; v_flag = lowest speed at the event of a pass that set the flag; a flag window that
     runs past a road's end / start is carried onto the first / last points of the linked next / previous trace (one hop);
+    FLAG_LANE (+-LANE_M) where, with lateral control active, the nearest modelV2 lane line (laneLineProbs > 0.5) came within
+    LANE_HALF_W of the car's centre at x = 0 for >= 0.3 s with no blinker within +-5 s (cache lane/<tag>.npz, position-free);
   * roads shorter than MIN_TRACE_M are dropped; roads are then cut where a pass moved from one road to another (so a trace starts or
     ends at every join and fork, cuts at least MIN_CUT_PTS apart) and trace_next links a trace to the single trace whose first point is
     within LINK_DIST_M / LINK_HDG of its last point and ahead of it (-1 if none or several).
@@ -252,10 +262,98 @@ def build_library(passes):
   return lib, aligns
 
 
+# rows columns (one per road point covered by a pass)
+C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART = range(11)
+EX_BLINK, EX_HAND, EX_SLOW, EX_LEAVE, EX_STOP, EX_JOIN = 1, 2, 4, 8, 16, 32
+EX_NAMES = {EX_BLINK: 'blinker +-5 s', EX_HAND: 'steering by hand +-2 s', EX_SLOW: 'below 19 mph', EX_LEAVE: 'last 150 m before leaving',
+            EX_STOP: 'slowing to a stop / pulling away', EX_JOIN: 'first 150 m after joining'}
+BLINK_PAD_S, HAND_PAD_S, SLOW_MPH, LEAVE_M = 5.0, 2.0, 19.0, 150.0
+STOP_DECEL, STOP_DECEL_S, STOP_MPH, STOP_LOOK_M = -0.8, 0.5, 10.0, 150.0
+PROVEN_M = 80.0
+LANE_HALF_W = 0.9              # m: the car's half width; a lane line nearer than this to the centre is touched or crossed
+LANE_PROB = 0.5
+LANE_MIN = 6                   # 0.3 s at 20 Hz
+LANE_BLINK_S = 5.0
+LANE_M = 60.0
+DISAGREE = 2.0                 # usable passes disagreeing by more than this factor in |kap|: the lower value
+
+
+def dilate(mask, pad):
+  """mask widened by pad samples each way"""
+  if pad <= 0 or not mask.any():
+    return mask.copy()
+  c = np.cumsum(np.r_[0, mask.astype(np.int64)])
+  n = len(mask)
+  i = np.arange(n)
+  return (c[np.minimum(n, i + pad + 1)] - c[np.maximum(0, i - pad)]) > 0
+
+
+def stop_mask(v, s, aego=None):
+  """slowing to a stop and pulling away: from where a sustained deceleration (aEgo < STOP_DECEL for STOP_DECEL_S) starts, when the speed
+  falls below STOP_MPH within STOP_LOOK_M of it, to the stop, then until the speed is back above SLOW_MPH"""
+  v = np.asarray(v, float)
+  n = len(v)
+  out = np.zeros(n, bool)
+  if n < 3:
+    return out
+  a = np.asarray(aego, float) if aego is not None else gauss(np.gradient(v) / DT, 0.25 / DT)
+  dec = a < STOP_DECEL
+  m = np.r_[0, dec.astype(np.int8), 0]
+  ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
+  slow = v < STOP_MPH * 0.44704
+  slow_idx = np.where(slow)[0]
+  fast_idx = np.where(v >= SLOW_MPH * 0.44704)[0]
+  for i0, i1 in ed:
+    if i1 - i0 < int(STOP_DECEL_S / DT):
+      continue
+    j = slow_idx[np.searchsorted(slow_idx, i0):]
+    if not len(j) or s[j[0]] > s[i1 - 1] + STOP_LOOK_M:
+      continue
+    j = int(j[0])
+    f = fast_idx[np.searchsorted(fast_idx, j):]
+    j2 = int(f[0]) if len(f) else n
+    out[i0:j2] = True
+  return out
+
+
+def excl_bits(p):
+  """20 Hz exclusion bits of a pass (curvature only): blinker +-5 s, driver steering by hand while lateral control is active +-2 s,
+  below 19 mph, slowing to a stop and pulling away"""
+  n = len(p['s'])
+  out = np.zeros(n, np.uint8)
+  if 'blink' in p:
+    out |= np.where(dilate(np.asarray(p['blink']) > .5, int(BLINK_PAD_S / DT)), EX_BLINK, 0).astype(np.uint8)
+  hand = np.zeros(n, bool)
+  if 'pressed' in p:
+    hand |= np.asarray(p['pressed']) > .5
+  if 'drv' in p:
+    hand |= np.abs(np.asarray(p['drv'])) >= TK_DRV
+  if 'lat_act' in p:
+    hand &= np.asarray(p['lat_act']) > .5      # only while openpilot steers: manual driving is the car's real path
+  out |=np.where(dilate(hand, int(HAND_PAD_S / DT)), EX_HAND, 0).astype(np.uint8)
+  out |= np.where(np.asarray(p['v']) < SLOW_MPH * 0.44704, EX_SLOW, 0).astype(np.uint8)
+  out |= np.where(stop_mask(p['v'], p['s'], p.get('aego')), EX_STOP, 0).astype(np.uint8)
+  return out
+
+
+def lane_events(lane_d, lat_act, blink):
+  """lane-line touches: lateral control active, the nearest lane line (prob > LANE_PROB) within LANE_HALF_W of the centre for at least
+  0.3 s, no blinker within +-5 s. -> 20 Hz onset indices"""
+  d = np.asarray(lane_d, float)
+  hit = np.isfinite(d) & (d <= LANE_HALF_W) & (np.asarray(lat_act) > .5)
+  hit &= ~dilate(np.asarray(blink) > .5, int(LANE_BLINK_S / DT))
+  m = np.r_[0, hit.astype(np.int8), 0]
+  ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
+  return np.array([int(a) for a, b in ed if b - a >= LANE_MIN], int)
+
+
 def collect(passes, lib, aligns):
-  """Per-pass samples on road points, flag intervals and road-to-road transitions (cut points)."""
-  rows = []          # (lib point, pass, kap, v, bank)
+  """Per-pass samples on road points, flag intervals, road-to-road transitions (cut points) and the pieces (a pass's stretch on
+  one road) with how each one ends: ('same',) the pass carries on along the road after a position gap, ('road', rb, qb) it moved
+  onto road rb at point qb, ('end',) the pass stopped there."""
+  rows = []
   flags = []         # (road, g_lo, g_hi, flag, v)
+  pieces = []        # (road, last point index, exit)
   cuts = collections.defaultdict(set)
   trans = set()      # (road left, its last point index, road entered, its first point index) as driven
   Lroad, base = lib['road'], lib['base']
@@ -265,7 +363,10 @@ def collect(passes, lib, aligns):
     rd_of = np.where(ok, Lroad[np.where(ok, lj, 0)], -1)
     s = p['s']
     sats, tks = p['sat_i'], p['tk_i']
-    # transitions between roads -> cuts (before the entered point, after the left point)
+    lns = np.asarray(p.get('lane_i', np.zeros(0, int)), int)
+    ev_s = np.sort(np.r_[s[sats], s[tks], s[lns]]) if len(sats) + len(tks) + len(lns) else np.zeros(0)
+    xb = excl_bits(p)
+    la = (np.asarray(p['lat_act']) > .5) if 'lat_act' in p else np.ones(len(s), bool)
     for k in np.where(ok[:-1] & ok[1:] & (rd_of[:-1] != rd_of[1:]))[0]:
       ra, rb = rd_of[k], rd_of[k + 1]
       cuts[rb].add(int(lj[k + 1] - base[rb]))
@@ -288,21 +389,51 @@ def collect(passes, lib, aligns):
         q0 = int(math.ceil(s_lib[0] / SP - 1e-9))
         q1 = min(int(math.floor(s_lib[-1] / SP + 1e-9)), int(lib['len'][rd]) - 1)
         if q1 >= q0:
+          # how the pass leaves this stretch
+          k3 = k2 + 1
+          while k3 < n and rd_of[k3] < 0:
+            k3 += 1
+          k0 = k - 1
+          while k0 >= 0 and rd_of[k0] < 0:
+            k0 -= 1
+          if k0 < 0:
+            entry = ('start',)
+          elif rd_of[k0] == rd:
+            entry = ('same',) if sl[k0] < s_lib[0] else ('start',)
+          else:
+            entry = ('road', int(rd_of[k0]), int(lj[k0] - base[rd_of[k0]]))
+          if k3 >= n:
+            exit_ = ('end',)
+          elif rd_of[k3] == rd:
+            exit_ = ('same',) if sl[k3] > s_lib[-1] else ('end',)
+          else:
+            exit_ = ('road', int(rd_of[k3]), int(lj[k3] - base[rd_of[k3]]))
+          piece = len(pieces)
+          pieces.append((int(rd), int(q1), exit_, int(q0), entry))
           q = np.arange(q0, q1 + 1)
           g = q * SP
           sr = np.interp(g, s_lib, s[idx20[ks]])
           i20 = np.clip(np.searchsorted(s, sr), 0, len(s) - 1)
           kap = gauss(np.interp(sr, s, p['kap']), KAP_SIGMA_M / SP)     # ~10 m along the road, per pass
           gr = p['grade'][i20] if 'grade' in p else np.full(len(q), np.nan)
-          rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr])
-          for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M)):
+          if len(ev_s):
+            lo_i = np.searchsorted(ev_s, sr - PROVEN_M, side='left')
+            hi_i = np.searchsorted(ev_s, sr + PROVEN_M, side='right')
+            clean = (hi_i == lo_i) & la[i20]
+          else:
+            clean = la[i20].copy()
+          clean &= (xb[i20] & EX_STOP) == 0            # never proven while braking to a stop or pulling away
+          rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr, xb[i20], np.full(len(q), piece),
+                            (q1 - q) * SP, clean, (q - q0) * SP])
+          for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M),
+                                  (lns, M.FLAG_LANE, LANE_M, LANE_M)):
             for e in evs:
               if i20[0] - EVENT_SLACK <= e <= i20[-1] + EVENT_SLACK:
                 ge = float(np.interp(s[e], sr, g)) if len(sr) > 1 else float(g[0])
                 flags.append((rd, ge - lo, ge + hi, fl, float(p['v'][e])))
       k = k2 + 1
-  rows = np.concatenate(rows) if rows else np.zeros((0, 6))
-  return rows, flags, cuts, trans
+  rows = np.concatenate(rows) if rows else np.zeros((0, 11))
+  return rows, flags, cuts, trans, pieces
 
 
 def group_median(key, val, n):
@@ -319,8 +450,9 @@ def group_median(key, val, n):
   return out
 
 
-def conservative_kap(key, val, n):
-  """per key: 1-2 samples -> the largest |val| with its sign; 3+ -> 90th percentile of |val| signed by the median's sign. nan if none."""
+def robust_kap(key, val, n):
+  """per key: 1 sample -> it; 2+ -> the SECOND sharpest |val|, signed by the median's sign, and where the samples disagree by more
+  than DISAGREE x in |val| the LOWEST |val| instead (meta kap_rule "second<="). nan if none."""
   ok = np.isfinite(val)
   key, val = key[ok], val[ok]
   out = np.full(n, np.nan)
@@ -329,31 +461,38 @@ def conservative_kap(key, val, n):
   o = np.lexsort((np.abs(val), key))
   key, val = key[o], val[o]
   uk, start, cnt = np.unique(key, return_index=True, return_counts=True)
-  sharpest = val[start + cnt - 1]
-  pos = 0.9 * (cnt - 1)
-  lo = np.floor(pos).astype(int)
-  hi = np.minimum(lo + 1, cnt - 1)
-  a = np.abs(val)
-  p90 = a[start + lo] + (pos - lo) * (a[start + hi] - a[start + lo])
+  second = val[start + np.maximum(cnt - 2, 0)]
+  lowest = np.abs(val[start])
+  sharpest = np.abs(val[start + cnt - 1])
   sgn = np.sign(group_median(key, val, n)[uk])
-  sgn = np.where(sgn == 0, np.sign(sharpest), sgn)
-  out[uk] = np.where(cnt < 3, sharpest, sgn * p90)
+  sgn = np.where(sgn == 0, np.sign(second), sgn)
+  mag = np.abs(second)
+  disagree = (cnt >= 2) & (sharpest > DISAGREE * lowest)
+  mag = np.where(disagree, np.minimum(mag, lowest), mag)
+  out[uk] = np.where(cnt < 2, second, sgn * mag)
   return out
 
 
-def merge(rows, NL):
-  """per library point: conservative kap, median v and bank, and the number of passes"""
+def merge(rows, NL, usable=None):
+  """per library point: robust kap from the usable samples, median v, bank and grade, npass, and v_proven (all samples)"""
   if len(rows):
-    key = rows[:, 0].astype(np.int64) * 100000 + rows[:, 1].astype(np.int64)
+    key = rows[:, C_PT].astype(np.int64) * 100000 + rows[:, C_PASS].astype(np.int64)
     _, first = np.unique(key, return_index=True)      # one sample per (point, pass)
-    rows = rows[np.sort(first)]
-  pt = rows[:, 0].astype(np.int64) if len(rows) else np.zeros(0, np.int64)
-  kap = conservative_kap(pt, rows[:, 2] if len(rows) else np.zeros(0), NL)
-  v = group_median(pt, rows[:, 3] if len(rows) else np.zeros(0), NL)
-  bank = group_median(pt, rows[:, 4] if len(rows) else np.zeros(0), NL)
-  grade = group_median(pt, rows[:, 5] if len(rows) else np.zeros(0), NL)
+    first = np.sort(first)
+    rows = rows[first]
+    usable = usable[first] if usable is not None else np.ones(len(rows), bool)
+  else:
+    usable = np.zeros(0, bool)
+  pt = rows[:, C_PT].astype(np.int64)
+  kap = robust_kap(pt[usable], rows[usable, C_KAP], NL)
+  v = group_median(pt, rows[:, C_V], NL)
+  bank = group_median(pt, rows[:, C_BANK], NL)
+  grade = group_median(pt, rows[:, C_GRADE], NL)
   npass = np.bincount(pt, minlength=NL)[:NL]
-  return kap, v, bank, npass, grade
+  v_proven = np.full(NL, np.nan)
+  cl = rows[:, C_CLEAN] > .5
+  np.fmax.at(v_proven, pt[cl], rows[cl, C_V])
+  return kap, v, bank, npass, grade, v_proven
 
 
 def spread_flags(flags, lib):
@@ -449,49 +588,107 @@ def carry_flags(arrays, flags, lib, tid):
         arrays['v_flag'][sl] = np.fmin(arrays['v_flag'][sl], v)
 
 
-def build(passes):
-  """passes (chronological) -> (arrays for ti_curve_memory.save, stats). Each pass: dict(drive, s, X, Y, v, kap, bank, sat_i, tk_i)."""
+def build(passes, info=None):
+  """passes (chronological) -> (arrays for ti_curve_memory.save, stats). Each pass: dict(drive, s, X, Y, v, kap, bank, sat_i, tk_i and,
+  optional, grade, blink, pressed, drv, lat_act). `info` (a dict) receives position-free diagnostics."""
   passes = [p for p in passes if len(p['s']) > 1]
   lib, aligns = build_library(passes)
-  rows, flags, cuts, trans = collect(passes, lib, aligns)
+  rows, flags, cuts, trans, pieces = collect(passes, lib, aligns)
   NL = len(lib['x'])
-  kap, v, bank, npass, grade = merge(rows, NL)
-  fl, vf = spread_flags(flags, lib)
-  out = collections.defaultdict(list)
-  starts = [0]
+  # ---- layout: kept roads cut into traces (geometry only) ----
+  hdg_lib = np.zeros(NL)
+  order, starts, tid = [], [0], {}
+  trace_lib = np.full(NL, -1, np.int64)
   n_roads = 0
-  tid = {}           # (road, first point index of the piece) -> trace; (road, last point index, 'end') -> trace
   for rd in range(len(lib['base'])):
     b, L = int(lib['base'][rd]), int(lib['len'][rd])
     if L * SP < MIN_TRACE_M:
       continue
     n_roads += 1
-    sl = slice(b, b + L)
-    xs, ys = gauss(lib['x'][sl], 1.0), gauss(lib['y'][sl], 1.0)
-    h = np.arctan2(np.gradient(ys), np.gradient(xs))
-    k_s = fill_nan(kap[sl])            # passes were smoothed before the per-point figure
-    v_s = fill_nan(v[sl])
-    pieces = [0] + split_points(L, cuts.get(rd, ())) + [L]
-    for a, c in zip(pieces[:-1], pieces[1:]):
-      out['x'].append(lib['x'][sl][a:c]); out['y'].append(lib['y'][sl][a:c]); out['hdg'].append(h[a:c])
-      out['kap'].append(k_s[a:c]); out['v'].append(v_s[a:c]); out['flags'].append(fl[sl][a:c]); out['v_flag'].append(vf[sl][a:c])
-      out['npass'].append(npass[sl][a:c]); out['bank'].append(bank[sl][a:c])
-      out['grade'].append(grade[sl][a:c])
-      tid[(rd, a)] = len(starts) - 1
-      tid[(rd, c - 1, 'end')] = len(starts) - 1
+    xs, ys = gauss(lib['x'][b:b + L], 1.0), gauss(lib['y'][b:b + L], 1.0)
+    hdg_lib[b:b + L] = np.arctan2(np.gradient(ys), np.gradient(xs))
+    cps = [0] + split_points(L, cuts.get(rd, ())) + [L]
+    for a, c in zip(cps[:-1], cps[1:]):
+      t = len(starts) - 1
+      tid[(rd, a)] = t
+      tid[(rd, c - 1, 'end')] = t
+      trace_lib[b + a:b + c] = t
+      order.append(np.arange(b + a, b + c))
       starts.append(starts[-1] + c - a)
   if len(starts) == 1:
     raise ValueError('no road long enough to keep')
-  arrays = {k: np.concatenate(vv) for k, vv in out.items()}
-  arrays['trace_start'] = np.array(starts, np.int64)
+  order = np.concatenate(order)
+  ts = np.array(starts, np.int64)
+  x, y, hdg = lib['x'][order], lib['y'][order], hdg_lib[order]
   observed = collections.defaultdict(set)
   for ra, qa, rb, qb in trans:
     ta, tb = tid.get((ra, qa, 'end')), tid.get((rb, qb))
     if ta is not None and tb is not None:
       observed[ta].add(tb)
-  arrays['trace_next'] = link_traces(arrays['x'], arrays['y'], arrays['hdg'], arrays['trace_start'], observed)
+  nxt = link_traces(x, y, hdg, ts, observed)
+  # ---- which pieces leave their trace (the pass's own continuation is not this trace's) ----
+  pos_in_trace = np.full(NL, -1, np.int64)
+  pos_in_trace[order] = np.arange(len(order)) - np.repeat(ts[:-1], np.diff(ts))
+  tlen = np.diff(ts)
+  leaving = np.zeros(len(pieces), bool)
+  joining = np.zeros(len(pieces), bool)
+  prev_of = collections.defaultdict(set)
+  for t_, u_ in enumerate(nxt):
+    if u_ >= 0:
+      prev_of[int(u_)].add(t_)
+  for i, (rd, q1, ex, q0, en) in enumerate(pieces):
+    j = int(lib['base'][rd]) + q0
+    t = trace_lib[j]
+    if t < 0 or en[0] == 'same':
+      continue
+    if en[0] == 'start':
+      joining[i] = True
+      continue
+    ja = int(lib['base'][en[1]]) + min(en[2], int(lib['len'][en[1]]) - 1)
+    ta = trace_lib[ja]
+    at_start = pos_in_trace[j] <= 1
+    at_end = ta >= 0 and pos_in_trace[ja] >= tlen[ta] - 2
+    joining[i] = not (at_start and at_end and ta in prev_of.get(int(t), set()))
+  for i, (rd, q1, ex, _q0, _en) in enumerate(pieces):
+    j = int(lib['base'][rd]) + q1
+    t = trace_lib[j]
+    if t < 0 or ex[0] == 'same':
+      continue
+    if ex[0] == 'end':
+      leaving[i] = True
+      continue
+    jb = int(lib['base'][ex[1]]) + min(ex[2], int(lib['len'][ex[1]]) - 1)
+    tb = trace_lib[jb]
+    at_end = pos_in_trace[j] >= tlen[t] - 2
+    at_start = tb >= 0 and pos_in_trace[jb] <= 1
+    leaving[i] = not (at_end and at_start and nxt[t] == tb)
+  excl = rows[:, C_EXCL].astype(np.uint8) if len(rows) else np.zeros(0, np.uint8)
+  if len(rows):
+    pc = rows[:, C_PIECE].astype(np.int64)
+    excl = excl | np.where(leaving[pc] & (rows[:, C_TOEND] <= LEAVE_M), EX_LEAVE, 0).astype(np.uint8)
+    excl = excl | np.where(joining[pc] & (rows[:, C_FROMSTART] <= LEAVE_M), EX_JOIN, 0).astype(np.uint8)
+  usable = excl == 0
+  kap, v, bank, npass, grade, v_proven = merge(rows, NL, usable)
+  nokap = ~np.isfinite(kap)
+  kap = np.where(nokap, 0.0, kap)
+  fl, vf = spread_flags(flags, lib)
+  fl = fl | np.where(nokap, M.FLAG_NOKAP, 0).astype(np.uint8)
+  v_f = np.zeros(NL)
+  for t in range(len(ts) - 1):
+    idx = order[ts[t]:ts[t + 1]]
+    v_f[idx] = fill_nan(v[idx])
+  arrays = dict(x=x, y=y, hdg=hdg, kap=kap[order], v=v_f[order], flags=fl[order], v_flag=vf[order], npass=npass[order],
+                bank=bank[order], grade=grade[order], v_proven=v_proven[order], trace_start=ts, trace_next=nxt)
   carry_flags(arrays, flags, lib, tid)
-  stats = dict(passes=len(passes), library_points=NL, roads=len(lib['base']), roads_kept=n_roads, traces=len(starts) - 1, points=len(arrays['x']))
+  if info is not None:
+    info['rows'] = int(len(rows))
+    info['excluded_rows'] = int((excl > 0).sum())
+    info['excluded_by_reason'] = {nm: int(((excl & b) > 0).sum()) for b, nm in EX_NAMES.items()}
+    info['pieces_leaving'] = int(leaving.sum())
+    info['pieces_joining'] = int(joining.sum())
+    info['lane_events'] = int(sum(len(p.get('lane_i', ())) for p in passes))
+    info['pieces'] = len(pieces)
+  stats = dict(passes=len(passes), library_points=NL, roads=len(lib['base']), roads_kept=n_roads, traces=len(ts) - 1, points=len(x))
   return arrays, stats
 
 
@@ -554,6 +751,66 @@ def read_positions(args):
                      o[1] if len(o) > 2 else np.nan, p.value[2] if len(p.value) > 2 else np.nan))
   np.savez_compressed(outp, llk=np.array(rows, float).reshape(-1, LLK_COLS))
   return tag, 'read'
+
+
+def read_lanes(args):
+  """one rlog -> lane/<tag>.npz: t (s from the first carState), d = |lateral offset| at x = 0 of the nearest modelV2 lane line with
+  laneLineProbs > LANE_PROB (nan when none). Position-free."""
+  tag, path = args
+  outp = _p('cache', 'lane', tag + '.npz')
+  if os.path.exists(outp):
+    return tag, 'cached'
+  from cereal import log as clog
+  with open(path, 'rb') as f:
+    evs = list(clog.Event.read_multiple_bytes(f.read()))
+  t0 = None
+  for e in evs:
+    if e.which() == 'carState':
+      t0 = e.logMonoTime
+      break
+  rows = []
+  if t0 is not None:
+    for e in evs:
+      if e.which() == 'modelV2':
+        m = e.modelV2
+        probs = list(m.laneLineProbs)
+        best = np.nan
+        for i, ln in enumerate(m.laneLines):
+          if i < len(probs) and probs[i] > LANE_PROB and len(ln.y):
+            dd = abs(float(ln.y[0]))
+            if not (dd >= best):
+              best = dd
+        rows.append(((e.logMonoTime - t0) * 1e-9, best))
+  np.savez_compressed(outp, lane=np.array(rows, float).reshape(-1, 2))
+  return tag, 'read'
+
+
+def ensure_lanes(tags, workers):
+  os.makedirs(_p('cache', 'lane'), exist_ok=True)
+  todo = [(t, p) for t, p in tags.items() if not os.path.exists(_p('cache', 'lane', t + '.npz'))]
+  if todo:
+    t0 = time.time()
+    from multiprocessing import Pool
+    with Pool(min(workers, 6), initializer=low_priority) as pool:
+      for i, _ in enumerate(pool.imap_unordered(read_lanes, todo, chunksize=4)):
+        if (i + 1) % 200 == 0:
+          print(f'  lanes {i + 1}/{len(todo)}', flush=True)
+    print(f'read lane lines from {len(todo)} rlogs in {time.time() - t0:.0f} s', flush=True)
+
+
+def lane_grid(tag, n):
+  """nearest lane-line distance on the segment's 20 Hz grid (last model frame within 0.2 s; nan otherwise or when not cached)"""
+  f = _p('cache', 'lane', tag + '.npz')
+  out = np.full(n, np.nan)
+  if not os.path.exists(f):
+    return out
+  l = np.load(f)['lane']
+  if len(l) < 2:
+    return out
+  l = l[np.argsort(l[:, 0])]
+  tg = np.arange(n) * DT
+  k = np.clip(np.searchsorted(l[:, 0], tg, side='right') - 1, 0, len(l) - 1)
+  return np.where(np.abs(tg - l[k, 0]) < 0.2, l[k, 1], np.nan)
 
 
 def pos_cached(tag):
@@ -678,6 +935,13 @@ def prepare_runs(tags, org, replay=False):
     sig = {nm: cat(lambda z, q, f=f: z[f]).astype(np.float32) for nm, f in (('en', 'enabled'), ('lat_act', 'lat_act'), ('ti', 'ti_cmd'),
                                                                            ('pressed', 'pressed'), ('drv', 'drv_trq'))}
     p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'])
+    p['blink'] = cat(lambda z, q: z['blink']).astype(np.float32)
+    for nm in ('pressed', 'drv', 'lat_act'):
+      p[nm] = sig[nm]
+    if all('aego' in z for z in zs):
+      p['aego'] = cat(lambda z, q: z['aego']).astype(np.float32)
+    p['lane_d'] = np.concatenate([lane_grid(t, k) for t, k in zip(ts, n)]).astype(np.float32)
+    p['lane_i'] = lane_events(p['lane_d'], p['lat_act'], p['blink'])
     if replay:
       p.update(sig)
       p['lat'], p['lon'] = lat, lon
@@ -859,6 +1123,7 @@ def load_passes(tags, workers):
     P = pickle.load(open(path, 'rb'))
   else:
     ensure_positions(allt, workers)
+    ensure_lanes(allt, workers)
     org = origin()
     t0 = time.time()
     P = prepare_runs(allt, org)
@@ -870,13 +1135,15 @@ def load_passes(tags, workers):
 
 def write_memory(passes, path, meta_extra):
   org = origin()
-  arrays, stats = build(passes)
+  info = {}
+  arrays, stats = build(passes, info)
+  stats.update(info)
   meta = dict(version=M.VERSION, spacing_m=SP, lat0=org['lat0'], lon0=org['lon0'], kx=org['kx'], ky=org['ky'],
               built=time.strftime('%Y-%m-%d %H:%M'), builder='tools/curve_slowing/build_memory.py', **meta_extra,
               params=dict(tol_m=TOL_M, hdg_tol_deg=math.degrees(HDG_TOL), min_trace_m=MIN_TRACE_M, limit_before_m=LIMIT_BEFORE_M,
                           limit_after_m=LIMIT_AFTER_M, takeover_m=TK_M, link_dist_m=LINK_DIST_M, link_hdg_deg=math.degrees(LINK_HDG),
                           kap_sigma_m=KAP_SIGMA_M, tk_drv_counts=TK_DRV, tk_sustain_s=TK_SUSTAIN * DT, tk_follow_s=TK_FOLLOW * DT),
-              kap_rule='max<3,p90>=3', stats=stats)
+              kap_rule='second<=', stats=stats)
   os.makedirs(os.path.dirname(path), exist_ok=True)
   M.save(path, arrays, meta)
   m = M.load(path)                   # validate
@@ -1060,6 +1327,7 @@ def main():
     gate = default_tags()
     ensure_positions({t: p for t, p in rt.items() if t in gate}, workers)
     rt = ensure_rlog_segs(rt, workers)
+    ensure_lanes(rt, workers)
     passes = prepare_runs(rt, origin())
     drives = list(collections.OrderedDict.fromkeys(t.split('-')[0] for t in rt))
     cnt = dict(cnt, segments_used=len(rt), drives_used=len(drives), gate_drives_used=len({t.split('-')[0] for t in rt if t in gate}))

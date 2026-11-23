@@ -743,3 +743,45 @@ def test_no_restore_without_trust_unless_past_the_corner():
   c.corner_end_odo = None
   run(c, car, 3000, lambda f, car: plan(None, trusted=False), start=1500)
   assert not [k for k, b in car.sent if b == "SET_PLUS"]
+
+
+def test_needs_more_only_when_the_floor_binds():
+  # behind plan, corner reachable within the floor: a mild line, never "NEEDS MORE"
+  c, car = C.Curve(), Car(50, 50)
+  run(c, car, 200, lambda f, car: dict(plan(39, corner=45), behind=True))
+  assert "NEEDS MORE" not in c.line2 and "as fast as the cruise allows" in c.line2 and not c.needs_more
+  # the corner's speed below the floor (50 - 15 = 35): "NEEDS MORE"
+  c, car = C.Curve(), Car(50, 50)
+  run(c, car, 200, lambda f, car: plan(30, corner=30))
+  assert c.needs_more and "NEEDS MORE" in c.line2
+
+
+def test_brake_then_res_puts_the_drivers_speed_back_promptly():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 1200, lambda f, car: plan(42, corner=42))
+  run(c, car, 1300, lambda f, car: plan(None), start=1200)          # partly restored, then...
+  low = car.set
+  run(c, car, 50, lambda f, car: plan(30, corner=30), start=2500, brake=True, cruise_on=False)   # a brake for a light
+  f0 = car.k
+
+  def res(f, car):
+    return f < f0 + 10
+  # RES at speed on an UNKNOWN road (no corner): fast taps back to 55, no wait for the car to catch up
+  run(c, car, 1500, lambda f, car: plan(None, trusted=False, known=False), start=f0, driver_button=res)
+  sets = [h[1] for h in car.history if h[0] >= f0]
+  assert sets[-1] == 55 and c.ref == 55
+  t_back = next(h[0] for h in car.history if h[0] >= f0 and h[1] == 55) - f0
+  assert t_back * DT < (55 - min(sets)) * 0.5 + 3.0, t_back     # about tap pace, not the car's pace
+
+
+def test_brake_then_res_with_a_real_corner_ahead_keeps_it_low():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 2500, lambda f, car: plan(42, corner=42))
+  run(c, car, 50, lambda f, car: plan(42, corner=42), start=2500, brake=True, cruise_on=False)
+  f0 = car.k
+  run(c, car, 1000, lambda f, car: plan(42, corner=42), start=f0, driver_button=lambda f, car: f < f0 + 10)
+  assert max(h[1] for h in car.history if h[0] >= f0 + 50) <= 42
+
+
+def test_pause_after_a_driver_button_is_10_s():
+  assert C.PAUSE_S == 10.0

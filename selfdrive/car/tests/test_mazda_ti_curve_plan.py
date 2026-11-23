@@ -78,17 +78,19 @@ def test_corner_mph_examples():
 
 def test_envelope_conservative_end():
   # the lower of the two measurements per band
-  assert P.envelope(25) == 1.14 and P.envelope(30) == 1.14 and P.envelope(35) == 2.12
+  # the measured limits (lateral-sensors-20261122); the 28-31 mph handover keeps the 19-27 figure; 90 % of them
+  assert P.envelope(25) == 1.41 and P.envelope(30) == 1.41 and P.envelope(35) == 2.20
   assert P.envelope(50) == 2.42 and P.envelope(65) == 2.13
-  assert P.MARGIN <= 0.88
+  assert P.MARGIN <= 0.90
 
 
 def test_flagged_point_at_least_10_below():
-  kap = np.array([0.0, 0.0])
-  flags = np.array([M.FLAG_LIMIT, M.FLAG_TAKEOVER], np.uint8)
-  vf = np.array([50 * MPH, 40 * MPH])
+  kap = np.array([1 / 300.0, 1 / 200.0, 0.0])               # real bends at the failing speeds (> 1 m/s^2), and a straight
+  flags = np.array([M.FLAG_LIMIT, M.FLAG_TAKEOVER, M.FLAG_LANE], np.uint8)
+  vf = np.array([50 * MPH, 40 * MPH, 50 * MPH])
   need = P.needed_mph(kap, flags, vf)
   assert need[0] <= 40 and need[1] <= 30
+  assert need[2] == P.MAX_MPH                                # a lane-line touch on a straight is not a corner
 
 
 def test_slow_distance_grows_with_drop():
@@ -186,10 +188,12 @@ def test_push_opens_the_gap_then_raises_to_target():
 
 def test_downhill_slow_car_is_flagged_not_pushed_lower():
   tr, mem = single_corner()
-  res = drive(mem, tr, 55, 160, closed=True, rate=0.5)
+  res = drive(mem, tr, 50, 160, closed=True, rate=0.5)  # 50 mph: floor 35, below the corner's own speed (the floor does not bind)
+  need = P.corner_mph(CORNER_K)[0]
+  assert need > 35
   corner = [p for t, s, p, v in res if p.kind == "corner"]
-  assert any(p.capped for p in corner)
-  assert min(p.ceil for p in corner) >= 40             # never below the floor, never "more push" than the 6 mph gap
+  assert any(p.behind for p in corner) and not any(p.capped for p in corner)   # behind plan is NOT "needs more"
+  assert min(p.ceil for p in corner) >= max(35, need - P.DRIVE_GAP_MPH)       # never below the floor, never more push than 6 mph
 
 
 def test_corner_right_after_long_straight_is_seen_far_ahead():
@@ -308,7 +312,7 @@ def test_plan_json_has_no_position():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 30)
   d = P.plan_json(res[-1][2], 12.0, 7, "shadow")
-  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner", "end"}
+  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner", "end", "behind", "alert"}
 
 
 def test_memory_roundtrip(tmp_path):
@@ -333,3 +337,79 @@ def test_each_corner_is_started_once_even_when_the_car_does_not_slow():
   pl = P.Planner(mem)
   drive(mem, tr, 60, 200, planner=pl)
   assert sum(1 for e in pl.events if e["kind"] == "start") <= 2
+
+
+# ---- the on-road warning --------------------------------------------------------------------------------------------------------
+def test_alert_when_the_floor_binds_early_once_and_clears():
+  tr = road((2500, 0.0), (120, 1 / 70.0), (800, 0.0))         # needs ~27-30 mph; at 60 mph the floor (45) binds
+  mem = M.synthetic([tr])
+  res = drive(mem, tr, 60, 200, closed=True)
+  on = [(t, s, p) for t, s, p, v in res if p.alert_mph is not None]
+  assert on, "no warning for a corner that needs more than the floor"
+  t0, s0, p0 = on[0]
+  t_entry = [t for t, s, p, v in res if s >= 2500][0]
+  assert t_entry - t0 >= P.ALERT_LEAD_S                   # early: at least the lead before the corner
+  assert all(p.alert_mph == p0.alert_mph for _, _, p in on)
+  # once per corner: one contiguous stretch, gone after the corner
+  ts = [t for t, _, _ in on]
+  assert all(b - a <= DT + 1e-6 for a, b in zip(ts, ts[1:]))
+  assert not any(p.alert_mph for t, s, p, v in res if s > 2620 + P.HOLD_AFTER_M + 20)
+
+
+def test_alert_when_behind_plan_and_not_when_reachable():
+  tr, mem = single_corner()
+  res = drive(mem, tr, 50, 160, closed=True, rate=0.4)      # the cruise slows far less than planned (floor 35 does not bind)
+  assert any(p.alert_mph for t, s, p, v in res)
+  res = drive(mem, tr, 50, 160, closed=True)                # as planned: no warning
+  assert not any(p.alert_mph for t, s, p, v in res)
+
+
+def test_proven_speed_means_no_slowing_and_trouble_wins():
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  n = len(tr["x"])
+  need = P.corner_mph(CORNER_K)[0]
+  mem = M.synthetic([tr])
+  mem.v_proven = np.full(n, 55 * MPH)                   # earlier passes took it at 55 without trouble
+  res = drive(mem, tr, 52, 120, planner=P.Planner(mem))
+  assert all(p.ceil is None for _, _, p in res)        # at or below the proven speed: no slowing
+  res = drive(mem, tr, 62, 120, planner=P.Planner(mem))
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") >= 55   # never below proven
+  # the same corner with a trouble flag: proven ignored, 10 below the failing speed
+  mem2 = M.synthetic([tr], flags=[np.full(n, M.FLAG_TAKEOVER, np.uint8)], v_flag=[np.full(n, 50 * MPH)])
+  mem2.v_proven = np.full(n, 55 * MPH)
+  res = drive(mem2, tr, 52, 120, planner=P.Planner(mem2))
+  assert any(p.ceil is not None and p.corner_mph <= 40 for _, _, p in res)
+
+
+def test_single_pass_corner_only_trims_until_the_model_confirms():
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  mem = M.synthetic([tr])
+  mem.npass = np.ones(mem.n, np.int32)
+  res = drive(mem, tr, 60, 120, planner=P.Planner(mem))
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") >= 60 - P.SINGLE_PASS_TRIM_MPH
+
+  def model(t, s):
+    return (np.array([0.0, 2.0, 4.0]), np.array([0.0, CORNER_K, CORNER_K])) if 1350 <= s <= 1650 else (np.array([0.0, 4.0]), np.zeros(2))
+  res = drive(mem, tr, 60, 120, planner=P.Planner(mem), model_fn=model)
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") < 60 - P.SINGLE_PASS_TRIM_MPH
+
+
+def test_hold_between_corners_only_when_the_next_slowdown_is_near():
+  far = road((1500, 0.0), (100, 1 / 120.0), (1200, 0.0), (100, 1 / 120.0), (800, 0.0))
+  res = drive(M.synthetic([far]), far, 60, 300, closed=True)
+  gap = [p for t, s, p, v in res if 1700 <= s <= 2000]
+  assert gap and not any(p.kind == "hold" for p in gap)          # far apart: restore fully, slow again later
+  assert max(v for t, s, p, v in res if 1700 <= s <= 2500) > 55
+  near = road((1500, 0.0), (100, 1 / 120.0), (60, 0.0), (100, 1 / 120.0), (800, 0.0))
+  res = drive(M.synthetic([near]), near, 60, 300, closed=True)
+  between = [p for t, s, p, v in res if 1630 <= s <= 1650]
+  assert between and all(p.ceil is not None for p in between)    # the next corner's slowdown starts at once: held
+
+
+def test_same_road_with_offset_and_sharper_memory_is_not_a_change():
+  # the remembered curvature is 1.6x sharper (a conservative figure) and 25 m out of step with this pass: still the same road
+  tr = road((600, 0.0), (120, 1 / 150.0), (200, 0.0), (120, -1 / 180.0), (200, 0.0), (150, 1 / 200.0), (600, 0.0))
+  mem_tr = dict(tr, kap=np.roll(tr["kap"], 5) * 1.6)
+  mem = M.synthetic([mem_tr])
+  res = drive(mem, tr, 45, 200)
+  assert not any(p.why == "road differs from memory" for _, _, p in res)

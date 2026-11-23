@@ -38,10 +38,23 @@ MPH = 0.44704
 # ---- what the steering can hold (lateral-sensors-20261122 and the codex corner design; the LOWER of the two per band) -------------
 # (lowest mph of the band, m/s^2 achieved at the steering limit). Measured: 1.41 / 2.20 / 2.42 / 2.13 at 19-27 / 28-41 / 42-56 / 57+;
 # design study episode medians: 1.14 / 1.14 (28-31, the stock-steering handover) / 2.12 (32-41) / 2.42 / 2.24.
-ENVELOPE = ((19.0, 1.14), (28.0, 1.14), (32.0, 2.12), (42.0, 2.42), (57.0, 2.13))
-MARGIN = 0.85                   # use at most 85 % of the envelope (the design proposed 88 %; the conservative start)
+ENVELOPE = ((19.0, 1.41), (28.0, 1.41), (32.0, 2.20), (42.0, 2.42), (57.0, 2.13))
+MARGIN = 0.90                   # 90 % of the MEASURED limit (first drive, 2026-11-23: too aggressive at the conservative end, 0.85 of the
+                                # lower design medians). The 28-31 mph handover keeps the weaker 19-27 mph figure. With the proven-speed
+                                # rule below, a corner is slowed for only above a speed earlier passes have not proven
+PROVEN_MIN_PASSES = 1           # a speed taken by any pass without the steering limit or a takeover is "proven" (memory v_proven)
+SINGLE_PASS_TRIM_MPH = 5        # a corner remembered from ONE pass, not confirmed by the model's preview: at most this small early trim
+MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its sharpest curvature is at least this share of it
+HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if the next slowdown would start within this of now
+# The on-road warning (first drive, 2026-11-23: a corner needing ~35 mph was reached at 40 and the car crossed the lane line, with no
+# alert). Raised, once per corner, when the corner's own speed is below what the feature may (the floor) or can (behind plan) reach,
+# early enough for the driver to brake calmly: lead ALERT_LEAD_S plus the distance to brake to the corner speed at CALM_BRAKE_MS2
+ALERT_LEAD_S = 4.0
+CALM_BRAKE_MS2 = 1.5
+ALERT_MARGIN_MPH = 2
 SPEED_WINDOW_MPH = 0.75         # a speed fits only if every speed within this of it fits (band edges, speed error)
 FLAGGED_DROP_MPH = 10           # where a pass hit the limit or had a takeover: at least this far below the speed it was driven at
+FLAG_MIN_LA = 1.0               # ... only where the remembered bend needed at least this lateral acceleration (m/s^2) at that speed
 CAR_MIN_MPH = 19                # the car's own lowest set speed
 MAX_MPH = 90
 
@@ -172,7 +185,9 @@ MIN_TRUST_CONF = 0.7
 CHANGE_WINDOW_M = 300.0
 CHANGE_MIN_M = 200.0            # judged only once this much has been compared
 CHANGE_BEND_K = 0.0015          # rms curvature (1/m) below which the window is "straight" in both: nothing to judge
-CHANGE_RATIO = 0.7              # rms(live - remembered) above this share of the larger rms: mismatch
+CHANGE_SHIFT_M = 50.0           # the comparison allows the two curvature traces to be offset by up to this along the road
+CHANGE_MIN_CORR = 0.3           # their best correlation below this: the road's shape differs
+CHANGE_STRIKES = 20             # ... on this many consecutive planner ticks (4 s at 5 Hz) before trust is dropped
 CHANGE_HOLDOFF_M = 500.0
 LIVE_K_TAU_S = 0.5              # smoothing of the live curvature (the memory is smoothed over ~10 m)
 
@@ -222,9 +237,11 @@ def corner_mph(k):
 def needed_mph(kap, flags, v_flag):
   """The speed each remembered point allows: corner_mph, and at least FLAGGED_DROP_MPH below a flagged pass's speed."""
   need = corner_mph(kap)
-  flagged = (np.asarray(flags) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER)) != 0
+  flagged = (np.asarray(flags) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
   vf = np.asarray(v_flag, np.float64)
-  cap = np.where(flagged & np.isfinite(vf), np.floor(vf / MPH) - FLAGGED_DROP_MPH, np.inf)
+  # trouble counts only where it was a CORNER at the failing speed (a lane-line touch or a takeover on a straight is not a corner)
+  corner_there = np.abs(np.asarray(kap, np.float64)) * np.where(np.isfinite(vf), vf, 0.0) ** 2 >= FLAG_MIN_LA
+  cap = np.where(flagged & np.isfinite(vf) & corner_there, np.floor(vf / MPH) - FLAGGED_DROP_MPH, np.inf)
   return np.minimum(need, np.maximum(cap, CAR_MIN_MPH))
 
 
@@ -250,6 +267,8 @@ class Plan(NamedTuple):
   model_k: Optional[float] = None # the sharpest |curvature| in the model's next MODEL_LOOK_S (the car side's restore check)
   kind: str = ""                  # "corner": slow to the ceiling; "hold": the highest set speed a restore may reach (never slows)
   end_m: Optional[float] = None   # a corner in progress: metres to the END of its tight stretch (dist_m is to its start)
+  behind: bool = False            # the car is slowing less than planned (not the same as capped)
+  alert_mph: Optional[int] = None # warn the driver: the corner ahead needs this speed and the feature will not get there
   trace: int = -1
   point: int = -1
 
@@ -266,6 +285,16 @@ class Planner:
   def __init__(self, memory):
     self.mem = memory
     self.need = needed_mph(memory.kap, memory.flags, memory.v_flag) if memory is not None else None
+    if memory is not None:
+      vp = np.asarray(getattr(memory, "v_proven", np.full(memory.n, np.nan)), np.float64)
+      self.proven = np.where(np.isfinite(vp), np.floor(vp / MPH), 0.0)
+      # where a pass had trouble (steering limit, firm takeover, lane-line crossing) the trouble wins: no proven speed there, and the
+      # target stays FLAGGED_DROP_MPH below the speed that failed (needed_mph)
+      trouble = (np.asarray(memory.flags) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
+      self.proven = np.where(trouble, 0.0, self.proven)
+      self.single = np.asarray(memory.npass) <= 1
+      self.kabs = np.abs(memory.kap)
+    self.skipped = set()
     self.limit = None
     self.reset()
 
@@ -281,12 +310,17 @@ class Planner:
     self.live_k = 0.0
     self.cmp = []                       # (odometer, live k, remembered k), every spacing of travel while locked
     self.cmp_next = 0.0
+    self.change_strikes = 0
     self.distrust_until = -1.0
     self.distrust_why = ""
     self.active = {}                    # point -> corner in progress: T (corner speed), at (odometer of the point), mode, since
     self.int_floor = None
     self.int_base = None
     self.end_m = None
+    self.behind = False
+    self.alert = None
+    self.alerting = set()
+    self.alerted = set()
     self.model_k = None
     self.events = []
 
@@ -407,9 +441,22 @@ class Planner:
     rl, rr = math.sqrt(float(np.mean(live ** 2))), math.sqrt(float(np.mean(rem ** 2)))
     scale = max(rl, rr)
     if scale < CHANGE_BEND_K:
+      self.change_strikes = 0
       return False
-    err = math.sqrt(float(np.mean((live - rem) ** 2)))
-    return err > CHANGE_RATIO * scale
+    # tolerant of where along the road the two line up (passes differ by 15 m typically, 50 m at worst) and of how sharp the stored
+    # figure is (it is the second-sharpest pass, not this one): the SHAPE must disagree at every shift within CHANGE_SHIFT_M
+    best = -1.0
+    n = len(live)
+    k = int(CHANGE_SHIFT_M / self.mem.spacing)
+    for sh in range(-k, k + 1):
+      x = live[max(0, sh):n + min(0, sh)]
+      y = rem[max(0, -sh):n - max(0, sh)]
+      if len(x) < 20 or x.std() < 1e-9 or y.std() < 1e-9:
+        continue
+      best = max(best, float(np.corrcoef(x, y)[0, 1]))
+    bad = best < CHANGE_MIN_CORR
+    self.change_strikes = self.change_strikes + 1 if bad else 0
+    return self.change_strikes >= CHANGE_STRIKES
 
   # ---- one tick ------------------------------------------------------------------------------------------------------------------
   def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None):
@@ -480,6 +527,32 @@ class Planner:
       floor = max(self.ABS_FLOOR_MPH, int(round(mph)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
       self.int_floor, self.int_base = floor, None
     shed_to = np.maximum(need, floor)
+    mem_pt = idx >= 0
+    u_ref0 = max(u, self.int_base or 0.0)
+    # 1. never a target below a speed earlier passes have PROVEN (taken without the steering limit or a takeover); a corner at or above
+    #    the car's speed by that measure is not slowed for at all
+    proven = np.where(mem_pt, self.proven[np.clip(idx, 0, None)], 0.0)
+    shed_env = shed_to.copy()
+    shed_to = np.maximum(shed_to, proven)
+    # 2. a corner remembered from ONE pass acts only as a small early trim until the driving model's own preview confirms the bend
+    single = mem_pt & self.single[np.clip(idx, 0, None)]
+    trim = np.zeros(len(idx), bool)
+    if single.any():
+      mk = self.model_k
+      confirmed = np.zeros(len(idx), bool)
+      if mk is not None:
+        confirmed = (dist <= v * MODEL_LOOK_S) & (mk >= MODEL_CONFIRM_SHARE * self.kabs[np.clip(idx, 0, None)])
+      trim = single & ~confirmed
+      shed_to = np.where(trim, np.maximum(shed_to, u_ref0 - SINGLE_PASS_TRIM_MPH), shed_to)
+    # what it chose NOT to slow for (logged once per corner, for review against outcomes)
+    skip = np.nonzero(((u_ref0 - shed_env) >= MIN_DROP_MPH) & ((u_ref0 - shed_to) < MIN_DROP_MPH) & mem_pt)[0]
+    for j in skip[:1]:
+      k_ = int(idx[j])
+      if k_ not in self.skipped and len(self.skipped) < 5000:
+        self.skipped.add(k_)
+        self.events.append({"kind": "not_slowing", "point": k_, "why": "proven speed" if proven[j] >= shed_env[j] + MIN_DROP_MPH or
+                            proven[j] >= u_ref0 - MIN_DROP_MPH else "one pass, model not confirming", "env_mph": int(shed_env[j]),
+                            "proven_mph": int(proven[j]), "mph": round(mph, 1), "dist": round(float(dist[j]), 1)})
     grade = getattr(self.mem, "grade", None)
     # tight against the speed now, the set speed, and (within a chain) the speed the chain started from, so a corner just after one
     # already slowed for still bounds the way back up (a "hold")
@@ -509,14 +582,16 @@ class Planner:
           va = v_allow(D, T, max(floor, T - DRIVE_GAP_MPH), buf)
           c = cands.get(key)
           if c is None or va < c["va"]:
-                cands[key] = {"T": T, "need": int(need[j]), "va": va, "D": D, "at": self.odo + float(dist[run[-1]]),
-                              "entry": self.odo + float(dist[run[0]])}
+                cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "trim": bool(trim[j]), "va": va, "D": D,
+                          "at": self.odo + float(dist[run[-1]]),
+                              "entry": self.odo + float(dist[run[0]]), "S1": max(floor, T - DRIVE_GAP_MPH), "buf": buf}
     # start: the car is at or above the highest speed from which it can still make it
     for key, c in cands.items():
       if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
         if not self.active and self.int_base is None:
           self.int_base = mph
-        self.active[key] = {"T": c["T"], "need": c["need"], "at": c["at"], "entry": c["entry"], "mode": "push", "since": t}
+        self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
+                            "since": t}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
                             "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
@@ -554,26 +629,71 @@ class Planner:
         ceil, cdist, cpt, kind, corner = cc, round(max(0.0, a_["entry"] - self.odo), 1), key, "corner", T
         cend = round(a_["at"] - self.odo, 1)
     if not self.active:
-      # no corner in progress: the highest set speed a restore may reach so the NEXT corner can still be made (chained corners hold
-      # only what the next one needs; a corner far enough away lets the speed come back fully)
+      # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
+      # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
       hold = None
       for key, c in cands.items():
+        need_m = approach_m(int(u_ref), c["T"], c["S1"]) + c["buf"] * u_ref * MPH
+        if (c["D"] - need_m) / max(v, 1.0) > HOLD_GAP_S:
+          continue
         if hold is None or c["va"] < hold[0]:
           hold = (c["va"], key, c)
       if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
         ceil, cdist, cpt, kind, corner = int(math.floor(hold[0])), round(hold[2]["D"], 1), hold[1], "hold", hold[2]["T"]
+    self.alert = self._alert(cands, floor, mph, v)
     if ceil is None:
       return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
-    capped = (bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor) or behind
+    # "capped" means ONE thing: a corner's target is below the floor (more than the feature may shed); a car slowing less than planned
+    # is "behind", reported separately and never as capped
+    capped = bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor
     why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if (cdist or 0) > 0 else "in the corner")
     self.end_m = cend
+    self.behind = behind
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold")
 
+  def _alert(self, cands, floor, mph, v):
+    """The corner speed to warn the driver about (whole mph) or None. A corner whose own speed (`Tc`) is below the floor, or that the
+    car is behind plan for, warns once it is within the calm-braking distance plus ALERT_LEAD_S; the warning stays until the speed is
+    within ALERT_MARGIN_MPH of it or the corner is passed, and is not raised again for the same corner."""
+    out = None
+    for key, c in cands.items():
+      a_ = self.active.get(key)
+      tc = a_["Tc"] if a_ is not None else c["Tc"]
+      behind = a_ is not None and a_["mode"] == "behind"
+      if c.get("trim") or not (tc < floor or behind) or mph <= tc + ALERT_MARGIN_MPH:
+        # (a corner known from ONE pass that the model's preview does not confirm never warns: memory alone is not enough)
+        if key in self.alerting:
+          self.alerting.discard(key)
+          self.alerted.add(key)
+        continue
+      vt = tc * MPH
+      d_alert = v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
+      d_entry = max(0.0, c["entry"] - self.odo)
+      # only when it will really arrive too fast: the floor itself is above the corner's speed, or (behind plan) even the cruise's full
+      # deceleration from now on, after its reaction, does not get there
+      a_max = RESP_FACTOR * SAT_MPH_S * MPH
+      v_arr2 = v * v - 2.0 * a_max * max(0.0, d_entry - v * REACTION_S)
+      arrive = max(floor, math.sqrt(max(0.0, v_arr2)) / MPH) if behind else floor
+      if arrive <= tc + ALERT_MARGIN_MPH and key not in self.alerting:
+        continue
+      if key in self.alerting or (key not in self.alerted and d_entry <= d_alert):
+        if key not in self.alerting:
+          self.events.append({"kind": "alert", "point": key, "corner_mph": tc, "floor": floor, "behind": behind, "mph": round(mph, 1),
+                              "dist": round(d_entry, 1)})
+        self.alerting.add(key)
+        out = tc if out is None else min(out, tc)
+    for key in [k for k in self.alerting if k not in cands and k not in self.active]:
+      self.alerting.discard(key)                  # passed
+      self.alerted.add(key)
+    return out
+
   def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind=""):
     end, self.end_m = self.end_m, None
+    behind, self.behind = self.behind, False
+    alert, self.alert = self.alert, None
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
-                self.limit, self.model_k, kind, end, self.trace, point)
+                self.limit, self.model_k, kind, end, behind, alert, self.trace, point)
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -582,4 +702,4 @@ def plan_json(plan, t_mono, seq, mode):
           "known": plan.known, "why": plan.why, "dist": plan.dist_m, "past": plan.past,
           "model_la": None if plan.model_la is None else round(plan.model_la, 2), "capped": plan.capped,
           "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
-          "corner": plan.corner_mph, "end": plan.end_m}
+          "corner": plan.corner_mph, "end": plan.end_m, "behind": plan.behind, "alert": plan.alert_mph}

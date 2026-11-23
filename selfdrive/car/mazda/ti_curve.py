@@ -58,13 +58,14 @@ MAX_SHED_MPH = 15                # never more than this below the known speed li
 MIN_MPH = 20.0                   # no press of either kind below this speed, at standstill or with the cruise in its standstill hold
 MPH = 0.44704
 GAS_MAX_S = 1.0                  # gas held longer than this stops the intervention
-PAUSE_S = 30.0                   # after the driver's own cruise button
+PAUSE_S = 10.0                   # after the driver's own cruise button (owner, first drive: 30 s was too long, "like 10 seconds")
 CLEAR_S = 2.0
 PLAN_STALE_S = 1.0               # planner output older than this is not used (it publishes at 5 Hz)
 PLAN_DEAD_S = 3.0                # ... older than this: the planner is taken as dead
 SETTLED_MPH = 3.0                # restore only with the speed within this of the set speed
 RESTORE_MIN_MPH = 2              # a restore toward a "hold" ceiling only for 2 mph or more (no dithering)
-RESTORE_LEAD_MPH = 3             # while restoring, the set speed is never more than this above the car's speed (a gentle catch-up)
+RESTORE_LEAD_MPH = 7             # while restoring, the set speed is at most this above the car's speed: enough gap for the cruise's
+                                 # own natural acceleration (it saturates near 6 mph), without one jump to the old set speed
 SETTLED_RESUME_MPH = 2.0         # "speed settling" ends below this gap (it starts above SETTLED_MPH): hysteresis
 HOLDING_AT_MPH = 1.0             # slowing -> holding within this of the corner speed; back to slowing above HOLDING_AT_MPH + 1
 TRUST_HOLD_M = 30.0              # trust lost during an approach: hold the set speed until this far past where the corner ended
@@ -145,6 +146,7 @@ class Curve:
     self.trust_hold_since = None
     self.restore_wait_since = None
     self.last_set_press = -10 ** 9    # frame of the driver's last SET+ / SET- press
+    self.after_brake = False          # a pedal / cruise-off stop left the set speed lowered: restore promptly once the cruise is back
     self.trust_past = False           # trust was lost during an approach and the car has since passed where the corner ended
     self.off_seen = False
 
@@ -178,9 +180,12 @@ class Curve:
     self.stop_lowered = lowered
     if lowered:
       self.left_at, self.own_press, self.left_doubt = inp.set_mph, False, False
+      # a pedal or the cruise going off left it lowered: once the cruise is back (RES or SET), the driver's own set speed is put back
+      # promptly (owner, first drive: a brake for a traffic light must never leave the lowered speed as theirs)
+      self.after_brake = why in ("brake pressed", "gas held", "cruise off", "openpilot disengaged", "cruise unavailable")
     if why.startswith("set speed changed") and inp.set_mph is not None and self.ref is not None and inp.set_mph < self.ref:
       # a change nobody asked for (possibly the driver's press the button flag missed): never restored, nothing more pressed until
-      # the driver acts;  is kept only as the limit for how far a later intervention may go
+      # the driver acts; `ref` is kept only as the limit for how far a later intervention may go
       self.left_at = inp.set_mph if self.left_at is None else self.left_at
       self.left_doubt = True
     # a fault of the button path or the planner latches until the driver acts (a cruise button or re-engaging the cruise)
@@ -212,6 +217,8 @@ class Curve:
       self.lowered_from = None
     self.taps_down = self.taps_up = 0
     self.trust_hold_since = self.restore_wait_since = None
+    if self.left_at is None:
+      self.corner_end_odo = None
 
   def _adopt(self, set_mph):
     """A set speed the driver may have chosen. While a set speed this feature left lowered is outstanding, only a value reached after
@@ -225,6 +232,7 @@ class Curve:
       self._ev("driver_chose", 0, set_mph=set_mph, was=self.ref)
       self.ref = set_mph
       self.left_at, self.own_press, self.left_doubt, self.lowered_from = None, False, False, None
+      self.after_brake = False
     elif set_mph != self.left_at:
       self.left_doubt = True              # neither ours nor a RES to the stored value: leave it alone, keep the message
 
@@ -464,7 +472,8 @@ class Curve:
       self.target = min(max(int(ceil), self.floor), self.ref)
       corner = plan.get("corner") if plan.get("corner") is not None else ceil
       self.shown = min(max(int(corner), self.floor), self.ref)
-      needs_more = bool(plan.get("capped")) or int(corner) < self.floor
+      needs_more = int(corner) < self.floor           # ONE meaning: the corner's target is below the floor (never "behind")
+      self.behind = bool(plan.get("behind"))
       if needs_more and not self.needs_more:
         self._ev("needs_more", frame, ceil=ceil, corner=corner, floor=self.floor, mph=round(inp.mph, 1))
       self.needs_more = needs_more
@@ -483,7 +492,8 @@ class Curve:
     # no corner ceiling (past the corner, a "hold" for the next one, or the planner not trusted): restore if lowered, else idle
     if self.intervening() or (self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and self.lowered_from is not None):
       if inp.set_mph >= self.ref:
-        self._ev("restored", frame, set_mph=inp.set_mph, taps_down=self.taps_down, taps_up=self.taps_up)
+        self._ev("restored", frame, set_mph=inp.set_mph, taps_down=self.taps_down, taps_up=self.taps_up, after_brake=self.after_brake)
+        self.after_brake = False
         self._end_intervention(frame)
         self._to(frame, "ready")
         return self._idle_text(plan)
@@ -497,7 +507,6 @@ class Curve:
         self.line2 = f"back to {self.ref} mph after it"
         return None
       self.target = self.shown = cap
-      self.corner_end_odo = None
       if self.left_doubt:
         self._to(frame, "holding", "set speed changed: left to you")
         self.line1 = f"ON: set speed {inp.set_mph} mph"
@@ -523,7 +532,8 @@ class Curve:
       return False, f"below {MIN_MPH:.0f} mph: no presses"
     if plan is None:
       return False, "planner output late"
-    if not plan.get("trusted") and not self.trust_past:
+    past_end = self.corner_end_odo is not None and self.odo >= self.corner_end_odo + TRUST_HOLD_M
+    if not plan.get("trusted") and not self.trust_past and not past_end and not self.after_brake:
       return False, "road not matched: not restoring"
     if plan.get("model_k") is None:
       return False, "no model preview"
@@ -535,7 +545,7 @@ class Curve:
     self.settling = gap > (SETTLED_RESUME_MPH if self.settling else SETTLED_MPH)      # hysteresis
     if self.settling:
       return False, "speed settling"
-    if inp.set_mph + 1 > inp.mph + RESTORE_LEAD_MPH:
+    if inp.set_mph + 1 > inp.mph + RESTORE_LEAD_MPH and not self.after_brake:
       return False, "car is below the set speed"                                      # paced to the car: a gentle catch-up
     return True, ""
 
@@ -549,7 +559,11 @@ class Curve:
     if self.state == "slowing" or self.state == "holding":
       word = "SLOWING FOR A CORNER" if self.state == "slowing" else "HOLDING FOR A CORNER"
       self.line1 = f"{word}: {self.lowered_from} -> {self.shown} mph"
-      self.line2 = "CORNER NEEDS MORE THAN I MAY SLOW: be ready" if self.needs_more else f"set speed now {inp.set_mph} mph"
+      self.line2 = ("CORNER NEEDS MORE THAN I MAY SLOW: be ready" if self.needs_more else
+                    "slowing as fast as the cruise allows" if getattr(self, "behind", False) else f"set speed now {inp.set_mph} mph")
+    elif self.after_brake:
+      self.line1 = f"RESTORING YOUR SET SPEED: {inp.set_mph} -> {self.ref} mph"
+      self.line2 = wait or "after the brake: back to your own set speed"
     else:
       self.line1 = f"RESTORING: {inp.set_mph} -> {self.ref} mph"
       self.line2 = wait or "speeding back up"
@@ -688,3 +702,19 @@ class Curve:
   @property
   def active(self):
     return self.intervening()
+
+
+def read_curve_alert(params_memory, now):
+  """(corner speed mph to warn about, the monotonic time of the planner output) from curve slowing's planner output, or (None, 0)."""
+  import json
+  try:
+    raw = params_memory.get(PARAM_PLAN)
+    d = json.loads(raw) if raw else None
+    if not isinstance(d, dict) or d.get("mode") != "act" or not d.get("alert"):
+      return None, 0.0
+    m = float(d.get("m", 0.0))
+    if now - m > 1.0:
+      return None, 0.0
+    return int(d["alert"]), m
+  except Exception:
+    return None, 0.0
