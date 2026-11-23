@@ -852,8 +852,8 @@ class Controls:
       undershooting = abs(desired_lateral_accel) / abs(1e-3 + actual_lateral_accel) > 1.2
       turning = abs(desired_lateral_accel) > 1.0
       # TODO: lac.saturated includes speed and other checks, should be pulled out
-      # PROPOSAL: Take Control only after the saturation has lasted TAKE_CONTROL_MIN_S in all (the 0.8 s steer limit timer plus
-      # 0.7 s held here): on the 2026-11-23 drive the 14 clips at the TI limit lasted 0.13-6.1 s; 1.5 s chimes for the 4 longest
+      # PROPOSAL: Take Control only after the saturation has lasted 1.5 s in all (the 0.8 s steer limit timer plus
+      # TAKE_CONTROL_HOLD_S = 0.7 s held here): on the 2026-11-23 drive the 14 clips at the TI limit lasted 0.13-6.1 s; 1.5 s chimes for the 4 longest
       # (2.0, 2.1, 2.8, 6.1 s), about 4.5 s before the end of the 6.1 s one, and never for the brief clips at corner entry
       held = lac_log.saturated and undershooting and turning
       self.sat_alert_frames = self.sat_alert_frames + 1 if held else 0
@@ -959,13 +959,10 @@ class Controls:
     hudControl.leftLaneVisible = True
 
     recent_blinker = (self.sm.frame - self.last_blinker_frame) * DT_CTRL < 5.0  # 5s blinker cooldown
-    # PROPOSAL (owner's decision): lane departure is also allowed while steering is active when the steering command was at or near
-    # its limit within the last second (the car is being carried wide by a corner it cannot hold, 2026-11-23 drive)
-    if abs(CC.actuators.steer) >= 0.96:
-      self.last_steer_at_limit_frame = self.sm.frame
-    near_limit = (self.sm.frame - getattr(self, "last_steer_at_limit_frame", -10 ** 9)) * DT_CTRL < 1.0
+    # (The proposed lane-departure-while-steering case is dropped: IsLdwEnabled defaults off and LDW needs the model's lane-change
+    # probability, so it could never be relied on. Running wide is covered by Take Control (1.5 s at the limit) and Running Wide.)
     ldw_allowed = self.is_ldw_enabled and CS.vEgo > LDW_MIN_SPEED and not recent_blinker \
-                  and (not CC.latActive or near_limit) and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
+                  and not CC.latActive and self.sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.calibrated
 
     model_v2 = self.sm['modelV2']
     desire_prediction = model_v2.meta.desirePrediction

@@ -487,9 +487,8 @@ class LatControlTorque(LatControl):
     self.break_boost += float(_clip(delta, -step, step))
     command = float(_clip(command + self.break_boost, -u_max, u_max))
 
-    # (col_trq / will_recover computed above the breaker; will_recover feeds the saturation report
-    # below -- a lightly-loaded clip does not warn, a missing reading (0, e.g. gen2) falls through
-    # to the old always-warn behaviour.)
+    # (col_trq / will_recover computed above the breaker. PROPOSAL: will_recover no longer mutes the saturation report; it is
+    # still computed and kept only for comparison in the diagnostics.)
 
     # Optional output smoothing. The filter tracks the command even while it is switched off, so
     # turning it on mid-corner continues from where the command already is instead of stepping
@@ -575,7 +574,7 @@ class LatControlTorque(LatControl):
                                                     curvature_limited, expected_to_recover=False))
     # PROPOSAL (for the owner's decision, 2026-11-23 drive): the "will recover" mute is no longer applied to the Take Control
     # warning. `will_recover` reads the 0x075 field the port calls column torque, which is the car's LATERAL ACCELERATION (~100 counts
-    # per m/s^2), so the warning was muted below about 1.77 m/s^2, exactly where this car runs wide. (will_recover still feeds the rest.)
+    # per m/s^2), so the warning was muted below about 1.77 m/s^2, exactly where this car runs wide. (will_recover is no longer used for the warning.)
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
