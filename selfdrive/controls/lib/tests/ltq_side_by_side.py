@@ -117,7 +117,15 @@ def replay(mods, paths, report):
     rows = {k: [] for k in topics}
     with open(path, "rb") as f:
       raw = f.read()
-    for ev in log.Event.read_multiple_bytes(raw):
+    events = log.Event.read_multiple_bytes(raw)
+    while True:
+      try:
+        ev = next(events)
+      except StopIteration:
+        break
+      except Exception:                                      # a segment cut short at the end of a drive: keep what was read
+        report["segments_truncated"] += 1
+        break
       w = ev.which()
       if w in rows:
         rows[w].append((ev.logMonoTime, getattr(ev, w), ev.valid))
@@ -247,7 +255,7 @@ def main():
   import numpy as np
   t0 = time.time()
   mods = modules(a.old)
-  report = {"numpy": np.__version__, "segments": 0, "segments_skipped": 0, "replay_cycles": 0, "replay_active": 0, "replay_mismatches": 0,
+  report = {"numpy": np.__version__, "segments": 0, "segments_skipped": 0, "segments_truncated": 0, "replay_cycles": 0, "replay_active": 0, "replay_mismatches": 0,
             "random_cycles": 0, "random_raised": 0, "random_mismatches": 0, "first": []}
   if a.rlogs:
     replay(mods, a.rlogs, report)
