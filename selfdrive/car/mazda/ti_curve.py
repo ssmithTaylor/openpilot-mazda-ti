@@ -238,6 +238,8 @@ class Curve:
     btn_rose = btn and not self.btn_was
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
+    if cruise_rose and self.left_at is not None and inp.set_mph is not None and inp.set_mph != self.left_at:
+      self.own_press = True               # the cruise set afresh at a new speed (SET): the driver's new choice; a RES returns to left_at
 
     if not inp.on:
       if self.state != "off":

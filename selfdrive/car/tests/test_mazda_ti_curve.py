@@ -683,3 +683,12 @@ def test_off_page_never_implies_a_press():
     for word in ("SLOWING FOR", "RESTORING", "HOLDING", "LOWERING", "PAUSED", "STOPPED"):
       assert word not in text, text
     assert st["line2"].startswith("OFF.") and len(st["line2"]) <= 52
+
+
+def test_cruise_set_afresh_at_a_new_speed_is_a_new_choice():
+  c, car = C.Curve(), Car(60, 60)
+  run(c, car, 2500, lambda f, car: plan(30, corner=30))
+  run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+  car.set = 52                                              # SET at the current speed (the button flag may be missed)
+  run(c, car, 3000, lambda f, car: plan(None), start=2550)
+  assert c.ref == 52 and c.left_at is None and car.history[-1][1] == 52
