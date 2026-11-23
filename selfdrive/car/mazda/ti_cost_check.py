@@ -11,7 +11,8 @@ the device's params, no CAN is sent, no message queue is opened):
   tests mode, idle   the plan in its tests mode, the car in a test window, the road too curved for any test: the scheduler runs, no signal
   tests mode, run    the plan in its tests mode on a straight road in a window: a test signal runs
 Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
-with a block running, plan on in its tests mode. Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
+with a block running, plan on in its tests mode. Then controlsd's lateral controller (plan off) with its scalar helpers in plain
+Python and, for comparison, with the numpy calls they replaced; the two must give bit-identical outputs (exit 1 otherwise). Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
 budget on average (default 300 us per cycle), 2 when the measurement is not valid (the running mode never ran a test).
 
 Budget: the drives of 2026-11-22 left about 1.5 ms per 10 ms cycle free on the controls core with the plan off (card about 32 % of the
@@ -218,6 +219,64 @@ def _run_controls(name, plan_on, mph, cycles, clock, count=False):
           "max_us": round(times[-1], 1), "ab_state": rn.ab.mode, "plan_mode": rn.plan.mode, "why": (rn.ab.message or rn.plan.why)[:80]}
 
 
+def run_lateral(name, use_numpy, cycles, seed=7):
+  """controlsd's lateral controller (LatControlTorque with the Mazda TI plant, plan off) per cycle, on a seeded drive-like input
+  sequence. use_numpy: the scalar helpers (scalar_np's clip / sign / interp) swapped back for the numpy calls they replaced, i.e. the
+  controller as before that change. Also returns the outputs' exact bits, so the two modes can be checked identical on the device."""
+  import math
+  import random
+  from cereal import car, log
+  import numpy as np
+  from openpilot.selfdrive.car.mazda import lateral_plant as lp_mod
+  from openpilot.selfdrive.controls.lib import latcontrol_torque as ltq
+  from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
+  saved = {(m, k): getattr(m, k) for m, k in ((ltq, "_clip"), (ltq, "_sign"), (ltq, "_LOW_SPEED"), (lp_mod, "_clip"), (lp_mod, "_sign"),
+                                               (lp_mod, "_Q_OF_V"), (lp_mod, "_GS_OF_V"))}
+  if use_numpy:
+    ltq._clip = lp_mod._clip = lambda x, lo, hi: np.clip(x, lo, hi)
+    ltq._sign = lp_mod._sign = np.sign
+    ltq._LOW_SPEED = lambda v: np.interp(v, ltq.LOW_SPEED_X, ltq.LOW_SPEED_Y)
+    lp_mod._Q_OF_V = lambda v: float(np.interp(v, lp_mod.V_BP, lp_mod.Q_BP))
+    lp_mod._GS_OF_V = lambda v: float(np.interp(v, lp_mod.V_BP, lp_mod.GS_BP))
+  try:
+    CP = car.CarParams.new_message()
+    CP.steerLimitTimer, CP.mass, CP.rotationalInertia, CP.wheelbase = 0.4, 1909.0, 2813.0, 2.7
+    CP.centerToFront, CP.steerRatio, CP.tireStiffnessFront, CP.tireStiffnessRear = 2.7 * 0.41, 15.5, 80000.0, 90000.0
+    lt = CP.lateralTuning
+    lt.init("torque")
+    lt.torque.kp, lt.torque.ki, lt.torque.friction, lt.torque.latAccelFactor = 0.8, 0.2, 0.1, 2.0
+    lt.torque.useSteeringAngle = True
+    ci = NS(lateral_plant=lp_mod.TiLateralPlant(600.0, 0.01), torque_from_lateral_accel=lambda: (lambda la, tp: la / tp.latAccelFactor),
+            lateral_accel_from_torque=lambda: (lambda t, tp: t * tp.latAccelFactor))
+    ctrl = ltq.LatControlTorque(CP, ci, 0.01)
+    VM = VehicleModel(CP)
+    params = log.LiveParametersData.new_message()
+    toggles = NS(lat_damping=True, lat_commit_setpoint=True, lat_friction_comp=True, lat_output_filter=False, lat_no_friction_relay=True,
+                 ti_steer_max=600.0)
+    r = random.Random(seed)
+    CS = car.CarState.new_message()
+    v, curv, times, out = 20.0, 0.0, [], []
+    for k in range(cycles + 300):
+      v = min(max(v + r.gauss(0, 0.05), 8.0), 32.0)
+      curv = min(max(curv + r.gauss(0, 1e-4), -0.01), 0.01)
+      CS.vEgo = v
+      CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-curv * (1 + r.gauss(0, 0.05)), v, 0.0))
+      CS.steeringRateDeg = r.gauss(0, 5)
+      fp = NS(lkasBlocked=v < 12.5, lkasEffective=r.uniform(0, 300), tiActive=True, columnTorque=r.gauss(0, 20))
+      t0 = time.perf_counter_ns()
+      steer, _, pid_log = ctrl.update(True, CS, VM, params, False, curv, False, 0.25, None, None, toggles, fp)
+      dt = time.perf_counter_ns() - t0
+      if k >= 300:
+        times.append(dt / 1000.0)
+        out.append((float(steer).hex(), pid_log.to_bytes()))
+  finally:
+    for (m, k), v in saved.items():
+      setattr(m, k, v)
+  times.sort()
+  return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
+          "max_us": round(times[-1], 1)}, out
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("--cycles", type=int, default=3000)
@@ -245,7 +304,20 @@ def main():
           f"  (A/B {r['ab_state']}, plan {r['plan_mode']})")
     if r["added_mean_us"] > a.budget_us:
       bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
-  print(json.dumps({"results": res, "controls": ctl, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
+  lat = []
+  try:
+    new, out_new = run_lateral("lateral controller (plain-Python helpers)", False, a.cycles)
+    old, out_old = run_lateral("lateral controller (numpy helpers, as before)", True, a.cycles)
+    same = out_new == out_old
+    for r in (old, new):
+      print(f"{r['mode']:46s} mean {r['mean_us']:8.1f} us  p99 {r['p99_us']:8.1f} us")
+    print(f"lateral controller: saved {old['mean_us'] - new['mean_us']:.1f} us per cycle; outputs bit-identical: {same}")
+    lat = [old, new, {"identical": same}]
+    if not same:
+      bad.append("the lateral controller's outputs differ between the numpy and the plain-Python helpers")
+  except Exception as e:                                     # the car-side numbers stand without it
+    print(f"lateral controller not timed: {type(e).__name__}: {e}")
+  print(json.dumps({"results": res, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
   if res[3]["test_running_share"] < 0.2:
     print("NOT VALID: no test signal ran in the running mode")
     return 2
