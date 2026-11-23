@@ -55,6 +55,7 @@ def ti_ab_log(event):
   except Exception:
     pass
 LDW_MIN_SPEED = 31 * CV.MPH_TO_MS
+TAKE_CONTROL_HOLD_S = 0.7   # PROPOSAL: on top of the 0.8 s steer limit timer, so Take Control needs 1.5 s at the limit in all
 LANE_DEPARTURE_THRESHOLD = 0.1
 CAMERA_OFFSET = 0.04
 
@@ -171,6 +172,7 @@ class Controls:
     self.cruise_mismatch_counter = 0
     self.last_blinker_frame = 0
     self.last_steering_pressed_frame = 0
+    self.sat_alert_frames = 0
     self.distance_traveled = 0
     self.last_functional_fan_frame = 0
     self.events_prev = []
@@ -841,6 +843,8 @@ class Controls:
     if CS.steeringPressed:
       self.last_steering_pressed_frame = self.sm.frame
     recent_steer_pressed = (self.sm.frame - self.last_steering_pressed_frame)*DT_CTRL < 2.0
+    if not (lac_log.active and not recent_steer_pressed and not self.CP.notCar):
+      self.sat_alert_frames = 0
     if lac_log.active and not recent_steer_pressed and not self.CP.notCar:
       clipped_speed = max(CS.vEgo, 0.3)
       actual_lateral_accel = self.curvature * (clipped_speed**2)
@@ -848,7 +852,12 @@ class Controls:
       undershooting = abs(desired_lateral_accel) / abs(1e-3 + actual_lateral_accel) > 1.2
       turning = abs(desired_lateral_accel) > 1.0
       # TODO: lac.saturated includes speed and other checks, should be pulled out
-      if undershooting and turning and lac_log.saturated:
+      # PROPOSAL: Take Control only after the saturation has lasted TAKE_CONTROL_MIN_S in all (the 0.8 s steer limit timer plus
+      # 0.7 s held here): on the 2026-11-23 drive the 14 clips at the TI limit lasted 0.13-6.1 s; 1.5 s chimes for the 4 longest
+      # (2.0, 2.1, 2.8, 6.1 s), about 4.5 s before the end of the 6.1 s one, and never for the brief clips at corner entry
+      held = lac_log.saturated and undershooting and turning
+      self.sat_alert_frames = self.sat_alert_frames + 1 if held else 0
+      if held and self.sat_alert_frames * DT_CTRL >= TAKE_CONTROL_HOLD_S:
         if self.frogpilot_toggles.goat_scream_alert:
           self.frogpilot_events.add(FrogPilotEventName.goatSteerSaturated)
         else:
