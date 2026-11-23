@@ -1089,7 +1089,7 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Light turned green",
       "",
       FrogPilotAlertStatus.frogpilot, AlertSize.small,
-      Priority.MID, VisualAlert.none, AudibleAlert.prompt, 3.),
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),      # LOW: never hides the curve warning (MID)
   },
 
   FrogPilotEventName.holidayActive: {
@@ -1109,7 +1109,7 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Lead departed",
       "",
       FrogPilotAlertStatus.frogpilot, AlertSize.small,
-      Priority.MID, VisualAlert.none, AudibleAlert.prompt, 3.),
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 3.),      # LOW: never hides the curve warning (MID)
   },
 
   FrogPilotEventName.noLaneAvailable: {
@@ -1158,12 +1158,14 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.WARNING: steer_authority_advisory_alert,
   },
 
+  # the three steering-trouble calls are HIGH: above the curve warning (MID; a tie goes to the later alert, which could hide them).
+  # Precedence only: still WARNING (no disengage), same visual, and a sound of their own (never the curve warning's prompt)
   FrogPilotEventName.steerLatchedWarning: {
     ET.WARNING: Alert(
       "Steering Has Stopped Mid-Corner",
       "Help it through",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .4),
+      Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.warningSoft, .4),
   },
 
   FrogPilotEventName.tiDropout: {
@@ -1171,17 +1173,18 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Steering Assist Dropped",
       "Take the wheel — interceptor offline",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.MID, VisualAlert.steerRequired, AudibleAlert.warningSoft, .5),
+      Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.warningSoft, .5),
   },
 
   FrogPilotEventName.steerRunningWide: {
-    # MID so it outranks the advisory when both are live: the advisory holds for seconds around a
-    # corner, and the reactive out-of-torque call must not be hidden behind it.
+    # HIGH so it outranks the curve warning (MID) and the model advisory (LOW) when both are live: they hold for seconds around a
+    # corner, and the reactive out-of-torque call must not be hidden behind them. warningSoft (was prompt, the curve warning's own
+    # chime: it was silent when it started while the curve warning was up); more urgent, still no disengage.
     ET.WARNING: Alert(
       "Running Wide — Slow Down",
       "Steering is at its limit",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.MID, VisualAlert.steerRequired, AudibleAlert.prompt, .4),
+      Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.warningSoft, .4),
   },
 
   FrogPilotEventName.torqueNNLoad: {

@@ -836,3 +836,20 @@ def test_alert_text_shows_the_true_number():
   sm = {"frogpilotPlan": NS(steerAdvisorySpeed=float(np_.float32(33 * 0.44704)))}    # the model advisory: 5-mph steps as before
   a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
   assert a.alert_text_1 == "Slow to 30 mph for the corner ahead"
+
+
+def test_alert_precedence_steering_calls_over_the_curve_warning_over_lead_and_green():
+  # fourth review, item 2: Running Wide / Steering Assist Dropped / Steering Has Stopped are HIGH (WARNING only, their own sound);
+  # the curve warning is MID; "Lead departed" and "Light turned green" are LOW so they never hide it
+  from types import SimpleNamespace as NS
+  from openpilot.selfdrive.controls.lib import events as E
+  from openpilot.selfdrive.controls.lib.events import ET, Priority, AudibleAlert, FrogPilotEventName as F
+  curve = E.steer_authority_advisory_alert(None, None, {"frogpilotPlan": NS(steerAdvisorySpeed=-13.4)}, False, 0, None)
+  assert curve.priority == Priority.MID
+  for name in ("steerRunningWide", "tiDropout", "steerLatchedWarning"):
+    a = E.FROGPILOT_EVENTS[getattr(F, name)][ET.WARNING]
+    assert a.priority == Priority.HIGH and a.priority < Priority.HIGHEST, name
+    assert set(E.FROGPILOT_EVENTS[getattr(F, name)]) == {ET.WARNING}, name        # no disengage, no other event type
+    assert a.audible_alert != curve.audible_alert, name                  # never silent behind the curve warning's chime
+  for name in ("leadDeparting", "greenLight"):
+    assert E.FROGPILOT_EVENTS[getattr(F, name)][ET.PERMANENT].priority < curve.priority, name

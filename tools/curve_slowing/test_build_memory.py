@@ -304,10 +304,48 @@ def test_brake_disengagement_at_speed_is_a_takeover_without_hand_steering():
   en[200:] = 0.0; lat[200:] = 0.0; brk[198:205] = 1.0             # the owner's protocol: brake to disengage, no torque while lateral on
   v = np.full(n, 15.0)                                           # 33 mph
   s = np.r_[0, np.cumsum(v[:-1] * B.DT)]
-  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s)[1]) == [200]
+  bend = np.full(n, 0.008)                                       # 15^2 * 0.008 = 1.8 m/s^2: a real bend at that speed
+  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s, kap=bend)[1]) == [200]
   v_slow = np.full(n, 10.0)                                      # 22 mph: below TK_BRAKE_MIN_MPH, an ordinary slow disengagement
   s_slow = np.r_[0, np.cumsum(v_slow[:-1] * B.DT)]
-  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v_slow, s=s_slow)[1]) == 0
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v_slow, s=s_slow, kap=bend)[1]) == 0
+
+
+def test_brake_only_takeover_needs_no_lead_and_a_sign_of_trouble():
+  # fourth review, item 5
+  n = 600
+  lat = np.ones(n); en = np.ones(n); ti = np.zeros(n); pressed = np.zeros(n); drv = np.zeros(n); brk = np.zeros(n)
+  en[300:] = 0.0; lat[300:] = 0.0; brk[298:305] = 1.0
+  v = np.full(n, 15.0)
+  s = np.r_[0, np.cumsum(v[:-1] * B.DT)]
+  gentle = np.full(n, 0.003)                                     # 0.7 m/s^2: a gentle bend
+  bend = np.full(n, 0.008)
+  lead = np.zeros(n); lead[250:310] = 1.0
+  ev = lambda **k: list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s, **k)[1])
+  assert ev(kap=gentle) == []                                    # gentle bend, no other sign: not trouble
+  assert ev(kap=bend) == [300]                                   # a real bend at that speed: trouble
+  assert ev(kap=bend, lead=lead) == []                           # ... but braking with a lead ahead is traffic
+  assert ev(kap=gentle, lane_i=[320]) == [300]                   # a lane-line event within 10 s: trouble
+  ti2 = ti.copy(); ti2[200:210] = 600.0                          # a steering-limit event 5 s before: trouble
+  assert list(B.run_events(ti2, lat, pressed, en, drv, brk=brk, v=v, s=s, kap=gentle)[1]) == [300]
+  drv2 = drv.copy(); drv2[310:330] = 8.0                         # firm hand torque right after the brake: judged as before (stays)
+  lat3 = lat.copy(); lat3[:] = 1.0; lat3[335:] = 0.0
+  assert 300 in list(B.run_events(ti, lat, pressed, en, drv2, brk=brk, v=v, s=s, kap=gentle, lead=lead)[1])
+
+
+def test_single_pass_bend_must_bend_one_way():
+  # fourth review, item 6: a one-pass S-wiggle (opposite curvature beside the peak) or a bend with little net turn is a phantom
+  one_way = make_pass('d0', [(200, 0.0), (120, 0.006), (300, 0.0)])            # 41 deg one way: kept
+  wiggle = make_pass('d1', [(200, 0.0), (40, 0.006), (40, -0.006), (300, 0.0)])  # S: dropped
+  small = make_pass('d2', [(200, 0.0), (30, 0.006), (300, 0.0)])               # 10 deg net: dropped
+  for p, keep in ((one_way, True), (wiggle, False), (small, False)):
+    arrays, _ = B.build([p])
+    i = int(round(215 / M.SPACING_M))
+    assert (abs(arrays['kap'][i]) > 0.004) == keep, keep
+    assert bool(arrays['flags'][i] & M.FLAG_NOKAP) == (not keep)
+  # the same S-wiggle from two passes is not judged by this test (it is the road)
+  arrays, _ = B.build([wiggle, make_pass('d3', [(200, 0.0), (40, 0.006), (40, -0.006), (300, 0.0)], y0=1.0)])
+  assert abs(arrays['kap'][int(round(215 / M.SPACING_M))]) > 0.004
 
 
 def test_kap_med_and_loader_fallback(tmp_path):

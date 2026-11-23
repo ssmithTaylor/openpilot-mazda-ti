@@ -85,7 +85,10 @@ def car_side(params_memory, now_wall, tc):
     if not isinstance(st, dict) or now_wall - float(st.get("t", 0.0)) > 3.0:
       return None, None, False
     ref = st.get("ref")
+    # its floor while it intervenes, else the floor it would take now (lead-aware: a lead holding the car slower lowers it)
     floor = st.get("floor") if st.get("state") in ("slowing", "holding", "restoring") else None
+    if not floor:
+      floor = st.get("floor_now")
     return (int(ref) if ref else None), (int(floor) if floor else None), bool(st.get("acting"))
   except Exception:
     return None, None, False

@@ -51,6 +51,14 @@ HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if 
 ALERT_LEAD_S = 4.0
 CALM_BRAKE_MS2 = 1.5
 ALERT_MARGIN_MPH = 2
+LATCH_EXTRA_S = 10.0            # a corner on trusted road this many seconds of driving inside the warning horizon is LATCHED (odometer)
+LATCH_PAST_M = 30.0             # ... and kept until the car is this far past its end, whatever the trust (fourth review, MUST 1)
+OBS_WINDOW_S = 2.0              # the cruise's OBSERVED deceleration over this, against what it was measured to give for the same gap
+OBS_MIN_EXPECT = 0.5            # ... judged only while it should be slowing at least this much (mph/s)
+OBS_KEEP_S = 10.0               # ... and the last judgement kept this long (to the corner) once the gap closes
+RAISE_SLACK_MPH = 0.5           # a warning starts only above need + ALERT_MARGIN_MPH + this (speed noise at the margin); ends at the margin
+SETTLE_MPH = 0.3                # within this of its set speed the cruise is taken to be at it
+SIM_DT_S = 0.2                  # the arrival prediction's time step
 ACCEL_MPH_S = 0.7               # the stock cruise speeding up toward its set speed (measured: 5 mph in 7-9 s)
 SPEED_WINDOW_MPH = 0.75         # a speed fits only if every speed within this of it fits (band edges, speed error)
 FLAGGED_DROP_MPH = 10           # where a pass hit the limit or had a takeover: at least this far below the speed it was driven at
@@ -328,6 +336,10 @@ class Planner:
     self.alert = None
     self.alerting = set()
     self.alerted = set()
+    self.hist = []                      # (t, mph, set mph) over the last OBS_WINDOW_S + REACTION_S
+    self.resp = RESP_FACTOR             # the share of the measured deceleration the cruise is giving now (never above RESP_FACTOR)
+    self.resp_t = -1e9
+    self.latch = {}                     # key -> corner (need, entry / low / end on the odometer): warned for whatever the trust
     self.model_k = None
     self.events = []
 
@@ -481,6 +493,7 @@ class Planner:
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
     v = max(0.0, float(v))
     self.odo += v * dt
+    self._observe(t, v / MPH, set_mph)
     if yaw_k is not None and math.isfinite(yaw_k):
       a = 1.0 if dt <= 0 else min(1.0, dt / LIVE_K_TAU_S)
       self.live_k += a * (yaw_k - self.live_k)
@@ -510,16 +523,23 @@ class Planner:
     elif self.cand is not None:
       conf = 0.5 * min(1.0, self.stable_s / STABLE_S)
     known = self.locked or self.cand is not None
+    mph = v / MPH
+    floor = self._floor(floor_mph, ref_mph, set_mph, mph)
+    untrusted = None
     if self.odo < self.distrust_until:
-      return self._out(None, 0.0, False, known, self.distrust_why, None, None, model_la)
-    if not self.locked:
-      why = "matching the remembered road" if self.cand is not None else "road not known here"
-      return self._out(None, conf, False, known, why, None, None, model_la)
-    if conf < MIN_TRUST_CONF:
-      return self._out(None, conf, False, True, "position uncertain", None, None, model_la)
+      untrusted = (0.0, known, self.distrust_why)
+    elif not self.locked:
+      untrusted = (conf, known, "matching the remembered road" if self.cand is not None else "road not known here")
+    elif conf < MIN_TRUST_CONF:
+      untrusted = (conf, True, "position uncertain")
+    if untrusted is not None:
+      # a corner latched while the road was trusted is still warned for, by the odometer, until it is passed: a GPS gap or a matcher
+      # miss never drops (or delays) a warning (fourth review, MUST 1). Nothing more is tapped down without trust: predicted so.
+      self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
+      self.alert = self._warn(list(self.latch.values()), mph, v, floor, acting, set_mph, lowering=False)
+      return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
 
     # ---- the corners ahead -------------------------------------------------------------------------------------------------------
-    mph = v / MPH
     u = max(mph, float(set_mph)) if set_mph else mph
     look = min(LOOKAHEAD_MAX_M, max(LOOKAHEAD_MIN_M, v * LOOKAHEAD_S))
     i0 = int(math.floor(self.pos))
@@ -538,11 +558,6 @@ class Planner:
     # ONE source with the car side (2026-11-23 drive: a floor kept here from an earlier 55 mph episode clamped every corner for 11 min
     # while the driver's set speed was 45): the car side's published floor while it intervenes, else the floor it WOULD use now from
     # the driver's own set speed (`ref_mph`, its published reference); nothing is kept here between ticks
-    if floor_mph is not None:
-      floor = int(floor_mph)
-    else:
-      base_ = ref_mph if ref_mph else (set_mph if set_mph else round(mph))
-      floor = max(self.ABS_FLOOR_MPH, int(round(base_)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
     self.int_floor = floor
     self.int_base = float(ref_mph) if ref_mph else None
     shed_to = np.maximum(need, floor)
@@ -555,8 +570,7 @@ class Planner:
     shed_to = np.maximum(shed_to, proven)
     # 2. a corner remembered from ONE pass is slowed for like any other (owner, 2026-11-23: "I don't think I want that actually" to the
     #    5 mph single-pass trim; "Surely once is enough for at least a first attempt"). Phantom protection comes from the pass-quality
-    #    filters in the memory builder only. (`trim` stays all False; kept so the warning's interface is unchanged.)
-    trim = np.zeros(len(idx), bool)
+    #    filters in the memory builder only.
     # what it chose NOT to slow for (logged once per corner, for review against outcomes)
     skip = np.nonzero(((u_ref0 - shed_env) >= MIN_DROP_MPH) & ((u_ref0 - shed_to) < MIN_DROP_MPH) & mem_pt)[0]
     for j in skip[:1]:
@@ -596,7 +610,7 @@ class Planner:
           va = v_allow(D, T, max(floor, T - DRIVE_GAP_MPH), buf)
           c = cands.get(key)
           if c is None or va < c["va"]:
-                cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "trim": bool(trim[j]), "va": va, "D": D,
+                cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "va": va, "D": D,
                           "at": self.odo + float(dist[run[-1]]),
                               "entry": self.odo + float(dist[run[0]]), "S1": max(floor, T - DRIVE_GAP_MPH), "buf": buf}
     # start: the car is at or above the highest speed from which it can still make it
@@ -654,7 +668,17 @@ class Planner:
           hold = (c["va"], key, c)
       if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
         ceil, cdist, cpt, kind, corner = int(math.floor(hold[0])), round(hold[2]["D"], 1), hold[1], "hold", hold[2]["T"]
-    self.alert = self._warn(idx, dist, np.maximum(need, proven), trim, mph, v, floor, acting, set_mph)
+    corners = self._corners(idx, dist, np.maximum(need, proven), mph)
+    # latch every corner within reach of the warning horizon (plus LATCH_EXTRA_S of driving) while the road is trusted, and keep it,
+    # by the odometer, until the car is LATCH_PAST_M past its end: also through a wrong re-match (a trusted position that no longer
+    # shows it). A corner seen now replaces its latched copy.
+    keys = {c["key"] for c in corners}
+    for c in corners:
+      if c["entry"] - self.odo <= self._horizon(v, c["need"]) + v * LATCH_EXTRA_S:
+        self.latch[c["key"]] = c
+    self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
+    corners = corners + [c for k, c in self.latch.items() if k not in keys]
+    self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True)
     if ceil is None:
       return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
     # "capped" means ONE thing: a corner's target is below the floor (more than the feature may shed); a car slowing less than planned
@@ -667,64 +691,132 @@ class Planner:
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold")
 
-  def _warn(self, idx, dist, need_true, trim, mph, v, floor, acting, set_mph=None):
-    """THE warning, one rule (2026-11-23 reviews): for every CONFIRMED corner ahead (2+ passes, or one pass confirmed by the model's
-    preview: the same test as the trim; the model's own point counts too) whose TRUE need (envelope, proven speed; never the floor)
-    is below the car's speed: predict the speed at its tightest point from what curve slowing will actually do from here (acting: the
-    cruise's measured saturated deceleration after its reaction, never below the floor it may go to; not acting: nothing, the speed
-    stays). If that is above need + ALERT_MARGIN and the corner is within the calm-braking horizon (ALERT_LEAD_S at this speed plus
-    the distance to brake to the need at CALM_BRAKE_MS2), warn with the true need. It holds until the speed is down to need +
-    ALERT_MARGIN or the corner is passed, and re-arms if the car speeds up again before it. Independent of whether an intervention
-    was started, is held, paused, stopped, floored, behind, or decided not to slow. -> the need (whole mph) or None."""
-    ok = (~trim) & (need_true < mph - ALERT_MARGIN_MPH) & (dist >= -HOLD_AFTER_M)
-    pts = np.nonzero(ok)[0]
+  def _floor(self, floor_mph, ref_mph, set_mph, mph):
+    """The floor, ONE source with the car side (fourth review, item 4): the car side's published floor (while it intervenes, or the
+    one it would take now: lead-aware, limit-aware); only without a car-side status, the same rule from the set speed."""
+    if floor_mph is not None:
+      return int(floor_mph)
+    base_ = ref_mph if ref_mph else (set_mph if set_mph else round(mph))
+    return max(self.ABS_FLOOR_MPH, int(round(base_)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
+
+  @staticmethod
+  def _horizon(v, need):
+    """The calm-braking horizon (m): ALERT_LEAD_S at this speed plus the distance to brake to the need at CALM_BRAKE_MS2."""
+    vt = need * MPH
+    return v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
+
+  def _corners(self, idx, dist, need_true, mph):
+    """The corners ahead the car is too fast for now: runs of points (at most 2 spacings apart) whose TRUE need (envelope, proven
+    speed; never the floor) is below mph - ALERT_MARGIN_MPH, up to HOLD_AFTER_M behind. Each: key (its last point, or the model's
+    point), need (whole mph, the run's lowest), entry / low / end on the odometer."""
+    pts = np.nonzero((need_true < mph - ALERT_MARGIN_MPH) & (dist >= -HOLD_AFTER_M))[0]
+    if not len(pts):
+      return []
+    order = pts[np.argsort(dist[pts])]
+    runs, cur = [], [order[0]]
+    for j in order[1:]:
+      if dist[j] - dist[cur[-1]] <= 2 * self.mem.spacing + 1e-6:
+        cur.append(j)
+      else:
+        runs.append(cur)
+        cur = [j]
+    runs.append(cur)
+    out = []
+    for run in runs:
+      run = np.array(run)
+      lo = run[int(np.argmin(need_true[run]))]
+      key = int(idx[run[-1]]) if idx[run[-1]] >= 0 else ("model", round(self.odo + float(dist[run[-1]]), -1))
+      out.append({"key": key, "need": int(need_true[lo]), "entry": self.odo + float(dist[run[0]]),
+                  "low": self.odo + float(dist[lo]), "end": self.odo + float(dist[run[-1]])})
+    return out
+
+  def _observe(self, t, mph, set_mph):
+    """How much of its measured deceleration the cruise is ACTUALLY giving (a weaker cruise than measured, a downhill, a heavy load):
+    observed speed drop over OBS_WINDOW_S against decel_mph_s(gap to the set speed REACTION_S earlier), while it should be slowing.
+    The prediction (`_arrive`) uses min(RESP_FACTOR, that share); fourth review, item 3."""
+    self.hist.append((t, mph, set_mph))
+    while self.hist and t - self.hist[0][0] > OBS_WINDOW_S + REACTION_S + 1e-6:
+      self.hist.pop(0)
+    if t - self.resp_t > OBS_KEEP_S:
+      self.resp = RESP_FACTOR
+    old = [h for h in self.hist if t - h[0] >= OBS_WINDOW_S - 1e-6]
+    if not old or set_mph is None or any(h[2] is None for h in self.hist):
+      return
+    t0, m0, _ = old[-1]
+    exp, n = 0.0, 0
+    for tt, m, _ in self.hist:
+      if tt < t0:
+        continue
+      lag = [h for h in self.hist if h[0] <= tt - REACTION_S + 1e-6]
+      sl = lag[-1][2] if lag else self.hist[0][2]
+      exp += decel_mph_s(m - sl)
+      n += 1
+    exp /= max(n, 1)
+    if exp < OBS_MIN_EXPECT:
+      return
+    obs = (m0 - mph) / max(t - t0, 1e-3)
+    self.resp = min(RESP_FACTOR, max(0.2, obs / exp))
+    self.resp_t = t
+
+  def _arrive(self, v, d, set0, s1, lowering):
+    """The speed (mph) at `d` metres from what curve slowing will actually do: the set speed tapped down from `set0` one mph per TAP_S
+    to `s1` when `lowering` (else it stays), the cruise following it REACTION_S late at its MEASURED deceleration for the gap
+    (decel_mph_s: weak at a small gap; fourth review, item 3) times RESP_FACTOR, or the share it is observed to give now if less
+    (`_observe`), and speeding up toward a set speed above it at ACCEL_MPH_S."""
+    vv, x, t = v / MPH, 0.0, 0.0
+    while x < d and t < 120.0:
+      tl = t - REACTION_S
+      s_lag = max(s1, set0 - tl / TAP_S) if (lowering and tl > 0) else set0
+      if vv > s_lag:
+        vv = max(s_lag, vv - self.resp * decel_mph_s(vv - s_lag) * SIM_DT_S)
+        if vv - s_lag < SETTLE_MPH:
+          vv = s_lag                              # the cruise settles on its set speed (it shows whole mph)
+      elif vv < s_lag:
+        vv = min(s_lag, vv + ACCEL_MPH_S * SIM_DT_S)
+      x += vv * MPH * SIM_DT_S
+      t += SIM_DT_S
+    return vv
+
+  def _warn(self, corners, mph, v, floor, acting, set_mph, lowering):
+    """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,
+    while it is not trusted): predict the speed at the corner's tightest point from what curve slowing will actually do (`_arrive`;
+    acting on trusted road: taps down to the push speed max(floor, need - DRIVE_GAP_MPH), never below the floor; otherwise the set
+    speed stays where it is). If that is above need + ALERT_MARGIN_MPH and the corner's entry is within the calm-braking horizon
+    (`_horizon`), warn with the TRUE need. A warning holds until the speed is down to need + ALERT_MARGIN_MPH or the corner is
+    passed, and re-arms if the car speeds up again before it. Independent of whether an intervention was started, held, paused,
+    stopped, floored, behind or decided against. -> the lowest need warned for (whole mph) or None."""
     seen = set()
     out = None
-    if len(pts):
-      order = pts[np.argsort(dist[pts])]
-      runs, cur = [], [order[0]]
-      for j in order[1:]:
-        if dist[j] - dist[cur[-1]] <= 2 * self.mem.spacing + 1e-6:
-          cur.append(j)
-        else:
-          runs.append(cur)
-          cur = [j]
-      runs.append(cur)
-      a_max = RESP_FACTOR * SAT_MPH_S * MPH
-      for run in runs:
-        run = np.array(run)
-        lo = run[int(np.argmin(need_true[run]))]
-        need = int(need_true[lo])
-        key = int(idx[run[-1]]) if idx[run[-1]] >= 0 else ("model", round(self.odo + float(dist[run[-1]]), -1))
-        seen.add(key)
-        d_low = max(0.0, float(dist[lo]))
-        d_entry = max(0.0, float(dist[run[0]]))
-        t_to = d_low / max(v, 1.0)
-        if acting:
-          if mph > floor:
-            v_dec2 = v * v - 2.0 * a_max * max(0.0, d_low - v * REACTION_S)
-            arrive = max(math.sqrt(max(0.0, v_dec2)) / MPH, float(floor))
-          else:
-            arrive = min(float(floor), mph + ACCEL_MPH_S * t_to)     # below the floor: the cruise takes it up toward the floor
-        else:
-          top = float(set_mph) if set_mph and set_mph > mph else mph   # nothing done: the cruise goes on toward its set speed
-          arrive = min(top, mph + ACCEL_MPH_S * t_to)
-        vt = need * MPH
-        horizon = v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
-        if key in self.alerted and key not in self.alerting and mph > need + ALERT_MARGIN_MPH + 3:
-          self.alerted.discard(key)               # sped up again before the corner: may warn again
-        if key in self.alerting:
-          if mph <= need + ALERT_MARGIN_MPH:
-            self.alerting.discard(key)
-            self.alerted.add(key)
-            continue
-        elif key in self.alerted or arrive <= need + ALERT_MARGIN_MPH or d_entry > horizon:
+    for c in corners:
+      key, need = c["key"], c["need"]
+      seen.add(key)
+      d_low = max(0.0, c["low"] - self.odo)
+      d_entry = max(0.0, c["entry"] - self.odo)
+      if key in self.alerted and key not in self.alerting and mph > need + ALERT_MARGIN_MPH + 3:
+        self.alerted.discard(key)               # sped up again before the corner: may warn again
+      if key not in self.alerting and (key in self.alerted or d_entry > self._horizon(v, need)):
+        continue
+      if not set_mph:
+        arrive = mph                              # no cruise: nothing changes the speed
+      elif acting and lowering:
+        arrive = self._arrive(v, d_low, float(set_mph), float(max(floor, need - DRIVE_GAP_MPH)), True)
+      else:
+        arrive = self._arrive(v, d_low, float(set_mph), float(set_mph), False)
+      if key in self.alerting:
+        # released only once the car IS at need + ALERT_MARGIN_MPH and is not going to be above it there (a car speeding up toward a
+        # set speed above the corner's keeps its warning)
+        if mph <= need + ALERT_MARGIN_MPH and arrive <= need + ALERT_MARGIN_MPH:
+          self.alerting.discard(key)
+          self.alerted.add(key)
           continue
-        else:
-          self.events.append({"kind": "alert", "point": key if isinstance(key, int) else -1, "need": need, "floor": int(floor),
-                              "acting": bool(acting), "mph": round(mph, 1), "arrive": round(arrive, 1), "dist": round(d_entry, 1)})
-          self.alerting.add(key)
-        out = need if out is None else min(out, need)
+      else:
+        if arrive <= need + ALERT_MARGIN_MPH + RAISE_SLACK_MPH:
+          continue
+        self.events.append({"kind": "alert", "point": key if isinstance(key, int) else -1, "need": need, "floor": int(floor),
+                            "acting": bool(acting), "trusted": bool(lowering), "mph": round(mph, 1), "arrive": round(arrive, 1),
+                            "dist": round(d_entry, 1)})
+        self.alerting.add(key)
+      out = need if out is None else min(out, need)
     for key in [k for k in self.alerting if k not in seen]:
       self.alerting.discard(key)                  # passed (or no longer ahead)
       self.alerted.add(key)

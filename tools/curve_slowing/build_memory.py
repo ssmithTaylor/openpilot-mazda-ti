@@ -70,6 +70,7 @@ Run (worktree venv python, PYTHONPATH with the cereal shim + this worktree, belo
   python tools/curve_slowing/build_memory.py                       # memory/curve_memory_v1.npz from the default drive set
   python tools/curve_slowing/build_memory.py --loo-all             # memory/loo/<drive>.npz, each from every other drive
   python tools/curve_slowing/build_memory.py --replay-caches       # memory/cache/drive_<drive>.npz
+  python tools/curve_slowing/build_memory.py --replay-caches --source all   # ... for EVERY recorded drive on this PC (signals for review)
   python tools/curve_slowing/build_memory.py --check               # position-free validation printout
 """
 import argparse
@@ -116,6 +117,22 @@ TK_FOLLOW = 40                # 2 s
 TK_STOP_MPH, TK_STOP_M = 5.0, 150.0    # a stop / near-stop within 150 m: a stop, not trouble
 TK_BLINK_S = 5.0                        # ... or the blinker within +-5 s (a junction turn)
 TK_BRAKE_MIN_MPH = 25.0                 # a brake disengagement at or above this speed is a takeover (owner's protocol)
+# ... but one with NO firm hand torque near it (brake only) only with no lead ahead (-5 s .. +1 s) AND a sign of steering trouble: a
+# steering-limit event within 10 s before it, a lane-line event within +-10 s, or a real bend at that speed (v^2 |kap| over +-30 m at
+# least TK_BRAKE_LA). Fourth review: brake-only takeovers on gentle bends (some behind a lead) made false trouble corners.
+TK_HAND_NEAR_S = 3.0
+# a bend remembered from ONE pass is kept only when it bends ONE way (fourth review, item 6; the owner removed the single-pass cap, so
+# phantom protection is the builder's): no opposite-sign curvature of at least SP_OPPOSITE_SHARE of its peak within +-SP_OPPOSITE_M of
+# the peak, and a net heading change of at least SP_MIN_TURN_DEG over +-SP_TURN_M. Otherwise kap = 0 and FLAG_NOKAP there. Points
+# with a steering-limit, takeover or lane-line flag are always kept.
+SP_OPPOSITE_SHARE = 0.4
+SP_OPPOSITE_M = 60.0
+SP_MIN_TURN_DEG = 15.0
+SP_TURN_M = 100.0
+TK_LEAD_S = (5.0, 1.0)
+TK_EVIDENCE_S = 10.0
+TK_BEND_M = 30.0
+TK_BRAKE_LA = 1.5                       # m/s^2
 BEND_KAP = 0.002               # takeover and lane-line flags are spread only over points of a real bend (stored |kap| >= this)
 EVENT_SLACK = 20               # 20 Hz samples: an event belongs to a piece within 1 s of it (s5_pieces)
 LINK_DIST_M = 20.0
@@ -147,14 +164,16 @@ def gauss(a, sigma_pts):
 
 
 # ---- events (s5_pieces.run_events) --------------------------------------------------------------------------------------------------
-def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None, blink=None):
+def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None, blink=None, lead=None, kap=None, lane_i=None):
   """steering-limit events (request at the clamp >= 0.3 s, lateral active, driver not pressing; s5_pieces) and TAKEOVERS as 20 Hz
   indices. A takeover is either
     - a firm hand takeover: |driver torque| >= TK_DRV sustained >= 0.5 s starting while lateral is active, then within 2 s lateral
       control inactive or openpilot disengaged; or
     - a BRAKE DISENGAGEMENT AT SPEED (the owner's protocol since 2026-11-19: brake to disengage, then steer): openpilot disengages
       with the brake pressed (within 0.5 s) at TK_BRAKE_MIN_MPH or more, with or without hand steering (on this car the brake drops
-      lateral first, so the hand torque usually starts after lateral is off).
+      lateral first, so the hand torque usually starts after lateral is off). A brake disengagement with no firm hand torque within
+      TK_HAND_NEAR_S counts only with no lead ahead (`lead`, when known) and a sign of steering trouble (TK_* above: a limit event,
+      a lane-line event `lane_i`, or a real bend at that speed from `kap`).
   Neither counts when it is a STOP, not a takeover: the car comes to a stop or near-stop (below TK_STOP_MPH) within TK_STOP_M after
   it, or the blinker is on within +-TK_BLINK_S (a turn at a junction). Slowing below 19 mph on a tight bend without stopping, and
   without a blinker, is still a takeover. Flags are spread over real bends only (FLAG_* spreading) and a pass with a takeover near a
@@ -183,6 +202,26 @@ def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None, blink=No
   hard = np.abs(drv) >= TK_DRV
   m = np.r_[0, hard.astype(np.int8), 0]
   ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
+  firm = [int(a) for a, b in ed if b - a >= TK_SUSTAIN]           # sustained firm hand torque onsets
+  ld = None if lead is None else (np.asarray(lead, float) > .5)
+  kk = None if kap is None else np.abs(np.asarray(kap, float))
+  lanes = np.asarray(lane_i if lane_i is not None else [], int)
+
+  def brake_only_ok(a):
+    w = int(round(TK_HAND_NEAR_S / DT))
+    if any(abs(f - a) <= w for f in firm):
+      return True                                                 # hand torque too: judged as before
+    if ld is not None and ld[max(0, a - int(round(TK_LEAD_S[0] / DT))):min(n, a + int(round(TK_LEAD_S[1] / DT)) + 1)].any():
+      return False                                                # a lead ahead: braking for traffic
+    we = int(round(TK_EVIDENCE_S / DT))
+    if any(a - we <= q <= a + int(round(1.0 / DT)) for q in sats) or any(abs(q - a) <= we for q in lanes):
+      return True
+    if kk is not None and ss is not None:
+      near = (ss >= ss[a] - TK_BEND_M) & (ss <= ss[a] + TK_BEND_M)
+      km = np.nanmax(np.where(near, kk, 0.0))
+      if np.isfinite(km) and vv[a] ** 2 * km >= TK_BRAKE_LA:
+        return True
+    return False
   for a, b in ed:
     if b - a < TK_SUSTAIN or not la[a]:
       continue
@@ -195,7 +234,7 @@ def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None, blink=No
     off = np.nonzero(e[:-1] & ~e[1:])[0] + 1                 # openpilot disengages
     half = int(round(0.5 / DT))
     for a in off:
-      if bk[max(0, a - half):min(n, a + half + 1)].any() and vv[a] >= TK_BRAKE_MIN_MPH * 0.44704:
+      if bk[max(0, a - half):min(n, a + half + 1)].any() and vv[a] >= TK_BRAKE_MIN_MPH * 0.44704 and brake_only_ok(int(a)):
         cand.append(int(a))
   tk = []
   for a in sorted(set(cand)):
@@ -664,6 +703,30 @@ def carry_flags(arrays, flags, lib, tid):
         arrays['v_flag'][sl] = np.fmin(arrays['v_flag'][sl], v)
 
 
+def single_pass_phantoms(arrays):
+  """-> bool per output point: single-pass bend points that fail the one-direction test (SP_* above)."""
+  kap = np.asarray(arrays['kap'], float)
+  npass = np.asarray(arrays['npass'])
+  trouble = (np.asarray(arrays['flags']) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | M.FLAG_LANE)) != 0
+  ts = np.asarray(arrays['trace_start'], np.int64)
+  out = np.zeros(len(kap), bool)
+  wo, wt = int(round(SP_OPPOSITE_M / SP)), int(round(SP_TURN_M / SP))
+  for t in range(len(ts) - 1):
+    a, b = int(ts[t]), int(ts[t + 1])
+    cand = (npass[a:b] <= 1) & (np.abs(kap[a:b]) >= BEND_KAP) & ~trouble[a:b]
+    d = np.diff(np.r_[0, cand.astype(np.int8), 0])
+    for i, j in zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]):
+      seg = kap[a + i:a + j]
+      pk = a + i + int(np.argmax(np.abs(seg)))
+      kp = kap[pk]
+      w = kap[max(a, pk - wo):min(b, pk + wo + 1)]
+      opposite = bool((np.sign(w) == -np.sign(kp)).any() and (np.abs(w[np.sign(w) == -np.sign(kp)]) >= SP_OPPOSITE_SHARE * abs(kp)).any())
+      turn = abs(float(kap[max(a, pk - wt):min(b, pk + wt + 1)].sum()) * SP) * 180.0 / math.pi
+      if opposite or turn < SP_MIN_TURN_DEG:
+        out[a + i:a + j] = True
+  return out
+
+
 def build(passes, info=None):
   """passes (chronological) -> (arrays for ti_curve_memory.save, stats). Each pass: dict(drive, s, X, Y, v, kap, bank, sat_i, tk_i and,
   optional, grade, blink, pressed, drv, lat_act). `info` (a dict) receives position-free diagnostics."""
@@ -757,7 +820,11 @@ def build(passes, info=None):
   arrays = dict(x=x, y=y, hdg=hdg, kap=kap[order], v=v_f[order], flags=fl[order], v_flag=vf[order], npass=npass[order],
                 bank=bank[order], grade=grade[order], v_proven=v_proven[order], kap_med=kap_med[order], trace_start=ts, trace_next=nxt)
   carry_flags(arrays, flags, lib, tid)
+  ph = single_pass_phantoms(arrays)
+  arrays['kap'] = np.where(ph, 0.0, arrays['kap'])
+  arrays['flags'] = (arrays['flags'] | np.where(ph, M.FLAG_NOKAP, 0)).astype(np.uint8)
   if info is not None:
+    info['single_pass_phantom_points'] = int(ph.sum())
     info['rows'] = int(len(rows))
     if len(rows):                                   # per output point (private diagnostics, never written to the file)
       stp = (excl & EX_STOP) > 0
@@ -1021,23 +1088,28 @@ def prepare_runs(tags, org, replay=False):
                                                                            ('pressed', 'pressed'), ('drv', 'drv_trq'))}
     brk = cat(lambda z, q: z['brk']).astype(np.float32)
     p['blink'] = cat(lambda z, q: z['blink']).astype(np.float32)
+    lead = cat(lambda z, q: z['lead'] if 'lead' in z else np.full(len(z['t']), np.nan)).astype(np.float32)
+    p['lane_d'] = np.concatenate([lane_grid(t, k) for t, k in zip(ts, n)]).astype(np.float32)
+    p['lane_i'] = lane_events(p['lane_d'], sig['lat_act'], p['blink'])
     p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'], brk=brk, v=v, s=p['s'],
-                                       blink=p['blink'])
+                                       blink=p['blink'], lead=np.nan_to_num(lead, nan=0.0) if np.isfinite(lead).any() else None,
+                                       kap=p['kap'], lane_i=p['lane_i'])
     for nm in ('pressed', 'drv', 'lat_act'):
       p[nm] = sig[nm]
     if all('aego' in z for z in zs):
       p['aego'] = cat(lambda z, q: z['aego']).astype(np.float32)
-    p['lane_d'] = np.concatenate([lane_grid(t, k) for t, k in zip(ts, n)]).astype(np.float32)
-    p['lane_i'] = lane_events(p['lane_d'], p['lat_act'], p['blink'])
     if replay:
       p.update(sig)
       p['lat'], p['lon'] = lat, lon
       p['pos_ok'] = np.concatenate([g[2] for g in grids])
       p['bearing_deg'] = np.concatenate([g[3] for g in grids])
       for nm, f in (('cr_en', 'cr_en'), ('cr_set', 'cr_set'), ('lead', 'lead'), ('brk', 'brk'), ('gas', 'gas'), ('blink', 'blink')):
-        p[nm] = cat(lambda z, q, f=f: z[f]).astype(np.float32)
+        p[nm] = cat(lambda z, q, f=f: z[f] if f in z else np.full(len(z['t']), np.nan)).astype(np.float32)
       la5 = []
       for z in zs:
+        if 'pred_t' not in z or 'pred_la' not in z:
+          la5.append(np.full(len(z['t']), np.nan))          # an rlog-read segment: no model preview cached
+          continue
         m = z['pred_t'] <= 5.0 + 1e-6
         la5.append(np.nanmax(np.abs(z['pred_la'][:, m]), axis=1) if m.any() else np.full(len(z['t']), np.nan))
       p['model_la5'] = np.concatenate(la5).astype(np.float32)
@@ -1257,8 +1329,12 @@ def _loo_init(tags):
 
 
 # ---- replay caches ------------------------------------------------------------------------------------------------------------------
-def write_replay_caches(tags, workers):
-  ensure_positions(tags, workers)
+def write_replay_caches(tags, workers, all_source=False):
+  """DATA_DIR/cache/drive_<drive>.npz for every drive of `tags` (the gate set; with all_source, every recorded drive on this PC: the
+  pass-quality signals (blinker, brake, lead, stop) are then cached for ALL drives, fourth review item 6). Segments read from the
+  rlog (not in seg20) have no model preview: model_la5 is nan there."""
+  if not all_source:
+    ensure_positions(tags, workers)
   org = origin()
   corners = pickle.load(open(STUDY + '/cache/corners.pkl', 'rb'))
   RU = pickle.load(open(STUDY + '/cache/runs.pkl', 'rb'))['RUNS']
@@ -1286,7 +1362,7 @@ def write_replay_caches(tags, workers):
     out['seg_tags'] = np.array([t for p in runs for t in p['tags']])
     out['seg_off'] = np.array([run_off[r] + p['off'][i] for r, p in enumerate(runs) for i in range(len(p['tags']))], np.int64)
     out['seg_run'] = np.array([r for r, p in enumerate(runs) for _ in p['tags']], np.int64)
-    cs = [c for c in corners if c['tag'] in tag_pos]
+    cs = [c for c in corners if c['tag'] in tag_pos and c['tag'] in study_off]
     rows = []
     for c in cs:
       r, o = tag_pos[c['tag']]
@@ -1390,7 +1466,7 @@ def main():
   if a.check:
     check(tags)
     return
-  if a.replay_caches:
+  if a.replay_caches and a.source != 'all':
     write_replay_caches(tags, workers)
     return
   if a.loo_all:
@@ -1405,8 +1481,8 @@ def main():
     return
   t0 = time.time()
   if a.source == 'all':
-    if a.loo_all or a.replay_caches or a.check:
-      raise SystemExit('--source all builds the on-car memory only (LOO, replay and the check stay on the gate set)')
+    if a.loo_all or a.check:
+      raise SystemExit('--source all builds the on-car memory (and, with --replay-caches, the drive caches) only')
     rt, cnt = recorded_tags()
     if a.drives:
       rt = {t: p for t, p in rt.items() if t.split('-')[0] in set(a.drives)}
@@ -1415,6 +1491,9 @@ def main():
     ensure_positions({t: p for t, p in rt.items() if t in gate}, workers)
     rt = ensure_rlog_segs(rt, workers)
     ensure_lanes(rt, workers)
+    if a.replay_caches:
+      write_replay_caches(rt, workers, all_source=True)
+      return
     passes = prepare_runs(rt, origin())
     drives = list(collections.OrderedDict.fromkeys(t.split('-')[0] for t in rt))
     cnt = dict(cnt, segments_used=len(rt), drives_used=len(drives), gate_drives_used=len({t.split('-')[0] for t in rt if t in gate}))

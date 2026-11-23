@@ -102,3 +102,31 @@ def test_h2_every_planner_log_call_with_real_events_does_not_raise():
 
 
 import numpy as np  # noqa: E402
+
+
+def test_car_side_relays_the_lead_aware_floor_when_not_intervening():
+  # fourth review, item 4: one floor source; while not intervening the car side's floor_now (lead-aware) is the planner's floor
+  import json
+  from openpilot.selfdrive.car.mazda import ti_curve as C
+
+  class S:
+    def __init__(self, d):
+      self.raw = json.dumps(d).encode()
+
+    def get(self, k):
+      return self.raw
+  st = {"t": 100.0, "state": "ready", "ref": 55, "floor": None, "floor_now": 25, "acting": True}
+  assert D.car_side(S(st), 100.5, C) == (55, 25, True)
+  st.update(state="slowing", floor=40)
+  assert D.car_side(S(st), 100.5, C) == (55, 40, True)             # while it intervenes: its intervention's floor
+  assert D.car_side(S(st), 104.0, C) == (None, None, False)         # stale
+
+
+def test_car_side_floor_now_is_lead_aware():
+  from openpilot.selfdrive.car.mazda import ti_curve as C
+  c = C.Curve()
+  c.ref = 55
+  inp = C.Inputs(on=True, engaged=True, cruise_on=True, cruise_available=True, mph=40.0, set_mph=55, lead=True, driver_button=False,
+                 counter=0, plan=None, plan_age=None, mono=0.0)
+  assert c._floor_for(inp, None) == 25                               # min(55, 40) - 15
+  assert c._floor_for(inp._replace(lead=False) if hasattr(inp, "_replace") else C.Inputs(**{**inp.__dict__, "lead": False}), None) == 40

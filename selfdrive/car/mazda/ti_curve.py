@@ -107,6 +107,7 @@ class Curve:
   def __init__(self):
     self.state = "off"
     self.why = ""
+    self.floor_now = None         # the floor a new intervention would take now (published for the planner)
     self.guard = PressGuard()
     self.events = []
     self.ref = None               # the driver's set speed
@@ -283,6 +284,7 @@ class Curve:
       self.off_view(inp.plan, inp.plan_age, inp.set_mph, inp.mph)
       return None
     self._update_alert(inp)
+    self.floor_now = self._floor_for(inp, inp.plan if self._plan_ok(inp) else None)
     if self.state == "off":
       if inp.cruise_on:
         self._adopt(inp.set_mph)
@@ -480,9 +482,7 @@ class Curve:
         lim = plan.get("limit")
         if lim and abs(float(lim) - inp.mph) > LIMIT_PLAUSIBLE_MPH:
           lim = None                          # stale or wrong, high or low: not used
-        lead_held = bool(inp.lead) and inp.mph < self.ref - 2.0       # a lead holds the car below the DRIVER's set speed
-        base = min(self.ref, int(round(inp.mph))) if lead_held else self.ref
-        self.floor = max(ABS_FLOOR_MPH, base - MAX_SHED_MPH, (int(lim) - MAX_SHED_MPH) if lim else 0)
+        self.floor = self._floor_for(inp, plan)
         self.lowered_from = self.ref
         self.restore_wait_since = None
         self.trust_past = False
@@ -552,6 +552,19 @@ class Curve:
       return None
     self._to(frame, "ready")
     return self._idle_text(plan, dead=dead)
+
+  def _floor_for(self, inp, plan):
+    """The floor a new intervention would take NOW: max(ABS_FLOOR_MPH, (ref, or min(ref, speed) when a lead holds the car under the
+    driver's set speed) - MAX_SHED_MPH, a plausible limit - MAX_SHED_MPH). ONE definition, also published (status "floor_now") so
+    the planner plans and warns with the same floor (fourth review, item 4)."""
+    if self.ref is None:
+      return None
+    lim = (plan or {}).get("limit")
+    if lim and abs(float(lim) - inp.mph) > LIMIT_PLAUSIBLE_MPH:
+      lim = None
+    lead_held = bool(inp.lead) and inp.mph < self.ref - 2.0       # a lead holds the car below the DRIVER's set speed
+    base = min(self.ref, int(round(inp.mph))) if lead_held else self.ref
+    return max(ABS_FLOOR_MPH, base - MAX_SHED_MPH, (int(lim) - MAX_SHED_MPH) if lim else 0)
 
   def _update_alert(self, inp):
     """The warning is the PLANNER's one rule (ti_curve_plan.Planner._warn, from this side's floor and state relayed by the daemon);
@@ -710,6 +723,7 @@ class Curve:
       self.line2 = "more than curve slowing can do: brake"
     return {"t": round(wall, 1), "v": 1, "state": self.state, "why": self.why, "line1": self.line1, "line2": self.line2,
             "ref": self.ref, "target": self.target, "floor": self.floor, "set": self.set_last, "needs_more": self.needs_more,
+            "floor_now": self.floor_now,
             "alert": self.alert_mph if self.state != "off" else None,
             "acting": self.state in ("ready", "slowing", "holding", "restoring") and not self.left_doubt,
             "down": self.taps_down, "up": self.taps_up}

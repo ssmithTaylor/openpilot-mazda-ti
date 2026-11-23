@@ -64,18 +64,19 @@ def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cl
     if f % 20 == 0:
       store.raw = json.dumps(cv.status(t)).encode()
       ref, floor, acting = D.car_side(store, t, C)
-      x, y = np.interp(s, s_road, tr["x"]), np.interp(s, s_road, tr["y"])
-      i = min(int(s // M.SPACING_M), len(tr["hdg"]) - 1)
+      sj = s + ov.get("_jump", 0.0)                                     # a matcher miss: fixes somewhere else
+      x, y = np.interp(sj, s_road, tr["x"]), np.interp(sj, s_road, tr["y"])
+      i = min(int(sj // M.SPACING_M), len(tr["hdg"]) - 1)
       ahead = np.arange(0, 4.01, 0.25)
       kk = np.array([tr["kap"][min(int(q // M.SPACING_M), len(tr["kap"]) - 1)] for q in s + ahead * car.mph * P.MPH])
-      p = pl.step(t, P.Fix(True, float(x), float(y), float(tr["hdg"][i])), car.mph * P.MPH,
+      p = pl.step(t, P.Fix(ov.get("_fix_valid", True), float(x), float(y), float(tr["hdg"][i])), car.mph * P.MPH,
                   set_mph=car.set if ov.get("cruise_on", True) else None, yaw_k=float(tr["kap"][i]), model_k=(ahead, kk),
                   ref_mph=ref, floor_mph=floor, acting=acting)
       plan_d, plan_t = P.plan_json(p, t, seq, "act"), t
       seq += 1
     kw = dict(on=True, engaged=True, cruise_on=True, cruise_available=True, mph=car.mph, set_mph=car.set, lead=False,
               driver_button=False, counter=car.counter, plan=plan_d, plan_age=None if plan_t is None else t - plan_t, mono=t)
-    kw.update(ov)
+    kw.update({k: v for k, v in ov.items() if not k.startswith("_")})
     b = cv.step(f, C.Inputs(**kw))
     if b:
       car.press(b)
@@ -90,6 +91,21 @@ def gaps(log, a, b, need):
   """rows in [a, b] m where the car is above need + 2 (+1 slack) and nothing warns"""
   return [(round(r["s"]), round(r["mph"], 1)) for r in log if a <= r["s"] <= b and r["mph"] > need + P.ALERT_MARGIN_MPH + 1
           and not r["alert"]]
+
+
+def stretches(log):
+  """the unbroken warning stretches: [(first row, last row)]"""
+  out, on, prev = [], None, None
+  for r in log:
+    if r["alert"] and on is None:
+      on = r
+    if not r["alert"] and on is not None:
+      out.append((on, prev))
+      on = None
+    prev = r
+  if on is not None:
+    out.append((on, prev))
+  return out
 
 
 def first_alert_lead_s(log, corner_s):
@@ -139,14 +155,30 @@ def test_a_brake_then_res_at_30_before_a_corner_needing_32():
 
 
 # ---- (b) a lead holds the car at 40, set 55, a corner needing 24 ------------------------------------------------------------------
+def _lead40(f, car, s):
+  car.mph = min(car.mph, 40.0)
+  return {"lead": True}
+
+
 def test_b_lead_holds_the_car_at_40_corner_needs_24():
-  def ev(f, car, s):
-    car.mph = min(car.mph, 40.0)
-    return {"lead": True}
-  log = e2e([(2500, None), (150, 24), (1200, None)], 55, mph0=40, events=ev)
-  assert any(r["alert"] == 24 for r in log)
+  # fourth review, item 4: the lead-held floor (min(ref, speed) - 15 = 25) is the planner's too, so the corner IS slowed for
+  log = e2e([(2500, None), (150, 24), (1200, None)], 55, mph0=40, events=_lead40)
+  assert min(r["set"] for r in log if 2400 <= r["s"] <= 2650) <= 26
+  assert not gaps(log, 2450, 2650, 24)
+
+
+def test_item4_lead_held_corners_24_to_30_are_slowed_for():
+  for need in (24, 27, 30):
+    log = e2e([(2500, None), (150, need), (1200, None)], 55, mph0=40, events=_lead40)
+    assert min(r["set"] for r in log if 2400 <= r["s"] <= 2650) <= max(need, 25) + 1, need
+    assert not gaps(log, 2500, 2650, need), need                            # in the corner: slowed, or warned
+
+
+def test_b2_lead_held_corner_below_the_floor_warns():
+  log = e2e([(2500, None), (150, 20), (1200, None)], 55, mph0=40, events=_lead40)
+  assert any(r["alert"] == 20 for r in log)
   assert not any("no known corner ahead" in r["line1"] for r in log if r["alert"])
-  assert not gaps(log, next(r["s"] for r in log if r["alert"]), 2650, 24)
+  assert not gaps(log, next(r["s"] for r in log if r["alert"]), 2650, 20)
 
 
 # ---- (d) a single-pass corner is like any other (owner, 2026-11-23): it warns when the car will be too fast -------------------------
@@ -205,3 +237,63 @@ def test_m2_a_driver_set_after_a_brake_is_their_speed_and_never_exceeded():
   log = e2e([(2500, None), (150, 45), (1200, None)], 60, events=ev)
   after = [r for r in log if "b" in st and r["t"] > (st["b"] + 70) * DT]
   assert after and max(r["set"] for r in after) <= 52
+
+
+# ---- fourth review, MUST 1: losing trust never drops or delays a warning (latched corners, by the odometer) ------------------------
+def _trust_case(mode, a, b):
+  def ev(f, car, s):
+    if a <= s <= b:
+      return {"_fix_valid": False} if mode == "nofix" else {"_jump": 400.0}
+    return {}
+  log = e2e([(2500, None), (150, 33), (1200, None)], 55, events=ev)
+  st = stretches(log)
+  t_c = next(r["t"] for r in log if r["s"] >= 2500)
+  assert len(st) == 1, [(round(x["t"] - t_c, 1), round(y["t"] - t_c, 1)) for x, y in st]      # one stretch: one chime
+  assert t_c - st[0][0]["t"] >= P.ALERT_LEAD_S, t_c - st[0][0]["t"]
+  assert not gaps(log, st[0][0]["s"], 2650, 33)
+  assert not any(r["alert"] for r in log if r["s"] > 2650 + 100)
+  return log
+
+
+def test_must1_no_fix_250_to_80_m_before():
+  _trust_case("nofix", 2250, 2420)
+
+
+def test_must1_fix_lost_120_to_30_m_before():
+  _trust_case("nofix", 2380, 2470)
+
+
+def test_must1_matcher_lost_200_to_50_m_before():
+  _trust_case("jump", 2300, 2450)
+
+
+def test_must1_matcher_lost_80_m_before_to_20_m_in():
+  _trust_case("jump", 2420, 2520)
+
+
+def test_must1_no_warning_for_a_corner_already_slowed_for_through_a_gps_gap():
+  for a, b in ((2380, 2470), (2430, 2560)):
+    def ev(f, car, s, a=a, b=b):
+      return {"_fix_valid": False} if a <= s <= b else {}
+    log = e2e([(2500, None), (150, 45), (1200, None)], 55, events=ev)
+    assert not any(r["alert"] for r in log), (a, b)
+
+
+# ---- fourth review, item 3: the prediction uses the measured deceleration FOR THE GAP: a weaker cruise is warned for in time ------
+class Car70(T.Car):
+  """the cruise at 70 % of the deceleration the planner was measured with"""
+
+  def tick(self):
+    before = self.mph
+    super().tick()
+    if self.mph < before:
+      self.mph = before - 0.7 * (before - self.mph)
+
+
+def test_item3_a_70pct_cruise_is_warned_for_early():
+  for need in (30, 33, 36, 40):
+    log = e2e([(2500, None), (150, need), (1200, None)], 55, car_cls=Car70)
+    entry = next(r["mph"] for r in log if r["s"] >= 2500)
+    if entry > need + P.ALERT_MARGIN_MPH + 1:
+      lead = first_alert_lead_s(log, 2500)
+      assert lead is not None and lead >= P.ALERT_LEAD_S, (need, lead)

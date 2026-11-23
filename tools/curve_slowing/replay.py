@@ -166,8 +166,11 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
         fix = P.Fix(bool(pos_ok[p]) and np.isfinite(xs[p]), float(xs[p]) if pos_ok[p] else 0.0, float(ys[p]) if pos_ok[p] else 0.0,
                     P.bearing_to_hdg(float(brg[p])) if np.isfinite(brg[p]) else 0.0)
         t0 = time.perf_counter()
+        # the car side's reference, floor (while it intervenes, else the one it would take now) and whether it acts: as the daemon
+        # relays them (ti_curve_plannerd.car_side)
+        acting = curve.state in ("ready", "slowing", "holding", "restoring") and not curve.left_doubt
         pl = planner.step(t, fix, v_sim, set_mph=cru.set, yaw_k=float(kap[p]), model_k=None, ref_mph=curve.ref,
-                          floor_mph=curve.floor if curve.intervening() else None)     # the car side's reference and floor (one source)
+                          floor_mph=(curve.floor if curve.intervening() and curve.floor else curve.floor_now), acting=acting)
         if en[p] and v_sim > 9.0:
           why_ticks[pl.why] += 1
         for pev in planner.events:
@@ -370,6 +373,7 @@ def main():
   ap.add_argument('--buffer', type=float, default=None, help='planner BUFFER_S override (the buffer sweep)')
   a = ap.parse_args()
   drives = a.drives or sorted(os.path.basename(p)[6:-4] for p in glob.glob(f'{DATA_DIR}/cache/drive_*.npz'))
+  drives = [d for d in drives if os.path.exists(f'{DATA_DIR}/loo/{d}.npz')]     # caches of every drive exist; LOO only for the gate set
   os.makedirs(a.out, exist_ok=True)
   from multiprocessing import Pool
   t0 = time.time()
