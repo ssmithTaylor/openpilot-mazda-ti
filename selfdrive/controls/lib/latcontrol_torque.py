@@ -453,7 +453,7 @@ class LatControlTorque(LatControl):
     # identify tire grip or prove that another steering shape cannot recover. In the cited route
     # 00000283 plateau, changing internal boost was clipped away from the constant outgoing command.
     col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
-    will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
+    # (will_recover, the lateral-acceleration "rack will recover" test, no longer mutes Take Control: removed, PROPOSAL)
     at_authority_latch = col_trq >= BREAKAWAY_TORQUE
 
     # The breaker needs sustained tracking error, low wheel rate and no pressed/limiting gate.
@@ -487,9 +487,8 @@ class LatControlTorque(LatControl):
     self.break_boost += float(_clip(delta, -step, step))
     command = float(_clip(command + self.break_boost, -u_max, u_max))
 
-    # (col_trq / will_recover computed above the breaker; will_recover feeds the saturation report
-    # below -- a lightly-loaded clip does not warn, a missing reading (0, e.g. gen2) falls through
-    # to the old always-warn behaviour.)
+    # (PROPOSAL: the "will recover" mute of the saturation report is removed;
+    # a clip at the limit counts like any other.)
 
     # Optional output smoothing. The filter tracks the command even while it is switched off, so
     # turning it on mid-corner continues from where the command already is instead of stepping
@@ -572,7 +571,10 @@ class LatControlTorque(LatControl):
     # clip here is not a loss of control and does not deserve a warning. 0 means the car did not
     # publish a reading, which falls through to the old behaviour.
     pid_log.saturated = bool(self._check_saturation(abs(command) >= u_max - 1.0, CS, steer_limited_by_safety,
-                                                    curvature_limited, expected_to_recover=will_recover))
+                                                    curvature_limited, expected_to_recover=False))
+    # PROPOSAL (for the owner's decision, 2026-11-23 drive): the "will recover" mute is no longer applied to the Take Control
+    # warning. `will_recover` reads the 0x075 field the port calls column torque, which is the car's LATERAL ACCELERATION (~100 counts
+    # per m/s^2), so the warning was muted below about 1.77 m/s^2, exactly where this car runs wide. (will_recover is no longer used for the warning.)
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
