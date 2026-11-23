@@ -171,7 +171,7 @@ def test_driver_button_ends_and_pauses_and_adopts():
     if f == 600:
       car.set = 50                                      # the driver's own press lands
     return 590 <= f < 610
-  run(c, car, 1000, lambda f, car: plan(45), driver_button=btn)
+  run(c, car, 1000, lambda f, car: plan(45), driver_button=btn, driver_set=True)
   assert c.state == "paused"
   assert not [k for k, b in car.sent if k > 600]
   run(c, car, 3400, lambda f, car: plan(None), start=1000, driver_button=False)
@@ -303,7 +303,7 @@ def test_property_never_above_reference_never_below_floor():
       car.tick()
       inp = C.Inputs(on=True, engaged=True, cruise_on=f >= state["brake_until"], cruise_available=True, mph=car.mph, set_mph=car.set,
                      brake=f < state["brake_until"], gas=f < state["gas_until"], lead=state["lead"],
-                     driver_button=f < state["btn_until"], counter=car.counter, plan=pf(f, car),
+                     driver_button=f < state["btn_until"], driver_set=f < state["btn_until"], counter=car.counter, plan=pf(f, car),
                      plan_age=5.0 if f < state["gap_until"] else 0.1, mono=f * DT)
       before = car.set
       b = c.step(f, inp)
@@ -514,7 +514,8 @@ def test_property_with_missed_presses_misreads_standstill_switch_off_and_trust_l
       else:
         p = plan(start - 12 if (f // 1500) % 2 == 0 else None, corner=start - 8, dist=200.0)
       inp = C.Inputs(on=f >= st["off_until"], engaged=True, cruise_on=True, cruise_available=True, mph=0.0 if slow else car.mph,
-                     set_mph=car.set, lead=False, driver_button=f < st["btn_until"], counter=car.counter, plan=p, plan_age=0.1,
+                     set_mph=car.set, lead=False, driver_button=f < st["btn_until"], driver_set=f < st["btn_until"],
+                     counter=car.counter, plan=p, plan_age=0.1,
                      mono=f * DT, standstill=slow)
       before = car.set
       b = c.step(f, inp)
@@ -575,7 +576,7 @@ def test_brake_and_resume_cannot_walk_the_set_speed_down():
 
     def res(f_, car, f1=f):
       return f_ < f1 + 10                                  # the driver's RES: back to the stored (lowered) set speed
-    run(c, car, 200, lambda f_, car: plan(None), start=f, driver_button=res, driver_res=True)
+    run(c, car, 200, lambda f_, car: plan(None), start=f, driver_button=res)          # RES: not a SET button
     f += 200
     assert min(h[1] for h in car.history) >= 45, (k, min(h[1] for h in car.history))
     assert c.ref == 60
@@ -593,7 +594,7 @@ def test_own_press_after_a_stop_is_a_new_choice():
     if f == 2560:
       car.set = 44                                          # the driver's SET-: a new choice
     return 2555 <= f < 2565
-  run(c, car, 4000, lambda f, car: plan(None), start=2550, driver_button=setm)
+  run(c, car, 4000, lambda f, car: plan(None), start=2550, driver_button=setm, driver_set=True)
   assert c.ref == 44 and car.history[-1][1] == 44          # adopted, never restored above it
 
 
@@ -619,7 +620,7 @@ def test_property_never_more_than_15_below_the_drivers_last_choice():
     seen_max = [start]
     f = 0
     for _ in range(rng.randint(3, 8)):
-      e = rng.choice(["corner", "corner", "brake_res", "press", "nothing"])
+      e = rng.choice(["corner", "corner", "brake_res", "press", "other_button", "nothing"])
       if e == "corner":
         ce = rng.randint(25, start)
         run(c, car, rng.randint(500, 3000), lambda f_, car, ce=ce: plan(ce, corner=ce), start=f)
@@ -628,7 +629,7 @@ def test_property_never_more_than_15_below_the_drivers_last_choice():
         run(c, car, 40, lambda f_, car: plan(None), start=f, brake=True, cruise_on=False)
         f = car.k
         f1 = f
-        run(c, car, 100, lambda f_, car: plan(None), start=f, driver_button=lambda f_, car, f1=f1: f_ < f1 + 10, driver_res=True)
+        run(c, car, 100, lambda f_, car: plan(None), start=f, driver_button=lambda f_, car, f1=f1: f_ < f1 + 10)
         f = car.k
       elif e == "press":
         f1 = f
@@ -638,9 +639,15 @@ def test_property_never_more_than_15_below_the_drivers_last_choice():
           if f_ == f1 + 5:
             car.set = new
           return f1 <= f_ < f1 + 10
-        run(c, car, 3500, lambda f_, car: plan(None), start=f, driver_button=press)
+        run(c, car, 3500, lambda f_, car: plan(None), start=f, driver_button=press, driver_set=True)
         choice[0] = new
         seen_max[0] = max(seen_max[0], new)
+        f = car.k
+      elif e == "other_button":
+        # DISTANCE / MODE / CANCEL+RES / RES, during a corner or after: never the driver's choice of speed
+        f1 = f
+        ce = rng.choice([None, rng.randint(25, start)])
+        run(c, car, 2500, lambda f_, car, ce=ce: plan(ce, corner=ce), start=f, driver_button=lambda f_, car, f1=f1: f1 + 300 <= f_ < f1 + 310)
         f = car.k
       else:
         run(c, car, rng.randint(200, 2000), lambda f_, car: plan(None), start=f)
@@ -689,6 +696,50 @@ def test_cruise_set_afresh_at_a_new_speed_is_a_new_choice():
   c, car = C.Curve(), Car(60, 60)
   run(c, car, 2500, lambda f, car: plan(30, corner=30))
   run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
-  car.set = 52                                              # SET at the current speed (the button flag may be missed)
-  run(c, car, 3000, lambda f, car: plan(None), start=2550)
+  car.set = 52                                              # SET at the current speed: told by the BUTTON, not by the value
+  run(c, car, 3000, lambda f, car: plan(None), start=2550, driver_button=lambda f, car: f < 2560, driver_set=True)
   assert c.ref == 52 and c.left_at is None and car.history[-1][1] == 52
+  # the same new value without a SET press (cruise on by RES, value unexplained): not adopted, nothing pressed
+  c2, car2 = C.Curve(), Car(60, 60)
+  run(c2, car2, 2500, lambda f, car: plan(30, corner=30))
+  run(c2, car2, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+  car2.set = 52
+  n = len(car2.sent)
+  run(c2, car2, 3000, lambda f, car: plan(None), start=2550)
+  assert c2.ref == 60 and len(car2.sent) == n and car2.history[-1][1] == 52
+
+
+
+@pytest.mark.parametrize("when", ["during", "after_stop"])
+def test_distance_mode_cancel_res_never_set_the_reference(when):
+  c, car = C.Curve(), Car(60, 60)
+  if when == "during":
+    run(c, car, 1500, lambda f, car: plan(30, corner=30))                                 # lowering toward 45
+    run(c, car, 3000, lambda f, car: plan(None), start=1500, driver_button=lambda f, car: f < 1510)   # a DISTANCE press
+  else:
+    run(c, car, 2500, lambda f, car: plan(30, corner=30))
+    run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+    run(c, car, 3000, lambda f, car: plan(None), start=2550, driver_button=lambda f, car: f < 2560)   # RES / MODE / CANCEL
+  assert c.ref == 60
+  # a later corner can still only go to 45 (60 - 15), never 15 below the lowered value
+  run(c, car, 3000, lambda f, car: plan(25, corner=25), start=car.k)
+  assert min(h[1] for h in car.history) >= 45
+
+
+def test_driver_set_at_exactly_the_lowered_value_is_a_new_choice():
+  c, car = C.Curve(), Car(60, 60)
+  run(c, car, 2500, lambda f, car: plan(30, corner=30))
+  low = car.set
+  run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+  # SET- pressed with the cruise coming on at exactly the lowered value: a new choice, never restored upward
+  run(c, car, 4000, lambda f, car: plan(None), start=2550, driver_button=lambda f, car: f < 2560, driver_set=True)
+  assert c.ref == low and car.history[-1][1] == low
+
+
+def test_no_restore_without_trust_unless_past_the_corner():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 1500, lambda f, car: plan(45, corner=45, dist=60.0))
+  # trust lost with the corner's end unknown to the car side: no blind restore
+  c.corner_end_odo = None
+  run(c, car, 3000, lambda f, car: plan(None, trusted=False), start=1500)
+  assert not [k for k, b in car.sent if b == "SET_PLUS"]

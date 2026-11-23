@@ -224,7 +224,7 @@ def test_longest_controller_lines_fit():
              "cruise check started"]
   line1 = [f"STOPPED: {r}" for r in reasons] + ["SLOWING FOR A CORNER: 100 -> 100 mph", "HOLDING FOR A CORNER: 100 -> 100 mph",
                                                "HOLDING FOR THE NEXT CORNER: 100 mph", "RESTORING: 100 -> 100 mph",
-                                               "PAUSED: you changed the set speed", "ON: planner not running", "ON: matching the road",
+                                               "PAUSED: you pressed a cruise button", "ON: planner not running", "ON: matching the road",
                                                "CURVE SLOWING OFF"]
   line2 = ["CORNER NEEDS MORE THAN I MAY SLOW: be ready", "Set speed 100 mph (was 100): set it yourself", "Nothing was changed",
            "shadow: the planner only logs", "back in 30 s", "the model sees a bend ahead", "next corner: holding what it needs",

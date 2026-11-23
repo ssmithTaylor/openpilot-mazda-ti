@@ -96,7 +96,8 @@ class Inputs(NamedTuple):
   plan_age: Optional[float] = None   # seconds since the planner wrote it (None: never)
   mono: Optional[float] = None
   standstill: bool = False        # the car at standstill or the stock cruise in its standstill hold
-  driver_res: bool = False        # the driver's pressed button is RES only (a RES returns to the stored set speed: not a new choice)
+  driver_set: bool = False        # the driver's pressed button is SET+ or SET- (the buttons that CHOOSE a speed); RES, DISTANCE, MODE
+                                  # and CANCEL never are
 
 
 class Curve:
@@ -143,6 +144,8 @@ class Curve:
     self.left_doubt = False       # the set speed moved in a way that is neither ours nor RES: leave it alone
     self.trust_hold_since = None
     self.restore_wait_since = None
+    self.last_set_press = -10 ** 9    # frame of the driver's last SET+ / SET- press
+    self.trust_past = False           # trust was lost during an approach and the car has since passed where the corner ended
     self.off_seen = False
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
@@ -238,8 +241,10 @@ class Curve:
     btn_rose = btn and not self.btn_was
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
-    if cruise_rose and self.left_at is not None and inp.set_mph is not None and inp.set_mph != self.left_at:
-      self.own_press = True               # the cruise set afresh at a new speed (SET): the driver's new choice; a RES returns to left_at
+    if inp.driver_button and inp.driver_set:
+      self.last_set_press = frame
+    if cruise_rose and (frame - self.last_set_press) * DT <= 1.5:
+      self.own_press = True               # the cruise set afresh with SET (by the button, whatever the value): the driver's new choice
 
     if not inp.on:
       if self.state != "off":
@@ -256,7 +261,7 @@ class Curve:
         self.tap_from = self.tap_to = None
         self.correct_down = False
         self._to(frame, "off")
-      if btn_rose and not inp.driver_res:
+      if btn_rose and inp.driver_set:
         self.off_note = self.restart_note = ""
         self.own_press = True
       self.off_view(inp.plan, inp.plan_age, inp.set_mph, inp.mph)
@@ -271,20 +276,26 @@ class Curve:
     if btn:
       if btn_rose:
         self._cut_tap()
-        if not inp.driver_res:
+        if inp.set_mph is not None and self.ref is not None and inp.set_mph < self.ref and self.left_at is None and \
+           (self.intervening() or self.lowered_from is not None):
+          # the set speed is below the driver's own: remember it as left lowered, so only their SET+ / SET- can make it the new choice
+          self.left_at, self.left_doubt = inp.set_mph, False
+          self.lowered_from = self.ref
+          self.own_press = False
+        if inp.driver_set:
           self.own_press = True
         if self.intervening() or self.state in ("ready", "stopped", "waiting"):
-          self._ev("driver_button", frame, set_mph=inp.set_mph, ref=self.ref, during=self.state)
+          self._ev("driver_button", frame, set_mph=inp.set_mph, ref=self.ref, during=self.state, set_button=bool(inp.driver_set))
         self._end_intervention(frame)
         self.pause_until = t + PAUSE_S
-        self._to(frame, "paused", "you changed the set speed")
-      self.line1, self.line2 = "PAUSED: you changed the set speed", f"back in {PAUSE_S:.0f} s"
+        self._to(frame, "paused", "you pressed a cruise button")
+      self.line1, self.line2 = "PAUSED: you pressed a cruise button", f"back in {PAUSE_S:.0f} s"
       return None
     if self.state == "paused":
       if inp.set_mph is not None and inp.cruise_on and (frame - (self.set_stable_since or frame)) * DT >= 1.0:
         self._adopt(inp.set_mph)                # their new set speed, once it has settled (a RES is not a new choice)
       if t < (self.pause_until or 0):
-        self.line1 = "PAUSED: you changed the set speed"
+        self.line1 = "PAUSED: you pressed a cruise button"
         self.line2 = f"back in {max(0.0, self.pause_until - t):.0f} s"
         return None
       if inp.cruise_on:
@@ -414,6 +425,8 @@ class Curve:
     if ceil is not None and trusted and kind != "hold" and (plan.get("end") is not None or plan.get("dist") is not None):
       # where the remembered tight stretch ENDS (the planner's "end"; "dist" is to its start)
       self.corner_end_odo = self.odo + max(0.0, float(plan["end"] if plan.get("end") is not None else plan["dist"]))
+    if self.intervening() and not trusted and self.corner_end_odo is not None and self.odo >= self.corner_end_odo + TRUST_HOLD_M:
+      self.trust_past = True              # trust lost, but the car is now past where the remembered corner ended
     if self.intervening() and not trusted and self.corner_end_odo is not None and self.odo < self.corner_end_odo + TRUST_HOLD_M:
       # trust lost during an approach (position, road left, road changed): hold what has been set until past where the corner ended
       self.trust_hold_since = frame if self.trust_hold_since is None else self.trust_hold_since
@@ -443,6 +456,7 @@ class Curve:
         self.floor = max(ABS_FLOOR_MPH, base - MAX_SHED_MPH, (int(lim) - MAX_SHED_MPH) if lim else 0)
         self.lowered_from = self.ref
         self.restore_wait_since = None
+        self.trust_past = False
         self._ev("start", frame, ceil=ceil, corner=plan.get("corner"), floor=self.floor, limit=lim, mph=round(inp.mph, 1),
                  set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
       # the set speed the planner asks for now (the push below the corner speed, then the corner speed), within the floor and
@@ -509,6 +523,8 @@ class Curve:
       return False, f"below {MIN_MPH:.0f} mph: no presses"
     if plan is None:
       return False, "planner output late"
+    if not plan.get("trusted") and not self.trust_past:
+      return False, "road not matched: not restoring"
     if plan.get("model_k") is None:
       return False, "no model preview"
     if not P.fits(float(plan["model_k"]), inp.set_mph + 1):

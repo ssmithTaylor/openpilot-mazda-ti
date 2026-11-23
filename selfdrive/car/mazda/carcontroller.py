@@ -780,6 +780,9 @@ class CarController(CarControllerBase):
         elif raw is None and not off_idle:
           self.curve_plan = None
       if not self.curve_on and cv.state == "off":
+        if read and getattr(CS, "crz_btns_set", False) and (cv.restart_note or cv.off_note):
+          cv.restart_note = cv.off_note = ""    # the driver's own SET+ / SET-: the "check it" note has been answered
+          self.curve_published = None
         if read and (self.curve_published is None or self.frame % 100 == 5):
           age = None if self.curve_plan_read is None else self.curve_plan_age + (now - self.curve_plan_read)
           out = CS.out
@@ -802,7 +805,7 @@ class CarController(CarControllerBase):
         driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
         cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
         check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
-        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_res=bool(getattr(CS, "crz_btns_res", False)))
+        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)))
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:
