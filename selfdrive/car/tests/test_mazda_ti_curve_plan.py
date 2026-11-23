@@ -86,11 +86,14 @@ def test_envelope_conservative_end():
 
 def test_flagged_point_at_least_10_below():
   kap = np.array([1 / 300.0, 1 / 200.0, 0.0])               # real bends at the failing speeds (> 1 m/s^2), and a straight
-  flags = np.array([M.FLAG_LIMIT, M.FLAG_TAKEOVER, M.FLAG_LANE], np.uint8)
+  flags = np.array([M.FLAG_LIMIT | M.FLAG_LANE, M.FLAG_TAKEOVER, M.FLAG_LANE], np.uint8)
   vf = np.array([50 * MPH, 40 * MPH, 50 * MPH])
   need = P.needed_mph(kap, flags, vf)
   assert need[0] <= 40 and need[1] <= 30
   assert need[2] == P.MAX_MPH                                # a lane-line touch on a straight is not a corner
+  # the steering command at its limit with the lane held (no lane-line or takeover flag) is not trouble (owner, 2026-11-23)
+  alone = P.needed_mph(kap[:1], np.array([M.FLAG_LIMIT], np.uint8), vf[:1])
+  assert alone[0] == P.corner_mph(kap[:1])[0]
 
 
 def test_slow_distance_grows_with_drop():
@@ -407,11 +410,15 @@ def test_history_beats_calculation_no_slowdown_where_driven_cleanly(flag, vf, vp
 def test_real_trouble_corner_still_slowed_and_warned():
   # steering at its limit at 45 and no clean pass well above it (best clean 47 < 45 + LIMIT_OUTWEIGH_MPH): slowed to 10 below, and
   # warned when the feature cannot get there
-  tr, mem = _flagged_corner(M.FLAG_LIMIT, 45, 47, k=1 / 150.0)
+  tr, mem = _flagged_corner(M.FLAG_LIMIT | M.FLAG_LANE, 45, 47, k=1 / 150.0)
   res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
   assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") <= 35
   res = drive(mem, tr, 50, 160, closed=True, rate=0.4)
   assert any(p.alert_mph for t, s, p, v in res)
+  # the same with the steering at its limit but the lane held (no lane-line / takeover flag): a clean pass, no slowing at 47
+  tr, mem = _flagged_corner(M.FLAG_LIMIT, 45, 47, k=1 / 150.0)
+  res = drive(mem, tr, 47, 120, planner=P.Planner(mem))
+  assert all(p.ceil is None for _, _, p in res)
   # no clean engaged pass at all (only the failing one): trouble wins too
   tr, mem = _flagged_corner(M.FLAG_TAKEOVER, 45, None, k=1 / 150.0)
   res = drive(mem, tr, 50, 120, planner=P.Planner(mem))

@@ -152,6 +152,13 @@ def main():
   print(f"memory {os.path.basename(a.mem)}; drives {len(drives)}; engaged {eng:.1f} h; slowdowns {len(allr)}: {cnt}")
   print(f"UNNECESSARY per engaged hour {cnt['UNNECESSARY'] / max(eng, 1e-9):.2f}; NEEDED per hour {cnt['NEEDED'] / max(eng, 1e-9):.2f}; "
         f"mph-seconds wasted {waste:.0f}")
+  un = [x for x in allr if x['cls'] == 'UNNECESSARY']
+  for lab, f in (('trouble cap, any', lambda r: r.startswith('trouble cap')),
+                 ('trouble cap with a limit event', lambda r: r.startswith('trouble cap (') and 'limit' in r.split(')')[0]),
+                 ('trouble cap from a limit event ALONE', lambda r: r.startswith('trouble cap (limit at')),
+                 ('envelope (no trouble cap)', lambda r: r.startswith('envelope'))):
+    k = sum(1 for x in un if f(x['rule']))
+    print(f"  unnecessary by rule: {lab}: {k} ({100.0 * k / max(len(un), 1):.0f} %)")
   print("worst unnecessary (segment+s | start mph -> target | actual clean min mph | memory passes, median, best clean | rule):")
   for x in sorted([x for x in allr if x['cls'] == 'UNNECESSARY'], key=lambda x: -(x['act'] - x['T']))[:a.worst]:
     print(f"  {x['seg']}+{x['sec']:.0f}s | {x['mph']:.0f}->{x['T']} | {x['act']:.0f} | n={x['npass']} med {x['vmed']:.0f} best {x['vpro']:.0f} | {x['rule']}")

@@ -261,6 +261,9 @@ def real_trouble(kap, flags, v_flag, v_proven=None):
   # trouble counts only where it was a CORNER at the failing speed (a lane-line touch or a takeover on a straight is not a corner)
   corner_there = np.abs(np.asarray(kap, np.float64)) * np.where(np.isfinite(vf), vf, 0.0) ** 2 >= FLAG_MIN_LA
   out = flagged & np.isfinite(vf) & corner_there
+  # the steering command at its limit is NOT trouble by itself on this car (owner, 2026-11-23: the "running wide" alert fires on bends
+  # it holds fine; the interceptor command saturates at 600 there): a limit flag counts only with a takeover or lane-line flag there too
+  out &= (fl & (M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
   if v_proven is not None:
     vp = np.asarray(v_proven, np.float64)
     over = np.where((fl & M.FLAG_LIMIT) != 0, LIMIT_OUTWEIGH_MPH, LANE_OUTWEIGH_MPH)
