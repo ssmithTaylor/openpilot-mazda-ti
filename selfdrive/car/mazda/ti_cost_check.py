@@ -79,6 +79,10 @@ def make_controller():
     stores.setdefault(key, MemParams())
     return stores[key]
   ccm.Params = params                                   # this process only: the device's params are never touched
+  # One car controller per measurement, as on the car: ControlsTimer keeps every timer ever made in a class list that its tick walks
+  # each cycle, so the timers of controllers made earlier in this process (other modes, other tests) are dropped first.
+  from openpilot.common.realtime import ControlsTimer
+  ControlsTimer.objects.clear()
   CP = NS(flags=int(MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR), carFingerprint="MAZDA_CX5", carName="mazda")
   cc = ccm.CarController("mazda_2017", CP, None)
 
