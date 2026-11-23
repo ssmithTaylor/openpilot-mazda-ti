@@ -208,8 +208,7 @@ class Planner:
     self.cmp_next = 0.0
     self.distrust_until = -1.0
     self.distrust_why = ""
-    self.last_tight_odo = None
-    self.held_ceil = None
+    self.committed = {}                 # point -> (speed it allows, odometer where it is): corners slowing has started for
     self.events = []
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
@@ -234,7 +233,7 @@ class Planner:
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
     self.trace = -1
     self.cmp = []
-    self.last_tight_odo = None
+    self.committed = {}
 
   def _advance(self, dist):
     """Move along the trace by `dist` metres; follows the continuation link at the end, or loses the lock."""
@@ -392,27 +391,29 @@ class Planner:
         idx = np.r_[idx, -1]
         dist = np.r_[dist, model_dist]
         need = np.r_[need, model_need]
-    drop = u - need
-    tight = drop >= MIN_DROP_MPH
-    ceil, cdist, cpt = None, None, -1
+    # what the car side will actually shed: never below its floor (the known limit, else the speed now, minus MAX_SHED_MPH), so the
+    # timing is for the drop that will really be asked for (a corner needing more is flagged, not started earlier)
+    floor = max(self.ABS_FLOOR_MPH, (self.limit if self.limit else int(round(mph))) - self.MAX_SHED_MPH)
+    shed_to = np.maximum(need, floor)
+    tight = (u - shed_to) >= MIN_DROP_MPH
     if tight.any():
-      dd = np.array([slow_distance_m(u, n) for n in need[tight]])
-      due = dist[tight] <= dd
-      if due.any():
-        k = int(np.argmin(np.where(due, need[tight], np.inf)))
-        ceil, cdist, cpt = int(need[tight][k]), float(dist[tight][k]), int(idx[tight][k])
-    behind = (dist <= 0.0) & tight
-    if ceil is not None or behind.any():
-      self.last_tight_odo = self.odo
-    if ceil is not None:
-      self.held_ceil = ceil if self.held_ceil is None else min(self.held_ceil, ceil) if cdist is not None and cdist <= 0 else ceil
-    elif self.held_ceil is not None and self.last_tight_odo is not None and self.odo - self.last_tight_odo <= HOLD_AFTER_M:
-      ceil, cdist = self.held_ceil, 0.0
-    else:
-      self.held_ceil = None
+      ti = np.nonzero(tight)[0]
+      dd = np.array([slow_distance_m(u, n) for n in shed_to[ti]])
+      for j in ti[dist[ti] <= dd]:
+        # due: committed until HOLD_AFTER_M past it (a corner once started is held, never dropped because the car has slowed)
+        key = int(idx[j])
+        at = self.odo + float(dist[j])
+        old = self.committed.get(key)
+        if old is None or need[j] < old[0]:
+          self.committed[key] = (float(need[j]), at if old is None else old[1])
+    for key in [k for k, (_, at) in self.committed.items() if self.odo > at + HOLD_AFTER_M]:
+      del self.committed[key]
+    ceil, cdist, cpt = None, None, -1
+    if self.committed:
+      key, (n_, at) = min(self.committed.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+      ceil, cdist, cpt = int(n_), round(at - self.odo, 1), key
     if ceil is None:
       return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
-    floor = max(self.ABS_FLOOR_MPH, (self.limit if self.limit else int(round(mph))) - self.MAX_SHED_MPH)
     capped = ceil < floor
     why = "model preview: sharper bend" if cpt == -1 else ("corner ahead" if cdist > 0 else "in the corner")
     return self._out(ceil, conf, True, True, why, cdist, ceil, model_la, capped=capped, point=cpt)

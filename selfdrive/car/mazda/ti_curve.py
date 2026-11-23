@@ -17,7 +17,8 @@ Every frame (the car controller calls `step`, 100 Hz; the planner's output is re
              page says so ("CORNER NEEDS MORE THAN I MAY SLOW: be ready"); logged.
   holding    at the target through the corner.
   restoring  the planner says past the corner AND the driving model's own preview ahead is gentle (model_la below MODEL_LA_RESTORE)
-             AND no lead is holding the car AND the speed has settled near the set speed: SET_PLUS taps, at most one per RESTORE_GAP_S,
+             AND the lead flag is readable AND the speed has settled near the set speed (a lead car does not block it: the stock cruise
+             keeps its gap, and staying lowered behind a lead that speeds up only opens a gap for following traffic): SET_PLUS taps, at most one per RESTORE_GAP_S,
              never above `ref` (never on memory alone: a fresh planner output with the model's preview is required).
   paused     the driver pressed a cruise button: the intervention ends at once, nothing is restored, their new set speed becomes `ref`,
              and nothing is done for PAUSE_S.
@@ -32,7 +33,7 @@ Never: a SET_PLUS above `ref`; a SET_MINUS below the floor; taps closer than the
 2 pressed frames 50 ms apart, PressGuard caps at 3 frames / 0.15 s, 0.25 s from one tap's last pressed frame to the next); a press on a
 frame where openpilot asks for cancel or resume, or while the driver's own cruise button frame shows a press, or while the cruise check
 runs; CANCEL or RESUME (this module only ever returns SET_MINUS / SET_PLUS). A lead car: lowering toward a ceiling still happens (the
-car does not surge into the corner when the lead leaves); raising does not.
+car does not surge into the corner when the lead leaves).
 
 Pure: no clock, no params; the car controller does the I/O (carcontroller.py `curve_step`). Events go to the `ti_curve` log channel.
 """
@@ -341,8 +342,6 @@ class Curve:
       return False, "no model preview"
     if plan["model_la"] >= MODEL_LA_RESTORE:
       return False, "the model sees a bend ahead"
-    if inp.lead:
-      return False, "following a car"
     if inp.lead is None:
       return False, "lead flag unreadable"
     if abs(inp.mph - inp.set_mph) > SETTLED_MPH:

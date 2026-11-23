@@ -135,13 +135,16 @@ def test_floor_from_known_limit():
   assert min(h[1] for h in car2.history) == C.ABS_FLOOR_MPH
 
 
-def test_no_restore_while_model_sees_a_bend_or_lead():
+def test_no_restore_while_model_sees_a_bend_or_lead_unreadable():
   c, car = C.Curve(), Car(55, 55)
   run(c, car, 6000, lambda f, car: plan(45) if f < 2000 else plan(None, model_la=1.5))
   assert car.history[-1][1] == 45 and c.state == "restoring" and "bend" in c.why
   c, car = C.Curve(), Car(55, 55)
+  run(c, car, 6000, lambda f, car: plan(45) if f < 2000 else plan(None), lead=lambda f, car: None if f >= 2000 else False)
+  assert car.history[-1][1] == 45                       # lead flag unreadable: no restore
+  c, car = C.Curve(), Car(55, 55)
   run(c, car, 6000, lambda f, car: plan(45) if f < 2000 else plan(None), lead=lambda f, car: f >= 2000)
-  assert car.history[-1][1] == 45
+  assert car.history[-1][1] == 55                       # following a car: restored (never above the driver's 55)
 
 
 def test_lead_still_lowers_toward_ceiling():

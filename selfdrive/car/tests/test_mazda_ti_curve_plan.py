@@ -139,7 +139,9 @@ def test_single_corner_slows_early_and_releases():
   assert on, "no ceiling before a corner that needs slowing"
   assert all(p.ceil == need for _, _, p in on)
   start_s = on[0][1]
-  assert 1500 - start_s >= P.slow_distance_m(55, need) - 2 * 55 * MPH * DT - 1
+  shed_to = max(need, 55 - 15)                          # the car side never sheds more than 15 mph below the speed (no known limit)
+  d = P.slow_distance_m(55, shed_to)
+  assert d - 2 * 55 * MPH * DT - 1 <= 1500 - start_s <= d + 1   # as late as possible, not earlier
   # held through the corner, released after it
   in_corner = [p for t, s, p in res if 1500 <= s <= 1650]
   assert all(p.ceil == need for p in in_corner)
@@ -151,9 +153,9 @@ def test_corner_right_after_long_straight_is_seen_far_ahead():
   # a sharp corner (needs ~25 mph) after 2 km of straight at 70 mph: the ceiling appears >= 500 m before it
   tr = road((2500, 0.0), (80, 1 / 60.0), (500, 0.0))
   mem = M.synthetic([tr])
-  res = drive(mem, tr, 70, 60)
+  res = drive(mem, tr, 70, 120)
   on = [s for t, s, p in res if p.ceil is not None]
-  assert on and 2500 - on[0] >= 500
+  assert on and 2500 - on[0] >= P.slow_distance_m(70, 55) - 10
 
 
 def test_s_bends_ceiling_is_the_lowest_due():
@@ -229,11 +231,11 @@ def test_follows_trace_link():
   b = M.synthetic_trace([(600, 0.0), (150, 1 / 150.0), (500, 0.0)], x0=a["x"][-1] + 5.0, y0=a["y"][-1], h0=end_h)
   mem = M.synthetic([a, b], nexts=[1, -1])
   whole = {k: np.r_[a[k], b[k]] for k in a}
-  res = drive(mem, whole, 55, 50)
+  res = drive(mem, whole, 55, 100)
   on = [s for t, s, p in res if p.ceil is not None]
   assert on and on[0] < 1000 + 600, "the corner on the next trace was not seen from the first"
   memb = M.synthetic([a, b], nexts=[-1, -1])
-  res2 = drive(memb, whole, 55, 50)
+  res2 = drive(memb, whole, 55, 100)
   assert not any(p.ceil is not None for t, s, p in res2 if s < 990)
 
 
