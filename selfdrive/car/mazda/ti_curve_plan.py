@@ -246,14 +246,36 @@ def corner_mph(k):
   return _RUNGS[first]
 
 
-def needed_mph(kap, flags, v_flag):
-  """The speed each remembered point allows: corner_mph, and at least FLAGGED_DROP_MPH below a flagged pass's speed."""
-  need = corner_mph(kap)
-  flagged = (np.asarray(flags) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
+LIMIT_OUTWEIGH_MPH = 5          # HISTORY BEATS CALCULATION (owner, 2026-11-23 second drive): a steering-limit flag is outweighed by a clean
+LANE_OUTWEIGH_MPH = 0           # engaged pass this much faster than the failing speed; a takeover / lane-line flag alone by one at or above it
+
+
+def real_trouble(kap, flags, v_flag, v_proven=None):
+  """Points where the record shows trouble that the clean passes do not outweigh: a flag (steering limit, firm takeover, lane line) on
+  a real bend at the failing speed, and no clean ENGAGED pass (memory v_proven: lateral control active, no event near, not stopping)
+  faster than the failing speed by LIMIT_OUTWEIGH_MPH (a limit flag) or LANE_OUTWEIGH_MPH (a takeover or lane-line flag alone).
+  Hand-driven passes never prove a speed: the lateral acceleration a driver reaches says nothing of what the steering can hold."""
+  fl = np.asarray(flags)
+  flagged = (fl & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
   vf = np.asarray(v_flag, np.float64)
   # trouble counts only where it was a CORNER at the failing speed (a lane-line touch or a takeover on a straight is not a corner)
   corner_there = np.abs(np.asarray(kap, np.float64)) * np.where(np.isfinite(vf), vf, 0.0) ** 2 >= FLAG_MIN_LA
-  cap = np.where(flagged & np.isfinite(vf) & corner_there, np.floor(vf / MPH) - FLAGGED_DROP_MPH, np.inf)
+  out = flagged & np.isfinite(vf) & corner_there
+  if v_proven is not None:
+    vp = np.asarray(v_proven, np.float64)
+    over = np.where((fl & M.FLAG_LIMIT) != 0, LIMIT_OUTWEIGH_MPH, LANE_OUTWEIGH_MPH)
+    outweighed = np.isfinite(vp) & np.isfinite(vf) & (np.floor(vp / MPH) >= np.floor(vf / MPH) + over)
+    out &= ~outweighed
+  return out
+
+
+def needed_mph(kap, flags, v_flag, v_proven=None):
+  """The speed each remembered point allows: corner_mph, and at least FLAGGED_DROP_MPH below a flagged pass's speed where that
+  trouble is real (real_trouble: not outweighed by a faster clean pass; without v_proven every flag on a real bend counts)."""
+  need = corner_mph(kap)
+  vf = np.asarray(v_flag, np.float64)
+  real = real_trouble(kap, flags, v_flag, v_proven)
+  cap = np.where(real, np.floor(np.where(np.isfinite(vf), vf, 0.0) / MPH) - FLAGGED_DROP_MPH, np.inf)
   return np.minimum(need, np.maximum(cap, CAR_MIN_MPH))
 
 
@@ -297,13 +319,15 @@ class Planner:
 
   def __init__(self, memory):
     self.mem = memory
-    self.need = needed_mph(memory.kap, memory.flags, memory.v_flag) if memory is not None else None
+    vp = np.asarray(getattr(memory, "v_proven", np.full(memory.n, np.nan)), np.float64) if memory is not None else None
+    self.need = needed_mph(memory.kap, memory.flags, memory.v_flag, vp) if memory is not None else None
     if memory is not None:
-      vp = np.asarray(getattr(memory, "v_proven", np.full(memory.n, np.nan)), np.float64)
       self.proven = np.where(np.isfinite(vp), np.floor(vp / MPH), 0.0)
-      # where a pass had trouble (steering limit, firm takeover, lane-line crossing) the trouble wins: no proven speed there, and the
-      # target stays FLAGGED_DROP_MPH below the speed that failed (needed_mph)
-      trouble = (np.asarray(memory.flags) & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
+      # HISTORY BEATS CALCULATION: the highest clean engaged speed on record is never slowed below, whatever the curvature says. Only
+      # where the trouble on record is REAL (real_trouble: not outweighed by a faster clean pass) does the trouble win: no proven speed
+      # there, and the target stays FLAGGED_DROP_MPH below the speed that failed (needed_mph). (Before 2026-11-23 any flag on any
+      # pass zeroed the proven speed: the cause of 10-15 mph slowdowns on bends driven cleanly many times.)
+      trouble = real_trouble(memory.kap, memory.flags, memory.v_flag, vp)
       self.proven = np.where(trouble, 0.0, self.proven)
       self.single = np.asarray(memory.npass) <= 1
       self.kabs = np.abs(memory.kap)

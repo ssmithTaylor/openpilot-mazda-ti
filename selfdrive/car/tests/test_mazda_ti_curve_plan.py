@@ -374,11 +374,48 @@ def test_proven_speed_means_no_slowing_and_trouble_wins():
   assert all(p.ceil is None for _, _, p in res)        # at or below the proven speed: no slowing
   res = drive(mem, tr, 62, 120, planner=P.Planner(mem))
   assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") >= 55   # never below proven
-  # the same corner with a trouble flag: proven ignored, 10 below the failing speed
-  mem2 = M.synthetic([tr], flags=[np.full(n, M.FLAG_TAKEOVER, np.uint8)], v_flag=[np.full(n, 50 * MPH)])
+  # the same corner with a trouble flag at or above every clean speed on record: proven ignored, 10 below the failing speed
+  mem2 = M.synthetic([tr], flags=[np.full(n, M.FLAG_TAKEOVER, np.uint8)], v_flag=[np.full(n, 56 * MPH)])
   mem2.v_proven = np.full(n, 55 * MPH)
-  res = drive(mem2, tr, 52, 120, planner=P.Planner(mem2))
-  assert any(p.ceil is not None and p.corner_mph <= 40 for _, _, p in res)
+  res = drive(mem2, tr, 58, 120, planner=P.Planner(mem2))
+  assert any(p.ceil is not None and p.corner_mph <= 46 for _, _, p in res)
+
+
+def _flagged_corner(flag, v_flag_mph, v_proven_mph, k=CORNER_K):
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  n = len(tr["x"])
+  mem = M.synthetic([tr], flags=[np.full(n, flag, np.uint8)], v_flag=[np.full(n, v_flag_mph * MPH)])
+  mem.v_proven = np.full(n, v_proven_mph * MPH) if v_proven_mph else np.full(n, np.nan)
+  return tr, mem
+
+
+@pytest.mark.parametrize("flag, vf, vp, at", [
+  (M.FLAG_LIMIT | M.FLAG_LANE, 40, 46, 45),   # first drive: limit+lane flag at 40 on one pass, best clean engaged pass 46: 45 -> 29 before
+  (M.FLAG_LANE, 45, 50, 45),                  # first drive: lane-line touch at 45, best clean 50: 45 -> 35 before
+  (M.FLAG_TAKEOVER, 48, 55, 52),              # first drive: one takeover at 48 on a bend taken at 55 clean: 55 -> 41 before
+  (M.FLAG_TAKEOVER | M.FLAG_LANE, 45, 45, 45),  # 22 of 23 passes clean at 45, the one other had trouble at 45
+])
+def test_history_beats_calculation_no_slowdown_where_driven_cleanly(flag, vf, vp, at):
+  # owner, 2026-11-23 second drive: "no way there is a history of speed problems on that curve": at or below the best clean speed
+  # on record no slowing, whatever the curvature formula says (the bend here needs well under the speed by the envelope)
+  tr, mem = _flagged_corner(flag, vf, vp, k=1 / 150.0)
+  assert P.corner_mph(1 / 150.0)[0] < at - 5
+  res = drive(mem, tr, at, 120, planner=P.Planner(mem))
+  assert all(p.ceil is None for _, _, p in res)
+
+
+def test_real_trouble_corner_still_slowed_and_warned():
+  # steering at its limit at 45 and no clean pass well above it (best clean 47 < 45 + LIMIT_OUTWEIGH_MPH): slowed to 10 below, and
+  # warned when the feature cannot get there
+  tr, mem = _flagged_corner(M.FLAG_LIMIT, 45, 47, k=1 / 150.0)
+  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") <= 35
+  res = drive(mem, tr, 50, 160, closed=True, rate=0.4)
+  assert any(p.alert_mph for t, s, p, v in res)
+  # no clean engaged pass at all (only the failing one): trouble wins too
+  tr, mem = _flagged_corner(M.FLAG_TAKEOVER, 45, None, k=1 / 150.0)
+  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
+  assert any(p.ceil is not None and p.corner_mph <= 35 for _, _, p in res)
 
 
 def test_single_pass_corner_is_slowed_for_like_any_other():
