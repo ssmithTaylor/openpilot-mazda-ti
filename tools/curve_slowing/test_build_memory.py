@@ -291,9 +291,23 @@ def test_takeover_not_a_brake_to_a_stop():
   v2 = v.copy(); v2[150:] = 2.0                                  # ... but a brake that goes on to a stop within 150 m is not
   s2 = np.r_[0, np.cumsum(v2[:-1] * B.DT)]
   assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v2, s=s2)[1]) == 0
-  v3 = v.copy(); v3[150:] = 7.0                                  # nor one that slows below 19 mph within 150 m (a junction)
+  v3 = v.copy(); v3[150:] = 7.0                                  # slows below 19 mph on a tight bend WITHOUT stopping: still trouble
   s3 = np.r_[0, np.cumsum(v3[:-1] * B.DT)]
-  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v3, s=s3)[1]) == 0
+  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v3, s=s3)[1]) == [100]
+  bl = np.zeros(n); bl[140:160] = 1.0                            # ... but with the blinker (a junction turn) it is not
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v3, s=s3, blink=bl)[1]) == 0
+
+
+def test_brake_disengagement_at_speed_is_a_takeover_without_hand_steering():
+  n = 400
+  lat = np.ones(n); en = np.ones(n); ti = np.zeros(n); pressed = np.zeros(n); drv = np.zeros(n); brk = np.zeros(n)
+  en[200:] = 0.0; lat[200:] = 0.0; brk[198:205] = 1.0             # the owner's protocol: brake to disengage, no torque while lateral on
+  v = np.full(n, 15.0)                                           # 33 mph
+  s = np.r_[0, np.cumsum(v[:-1] * B.DT)]
+  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s)[1]) == [200]
+  v_slow = np.full(n, 10.0)                                      # 22 mph: below TK_BRAKE_MIN_MPH, an ordinary slow disengagement
+  s_slow = np.r_[0, np.cumsum(v_slow[:-1] * B.DT)]
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v_slow, s=s_slow)[1]) == 0
 
 
 def test_kap_med_and_loader_fallback(tmp_path):

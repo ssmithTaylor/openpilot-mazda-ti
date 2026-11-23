@@ -381,17 +381,13 @@ def test_proven_speed_means_no_slowing_and_trouble_wins():
   assert any(p.ceil is not None and p.corner_mph <= 40 for _, _, p in res)
 
 
-def test_single_pass_corner_only_trims_until_the_model_confirms():
+def test_single_pass_corner_is_slowed_for_like_any_other():
+  # owner, 2026-11-23: no single-pass trim; a corner from one pass gets its full need (within the floor), model or not
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
   mem.npass = np.ones(mem.n, np.int32)
-  res = drive(mem, tr, 60, 120, planner=P.Planner(mem))
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") >= 60 - P.SINGLE_PASS_TRIM_MPH
-
-  def model(t, s):
-    return (np.array([0.0, 2.0, 4.0]), np.array([0.0, CORNER_K, CORNER_K])) if 1350 <= s <= 1650 else (np.array([0.0, 4.0]), np.zeros(2))
-  res = drive(mem, tr, 60, 120, planner=P.Planner(mem), model_fn=model)
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") < 60 - P.SINGLE_PASS_TRIM_MPH
+  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") == max(P.corner_mph(CORNER_K)[0], 50 - 15)
 
 
 def test_hold_between_corners_only_when_the_next_slowdown_is_near():

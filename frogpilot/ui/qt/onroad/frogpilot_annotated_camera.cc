@@ -1,3 +1,4 @@
+#include <cmath>
 #include <QMovie>
 
 #include "frogpilot/ui/qt/onroad/frogpilot_annotated_camera.h"
@@ -514,7 +515,11 @@ void FrogPilotAnnotatedCameraWidget::paintCurveSpeedControl(QPainter &p, const c
 // the car's authority and on NONE of the 12 the driver completed hands-off. A display that cries
 // wolf gets ignored, so a false positive costs more than a miss here.
 void FrogPilotAnnotatedCameraWidget::paintSteerAuthority(QPainter &p, const cereal::FrogPilotPlan::Reader &frogpilotPlan, bool isMetric) {
-  float advisory = frogpilotPlan.getSteerAdvisorySpeed();
+  // Negative = curve slowing's warning (the remembered corner's true need; frogpilot_planner.py), drawn the same way with its
+  // exact number; positive = the model advisory as before
+  const float raw_advisory = frogpilotPlan.getSteerAdvisorySpeed();
+  const bool curve_warning = raw_advisory < 0.0f;
+  float advisory = std::fabs(raw_advisory);
   bool latched = frogpilotPlan.getSteerLatched();
   if (advisory <= 0.0f && !latched) {
     return;
@@ -542,7 +547,7 @@ void FrogPilotAnnotatedCameraWidget::paintSteerAuthority(QPainter &p, const cere
     p.drawText(QRect(box.x(), box.y() + 8, box.width(), 34), Qt::AlignCenter, tr("SLOW TO"));
     p.setFont(InterFont(60, QFont::Bold));
     p.drawText(QRect(box.x(), box.y() + 42, box.width(), 76), Qt::AlignCenter,
-               QString::number(std::nearbyint(shown)));
+               QString::number(curve_warning ? std::floor(shown + 0.05f) : std::nearbyint(shown)));
   }
 
   p.restore();

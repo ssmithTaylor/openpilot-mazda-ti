@@ -113,7 +113,9 @@ TK_M = 60.0
 TK_DRV = 5.0                   # driver-torque counts
 TK_SUSTAIN = 10               # 0.5 s at 20 Hz
 TK_FOLLOW = 40                # 2 s
-TK_STOP_MPH, TK_STOP_M = 19.0, 150.0   # a takeover that ends in a stop or below 19 mph within 150 m is a stop, not trouble
+TK_STOP_MPH, TK_STOP_M = 5.0, 150.0    # a stop / near-stop within 150 m: a stop, not trouble
+TK_BLINK_S = 5.0                        # ... or the blinker within +-5 s (a junction turn)
+TK_BRAKE_MIN_MPH = 25.0                 # a brake disengagement at or above this speed is a takeover (owner's protocol)
 BEND_KAP = 0.002               # takeover and lane-line flags are spread only over points of a real bend (stored |kap| >= this)
 EVENT_SLACK = 20               # 20 Hz samples: an event belongs to a piece within 1 s of it (s5_pieces)
 LINK_DIST_M = 20.0
@@ -145,33 +147,63 @@ def gauss(a, sigma_pts):
 
 
 # ---- events (s5_pieces.run_events) --------------------------------------------------------------------------------------------------
-def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None):
-  """steering-limit events (request at the clamp >= 0.3 s, lateral active, driver not pressing; s5_pieces) and firm takeovers
-  (lateral active at the onset of |driver torque| >= TK_DRV sustained >= 0.5 s, then within 2 s of its end lateral control inactive
-  or openpilot disengaged) as 20 Hz indices (the onset). A brake to a stop is never a takeover: not counted when the brake is
-  pressed in that window (openpilot disengaged by the brake) or the car is below TK_STOP_MPH within TK_STOP_M after the onset."""
+def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None, blink=None):
+  """steering-limit events (request at the clamp >= 0.3 s, lateral active, driver not pressing; s5_pieces) and TAKEOVERS as 20 Hz
+  indices. A takeover is either
+    - a firm hand takeover: |driver torque| >= TK_DRV sustained >= 0.5 s starting while lateral is active, then within 2 s lateral
+      control inactive or openpilot disengaged; or
+    - a BRAKE DISENGAGEMENT AT SPEED (the owner's protocol since 2026-11-19: brake to disengage, then steer): openpilot disengages
+      with the brake pressed (within 0.5 s) at TK_BRAKE_MIN_MPH or more, with or without hand steering (on this car the brake drops
+      lateral first, so the hand torque usually starts after lateral is off).
+  Neither counts when it is a STOP, not a takeover: the car comes to a stop or near-stop (below TK_STOP_MPH) within TK_STOP_M after
+  it, or the blinker is on within +-TK_BLINK_S (a turn at a junction). Slowing below 19 mph on a tight bend without stopping, and
+  without a blinker, is still a takeover. Flags are spread over real bends only (FLAG_* spreading) and a pass with a takeover near a
+  point never counts toward v_proven there."""
   sat = (np.abs(ti) >= SAT_TI) & (lat_act > .5) & (pressed < .5)
   m = np.r_[0, sat.astype(np.int8), 0]
   ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
   sats = [int(a) for a, b in ed if (b - a) >= SAT_MIN]
+  la, e = lat_act > .5, en > .5
+  n = len(la)
+  vv = None if v is None else np.asarray(v, float)
+  ss = None if s is None else np.asarray(s, float)
+  bl = None if blink is None else (np.asarray(blink) > .5)
+
+  def is_stop(a):
+    if vv is not None and ss is not None:
+      ahead = (ss >= ss[a]) & (ss <= ss[a] + TK_STOP_M)
+      if (vv[ahead] < TK_STOP_MPH * 0.44704).any():
+        return True
+    if bl is not None:
+      w = int(round(TK_BLINK_S / DT))
+      if bl[max(0, a - w):min(n, a + w + 1)].any():
+        return True
+    return False
+  cand = []
   hard = np.abs(drv) >= TK_DRV
   m = np.r_[0, hard.astype(np.int8), 0]
   ed = np.where(np.diff(m) != 0)[0].reshape(-1, 2)
-  la, e = lat_act > .5, en > .5
-  tk = []
   for a, b in ed:
     if b - a < TK_SUSTAIN or not la[a]:
       continue
-    w = slice(a, min(len(la), b + TK_FOLLOW))
+    w = slice(a, min(n, b + TK_FOLLOW))
     if not ((~la[w]).any() or (~e[w]).any()):
       continue
-    # M4: a brake in the window is the owner's protocol for taking over (brake to disengage), so it does NOT discard a takeover; only
-    # a brake that goes on to a stop or below TK_STOP_MPH (the stop rule below) does, and the flag is spread over real bends only
-    if v is not None and s is not None:
-      ahead = (np.asarray(s) >= s[a]) & (np.asarray(s) <= s[a] + TK_STOP_M)
-      if (np.asarray(v)[ahead] < TK_STOP_MPH * 0.44704).any():
-        continue
-    tk.append(int(a))
+    cand.append(int(a))
+  if brk is not None and vv is not None:
+    bk = np.asarray(brk) > .5
+    off = np.nonzero(e[:-1] & ~e[1:])[0] + 1                 # openpilot disengages
+    half = int(round(0.5 / DT))
+    for a in off:
+      if bk[max(0, a - half):min(n, a + half + 1)].any() and vv[a] >= TK_BRAKE_MIN_MPH * 0.44704:
+        cand.append(int(a))
+  tk = []
+  for a in sorted(set(cand)):
+    if tk and a - tk[-1] < int(round(2.0 / DT)):
+      continue
+    if is_stop(a):
+      continue
+    tk.append(a)
   return np.array(sats, int), np.array(tk, int)
 
 
@@ -988,8 +1020,9 @@ def prepare_runs(tags, org, replay=False):
     sig = {nm: cat(lambda z, q, f=f: z[f]).astype(np.float32) for nm, f in (('en', 'enabled'), ('lat_act', 'lat_act'), ('ti', 'ti_cmd'),
                                                                            ('pressed', 'pressed'), ('drv', 'drv_trq'))}
     brk = cat(lambda z, q: z['brk']).astype(np.float32)
-    p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'], brk=brk, v=v, s=p['s'])
     p['blink'] = cat(lambda z, q: z['blink']).astype(np.float32)
+    p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'], brk=brk, v=v, s=p['s'],
+                                       blink=p['blink'])
     for nm in ('pressed', 'drv', 'lat_act'):
       p[nm] = sig[nm]
     if all('aego' in z for z in zs):

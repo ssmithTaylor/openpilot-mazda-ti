@@ -352,6 +352,12 @@ class Curve:
         self.correct_down = False
         self._adopt(inp.set_mph)
         self._to(frame, "ready")
+      elif not why and self.why == "gas held" and self.after_brake and not self.correct_down and not self.left_doubt:
+        # the gas override is over and the cruise is still on: put the driver's set speed back like after brake + RES
+        self.clear_since = frame if self.clear_since is None else self.clear_since
+        if (frame - self.clear_since) * DT >= CLEAR_S:
+          self._to(frame, "ready")
+          self.clear_since = None
       elif not why and not self.stop_latched and not self.correct_down:
         self.clear_since = frame if self.clear_since is None else self.clear_since
         if (frame - self.clear_since) * DT >= CLEAR_S:
@@ -548,24 +554,11 @@ class Curve:
     return self._idle_text(plan, dead=dead)
 
   def _update_alert(self, inp):
-    """The on-road warning, every frame (also during a button pause, M3): the remembered corner's TRUE need (the planner's "need",
-    not its floor-clamped target) is below this side's floor (the one in force, or the one it would use now from the driver's own set
-    speed), or the planner says the car will arrive too fast; and the car is more than ALERT_MARGIN above the need. Cleared when the
-    car is down to it, the corner is passed (no corner ceiling), the plan is late, or the feature is off (S1)."""
+    """The warning is the PLANNER's one rule (ti_curve_plan.Planner._warn, from this side's floor and state relayed by the daemon);
+    this side only relays it for the page, every frame, and drops it only when the planner's output is late or the feature is off."""
     plan = inp.plan if self._plan_ok(inp) else None
-    self.alert_mph = None
-    if plan is None or not plan.get("trusted") or plan.get("ceil") is None or plan.get("kind", "corner") == "hold":
-      return
-    need = plan.get("need") if plan.get("need") is not None else plan.get("corner")
-    if need is None:
-      return
-    floor = self.floor if (self.intervening() and self.floor is not None) else \
-      (max(ABS_FLOOR_MPH, self.ref - MAX_SHED_MPH) if self.ref else None)
-    behind = plan.get("alert")
-    if floor is not None and int(need) < floor and inp.mph > int(need) + P.ALERT_MARGIN_MPH:
-      self.alert_mph = int(need)
-    elif behind and inp.mph > int(behind) + P.ALERT_MARGIN_MPH:
-      self.alert_mph = int(behind)
+    a = plan.get("alert") if plan else None
+    self.alert_mph = int(a) if a else None
 
   def _restore_ok(self, inp, plan):
     if inp.mph < MIN_MPH or inp.standstill:
@@ -711,9 +704,14 @@ class Curve:
   def status(self, wall):
     if self.state == "off" and not self.off_seen:   # before the first step / off_view
       self.off_view(None, None, None, 0.0)
+    if self.state != "off" and self.alert_mph:
+      # the page agrees with the on-road warning, whatever the state (never "no known corner ahead" while it shows)
+      self.line1 = f"SLOW DOWN: corner needs {self.alert_mph} mph"
+      self.line2 = "more than curve slowing can do: brake"
     return {"t": round(wall, 1), "v": 1, "state": self.state, "why": self.why, "line1": self.line1, "line2": self.line2,
             "ref": self.ref, "target": self.target, "floor": self.floor, "set": self.set_last, "needs_more": self.needs_more,
             "alert": self.alert_mph if self.state != "off" else None,
+            "acting": self.state in ("ready", "slowing", "holding", "restoring") and not self.left_doubt,
             "down": self.taps_down, "up": self.taps_up}
 
   def off_view(self, plan, plan_age, set_mph, mph):
@@ -745,18 +743,21 @@ class Curve:
     return self.intervening()
 
 
+ALERT_FRESH_S = 1.0               # the planner writes every 0.2 s: a warning older than this is dropped (no flicker, no re-chime)
+
+
 def read_curve_alert(params_memory, now):
-  """(corner speed mph to warn about, its time) from the CAR SIDE's status (TiCurveStatus: its own floor and needs_more), or (None, 0).
-  `now` is wall time (the status carries time.time())."""
+  """(corner speed mph to warn about, its monotonic time) from the PLANNER's output (TiCurvePlan, written at 5 Hz) while curve slowing
+  is on, or (None, 0). `now` is time.monotonic()."""
   import json
   try:
-    raw = params_memory.get(PARAM_STATUS)
+    raw = params_memory.get(PARAM_PLAN)
     d = json.loads(raw) if raw else None
-    if not isinstance(d, dict) or not d.get("alert"):
+    if not isinstance(d, dict) or d.get("mode") != "act" or not d.get("alert"):
       return None, 0.0
-    w = float(d.get("t", 0.0))
-    if now - w > 1.5:
+    m = float(d.get("m", 0.0))
+    if now - m > ALERT_FRESH_S:
       return None, 0.0
-    return int(d["alert"]), w
+    return int(d["alert"]), m
   except Exception:
     return None, 0.0

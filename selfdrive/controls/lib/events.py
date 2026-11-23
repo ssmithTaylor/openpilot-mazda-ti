@@ -271,7 +271,7 @@ def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: mess
     title,
     "The steering cannot hold it at this speed",
     AlertStatus.userPrompt, AlertSize.mid,
-    Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.4)
+    Priority.MID if raw < 0 else Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.4)
 
 
 def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:

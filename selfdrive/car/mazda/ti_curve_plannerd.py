@@ -76,18 +76,19 @@ def log_payload(*parts, **extra):
 
 
 def car_side(params_memory, now_wall, tc):
-  """(ref, floor) from the car side's published status (TiCurveStatus) when fresh: its reference (the driver's own set speed) always,
-  its floor only while it intervenes. (None, None) when stale or unreadable."""
+  """(ref, floor, acting) from the car side's published status (TiCurveStatus) when fresh: its reference (the driver's own set speed),
+  its floor while it intervenes, and whether it will act on a corner now (ON and ready / intervening, not paused, stopped, waiting or
+  holding a set speed left to the driver). (None, None, False) when stale or unreadable: then the warning assumes nothing is done."""
   try:
     raw = params_memory.get(tc.PARAM_STATUS)
     st = json.loads(raw) if raw else None
     if not isinstance(st, dict) or now_wall - float(st.get("t", 0.0)) > 3.0:
-      return None, None
+      return None, None, False
     ref = st.get("ref")
     floor = st.get("floor") if st.get("state") in ("slowing", "holding", "restoring") else None
-    return (int(ref) if ref else None), (int(floor) if floor else None)
+    return (int(ref) if ref else None), (int(floor) if floor else None), bool(st.get("acting"))
   except Exception:
-    return None, None
+    return None, None, False
 
 
 def keep_off_control_core():
@@ -168,9 +169,9 @@ def main():
         limit = fresh_limit(sm.alive["frogpilotPlan"], float(sm["frogpilotPlan"].slcMapSpeedLimit), v, ok, t, lim_state)
       except Exception:
         limit = None
-      ref_mph, floor_mph = car_side(params_memory, time.time(), tc)
+      ref_mph, floor_mph, acting = car_side(params_memory, time.time(), tc)
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit,
-                          ref_mph=ref_mph, floor_mph=floor_mph)
+                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting)
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")
       params_memory.put(tc.PARAM_PLAN, json.dumps(d))
