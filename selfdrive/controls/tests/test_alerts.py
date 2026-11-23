@@ -63,7 +63,8 @@ class TestAlerts:
 
     for alert in ALERTS:
       if not isinstance(alert, Alert):
-        alert = alert(self.CP, self.CS, self.sm, metric=False, soft_disable_time=100)
+        # FrogPilot callbacks take frogpilot_toggles (events.py passes it from controlsd); the stock defaults are used here.
+        alert = alert(self.CP, self.CS, self.sm, metric=False, soft_disable_time=100, frogpilot_toggles=FROGPILOT_TOGGLES)
 
       # for full size alerts, both text fields wrap the text,
       # so it's unlikely that they  would go past the max width
