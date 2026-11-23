@@ -189,6 +189,14 @@ class CarController(CarControllerBase):
     self.curve_plan_read = None
     self.curve_published = None
     if self.curve is not None:
+      # the previous run of this process may have left the set speed lowered (a restart mid-intervention): say so on the page
+      try:
+        old = json.loads(self.params_memory.get(curve_mod.PARAM_STATUS) or b"{}")
+        if old.get("state") in ("slowing", "holding", "restoring") or (old.get("state") == "stopped" and
+                                                                       (old.get("set") or 0) < (old.get("ref") or 0)):
+          self.curve.restart_note = "Restarted: set speed may be lowered: check it"
+      except Exception:
+        pass
       for key in (curve_mod.PARAM_ON, curve_mod.PARAM_STATUS):
         try:
           self.params_memory.remove(key)
@@ -787,7 +795,8 @@ class CarController(CarControllerBase):
         brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
         driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
         cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
-        check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now)
+        check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
+        standstill=bool(out.standstill or getattr(cruise, "standstill", False)))
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:

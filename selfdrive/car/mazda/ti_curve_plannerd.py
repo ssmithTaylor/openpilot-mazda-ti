@@ -47,6 +47,24 @@ def model_curvature(m):
     return None
 
 
+LIMIT_MAX_AGE_S = 2.0           # frogpilotPlan must have been received within this (it is published at 20 Hz)
+LIMIT_MAX_BELOW_MPH = 15.0      # a limit more than this below the car's speed is implausible (a stale or wrong value)
+
+
+def fresh_limit(alive, limit_ms, v_ms, position_ok, t, state):
+  """The road's speed limit in mph when it is KNOWN: frogpilotPlan alive (the speed-limit toggle on: the planner fills it only then),
+  a position fix now, a value above zero, and plausible against the car's speed (not more than LIMIT_MAX_BELOW_MPH below it). The
+  car side uses a known limit only to slow LESS (floor = max(speed - 15, limit - 15, 25)), so a wrong value can never add slowing."""
+  if not alive or not position_ok or limit_ms <= 0.5:
+    state["t"] = None
+    return None
+  mph = limit_ms / MPH
+  if mph < v_ms / MPH - LIMIT_MAX_BELOW_MPH:
+    return None
+  state["t"] = t
+  return mph
+
+
 def keep_off_control_core():
   try:
     cores = [c for c in os.sched_getaffinity(0) if c != CONTROL_CORE]
@@ -85,6 +103,7 @@ def main():
   seq = 0
   last_key, last_summary = None, 0.0
   yaw, yaw_t = None, -1e9
+  lim_state = {"t": None}
   cpu = []
   while True:
     sm.update(0)
@@ -115,8 +134,7 @@ def main():
             yaw_k = None
       limit = None
       try:
-        lim = float(sm["frogpilotPlan"].slcMapSpeedLimit)
-        limit = lim / MPH if lim > 0.5 else None
+        limit = fresh_limit(sm.alive["frogpilotPlan"], float(sm["frogpilotPlan"].slcMapSpeedLimit), v, ok, t, lim_state)
       except Exception:
         limit = None
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit)

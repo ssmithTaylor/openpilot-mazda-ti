@@ -475,7 +475,7 @@ class Planner:
     if self.active or (self.int_base is not None and mph < self.int_base - 2.0):
       floor = self.int_floor
     else:
-      floor = max(self.ABS_FLOOR_MPH, (self.limit if self.limit else int(round(mph))) - self.MAX_SHED_MPH)
+      floor = max(self.ABS_FLOOR_MPH, int(round(mph)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
       self.int_floor, self.int_base = floor, None
     shed_to = np.maximum(need, floor)
     grade = getattr(self.mem, "grade", None)

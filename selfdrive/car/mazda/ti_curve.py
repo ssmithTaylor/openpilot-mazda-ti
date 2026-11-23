@@ -13,7 +13,8 @@ Every frame (the car controller calls `step`, 100 Hz; the planner's output is re
              lower before the next; the planner first asks for a set speed up to 6 mph below the corner speed (the gap at which the
              cruise slows fastest), then for the corner speed itself as the car reaches it (SET_PLUS taps, never above `ref`). The
              target is never below the FLOOR of this intervention:
-               floor = max(ABS_FLOOR_MPH, (the road's known speed limit, else the speed when the intervention started) - MAX_SHED_MPH)
+               floor = max(ABS_FLOOR_MPH, the speed when it started - MAX_SHED_MPH, the known speed limit - MAX_SHED_MPH)
+             (a known limit can only make it slow LESS; the planner passes a limit only when it is fresh and plausible)
              (owner, 2026-11-23: "never shed more than about 15 miles per hour beneath the known speed limit of a road. If the speed
              limit is unknown, we should just use current speed."). A corner that needs more: the set speed goes to the floor and the
              page says so ("CORNER NEEDS MORE THAN I MAY SLOW: be ready"); logged.
@@ -43,7 +44,7 @@ Pure: no clock, no params; the car controller does the I/O (carcontroller.py `cu
 from typing import NamedTuple, Optional
 
 from openpilot.selfdrive.car.mazda import ti_curve_plan as P
-from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, PressGuard, Tap
+from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, FRAME_SPACING, PressGuard, Tap
 
 PARAM_ON = "TiCurveOn"           # tmpfs, the page: "1" on for this drive, "0" / absent off
 PARAM_PLAN = "TiCurvePlan"       # tmpfs, the planner (ti_curve_plannerd.py): its output, 5 Hz
@@ -54,7 +55,8 @@ PRESSED_FRAMES = 2               # a real tap (the cruise check's recipe A, acce
 ACCEPT_WAIT_S = 1.0              # first pressed frame to the set speed reading the step (measured 0.08-0.09 s)
 ABS_FLOOR_MPH = 25               # never a set speed below this (the car's own floor is 19)
 MAX_SHED_MPH = 15                # never more than this below the known speed limit, else below the speed at the start
-MIN_MPH = 20.0                   # no taps below this speed
+MIN_MPH = 20.0                   # no press of either kind below this speed, at standstill or with the cruise in its standstill hold
+MPH = 0.44704
 GAS_MAX_S = 1.0                  # gas held longer than this stops the intervention
 PAUSE_S = 30.0                   # after the driver's own cruise button
 CLEAR_S = 2.0
@@ -62,6 +64,11 @@ PLAN_STALE_S = 1.0               # planner output older than this is not used (i
 PLAN_DEAD_S = 3.0                # ... older than this: the planner is taken as dead
 SETTLED_MPH = 3.0                # restore only with the speed within this of the set speed
 RESTORE_MIN_MPH = 2              # a restore toward a "hold" ceiling only for 2 mph or more (no dithering)
+RESTORE_LEAD_MPH = 3             # while restoring, the set speed is never more than this above the car's speed (a gentle catch-up)
+SETTLED_RESUME_MPH = 2.0         # "speed settling" ends below this gap (it starts above SETTLED_MPH): hysteresis
+HOLDING_AT_MPH = 1.0             # slowing -> holding within this of the corner speed; back to slowing above HOLDING_AT_MPH + 1
+TRUST_HOLD_M = 30.0              # trust lost during an approach: hold the set speed until this far past where the corner ended
+STATE_LOG_MIN_S = 1.0            # the same state with a different reason is logged at most this often
 TEXT_STALE_S = 3.0               # the page calls a status older than this stale
 
 STATES = ("off", "ready", "slowing", "holding", "restoring", "paused", "stopped", "waiting")
@@ -85,6 +92,7 @@ class Inputs(NamedTuple):
   plan: Optional[dict] = None     # the planner's last output (ti_curve_plan.plan_json)
   plan_age: Optional[float] = None   # seconds since the planner wrote it (None: never)
   mono: Optional[float] = None
+  standstill: bool = False        # the car at standstill or the stock cruise in its standstill hold
 
 
 class Curve:
@@ -116,14 +124,24 @@ class Curve:
     self.lowered_from = None      # ref at the start of the intervention, for the page
     self.shown = None             # the corner speed shown on the page (the target may be the push below it)
     self.line1, self.line2 = "OFF", ""
+    self.odo = 0.0                # metres driven (from the speed), for holding after a loss of trust
+    self.corner_end_odo = None    # where the corner being slowed for ends (from the planner's distance)
+    self.correct_down = False     # the set speed ended ABOVE the reference: single aligned SET_MINUS taps back to it
+    self.restart_note = ""        # set by the car controller when the previous run may have left the set speed lowered
+    self.off_note = ""            # switched off mid-intervention: what is left for the driver
+    self.settling = False
+    self.tap_correcting = False
+    self.log_state = (None, None, -10 ** 9)
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
     self.events.append({"kind": kind, "frame": int(frame), **kw})
 
   def _to(self, frame, state, why=""):
-    if state != self.state or why != self.why:
+    ls, lw, lf = self.log_state
+    if state != ls or (why != lw and (frame - lf) * DT >= STATE_LOG_MIN_S):
       self._ev("state", frame, state=state, why=why, set_mph=self.set_last, ref=self.ref, target=self.target, floor=self.floor)
+      self.log_state = (state, why, frame)
     self.state, self.why = state, why
 
   def intervening(self):
@@ -135,6 +153,8 @@ class Curve:
   def _cut_tap(self):
     if self.tap is not None:
       self.guard.end()
+      if not self.tap.frames:
+        self.tap_from = self.tap_to = None   # nothing was sent: nothing to read back
     self.tap = None
 
   def _stop(self, frame, inp, why):
@@ -147,8 +167,22 @@ class Curve:
     self.clear_since = None
     self._to(frame, "stopped", why)
     self.line1 = f"STOPPED: {why}"
-    self.line2 = (f"Set speed {inp.set_mph} mph (was {self.ref}): set it yourself" if lowered else "Nothing was changed")
+    self.line2 = self._left_text(inp.set_mph, why)
     self.target = None
+    if inp.set_mph is not None and self.ref is not None and inp.set_mph > self.ref:
+      self.correct_down = True      # above the driver's own set speed: put back down by single aligned taps (lowering is allowed)
+      self.stop_latched = True
+
+  def _left_text(self, set_mph, why=""):
+    """What is left for the driver: never "nothing changed" when the set speed differs from theirs."""
+    if set_mph is None or self.ref is None:
+      return "Set speed unknown: check it"
+    if set_mph < self.ref:
+      word = "left at" if why == "gas held" else ""
+      return f"Set speed {word + ' ' if word else ''}{set_mph} mph (was {self.ref}): set it yourself"
+    if set_mph > self.ref:
+      return f"Set speed {set_mph} mph is above yours ({self.ref}): lowering it"
+    return f"Set speed {set_mph} mph, as you set it"
 
   def _end_intervention(self, frame):
     self.target, self.floor, self.needs_more, self.lowered_from = None, None, False, None
@@ -166,17 +200,27 @@ class Curve:
     self.cruise_was_on = inp.cruise_on
     btn_rose = btn and not self.btn_was
     self.btn_was = btn
+    self.odo += max(0.0, inp.mph) * MPH * DT
 
     if not inp.on:
       if self.state != "off":
         self._cut_tap()
-        self._ev("switched_off", frame, set_mph=inp.set_mph, ref=self.ref)
+        lowered = self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and \
+          (self.intervening() or self.stop_lowered)
+        self.off_note = f"Set speed {inp.set_mph} mph (was {self.ref}): set it yourself" if lowered else ""
+        self._ev("switched_off", frame, set_mph=inp.set_mph, ref=self.ref, lowered=lowered)
         self._end_intervention(frame)
+        self.tap_from = self.tap_to = None
+        self.correct_down = False
         self._to(frame, "off")
-      self.line1, self.line2 = "CURVE SLOWING OFF", "shadow: the planner only logs"
+      if btn_rose:
+        self.off_note = self.restart_note = ""
+      self.line1 = "CURVE SLOWING OFF"
+      self.line2 = self.off_note or self.restart_note or "shadow: the planner only logs"
       return None
     if self.state == "off":
       self.ref = inp.set_mph if inp.cruise_on else None
+      self.off_note = self.restart_note = ""
       self._to(frame, "ready")
 
     # the driver's own cruise button: ends any intervention, adopts their set speed, pauses
@@ -220,11 +264,14 @@ class Curve:
     elif inp.set_mph is None:
       why = "set speed unreadable"
 
+    if self.state == "stopped" and self.correct_down and not btn and not why:
+      return self._correct(frame, inp)
     if self.state == "stopped":
       if btn_rose or (cruise_rose and inp.set_mph is not None):
+        self.correct_down = False
         self.ref = inp.set_mph
         self._to(frame, "ready")
-      elif not why and not self.stop_latched:
+      elif not why and not self.stop_latched and not self.correct_down:
         self.clear_since = frame if self.clear_since is None else self.clear_since
         if (frame - self.clear_since) * DT >= CLEAR_S:
           self.ref = inp.set_mph
@@ -277,9 +324,15 @@ class Curve:
       self._stop(frame, inp, "planner stopped" if dead else "planner output late")
       return None
 
+    if self.tap is not None and self.tap.first is None and self.tap.button == "SET_MINUS" and not self.tap_correcting:
+      p_ = inp.plan if plan_ok else None
+      if not (p_ and p_.get("trusted") and p_.get("ceil") is not None and p_.get("kind", "corner") != "hold"):
+        self._cut_tap()                     # a SET_MINUS not yet sent whose corner ceiling has gone: not sent
     out = self._send(frame, inp)
     if out is not None or self.tap is not None:
       return out
+    if self.tap_to is not None and self.tap_first is None:
+      self.tap_from = self.tap_to = None
     if self.tap_to is not None:
       # waiting for the read back of the last tap
       if inp.set_mph == self.tap_to:
@@ -296,14 +349,23 @@ class Curve:
     ceil = plan.get("ceil") if plan else None
     trusted = bool(plan.get("trusted")) if plan else False
     kind = plan.get("kind", "corner") if plan else ""
+    if ceil is not None and trusted and kind != "hold" and plan.get("dist") is not None:
+      self.corner_end_odo = self.odo + max(0.0, float(plan["dist"]))
+    if self.intervening() and not trusted and self.corner_end_odo is not None and self.odo < self.corner_end_odo + TRUST_HOLD_M:
+      # trust lost during an approach (position, road left, road changed): hold what has been set until past where the corner ended
+      self.target = self.shown = inp.set_mph
+      self._to(frame, "holding", "road not matched: holding past the corner")
+      self.line1 = f"HOLDING: {inp.set_mph} mph"
+      self.line2 = "road not matched: holding past the corner"
+      return None
     if ceil is not None and trusted and kind != "hold" and inp.mph >= MIN_MPH:
       if not self.intervening():
         if ceil >= inp.set_mph:
           return self._idle_text(plan)
-        # a new intervention: its floor from the known limit, else the speed now
+        # a new intervention: never more than MAX_SHED_MPH below the speed now; a KNOWN limit (fresh and plausible, checked by the
+        # planner) can only make that LESS: floor = max(absolute floor, speed - 15, limit - 15)
         lim = plan.get("limit")
-        base = int(lim) if lim else int(round(inp.mph))
-        self.floor = max(ABS_FLOOR_MPH, base - MAX_SHED_MPH)
+        self.floor = max(ABS_FLOOR_MPH, int(round(inp.mph)) - MAX_SHED_MPH, (int(lim) - MAX_SHED_MPH) if lim else 0)
         self.lowered_from = self.ref
         self._ev("start", frame, ceil=ceil, corner=plan.get("corner"), floor=self.floor, limit=lim, mph=round(inp.mph, 1),
                  set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
@@ -320,13 +382,12 @@ class Curve:
         self._to(frame, "slowing")
         self._lines(inp)
         return self._start(frame, inp, "SET_MINUS")
+      near = inp.mph <= self.shown + HOLDING_AT_MPH + (1.0 if self.state == "holding" else 0.0)   # hysteresis
+      self._to(frame, "holding" if near else "slowing")
+      self._lines(inp)
       if inp.set_mph < self.target:
         # the planned raise from the push back to the corner speed as the car reaches it (never above `ref`)
-        self._to(frame, "slowing" if inp.mph > self.shown + 1.0 else "holding")
-        self._lines(inp)
         return self._start(frame, inp, "SET_PLUS")
-      self._to(frame, "slowing" if inp.mph > self.shown + 1.0 else "holding")
-      self._lines(inp)
       return None
 
     # no corner ceiling (past the corner, a "hold" for the next one, or the planner not trusted): restore if lowered, else idle
@@ -346,6 +407,7 @@ class Curve:
         self.line2 = f"back to {self.ref} mph after it"
         return None
       self.target = self.shown = cap
+      self.corner_end_odo = None
       ok, wait = self._restore_ok(inp, plan)
       self._to(frame, "restoring", wait)
       self._lines(inp, wait)
@@ -364,8 +426,12 @@ class Curve:
       return False, "the model sees a bend ahead"
     if inp.lead is None:
       return False, "lead flag unreadable"
-    if inp.mph - inp.set_mph > SETTLED_MPH:
+    gap = inp.mph - inp.set_mph
+    self.settling = gap > (SETTLED_RESUME_MPH if self.settling else SETTLED_MPH)      # hysteresis
+    if self.settling:
       return False, "speed settling"
+    if inp.set_mph + 1 > inp.mph + RESTORE_LEAD_MPH:
+      return False, "following the car back up"                                      # paced to the car: a gentle catch-up
     return True, ""
 
   def _idle_text(self, plan, dead=False):
@@ -394,57 +460,97 @@ class Curve:
 
   def _can_press(self, inp):
     return not (inp.cancel_req or inp.resume_req or inp.driver_button or inp.driver_button is None or inp.counter is None
-                or inp.check_active)
+                or inp.check_active or inp.standstill or inp.mph < MIN_MPH)
 
-  def _start(self, frame, inp, button):
-    if self.tap is not None or self.tap_to is not None or not self._can_press(inp) or not self._direction_ok(button, inp.set_mph):
+  def _start(self, frame, inp, button, correcting=False):
+    """Request one tap. Like the reviewed cruise check (ti_cruise_check._start_tap / _send): the tap waits for a new car button frame
+    (a counter change, at most PHASE_WAIT_S), so both pressed frames fall between two of the car's own idle frames and register as
+    ONE press; then PRESSED_FRAMES frames FRAME_SPACING apart, each re-checked, under PressGuard."""
+    if self.tap is not None or self.tap_to is not None or not self._can_press(inp):
       return None
-    if not self.guard.begin(frame, inp.mono):
-      return None                     # too soon after the previous tap
+    if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
+      return None
     self.tap = Tap(button, PRESSED_FRAMES, frame, inp.counter, inp.set_mph + (1 if button == "SET_PLUS" else -1))
-    self.tap.first = frame            # this frame is the tap's first pressed frame (begun above)
-    self.tap_from, self.tap_to, self.tap_first = inp.set_mph, self.tap.target, frame
+    self.tap_correcting = correcting
+    self.tap_from, self.tap_to, self.tap_first = inp.set_mph, self.tap.target, None
     if button == "SET_MINUS":
       self.taps_down += 1
     else:
       self.taps_up += 1
-    return self._press(frame, inp)
+    return self._send(frame, inp)
 
-  def _press(self, frame, inp):
-    tap = self.tap
-    if not self._can_press(inp) or inp.set_mph == tap.target or not self._direction_ok(tap.button, self.tap_from):
-      tap.n = len(tap.frames)         # the step has landed, or pressing is not allowed now: no further frame of this tap
-    elif self.guard.allow(frame, inp.mono):
-      tap.frames.append((int(frame), inp.counter, (inp.counter + 1) % 16))
-      if tap.done:
-        self._tap_done(frame, inp)
-      return tap.button
-    else:
-      tap.n = len(tap.frames)
-    if tap.done:
-      self._tap_done(frame, inp)
-    return None
+  def _correct_ok(self, set_mph):
+    return set_mph is not None and self.ref is not None and set_mph - 1 >= self.ref
 
   def _send(self, frame, inp):
-    """The next pressed frame of the tap in flight, if one is due."""
+    """The next pressed frame of the tap in flight, or None (the cruise check's _send, frame for frame)."""
     tap = self.tap
     if tap is None:
       return None
-    if (frame - tap.first) % 5 != 0:
+    out = None
+    ok = self._correct_ok(self.tap_from) if self.tap_correcting else self._direction_ok(tap.button, self.tap_from)
+    if tap.due(frame, inp.counter) and (inp.set_mph == tap.target or not ok or not self._can_press(inp)):
+      tap.n = len(tap.frames)         # landed, or pressing is not allowed now: no further frame of this tap
+    elif tap.due(frame, inp.counter):
+      if tap.first is None:
+        if not self.guard.begin(frame, inp.mono):
+          tap.counter0, tap.requested = inp.counter, frame   # too soon after the previous tap: wait, then for the next car frame
+          return None
+        tap.first = frame
+        self.tap_first = frame
+      if self.guard.allow(frame, inp.mono):
+        tap.frames.append((int(frame), inp.counter, (inp.counter + 1) % 16))
+        out = tap.button
+      else:
+        tap.n = len(tap.frames)       # the cap ends the tap: never a longer press
+    if tap.done:
+      if tap.first is None:
+        tap.first = frame             # refused before its first frame: nothing was sent
+        self.tap_first = frame
+      self._tap_done(frame, inp)
+    return out
+
+  def _correct(self, frame, inp):
+    """Stopped with the set speed above the driver's: single aligned SET_MINUS taps down to it, read back one by one."""
+    if self.tap is not None:
+      return self._send(frame, inp)
+    if self.tap_to is not None:
+      if inp.set_mph == self.tap_to:
+        self.tap_from = self.tap_to = None
+      elif inp.set_mph not in (self.tap_from, self.tap_to) or (frame - (self.tap_first or frame)) * DT >= ACCEPT_WAIT_S:
+        self.correct_down = False     # it did not go as asked: nothing more
+        self.tap_from = self.tap_to = None
+        self.line2 = self._left_text(inp.set_mph)
+        return None
+      else:
+        return None
+    if not self._correct_ok(inp.set_mph):
+      self.correct_down = False
+      self.line2 = self._left_text(inp.set_mph)
       return None
-    return self._press(frame, inp)
+    self.line2 = self._left_text(inp.set_mph)
+    return self._start(frame, inp, "SET_MINUS", correcting=True)
 
   def _tap_done(self, frame, inp):
     self._ev("tap", frame, button=self.tap.button, frames=[list(f) for f in self.tap.frames], set_before=self.tap_from,
-             set_now=inp.set_mph)
+             set_now=inp.set_mph, correcting=bool(self.tap_correcting))
+    sent = bool(self.tap.frames)
     self.guard.end()
     self.tap = None
+    if not sent:
+      self.tap_from = self.tap_to = None   # refused before any frame was sent: nothing to read back
+      if self.tap_correcting:
+        self.taps_down -= 1
+      return
     if inp.set_mph == self.tap_to:
       self._ev("step", frame, set_mph=inp.set_mph, ms=int(round((frame - self.tap_first) * DT * 1000)))
       self.tap_from = self.tap_to = None
 
   # ---- the page -------------------------------------------------------------------------------------------------------------------
   def status(self, wall):
+    if self.state == "off":                     # also before the first step (the car controller publishes off without stepping)
+      self.line1 = "CURVE SLOWING OFF"
+      self.line2 = self.off_note or self.restart_note or "shadow: the planner only logs"
     return {"t": round(wall, 1), "v": 1, "state": self.state, "why": self.why, "line1": self.line1, "line2": self.line2,
             "ref": self.ref, "target": self.target, "floor": self.floor, "set": self.set_last, "needs_more": self.needs_more,
             "down": self.taps_down, "up": self.taps_up}

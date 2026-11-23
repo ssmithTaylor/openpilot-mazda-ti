@@ -8,8 +8,11 @@ from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, MAX_PRESSED_FRAMES,
 
 
 class Car:
-  """The stock cruise as the car controller sees it: counter at 10 Hz, set speed read 4 frames after a press's first frame, a press
-  lasting 0.52 s read as a hold (jump to a multiple of 5); the speed follows the set speed at ~1.2 mph/s after 0.5 s."""
+  """The stock cruise as the car controller sees it, PHASE-AWARE: the button module sends its own idle (not pressed) 0x09D frame at
+  10 Hz (k % 10 == 3, counter + 1). A press registers on a pressed frame that follows an idle one, so two pressed frames with an idle
+  frame between them register as TWO presses. A press is read 4 frames after its first frame; an unbroken press lasting 0.52 s reads
+  as a hold (jump to a multiple of 5). Modes: accept, ignore, hold_misread (every press reads as a hold), double (a SET_PLUS press
+  registers +2). The speed follows the set speed at ~1.2 mph/s down and 0.7 up."""
 
   def __init__(self, mph=55.0, set_mph=55, mode="accept"):
     self.k = 0
@@ -19,14 +22,16 @@ class Car:
     self.mode = mode
     self.pending = []
     self.press_start = None
-    self.last_press = None
-    self.sent = []              # (k, button)
+    self.pressed_now = False      # the last frame on the bus was a pressed one
+    self.sent = []                # (k, button)
+    self.registered = 0           # presses the car registered
     self.history = []
 
   def tick(self):
     self.k += 1
     if self.k % 10 == 3:
       self.counter = (self.counter + 1) % 16
+      self.pressed_now = False    # the module's own idle frame
     for p in [p for p in self.pending if p[0] <= self.k]:
       self.pending.remove(p)
       self.set = p[1]
@@ -38,15 +43,21 @@ class Car:
 
   def press(self, button):
     self.sent.append((self.k, button))
-    new = self.last_press is None or self.k - self.last_press > 15
-    self.last_press = self.k
+    new = not self.pressed_now
+    self.pressed_now = True
     if new:
       self.press_start = self.k
     if self.mode == "ignore":
       return
     step = -1 if button == "SET_MINUS" else 1
     if new:
-      self.pending.append((self.k + 4, self.set + step))
+      self.registered += 1
+      if self.mode == "hold_misread":
+        self.pending.append((self.k + 4, (self.set // 5 + (0 if step < 0 else 1)) * 5))
+      elif self.mode == "double" and step > 0:
+        self.pending.append((self.k + 4, self.set + 2))
+      else:
+        self.pending.append((self.k + 4, self.set + step))
     elif self.k - self.press_start >= 52:
       self.pending.append((self.k + 1, (self.set // 5 + (0 if step < 0 else 1)) * 5))
 
@@ -130,7 +141,7 @@ def test_floor_from_speed_when_limit_unknown():
 def test_floor_from_known_limit():
   c, car = C.Curve(), Car(60, 60)
   run(c, car, 4000, lambda f, car: plan(30, limit=50))
-  assert min(h[1] for h in car.history) == 35          # 50 - 15
+  assert min(h[1] for h in car.history) == 45          # max(60 - 15, 50 - 15): a known limit never adds slowing
   c2, car2 = C.Curve(), Car(40, 40)
   run(c2, car2, 4000, lambda f, car: plan(20, limit=35))
   assert min(h[1] for h in car2.history) == C.ABS_FLOOR_MPH
@@ -382,3 +393,167 @@ def test_controller_sends_taps_only_when_on_and_excludes_the_cruise_check():
   cc, mem = mod.make_controller()
   cc.curve_on = True
   assert cc.cruise_others_on() == "curve slowing is on"
+
+
+# ---- review fixes (2026-11-23): tap alignment, low speed, trust loss, pacing, messages ------------------------------------------
+@pytest.mark.parametrize("direction", ["down", "up"])
+def test_every_tap_is_aligned_and_registers_once(direction):
+  c, car = C.Curve(), Car(55, 55)
+  if direction == "down":
+    run(c, car, 3000, lambda f, car: plan(41, corner=41))
+  else:
+    run(c, car, 6000, lambda f, car: plan(41, corner=41) if f < 2500 else plan(None))
+  tt = taps(car)
+  assert tt and car.registered == len(tt)               # one registered press per tap: never press-release-press
+  for t in tt:
+    assert (t[0][0] - 3) // 10 == (t[-1][0] - 3) // 10  # no module idle frame between a tap's pressed frames
+    assert t[0][0] % 10 == 3                            # sent right after the module's new frame (the cruise check's alignment)
+  assert c.state != "stopped", c.why
+  assert max(h[1] for h in car.history) <= 55
+  if direction == "up":
+    assert any(b == "SET_PLUS" for _, b in car.sent) and car.history[-1][1] == 55
+
+
+def test_set_above_reference_is_corrected_down():
+  c, car = C.Curve(), Car(55, 55, mode="double")
+  run(c, car, 8000, lambda f, car: plan(45, corner=45) if f < 2500 else plan(None))
+  assert car.history[-1][1] <= 55                       # +2 on a restore tap: put back by single aligned SET_MINUS taps
+  assert "Nothing was changed" not in c.line2
+
+
+@pytest.mark.parametrize("over", [{"mph": 15.0}, {"standstill": True}])
+def test_no_press_at_low_speed_or_standstill(over):
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 2500, lambda f, car: plan(45, corner=45))
+  n = len(car.sent)
+  run(c, car, 3000, lambda f, car: plan(None), start=2500, **over)          # stop-and-go with the set speed lowered
+  assert len(car.sent) == n
+
+
+def test_trust_lost_during_approach_holds_until_past_the_corner():
+  c, car = C.Curve(), Car(55, 55)
+
+  def pf(f, car):
+    if f < 300:
+      return plan(45, corner=45, dist=400.0 - f * 0.01 * 24.6)
+    return plan(None, trusted=False)
+  run(c, car, 1500, pf)
+  assert not [k for k, b in car.sent if b == "SET_PLUS"]
+  assert c.state == "holding" and "past the corner" in c.why
+  run(c, car, 9000, pf, start=1500)
+  assert car.history[-1][1] == 55                       # restored once well past where the corner ended
+
+
+def test_restore_is_paced_to_the_car():
+  c, car = C.Curve(), Car(55, 55)
+  seen = []
+
+  def pf(f, car):
+    seen.append((f, car.mph, car.set))
+    return plan(40, corner=40) if f < 2500 else plan(None)
+  run(c, car, 9000, pf)
+  ups = {k for k, b in car.sent if b == "SET_PLUS"}
+  by_k = {f + 1: (mph, setv) for f, mph, setv in seen}
+  for k in ups:
+    if k in by_k:
+      mph, setv = by_k[k]
+      assert setv + 1 <= mph + C.RESTORE_LEAD_MPH + 0.5
+  assert car.history[-1][1] == 55
+
+
+def test_switch_off_mid_intervention_says_what_is_left():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 2500, lambda f, car: plan(45, corner=45))
+  run(c, car, 200, lambda f, car: plan(45, corner=45), start=2500, on=False)
+  assert c.state == "off" and "set it yourself" in c.line2 and "(was 55)" in c.line2
+
+
+def test_gas_override_message():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 1500, lambda f, car: plan(45, corner=45), gas=lambda f, car: f >= 1200)
+  assert c.state == "stopped" and "left at" in c.line2 and "set it yourself" in c.line2
+
+
+def test_state_flips_are_not_logged_every_cycle():
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 3000, lambda f, car: plan(50, corner=50), mph=lambda f, car: 51.0 + (0.6 if (f // 3) % 2 else -0.6))
+  n = sum(1 for e in c.events if e["kind"] == "state")
+  assert n < 20, n
+
+
+def test_property_with_missed_presses_misreads_standstill_switch_off_and_trust_loss():
+  rng = random.Random(11)
+  for trial in range(120):
+    c = C.Curve()
+    start = rng.choice([40, 50, 60, 70])
+    car = Car(start, start, mode=rng.choice(["accept", "accept", "accept", "hold_misread", "double", "ignore"]))
+    ref = [start]
+    ev = {rng.randrange(100, 5000): rng.choice(["missed_press", "button", "standstill", "off", "trust", "jump"]) for _ in range(3)}
+    st = {"standstill_until": -1, "off_until": -1, "trust_until": -1, "btn_until": -1}
+    for f in range(6000):
+      e = ev.get(f)
+      if e == "missed_press":
+        car.set = max(25, car.set + rng.choice([-2, 3]))           # the driver's press the button flag missed
+        ref[0] = car.set
+      elif e == "button":
+        st["btn_until"] = f + 20
+        car.set = max(25, car.set + rng.choice([-3, 2]))
+        ref[0] = car.set
+      elif e == "standstill":
+        st["standstill_until"] = f + 400
+      elif e == "off":
+        st["off_until"] = f + 300
+      elif e == "trust":
+        st["trust_until"] = f + 600
+      elif e == "jump":
+        car.set = max(25, car.set - 5)
+      car.tick()
+      slow = f < st["standstill_until"]
+      if f < st["trust_until"]:
+        p = plan(None, trusted=False)
+      else:
+        p = plan(start - 12 if (f // 1500) % 2 == 0 else None, corner=start - 8, dist=200.0)
+      inp = C.Inputs(on=f >= st["off_until"], engaged=True, cruise_on=True, cruise_available=True, mph=0.0 if slow else car.mph,
+                     set_mph=car.set, lead=False, driver_button=f < st["btn_until"], counter=car.counter, plan=p, plan_age=0.1,
+                     mono=f * DT, standstill=slow)
+      before = car.set
+      b = c.step(f, inp)
+      if b is not None:
+        assert not slow and inp.mph >= C.MIN_MPH and inp.on
+        if b == "SET_PLUS":
+          assert before + 1 <= ref[0], (trial, f, before, ref[0])
+        else:
+          assert before - 1 >= C.ABS_FLOOR_MPH
+        car.press(b)
+    tt = taps(car)
+    for t in tt:
+      assert len(t) <= MAX_PRESSED_FRAMES and (t[-1][0] - t[0][0]) * DT <= MAX_TAP_SPAN_S + 1e-9
+    for a_, b_ in zip(tt, tt[1:]):
+      assert (b_[0][0] - a_[-1][0]) * DT >= MIN_TAP_GAP_S - 1e-9
+    if car.mode == "accept":
+      assert car.registered == len(tt), trial                       # aligned: one registered press per tap
+
+
+def test_floor_never_more_than_15_below_the_speed_whatever_the_limit():
+  for lim, mph, want in ((50, 60, 45), (35, 55, 40), (None, 55, 40), (70, 55, 55)):
+    c, car = C.Curve(), Car(mph, mph)
+    run(c, car, 4000, lambda f, car: plan(25, corner=25, limit=lim))
+    assert min(h[1] for h in car.history) == max(C.ABS_FLOOR_MPH, want), (lim, mph)
+
+
+def test_controller_restart_mid_intervention_says_check_the_set_speed():
+  mod = _controller()
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  import json as _json
+  store = mod.MemParams({C.PARAM_STATUS: _json.dumps({"state": "slowing", "set": 48, "ref": 62}).encode()})
+  orig = ccm.Params
+  ccm.Params = lambda path=None: store if path and "shm" in str(path) else mod.MemParams()
+  try:
+    from types import SimpleNamespace as NS
+    from openpilot.selfdrive.car.mazda.values import MazdaFlags
+    cc = ccm.CarController("mazda_2017", NS(flags=int(MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR), carFingerprint="MAZDA_CX5",
+                                            carName="mazda"), None)
+  finally:
+    ccm.Params = orig
+  st = cc.curve.status(0.0)
+  assert st["state"] == "off" and "may be lowered" in st["line2"]

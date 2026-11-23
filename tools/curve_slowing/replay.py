@@ -133,6 +133,7 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
     seq = 0
     last_btn_k = -10 ** 9
     state_time = collections.Counter()
+    correction_taps = 0
     loss_by_state = collections.Counter()
     while p < n - 1:
       # recorded index for the simulated distance (by time while stopped)
@@ -182,7 +183,8 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
       curve.events.clear()
       if btn is not None and (k - last_btn_k) > 10:
         taps[btn] += 1
-        if btn == "SET_MINUS" and (plan is None or not plan.get("trusted") or plan.get("ceil") is None):
+        correction_taps += curve.state == "stopped"
+        if btn == "SET_MINUS" and curve.state != "stopped" and (plan is None or not plan.get("trusted") or plan.get("ceil") is None):
           taps_untrusted += 1
       if btn is not None:
         last_btn_k = k
@@ -215,7 +217,7 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
       t += DT
       k += 1
     rec_T = n * REC_DT
-    runs.append(dict(run=r, rec_s=rec_T, sim_s=t, taps_down=taps["SET_MINUS"], taps_up=taps["SET_PLUS"], taps_untrusted=taps_untrusted,
+    runs.append(dict(run=r, rec_s=rec_T, sim_s=t, taps_down=taps["SET_MINUS"], taps_up=taps["SET_PLUS"], taps_untrusted=taps_untrusted, correction_taps=correction_taps,
                      events=dict(events), state_time={f'{a_}|{b_}': round(v_, 1) for (a_, b_), v_ in state_time.items()},
                      loss={f'{a_}|{b_}': round(v_, 2) for (a_, b_), v_ in loss_by_state.items()}))
     # corners
@@ -327,6 +329,7 @@ def summarise(res):
     taps_up_per_hour=round(sum(x['taps_up'] for x in runs) / max(rec_h, 1e-9), 1),
     interventions_per_hour=round(ev.get('ev_start', 0) / max(rec_h, 1e-9), 1),
     minus_taps_without_trusted_ceiling=sum(x['taps_untrusted'] for x in runs),
+    correction_taps_down_to_reference=sum(x.get('correction_taps', 0) for x in runs),
     time_lost_s_per_hour_by_state={k_: round(v_ / max(rec_h, 1e-9), 1) for k_, v_ in lo.most_common(12)},
     seconds_by_state={k_: round(v_) for k_, v_ in st.most_common(14) if not k_.startswith('ready|') and not k_.startswith('off|')},
     steep_approaches=[dict(grade=c['grade_deg'], grade_min=c['grade_min_deg'], over=c['over_target']) for c in steep],
