@@ -10,6 +10,7 @@ from openpilot.selfdrive.car.interfaces import FRICTION_THRESHOLD
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, apply_center_deadzone, get_friction
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.pid import PIDController
+from openpilot.selfdrive.controls.lib.scalar_np import Interp, clip as _clip, sign as _sign
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
 # At higher speeds (25+mph) we can assume:
@@ -25,6 +26,9 @@ from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_G
 
 LOW_SPEED_X = [0, 10, 20, 30]
 LOW_SPEED_Y = [15, 13, 10, 5]
+# np.interp(v, LOW_SPEED_X, LOW_SPEED_Y) in plain Python (scalar_np: bit for bit numpy's), wrapped back into np.float64 at the call
+# sites so everything downstream sees the same type as before
+_LOW_SPEED = Interp(LOW_SPEED_X, LOW_SPEED_Y)
 
 MAX_LAT_JERK_UP = 2.5            # m/s^3
 
@@ -197,7 +201,7 @@ class CommitFilter:
     fast = (v * self.x) < 0.0 or abs(v) > abs(self.x)
     self.x += (self.a_deepen if fast else self.a_release) * (v - self.x)
     lim = abs(v) + COMMIT_MAX_EXTRA
-    self.x = float(np.clip(self.x, -lim, lim))
+    self.x = float(_clip(self.x, -lim, lim))
     return self.x
 
 class LatControlTorque(LatControl):
@@ -302,15 +306,15 @@ class LatControlTorque(LatControl):
     # Committed reference, see COMMIT_TAU_DEEPEN above. Both ratchets, the gate and the blend run
     # while inactive too (same rationale as the request filter above: engaging mid-corner must
     # start from the truth). The setpoint is read here rather than below for the same reason.
-    delay_frames = int(np.clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
+    delay_frames = int(_clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
     setpoint = self.requested_lateral_accel_buffer[-delay_frames]
     commit_ff = self.commit_ff_filter.update(future_lateral_accel)
     commit_sp = self.commit_sp_filter.update(setpoint)
     commit_on = bool(getattr(frogpilot_toggles, "lat_commit_setpoint", False))
-    commit_gate = float(np.clip((self.commit_gate_filter.update(abs(future_lateral_accel)) - COMMIT_GATE_ON) /
+    commit_gate = float(_clip((self.commit_gate_filter.update(abs(future_lateral_accel)) - COMMIT_GATE_ON) /
                                 (COMMIT_GATE_FULL - COMMIT_GATE_ON), 0.0, 1.0))
     commit_step = self.dt / COMMIT_BLEND_RAMP
-    self.commit_blend += float(np.clip((commit_gate if commit_on else 0.0) - self.commit_blend,
+    self.commit_blend += float(_clip((commit_gate if commit_on else 0.0) - self.commit_blend,
                                        -commit_step, commit_step))
     ff_lat_accel = future_lateral_accel + self.commit_blend * (commit_ff - future_lateral_accel)
     tracked_setpoint = setpoint + self.commit_blend * (commit_sp - setpoint)
@@ -381,7 +385,7 @@ class LatControlTorque(LatControl):
     # upstream does) -- committed in corners, raw otherwise; both computed above.
     lat_accel_offset = self.torque_params.latAccelOffset
     error = tracked_setpoint - measurement
-    low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
+    low_speed_factor = (np.float64(_LOW_SPEED(CS.vEgo)) / max(CS.vEgo, MIN_SPEED)) ** 2
     error_lsf = error + low_speed_factor / self.torque_params.kp * error
 
     # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts
@@ -426,7 +430,7 @@ class LatControlTorque(LatControl):
         self.lane_release.permitted, self.lane_release.elapsed[0], CS.steeringRateDeg, self.dt)
       if fric_w is not None:
         fric_comp *= fric_w              # A/B blend
-      command = float(np.clip(command + fric_comp, -u_max, u_max))
+      command = float(_clip(command + fric_comp, -u_max, u_max))
     else:
       self.friction_release.reset()
 
@@ -439,11 +443,11 @@ class LatControlTorque(LatControl):
     relay_w = ab_weight(frogpilot_toggles, "lat_no_friction_relay")      # weight of "relay off"
     relay_off = bool(getattr(frogpilot_toggles, "lat_no_friction_relay", False)) if relay_w is None else relay_w >= 1.0
     if la_max > 0.0 and not relay_off:
-      friction_torque = self.friction_torque * u_max * float(np.clip(
+      friction_torque = self.friction_torque * u_max * float(_clip(
         apply_center_deadzone(error, FRICTION_DEADZONE) / FRICTION_THRESHOLD, -1.0, 1.0))
       if relay_w is not None:
         friction_torque *= 1.0 - relay_w  # A/B blend
-    command = float(np.clip(command + friction_torque, -u_max, u_max))
+    command = float(_clip(command + friction_torque, -u_max, u_max))
 
     # Preserve the empirical high-column-load stand-down threshold. Column load does not by itself
     # identify tire grip or prove that another steering shape cannot recover. In the cited route
@@ -466,10 +470,10 @@ class LatControlTorque(LatControl):
     self.break_frames = self.break_frames + 1 if stuck else 0
     engaged_long_enough = self.break_frames * self.dt >= BREAK_DEBOUNCE
     if engaged_long_enough and wheel_rate < BREAK_FREE_RATE:
-      direction = np.sign(command) if command != 0.0 else np.sign(error)
+      direction = _sign(command) if command != 0.0 else _sign(error)
       # Grow the target only while the low-rate/error conditions remain satisfied.
       stuck_s = self.break_frames * self.dt - BREAK_DEBOUNCE
-      escalation = float(np.clip(stuck_s / BREAK_ESCALATE, 0.0, 1.0))
+      escalation = float(_clip(stuck_s / BREAK_ESCALATE, 0.0, 1.0))
       target = (BREAK_STAGE1 + (BREAK_MAX - BREAK_STAGE1) * escalation) * u_max * float(direction)
     else:
       target = 0.0
@@ -480,8 +484,8 @@ class LatControlTorque(LatControl):
     delta = target - self.break_boost
     toward_zero = abs(target) < abs(self.break_boost) or (target * self.break_boost) < 0
     step = step_down if toward_zero else step_up
-    self.break_boost += float(np.clip(delta, -step, step))
-    command = float(np.clip(command + self.break_boost, -u_max, u_max))
+    self.break_boost += float(_clip(delta, -step, step))
+    command = float(_clip(command + self.break_boost, -u_max, u_max))
 
     # (col_trq / will_recover computed above the breaker; will_recover feeds the saturation report
     # below -- a lightly-loaded clip does not warn, a missing reading (0, e.g. gen2) falls through
@@ -498,9 +502,9 @@ class LatControlTorque(LatControl):
     # command while it is off, but DISABLING would hand back the raw command in one frame -- a step
     # the size of whatever ripple was being removed. Ramping the blend makes both directions
     # continuous, which is the point of a control meant to be flipped while moving.
-    self.out_filter_on += float(np.clip((1.0 if smooth else 0.0) - self.out_filter_on,
+    self.out_filter_on += float(_clip((1.0 if smooth else 0.0) - self.out_filter_on,
                                         -self.dt / OUT_FILTER_TAU, self.dt / OUT_FILTER_TAU))
-    command = float(np.clip(command + self.out_filter_on * (filtered - command), -u_max, u_max))
+    command = float(_clip(command + self.out_filter_on * (filtered - command), -u_max, u_max))
 
     output_torque = command / u_max
     self.plant.u_prev = -command   # wire convention: actuators.steer is positive left
@@ -588,7 +592,7 @@ class LatControlTorque(LatControl):
       curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
       lateral_accel_deadzone = curvature_deadzone * CS.vEgo ** 2
 
-      delay_frames = int(np.clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
+      delay_frames = int(_clip(lat_delay / self.dt, 1, self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES))
       expected_lateral_accel = self.requested_lateral_accel_buffer[-delay_frames]
       # TODO factor out lateral jerk from error to later replace it with delay independent alternative
       future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
@@ -600,7 +604,7 @@ class LatControlTorque(LatControl):
       measurement_rate = self.measurement_rate_filter.update((measurement - self.previous_measurement) / self.dt)
       self.previous_measurement = measurement
 
-      low_speed_factor = (np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y) / max(CS.vEgo, MIN_SPEED)) ** 2
+      low_speed_factor = (np.float64(_LOW_SPEED(CS.vEgo)) / max(CS.vEgo, MIN_SPEED)) ** 2
       setpoint = lat_delay * desired_lateral_jerk + expected_lateral_accel
       error = setpoint - measurement
       error_lsf = error + low_speed_factor / self.torque_params.kp * error

@@ -36,10 +36,14 @@ The controller works in its own frame and handles signs at the call site.
 """
 import numpy as np
 
+from openpilot.selfdrive.controls.lib.scalar_np import Interp, clip as _clip, sign as _sign
+
 # --- fitted tables (see module docstring) -----------------------------------------------------
 V_BP = [7.0, 12.5, 15.0, 17.5, 20.0, 25.0, 30.0, 35.0]              # m/s (25, 45, 54, 63, 72, 90, 108, 126 km/h)
 Q_BP = [2.79e-6, 3.14e-6, 3.49e-6, 4.00e-6, 4.51e-6, 4.96e-6, 4.96e-6, 4.96e-6]  # m/s^2 per count^2, interceptor
 GS_BP = [1.21e-3, 1.21e-3, 1.31e-3, 1.88e-3, 2.14e-3, 2.34e-3, 2.41e-3, 2.41e-3]  # m/s^2 per LKAS_EFFECTIVE count, stock
+_Q_OF_V = Interp(V_BP, Q_BP)     # np.interp over these tables in plain Python (scalar_np: bit for bit numpy's), asked every frame
+_GS_OF_V = Interp(V_BP, GS_BP)
 
 K_EFF = 0.90            # LKAS_EFFECTIVE the EPS applies per count of stock request, settled (measured p50 0.91)
 EFF_MAX = 308.0         # EPS clip on the stock path (never exceeded in 342 segments)
@@ -126,10 +130,10 @@ class TiLateralPlant:
     self._u_grid = np.arange(0.0, self.ti_steer_max + 1.0, max(self.ti_steer_max / 60.0, 1.0))
 
   def _q(self, v):
-    return float(np.interp(v, V_BP, Q_BP)) * self.alpha_ti
+    return _Q_OF_V(v) * self.alpha_ti
 
   def _gs(self, v):
-    return float(np.interp(v, V_BP, GS_BP)) * self.alpha_stock
+    return _GS_OF_V(v) * self.alpha_stock
 
   # -- state machine -----------------------------------------------------------------------------
   def update_state(self, v, lkas_blocked, eff_meas, ti_active, active=True):
@@ -139,7 +143,7 @@ class TiLateralPlant:
     assumption, i.e. we under-deliver rather than over-steer."""
     u_prev = abs(self.u_prev)
     e_abs = abs(float(eff_meas))
-    same_sign = (float(eff_meas) == 0.0) or (np.sign(eff_meas) == np.sign(self.u_prev)) or self.u_prev == 0.0
+    same_sign = (float(eff_meas) == 0.0) or (_sign(eff_meas) == _sign(self.u_prev)) or self.u_prev == 0.0
 
     if not active:
       # not steering: nothing to infer, re-arm so the next engagement uses the measurement
@@ -228,7 +232,7 @@ class TiLateralPlant:
     """Steady-state lateral acceleration (m/s^2, +left) for a command of u counts (+left)."""
     u = float(u)
     u_abs = min(abs(u), self.ti_steer_max)
-    return float(np.sign(u) * (self._stock_la(u_abs, v) + self._ti_la(u_abs, v)))
+    return float(_sign(u) * (self._stock_la(u_abs, v) + self._ti_la(u_abs, v)))
 
   def la_max(self, v):
     """What this car can actually do right now, at the ceiling and in the current actuator state.
@@ -265,7 +269,7 @@ class TiLateralPlant:
         span = la_grid[hi] - la_grid[lo]
         frac = 0.0 if span <= 0.0 else (a - la_grid[lo]) / span
         u = float(grid[lo] + frac * (grid[hi] - grid[lo]))
-    return float(np.clip(u, 0.0, self.ti_steer_max) * (1.0 if la >= 0.0 else -1.0))
+    return float(_clip(u, 0.0, self.ti_steer_max) * (1.0 if la >= 0.0 else -1.0))
 
   def inverse_closed(self, la, v):
     """Closed-form inverse of the settled model, for tests and for reading the algebra:
