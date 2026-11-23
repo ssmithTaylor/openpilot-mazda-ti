@@ -190,7 +190,7 @@ def main():
          "--confcutdir", str(REPO / "selfdrive" / "car"), "-o", "addopts=", "--import-mode=importlib",
          "-p", "no:cacheprovider", "-p", "pc_plugin", "--strict-markers", "-q", "-W", "ignore::DeprecationWarning", "--durations=5"]
   if n != "0":
-    cmd += ["-n", str(n), "--dist", "loadfile"]  # one file per worker: the screen test compiles C++ and must not race
+    cmd += ["-n", str(n), "--dist", "loadgroup"]  # per test; the screen test (C++ compile) is one xdist_group
   if not a.slow:
     cmd += ["-m", "not slow and not tici"]
   rest = [str(REPO / r) if not r.startswith("-") and (REPO / r.split("::")[0]).exists() else r for r in a.rest]
