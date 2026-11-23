@@ -53,9 +53,10 @@ def _loop(rows, prog, new, counter=None):
   armed_seq, out = [], []
   for k, row in enumerate(rows):
     profile = g.advance_zone(row["v_ego"]).profile
-    if new == "cached":
-      rem, can_run, strict = cache.frame(g, prog.remaining, profile, (id(prog), prog.version))
-      armed = runner.pick(k, profile, rem, can_run, strict)
+    rem_upd = prog.remaining
+    if new == "cached":                                 # as the car controller: the cached answers, totals and progress
+      rem_upd, can_run, strict = cache.frame(g, prog.remaining, profile, (id(prog), prog.version))
+      armed = runner.pick(k, profile, rem_upd, can_run, strict, stats=can_run.stats)
     elif new:
       rem, can_run, strict = ti.frame_scheduler(g, prog.remaining)
       armed = runner.pick(k, profile, rem, can_run, strict)
@@ -63,7 +64,7 @@ def _loop(rows, prog, new, counter=None):
       armed = runner.pick(k, profile, prog.remaining, lambda t, w: g.can_run(t, w, prog.remaining),
                           lambda t, w: g.next_is_strict(t, w, prog.remaining))
     armed_seq.append(armed)
-    out.append(g.update(armed, k, **row, remaining=prog.remaining))
+    out.append(g.update(armed, k, **row, remaining=rem_upd))
     prog.add(g.credit)
   return armed_seq, out, logged, runner
 
@@ -225,6 +226,26 @@ def test_the_on_device_cost_check_runs_and_a_test_runs_in_its_running_mode():
   assert run["test_running_share"] > 0.2 and idle["test_running_share"] == 0.0 and run["mean_us"] > 0
 
 
+# Operation counts per car-controller cycle (sys.setprofile: Python function calls and builtin calls), deterministic for one Python
+# version. c66f422 on Python 3.14: plan off 150 Python + 177 builtin, A/B 158 + 185, tests idle 459 + 368, tests running 364 + 296 (the
+# device measured tests idle +630 us and running +464 us over plan off). After the cuts: 54 + 97, 62 + 104, 103 + 167, 111 + 181. The
+# bounds leave room for another Python version (3.11 on the device makes each comprehension a call) and fail on a return of the old cost.
+_OP_BOUNDS = {"off": (75, 210), "ab": (85, 230), "idle": (140, 360), "run": (150, 390)}
+
+
+def test_the_operation_count_per_cycle_stays_under_its_bound_in_every_mode():
+  spec = importlib.util.spec_from_file_location("ti_cost_check_for_ops", HERE.parents[0] / "mazda" / "ti_cost_check.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  modes = {"off": (None, 38.0, 0.0003), "ab": ("ab", 45.0, 0.0003), "idle": ("tests", 38.0, 0.02), "run": ("tests", 38.0, 0.0003)}
+  got = {m: mod.count_mode(*a, cycles=100) for m, a in modes.items()}
+  assert got["run"]["test_running"] and not got["idle"]["test_running"]
+  for m, (py_max, total_max) in _OP_BOUNDS.items():
+    assert got[m]["py"] <= py_max and got[m]["total"] <= total_max, (m, got[m])
+  for m in ("idle", "run"):                              # what the tests mode adds over the plan off
+    assert got[m]["py"] - got["off"]["py"] <= 90, (m, got)
+
+
 # ---- against the literal pre-change code (95e17e3), with the real test accountant and every kind of progress change ------------------
 def _ref_module():
   spec = importlib.util.spec_from_file_location("ti_ident_ref_95e17e3", HERE / "ti_ident_ref_95e17e3.py")
@@ -289,11 +310,11 @@ def _accountant_pipeline(mod, mode, rows, actions):
     if mode == "old":
       armed = runner.pick(k, profile, acc.remaining, lambda t, w: g.can_run(t, w, acc.remaining),
                           lambda t, w: g.next_is_strict(t, w, acc.remaining))
-    else:
+    else:                                               # as the car controller does it (pick with the kept totals, update with rem)
       rem, can_run, strict = cache.frame(g, acc.remaining, profile, (id(acc), None if mode == "noversion" else acc.version))
-      armed = runner.pick(k, profile, rem, can_run, strict)
+      armed = runner.pick(k, profile, rem, can_run, strict, stats=can_run.stats)
     armed_seq.append(armed)
-    out.append(g.update(armed, k, **row, remaining=acc.remaining))
+    out.append(g.update(armed, k, **row, remaining=acc.remaining if mode == "old" else rem))
     acc.update(toggles, row["v_ego"], True, (), credit=g.credit, run_all_forced=True)
     versions.add(getattr(acc, "version", None))
   return armed_seq, out, logged, (runner.draw, runner.current, runner.mode), versions

@@ -126,8 +126,47 @@ def run_mode(name, plan_mode, mph, curvature, cycles):
           "max_us": round(times[-1], 1), "test_running_share": round(ran / len(times), 3)}
 
 
-def run_controls(name, plan_on, mph, cycles):
-  """controlsd's side: TiAbRunner.step per cycle (the A/B alternation and the plan), with the friction relay set up."""
+def _counting(fn):
+  """(result, python calls, C calls) of fn() under sys.setprofile: the operation count, deterministic for one Python version."""
+  n = [0, 0]
+
+  def prof(frame, event, arg):
+    if event == "call":
+      n[0] += 1
+    elif event == "c_call":
+      n[1] += 1
+  sys.setprofile(prof)
+  try:
+    out = fn()
+  finally:
+    sys.setprofile(None)
+  return out, n[0], n[1]
+
+
+def count_mode(plan_mode, mph, curvature, cycles=200, warm=300):
+  """Calls per car-controller cycle in one mode, after the warm-up: {"py": Python function calls, "c": builtin calls, "total"}."""
+  from openpilot.selfdrive.car.mazda import ti_plan as tp
+  cc, mem = make_controller()
+  toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
+  CC, CS = inputs(mph, curvature)
+  py = c = 0
+  for k in range(warm + cycles):
+    if k % 50 == 0:
+      mem.put_bool("TiPlanOn", plan_mode is not None)
+      if plan_mode is not None:
+        mem.put("TiPlan", tp.encode_plan(tp.PlanOut(plan_mode, plan_mode == "ab", "", "", 1), time.time(), False, "costcheck", True))
+    if k < warm:
+      cc.update(CC, CS, k * 10_000_000, toggles)
+    else:
+      _, p_, c_ = _counting(lambda: cc.update(CC, CS, k * 10_000_000, toggles))
+      py, c = py + p_, c + c_
+  return {"py": round(py / cycles, 1), "c": round(c / cycles, 1), "total": round((py + c) / cycles, 1),
+          "test_running": bool(getattr(cc, "ti_ident", None) is not None and cc.ti_ident.running)}
+
+
+def run_controls(name, plan_on, mph, cycles, count=False):
+  """controlsd's side: TiAbRunner.step per cycle (the A/B alternation and the plan), with the friction relay set up. count: the calls
+  per step (as count_mode) instead of the times."""
   from openpilot.selfdrive.car.mazda import ti_ab, ti_plan as tp
   clock = [time.time()]
   fake = NS(time=lambda: clock[0], monotonic=lambda: clock[0], perf_counter=time.perf_counter, perf_counter_ns=time.perf_counter_ns)
@@ -136,21 +175,21 @@ def run_controls(name, plan_on, mph, cycles):
   if real[1] is not None:
     tp.time = fake
   try:
-    return _run_controls(name, plan_on, mph, cycles, clock)
+    return _run_controls(name, plan_on, mph, cycles, clock, count)
   finally:
     ti_ab.time = real[0]
     if real[1] is not None:
       tp.time = real[1]
 
 
-def _run_controls(name, plan_on, mph, cycles, clock):
+def _run_controls(name, plan_on, mph, cycles, clock, count=False):
   from openpilot.selfdrive.car.mazda import ti_ab, ti_plan as tp
   warm = 2000
   disk = MemParams({"TiAbConfig": json.dumps({"setting": "LatNoFrictionRelay", "b": True, "block_min": 4})})
   mem = MemParams({"TiPlanOn": b"0"})
   rn = ti_ab.TiAbRunner(disk, mem)                     # controls starts with the plan off; START comes after it is running
   toggles = NS(lat_no_friction_relay=False, steerKp=[[0.0], [1.0]])
-  times = []
+  times, calls = [], [0, 0]
   for k in range(cycles + warm):
     clock[0] += 0.01
     if k == 50:
@@ -160,11 +199,20 @@ def _run_controls(name, plan_on, mph, cycles, clock):
       if raw:
         nonce, seq = tp.plan_ident(raw)
         mem.put("TiPlanAck", json.dumps(tp.make_ack(nonce, seq, False, 0, 0.0, clock[0])))
+    def step(k=k):
+      rn.step(toggles, engaged=True, v_ego=mph * 0.44704, curvature=0.0003, steer=0.03, saturated=False, steering_pressed=False,
+              driver_torque=0.0, lane_change=False, blinker=False, ti_ok=True, fault=False, controller_ok=True, mono_ns=k * 10_000_000)
+    if count and k >= warm:
+      _, p_, c_ = _counting(step)
+      calls[0], calls[1] = calls[0] + p_, calls[1] + c_
+      continue
     t0 = time.perf_counter_ns()
-    rn.step(toggles, engaged=True, v_ego=mph * 0.44704, curvature=0.0003, steer=0.03, saturated=False, steering_pressed=False,
-            driver_torque=0.0, lane_change=False, blinker=False, ti_ok=True, fault=False, controller_ok=True, mono_ns=k * 10_000_000)
+    step()
     if k >= warm:
       times.append((time.perf_counter_ns() - t0) / 1000.0)
+  if count:
+    return {"mode": name, "py": round(calls[0] / cycles, 1), "c": round(calls[1] / cycles, 1), "total": round(sum(calls) / cycles, 1),
+            "ab_state": rn.ab.mode, "plan_mode": rn.plan.mode}
   times.sort()
   return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
           "max_us": round(times[-1], 1), "ab_state": rn.ab.mode, "plan_mode": rn.plan.mode, "why": (rn.ab.message or rn.plan.why)[:80]}

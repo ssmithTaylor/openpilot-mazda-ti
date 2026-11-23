@@ -459,6 +459,7 @@ class TestAccountant:
     self.active_interval = set()  # step_seconds tests that ran clean at any frame since the last publish
     self.all_seen = False        # run all was on at any frame since the last publish
     self.failed = False
+    self._enabled_for, self._enabled = object(), ()   # the toggles object the enabled flags were read from, and the flags
     self.version = 0             # +1 whenever what `remaining` returns can change (a credit, a publish, the first read, a failure)
 
   def _fail(self, where):
@@ -476,8 +477,14 @@ class TestAccountant:
     try:
       run_all = getattr(toggles, RUN_ALL_TOGGLE, None) is True or run_all_forced is True
       self.all_seen = self.all_seen or run_all
-      for t in self.tests:
-        if not (t.enabled(toggles) or (run_all and t.metric == "step_seconds")):
+      if toggles is not self._enabled_for:
+        # which tests the toggles switch on, read again only for a new toggles object (card replaces it on every reload)
+        self._enabled = tuple(t.enabled(toggles) for t in self.tests)
+        self._enabled_for = toggles
+      if not run_all and not any(self._enabled):
+        return                                           # nothing is on: nothing to count (cost: this ran every cycle)
+      for t, on in zip(self.tests, self._enabled):
+        if not (on or (run_all and t.metric == "step_seconds")):
           continue
         self.seen_interval.add(t.id)
         self.run_seen.add(t.id)

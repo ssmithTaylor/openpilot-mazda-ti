@@ -266,11 +266,15 @@ def n_steps(key):
   return len(SWEEP_TONES) if key == SWEEP else len(LADDER_AMPS) if key == LADDER else len(PULSE_AMPS)
 
 
+_STEPS_IN_BAND = {}
+
+
 def steps_in_band(key, label):
-  """Number of steps captured in a band (the first ones of the table)."""
-  if key == LADDER:
-    return sum(1 for a in LADDER_AMPS if a <= LADDER_CAPS[label])
-  return n_steps(key)
+  """Number of steps captured in a band (the first ones of the table). Constant per (test, band): kept once computed."""
+  got = _STEPS_IN_BAND.get((key, label))
+  if got is None:
+    got = _STEPS_IN_BAND[(key, label)] = (sum(1 for a in LADDER_AMPS if a <= LADDER_CAPS[label]) if key == LADDER else n_steps(key))
+  return got
 
 
 _STEP_PARAMS = {}
@@ -299,8 +303,43 @@ def unit_credit(key, step):
   return round(step_params(key, step)[2] * DT, 2)
 
 
+_SMALL = {}
+
+
 def small(key, step):
-  return step_params(key, step)[1] <= SMALL_AMP
+  got = _SMALL.get((key, step))
+  if got is None:
+    got = _SMALL[(key, step)] = step_params(key, step)[1] <= SMALL_AMP
+  return got
+
+
+_SMALL_FLAGS = {}
+
+
+def small_flags(key, band):
+  """small(key, s) for each step captured in `band`, as a tuple. Constant per (test, band): kept once computed."""
+  got = _SMALL_FLAGS.get((key, band))
+  if got is None:
+    got = _SMALL_FLAGS[(key, band)] = tuple(small(key, s) for s in range(steps_in_band(key, band)))
+  return got
+
+
+# `feasible` for _pick when no step is allowed now (the limits close every step class of the window, or an input is not finite):
+# the same answer as a test that is False for every step, without a call per step
+NONE_FEASIBLE = object()
+
+
+def limit_open(strict, profile, base_request, curvature, lat_demand, ti_max):
+  """True when no limit closes a step of this class (strict: not small) in `profile` now: exactly `limit_state(...)[0] is None`
+  (each value finite and not above its bound), without building the dicts (cost: asked every frame)."""
+  b = abs(base_request)
+  c = abs(curvature)
+  la = abs(lat_demand)
+  if strict:
+    return (math.isfinite(b) and b <= COMMAND_LIMIT_FRACTION[profile][0] * ti_max and math.isfinite(c) and c <= MAX_CURVATURE
+            and math.isfinite(la) and la <= MAX_LAT_DEMAND)
+  return (math.isfinite(b) and b <= COMMAND_LIMIT_FRACTION[profile][1] * ti_max and math.isfinite(c) and c <= MAX_CURVATURE_SMALL
+          and math.isfinite(la) and la <= MAX_LAT_DEMAND_SMALL)
 
 
 def freq(key, step):
@@ -413,8 +452,14 @@ def band_for(v_ego, lkas_blocked=None):
   return z.window, z.ti_alone
 
 
+_PEAK = {}
+
+
 def peak_counts(key):
-  return max(step_params(key, s)[1] for s in range(n_steps(key)))
+  got = _PEAK.get(key)
+  if got is None:
+    got = _PEAK[key] = max(step_params(key, s)[1] for s in range(n_steps(key)))
+  return got
 
 
 def rate_room(limits, key):
@@ -566,19 +611,24 @@ class RunAll:
     self.current, self.profile, self.mode, self.blocked = test, profile, mode, 0
     return test
 
-  def pick(self, frame, profile, remaining, can_run=None, strict=None):
+  def pick(self, frame, profile, remaining, can_run=None, strict=None, stats=None):
     """`strict(k, profile)`: this test's next step is a strict-gated one (the 44-count pulse, the ladder's larger steps). Strict-open
     stretches are the scarce resource (the limits are tighter), so when one is open a test that can use it goes first instead of the
     current one finishing its small steps (which can run in any stretch). No limit changes."""
     if profile is None:
       return self.current
     run = (lambda k: True) if can_run is None else (lambda k: bool(can_run(k, profile)))
-    totals, shares = {}, {}
-    for k in RUN_ALL_ORDER:
-      totals[k] = window_total(k, profile, remaining)
-      shares[k] = band_share(k, profile, remaining)
-      if totals[k] is None or shares[k] is None:
+    if stats is not None:
+      totals, shares = stats(profile)                    # the same window_total / band_share, kept while the progress is unchanged
+      if totals is None:
         return None
+    else:
+      totals, shares = {}, {}
+      for k in RUN_ALL_ORDER:
+        totals[k] = window_total(k, profile, remaining)
+        shares[k] = band_share(k, profile, remaining)
+        if totals[k] is None or shares[k] is None:
+          return None
     same = profile == self.profile
     cur = self.current
     patience = int(round(BLOCK_PATIENCE_S / DT))
@@ -779,6 +829,7 @@ class TiIdent:
     """(step, extra): the first step of the table still to capture in `band` (this frame's credit counted) that the
     limits allow now, else the first still to capture; with everything captured, the least-collected one as extra
     (ties: the first), among those the limits allow if any; (None, False) when progress is unknown."""
+    never = feasible is NONE_FEASIBLE
     lefts = []
     for s in range(steps_in_band(key, band)):
       left = remaining(key, band, s)
@@ -788,9 +839,9 @@ class TiIdent:
         left -= credit[3]
       lefts.append((s, left))
     todo = [s for s, left in lefts if left > 1e-6]
-    allowed = [(s, left) for s, left in lefts if feasible is None or feasible(s)]
+    allowed = [] if never else [(s, left) for s, left in lefts if feasible is None or feasible(s)]
     if todo:
-      ok = [s for s in todo if feasible is None or feasible(s)]
+      ok = [] if never else [s for s in todo if feasible is None or feasible(s)]
       if ok:
         return ok[0], False
       if not allowed:
@@ -825,7 +876,8 @@ class TiIdent:
 
   def _limit_class(self, key, step, band, memo):
     """limit_state of this frame for a step, computed once per step class (small or not) and window."""
-    c = (small(key, step), band)
+    sm = _SMALL.get((key, step))
+    c = (small(key, step) if sm is None else sm, band)
     if c not in memo:
       memo[c] = self.limit_state(key, step, band, **self.inputs)
     return memo[c]
@@ -901,7 +953,9 @@ class TiIdent:
     self.stopped_age += 1
     # A non-finite input (NaN or infinity) closes the gate: nothing comparable can be trusted, and a NaN passes every
     # "greater than the limit" test. Zero at once, like a touch.
-    bad = not all(math.isfinite(x) for x in (v_ego, base_request, curvature, lat_demand, driver_torque, ti_max))
+    isfin = math.isfinite
+    bad = not (isfin(v_ego) and isfin(base_request) and isfin(curvature) and isfin(lat_demand) and isfin(driver_torque)
+               and isfin(ti_max))
     magnitude = abs(driver_torque) if math.isfinite(driver_torque) else 0.0
     self.loud = self.loud + 1 if magnitude >= DRIVER_QUIET_COUNTS else 0
     touch = self.touch = bool(steering_pressed or magnitude >= DRIVER_FIRM_COUNTS
@@ -932,31 +986,56 @@ class TiIdent:
                   left=None if left is None else round(left - self.credit[3], 2))
 
     key = armed if armed in KEYS else None
+    if key is None and self.test is None:
+      # nothing armed and nothing running: what the full path below does then, without its work (cost: every cycle with the tests
+      # off): the reason is "off", no gate, no count, no signal
+      self.reason = "off"
+      self.last = 0
+      self.emitted = None
+      return 0
     # This frame's limit checks, one per step class (limit_state depends on the step only through small(); cost: it ran for every step
     # of the window two or three times a frame)
     lim_memo = {}
-    finite_in = all(math.isfinite(x) for x in self.inputs.values())
+    finite_in = isfin(base_request) and isfin(curvature) and isfin(lat_demand) and isfin(ti_max)
 
     def lim(k, s_):
       return self._limit_class(k, s_, band, lim_memo)
 
+    viol_at, n_now, rearm_frames = self.viol_at, self.n, REARM_S / DT
+
     def feasible_now(k, s_):              # = self._feasible(k, s_, band) on this frame's inputs
-      if not finite_in or lim(k, s_)[0] is not None:
+      if not finite_in:
         return False
-      return (self.n - self.viol_at.get((k, s_), (-10 ** 9, None))[0]) > REARM_S / DT
-    # Which steps the limits close right now: when each last did, for the re-arm dwell
+      sm_ = _SMALL.get((k, s_))
+      why_ = lim_memo.get((small(k, s_) if sm_ is None else sm_, band))
+      if (lim(k, s_) if why_ is None else why_)[0] is not None:
+        return False
+      return (n_now - viol_at.get((k, s_), (-10 ** 9, None))[0]) > rearm_frames
+    # Which steps the limits close right now: when each last did, for the re-arm dwell (the limit result is one per step class)
+    any_open = False                      # some step class of the window open now (else no step is feasible this frame)
     if key is not None and band is not None:
-      for st_ in range(steps_in_band(key, band)):
-        why = lim(key, st_)
+      why_small = why_strict = None       # the limit result of each step class, looked up once
+      for st_, sm in enumerate(small_flags(key, band)):
+        if sm:
+          if why_small is None:
+            why_small = lim(key, st_)
+          why = why_small
+        else:
+          if why_strict is None:
+            why_strict = lim(key, st_)
+          why = why_strict
         if why[0] is not None:
-          self.viol_at[(key, st_)] = (self.n, why[0])
+          viol_at[(key, st_)] = (n_now, why[0])
+        else:
+          any_open = True
     # The step whose limits apply: the running one, else the one that would start
     step, extra = (None, False)
     if key is not None and band is not None:
       if self.test == key and not self.fading:
         step, extra = self.step, self.extra
       else:
-        step, extra = self._pick(key, band, remaining, self.credit, lambda s: feasible_now(key, s))
+        step, extra = self._pick(key, band, remaining, self.credit,
+                                 (lambda s: feasible_now(key, s)) if finite_in and any_open else NONE_FEASIBLE)
     strict = step is None or not small(key, step)
     touch_hold = (TOUCH_HOLDOFF_S if strict else TOUCH_HOLDOFF_SMALL_S) / DT
     limit = (None, None, None)
@@ -1109,9 +1188,10 @@ def frame_scheduler(ident, remaining):
       elif not finite:
         ok = False
       else:
-        lk = (small(k, s), w)
+        strict_ = not small(k, s)
+        lk = (strict_, w)
         if lk not in limit_memo:
-          limit_memo[lk] = ident.limit_state(k, s, w, **inputs)[0] is None
+          limit_memo[lk] = limit_open(strict_, w, inputs["base_request"], inputs["curvature"], inputs["lat_demand"], inputs["ti_max"])
         ok = limit_memo[lk] and (ident.n - ident.viol_at.get((k, s), (-10 ** 9, None))[0]) > rearm
       feas_memo[key] = ok
     return feas_memo[key]
@@ -1122,18 +1202,44 @@ def frame_scheduler(ident, remaining):
       step_memo[key] = ident._pick(k, w, rem, None, lambda s: feasible(k, s, w))[0]
     return step_memo[key]
 
+  run_memo, strict_memo = {}, {}
+
   def can_run(k, w):
-    if inputs is None or w is None:
-      return True
-    if not finite:
-      return False
-    step = next_step(k, w)
-    return step is not None and feasible(k, step, w)
+    got = run_memo.get((k, w))
+    if got is None:
+      if inputs is None or w is None:
+        got = True
+      elif not finite:
+        got = False
+      else:
+        step = next_step(k, w)
+        got = step is not None and feasible(k, step, w)
+      run_memo[(k, w)] = got
+    return got
 
   def strict(k, w):
-    step = next_step(k, w)
-    return step is not None and not small(k, step)
+    got = strict_memo.get((k, w))
+    if got is None:
+      step = next_step(k, w)
+      got = strict_memo[(k, w)] = step is not None and not small(k, step)
+    return got
 
+  stats_memo = {}
+
+  def stats(w):
+    """(totals, shares) of RunAll.pick for window w: window_total / band_share of every test, or (None, None) when unknown."""
+    if w not in stats_memo:
+      totals, shares = {}, {}
+      for k in RUN_ALL_ORDER:
+        totals[k] = window_total(k, w, rem)
+        shares[k] = band_share(k, w, rem)
+        if totals[k] is None or shares[k] is None:
+          stats_memo[w] = (None, None)
+          return stats_memo[w]
+      stats_memo[w] = (totals, shares)
+    return stats_memo[w]
+
+  can_run.stats = stats
   return rem, can_run, strict
 
 
@@ -1165,12 +1271,18 @@ class SchedulerCache:
       self.key = None
       return frame_scheduler(ident, remaining)
     inputs = ident.inputs
-    finite = inputs is None or all(math.isfinite(x) for x in inputs.values())
+    isfin = math.isfinite
+    if inputs is None:
+      finite = True
+    else:
+      base, curv, lat, tmax = inputs["base_request"], inputs["curvature"], inputs["lat_demand"], inputs["ti_max"]
+      finite = isfin(base) and isfin(curv) and isfin(lat) and isfin(tmax)
     lims = ()
     if inputs is not None and finite and profile is not None:
-      lims = tuple((c, ident.limit_state(k, s, profile, **inputs)[0] is None) for c, (k, s) in sorted(_class_rep().items()))
+      lims = (limit_open(False, profile, base, curv, lat, tmax), limit_open(True, profile, base, curv, lat, tmax))
     rearm = REARM_S / DT
-    dwell = frozenset(ks for ks, v in ident.viol_at.items() if not (ident.n - v[0]) > rearm)
+    n = ident.n
+    dwell = frozenset({ks for ks, v in ident.viol_at.items() if not (n - v[0]) > rearm}) if ident.viol_at else frozenset()
     key = (id(ident), profile, inputs is None, finite, lims, dwell, version)
     if key != self.key or self.fns is None:
       self.key, self.fns = key, frame_scheduler(ident, remaining)

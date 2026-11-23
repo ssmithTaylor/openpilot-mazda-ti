@@ -596,7 +596,9 @@ class TiAb:
     if not on:
       self.seen_off = True
 
-    finite = all(isinstance(x, (int, float)) and math.isfinite(x) for x in (v_ego, curvature, steer, driver_torque))
+    finite = (isinstance(v_ego, (int, float)) and math.isfinite(v_ego) and isinstance(curvature, (int, float)) and math.isfinite(curvature)
+              and isinstance(steer, (int, float)) and math.isfinite(steer) and isinstance(driver_torque, (int, float))
+              and math.isfinite(driver_torque))
     self.sat_frames = self.sat_frames + 1 if (finite and abs(steer) >= SAT_STEER) else 0
     mag = abs(driver_torque) if finite else 0.0
     self.loud = self.loud + 1 if mag >= DRIVER_QUIET_COUNTS else 0
@@ -1108,9 +1110,14 @@ class TiAbRunner:
       if self.k % self.ON_EVERY == 0:
         self._read()
       self.k += 1
-      specs = [SETTINGS[n] for n in ALLOWED]
-      stored = {s.name: stored_value(s, toggles) for s in specs}
-      tests = any(getattr(toggles, t, False) is True for t in TEST_TOGGLES)
+      if toggles is not getattr(self, "_stored_for", None):
+        # the owner's stored values and the test toggles, read again only when controlsd hands over a new toggles object (it
+        # replaces it on every reload and never changes it in place; cost: six reads and a scan every cycle)
+        specs = [SETTINGS[n] for n in ALLOWED]
+        self._stored = {s.name: stored_value(s, toggles) for s in specs}
+        self._tests_on = any(getattr(toggles, t, False) is True for t in TEST_TOGGLES)
+        self._stored_for = toggles
+      stored, tests = self._stored, self._tests_on
       on, paused = self.on, tests
       try:
         v = inputs["v_ego"]

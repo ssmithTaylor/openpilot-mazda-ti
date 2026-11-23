@@ -66,13 +66,31 @@ FADE_OUT_S = 0.25
 RATE_ROOM_FACTOR = 2.0
 
 
+_SLEW, _PEAK = {}, {}   # the presets are constants: each sum is computed once (these are asked every frame)
+
+
 def max_slew_per_frame(preset=ACTIVE_PRESET):
   """Largest change of the unit waveform between two frames (TI counts): sum of 2*pi*f*A*DT."""
-  return sum(2.0 * math.pi * f * a * DT for f, a in PRESETS[preset])
+  got = _SLEW.get(preset)
+  if got is None:
+    got = _SLEW[preset] = sum(2.0 * math.pi * f * a * DT for f, a in PRESETS[preset])
+  return got
 
 
 def peak_counts(preset=ACTIVE_PRESET):
-  return sum(a for _, a in PRESETS[preset])
+  got = _PEAK.get(preset)
+  if got is None:
+    got = _PEAK[preset] = sum(a for _, a in PRESETS[preset])
+  return got
+
+
+_PEAK_ALL = []
+
+
+def _peak_all():
+  if not _PEAK_ALL:
+    _PEAK_ALL.append(max(peak_counts(p) for p in PRESETS))
+  return _PEAK_ALL[0]
 
 
 def waveform(frame, preset=ACTIVE_PRESET):
@@ -86,7 +104,7 @@ def rate_room(limits):
   rate, the high-range climb rate when its knee lies inside that range, and the release rate."""
   up = limits.TI_STEER_DELTA_UP
   knee = getattr(limits, 'TI_STEER_DELTA_UP_KNEE', limits.TI_STEER_MAX)
-  if knee <= MAX_BASE_FRACTION * limits.TI_STEER_MAX + max(peak_counts(p) for p in PRESETS):
+  if knee <= MAX_BASE_FRACTION * limits.TI_STEER_MAX + _peak_all():
     up = min(up, getattr(limits, 'TI_STEER_DELTA_UP_HIGH', up))
   return min(up, limits.TI_STEER_DELTA_DOWN)
 

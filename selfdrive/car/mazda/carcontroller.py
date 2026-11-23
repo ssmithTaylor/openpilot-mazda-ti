@@ -102,6 +102,12 @@ class CarController(CarControllerBase):
     self.brake_counter = 0
     self.frame = 0
     self.ccp = CarControllerParams(CP)
+    # CP.flags tests cached once (an IntFlag `&` costs several Python calls; update asked about a dozen a cycle)
+    self.flag_ti = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
+    self.flag_gen1 = bool(CP.flags & MazdaFlags.GEN1)
+    self.flag_gen2 = bool(CP.flags & MazdaFlags.GEN2)
+    self.flag_no_fsc = bool(CP.flags & MazdaFlags.NO_FSC)
+    self.flag_radar = bool(CP.flags & MazdaFlags.RADAR_INTERCEPTOR)
     self.hold_timer = Timer(6.0)
     self.hold_delay = Timer(.5) # delay before we start holding as to not hit the brakes too hard
     self.resume_timer = Timer(0.5)
@@ -568,27 +574,31 @@ class CarController(CarControllerBase):
       return getattr(self.ccp, attr)
 
   def apply_ti_tuning(self, frogpilot_toggles):
-    # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
-    # writing them here takes effect immediately. Falls back to the compiled-in value whenever a
-    # toggle is absent, which keeps older FrogPilot params files working.
-    self.ccp.TI_STEER_MAX = self._ti_limit(frogpilot_toggles, "TI_STEER_MAX", "ti_steer_max")
-    self.ccp.TI_STEER_DELTA_UP = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP", "ti_steer_delta_up")
-    self.ccp.TI_STEER_DELTA_DOWN = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_DOWN", "ti_steer_delta_down")
-    self.ccp.TI_STEER_DRIVER_ALLOWANCE = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_ALLOWANCE", "ti_steer_driver_allowance")
-    self.ccp.TI_STEER_DRIVER_MULTIPLIER = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_MULTIPLIER", "ti_steer_driver_multiplier")
-    self.ccp.TI_STEER_DELTA_UP_KNEE = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_KNEE", "ti_steer_delta_up_knee")
-    # The high-magnitude rate is the REDUCED one by construction. Letting it exceed the base rate
-    # would inverse the whole point -- fast where the unit is suspect, slow where it is proven --
-    # so it is held at or below it rather than trusted to be set sensibly.
-    self.ccp.TI_STEER_DELTA_UP_HIGH = min(
-      self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_HIGH", "ti_steer_delta_up_high"),
-      self.ccp.TI_STEER_DELTA_UP)
-    # Not a ccp field -- carstate applies it to steeringPressed -- but it belongs in the run's
-    # config stamp, because it changes when openpilot decides the driver is overriding and so
-    # changes what the driver_limited counter means.
-    self.ti_steer_threshold = getattr(frogpilot_toggles, "ti_steer_threshold", None)
-    # Absent (older toggles JSON) reads as off.
-    self.ti_dither_enabled = bool(getattr(frogpilot_toggles, "ti_dither", False))
+    # Re-read only when the toggles object is a new one (controlsd / card replace it on every reload; it is never changed in place):
+    # the limits are a pure function of it and of the values set here last time (cost: seven clipped reads every cycle).
+    if frogpilot_toggles is not getattr(self, "ti_tuned_for", None):
+      # The TI limits live on self.ccp, which the rate/driver-torque limiters read every frame, so
+      # writing them here takes effect immediately. Falls back to the compiled-in value whenever a
+      # toggle is absent, which keeps older FrogPilot params files working.
+      self.ccp.TI_STEER_MAX = self._ti_limit(frogpilot_toggles, "TI_STEER_MAX", "ti_steer_max")
+      self.ccp.TI_STEER_DELTA_UP = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP", "ti_steer_delta_up")
+      self.ccp.TI_STEER_DELTA_DOWN = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_DOWN", "ti_steer_delta_down")
+      self.ccp.TI_STEER_DRIVER_ALLOWANCE = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_ALLOWANCE", "ti_steer_driver_allowance")
+      self.ccp.TI_STEER_DRIVER_MULTIPLIER = self._ti_limit(frogpilot_toggles, "TI_STEER_DRIVER_MULTIPLIER", "ti_steer_driver_multiplier")
+      self.ccp.TI_STEER_DELTA_UP_KNEE = self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_KNEE", "ti_steer_delta_up_knee")
+      # The high-magnitude rate is the REDUCED one by construction. Letting it exceed the base rate
+      # would inverse the whole point -- fast where the unit is suspect, slow where it is proven --
+      # so it is held at or below it rather than trusted to be set sensibly.
+      self.ccp.TI_STEER_DELTA_UP_HIGH = min(
+        self._ti_limit(frogpilot_toggles, "TI_STEER_DELTA_UP_HIGH", "ti_steer_delta_up_high"),
+        self.ccp.TI_STEER_DELTA_UP)
+      # Not a ccp field -- carstate applies it to steeringPressed -- but it belongs in the run's
+      # config stamp, because it changes when openpilot decides the driver is overriding and so
+      # changes what the driver_limited counter means.
+      self.ti_steer_threshold = getattr(frogpilot_toggles, "ti_steer_threshold", None)
+      # Absent (older toggles JSON) reads as off.
+      self.ti_dither_enabled = bool(getattr(frogpilot_toggles, "ti_dither", False))
+      self.ti_tuned_for = frogpilot_toggles
     if self.frame % 10 == 0:
       # A/B alternation (ti_ab.py) and the tests exclude each other: the switch is tmpfs, off at every boot. An unreadable
       # switch keeps the last value read; the A/B side independently refuses to run while any test toggle is on.
@@ -703,7 +713,7 @@ class CarController(CarControllerBase):
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
 
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+    if self.flag_ti:
       lag = getattr(self, "ti_lag", None)
       if lag is not None:
         try:
@@ -719,6 +729,9 @@ class CarController(CarControllerBase):
                       "ramp": bool(CS.ti_ramp_down), "version": int(CS.ti_version)}
 
     apply_steer = 0
+    is_ti = getattr(self, "flag_ti", None)        # the cached flag (a host without it: the steering-block tests)
+    if is_ti is None:
+      is_ti = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
     ti_apply_steer = 0
     new_steer = ti_new_steer = 0
     ti_dither = 0
@@ -731,7 +744,7 @@ class CarController(CarControllerBase):
       new_steer = int(round(CC.actuators.steer * self.ccp.STEER_MAX))
       apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last,
                                                      CS.out.steeringTorque, self.ccp)
-      if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      if is_ti:
         ti_new_steer = 0
         if CS.ti_lkas_allowed:
           ti_new_steer = int(round(CC.actuators.steer * self.ccp.TI_STEER_MAX))
@@ -759,6 +772,7 @@ class CarController(CarControllerBase):
             on = self.ti_ident_on
             free = (tests is not None and not self.ti_dither_enabled and (dither is None or dither.envelope == 0.0)
                     and not getattr(self, "ti_ab_on", False))
+            rem_now = tests.remaining if tests is not None else None
             try:
               if free and self.ti_ident_all and not on:
                 # Run all: the scheduler picks the test for the window the car is in, or the nearest one between
@@ -769,8 +783,8 @@ class CarController(CarControllerBase):
                 sched = getattr(self, "ti_sched", None)
                 if sched is None:
                   sched = self.ti_sched = ti_ident_mod.SchedulerCache()
-                rem, can_run, strict = sched.frame(ident, tests.remaining, profile, (id(tests), getattr(tests, "version", None)))
-                armed = self.ti_run_all.pick(self.frame, profile, rem, can_run, strict)
+                rem_now, can_run, strict = sched.frame(ident, tests.remaining, profile, (id(tests), getattr(tests, "version", None)))
+                armed = self.ti_run_all.pick(self.frame, profile, rem_now, can_run, strict, stats=getattr(can_run, "stats", None))
               else:
                 armed = on[0] if (len(on) == 1 and free and not self.ti_ident_all) else None
               self.ti_ident_armed = armed
@@ -782,7 +796,7 @@ class CarController(CarControllerBase):
                 lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, curvature=CC.actuators.curvature,
                 lkas_blocked=getattr(CS, "lkas_blocked", None),
                 room=ti_ident_mod.rate_room(self.ccp, armed) if armed is not None else None,
-                remaining=tests.remaining if tests is not None else None))
+                remaining=rem_now))
             except Exception:
               # Never take the controller down: no signal from this frame on, tests off for the rest of the drive
               ti_ident, ident = 0, None
@@ -807,7 +821,7 @@ class CarController(CarControllerBase):
         self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+    if is_ti:
       # The undithered limiter history; equal to the sent one whenever the dither is idle.
       self.ti_reported_last = ti_apply_steer if ti_reported is None else ti_reported
       self.ti_dither_seen |= self.ti_dither_enabled
@@ -824,7 +838,7 @@ class CarController(CarControllerBase):
           except Exception:
             self.ti_ident_failed()
 
-    if self.CP.flags & MazdaFlags.GEN1:
+    if self.flag_gen1:
       if CC.cruiseControl.cancel:
         # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
         # a race condition with the stock system, where the second cancel from openpilot
@@ -844,7 +858,7 @@ class CarController(CarControllerBase):
 
       # Cruise set-speed check: SET_M / SET_P only, never CANCEL or RESUME, and nothing on a frame where openpilot asks for either
       # (checked again inside). After the existing cancel / resume logic, which it never changes.
-      if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      if self.flag_ti:
         cruise_msg = self.cruise_check_step(CC, CS, ti_apply_steer)
         if cruise_msg is not None:
           can_sends.append(cruise_msg)
@@ -855,10 +869,10 @@ class CarController(CarControllerBase):
         steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
         # TODO: find a way to silence audible warnings so we can add more hud alerts
         steer_required = steer_required and CS.lkas_allowed_speed
-        if not self.CP.flags & MazdaFlags.NO_FSC:
+        if not self.flag_no_fsc:
           can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
 
-      if self.CP.flags & MazdaFlags.RADAR_INTERCEPTOR:
+      if self.flag_radar:
         hold = False
         if CS.out.standstill:
           hold = self.hold_timer.active()
@@ -886,7 +900,7 @@ class CarController(CarControllerBase):
         if self.frame % 2 == 0:
           can_sends.extend(mazdacan.create_radar_command(self.packer, self.frame, CC.longActive, CS, hold))
 
-    elif self.CP.flags & MazdaFlags.GEN2:
+    elif self.flag_gen2:
       raw_acc_output = (CC.actuators.accel * 200) + 2000
       if CC.longActive:
         if self.params.get_bool("BlendedACC"):
@@ -942,11 +956,11 @@ class CarController(CarControllerBase):
     can_sends.extend(mazdacan.create_steering_control(
       self.packer, self.CP,
       self.frame, apply_steer, CS.cam_lkas,
-      ti_apply_steer if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR else None
+      ti_apply_steer if self.flag_ti else None
     ))
 
     new_actuators = CC.actuators.as_builder()
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CS.ti_lkas_allowed:
+    if is_ti and CS.ti_lkas_allowed:
       # While the TI is in RUN it is the actuator that actually steers the car, so report its
       # command rather than the stock LKAS one. torqued fits its model to actuatorsOutput.steer,
       # and the two commands are limited differently (TI_STEER_DELTA_UP vs STEER_DELTA_UP, driver
@@ -966,7 +980,7 @@ class CarController(CarControllerBase):
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX
       new_actuators.steerOutputCan = apply_steer
 
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+    if self.flag_ti:
       # Trigger polls stay at 1Hz -- they are tmpfs reads costing microseconds, and the flag button
       # needs to feel responsive.
       if self.frame % 100 == 0:
@@ -1004,7 +1018,7 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     Timer.tick()
-    if self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+    if is_ti:
       diag = car.CarOutput.MazdaActuatorDiagnostics.new_message()
       diag.version = 1
       diag.latActive = CC.latActive
