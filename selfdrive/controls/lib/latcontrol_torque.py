@@ -572,7 +572,10 @@ class LatControlTorque(LatControl):
     # clip here is not a loss of control and does not deserve a warning. 0 means the car did not
     # publish a reading, which falls through to the old behaviour.
     pid_log.saturated = bool(self._check_saturation(abs(command) >= u_max - 1.0, CS, steer_limited_by_safety,
-                                                    curvature_limited, expected_to_recover=will_recover))
+                                                    curvature_limited, expected_to_recover=False))
+    # PROPOSAL (for the owner's decision, 2026-11-23 drive): the "will recover" mute is no longer applied to the Take Control
+    # warning. `will_recover` reads the 0x075 field the port calls column torque, which is the car's LATERAL ACCELERATION (~100 counts
+    # per m/s^2), so the warning was muted below about 1.77 m/s^2, exactly where this car runs wide. (will_recover still feeds the rest.)
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
