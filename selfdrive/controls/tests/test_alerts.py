@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+from types import SimpleNamespace
 from PIL import Image, ImageDraw, ImageFont
 
 from cereal import log, car
@@ -11,6 +12,9 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.controls.lib.events import Alert, EVENTS, ET
 from openpilot.selfdrive.controls.lib.alertmanager import set_offroad_alert
 from openpilot.selfdrive.test.process_replay.process_replay import CONFIGS
+
+# What controlsd passes as frogpilot_toggles, at the stock defaults the alert callbacks read.
+FROGPILOT_TOGGLES = SimpleNamespace(current_holiday_theme="stock", has_cc_long=False, startup_alert_top="", startup_alert_bottom="")
 
 AlertSize = log.ControlsState.AlertSize
 
