@@ -133,8 +133,8 @@ class FrogPilotPlanner:
     # through the same on-road alert as the advisory (lower speed wins). A driver warning only: nothing is sent to the car.
     self.curve_tick = getattr(self, "curve_tick", 0) + 1
     if self.curve_tick % 5 == 0:
-      self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.monotonic())
-    if getattr(self, "curve_alert_mph", None) and time.monotonic() - self.curve_alert_t < 1.0:
+      self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.time())
+    if getattr(self, "curve_alert_mph", None) and time.time() - self.curve_alert_t < 1.5:
       curve_ms = self.curve_alert_mph * CV.MPH_TO_MS
       self.steer_advisory_speed = min(self.steer_advisory_speed, curve_ms) if self.steer_advisory_speed > 0 else curve_ms
 

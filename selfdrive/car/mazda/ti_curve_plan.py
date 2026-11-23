@@ -189,6 +189,8 @@ CHANGE_MIN_M = 200.0            # judged only once this much has been compared
 CHANGE_BEND_K = 0.0015          # rms curvature (1/m) below which the window is "straight" in both: nothing to judge
 CHANGE_SHIFT_M = 50.0           # the comparison allows the two curvature traces to be offset by up to this along the road
 CHANGE_MIN_CORR = 0.3           # their best correlation below this: the road's shape differs
+CHANGE_FLAT_STD = 0.0006        # curvature spread (1/m) below which a window has no shape: compare levels instead
+CHANGE_LEVEL_SHARE = 0.35       # ... a level less than this share of the other (or the opposite way) differs
 CHANGE_STRIKES = 20             # ... on this many consecutive planner ticks (4 s at 5 Hz) before trust is dropped
 CHANGE_HOLDOFF_M = 150.0        # a distrust costs this much road (was 500 m: 16.5 % of a drive lost to false changes)
 LIVE_K_TAU_S = 0.5              # smoothing of the live curvature (the memory is smoothed over ~10 m)
@@ -449,6 +451,13 @@ class Planner:
       return False
     # tolerant of where along the road the two line up (passes differ by 15 m typically, 50 m at worst) and of how sharp the stored
     # figure is (it is the second-sharpest pass, not this one): the SHAPE must disagree at every shift within CHANGE_SHIFT_M
+    # a long even bend (or a straight) has no shape to correlate: compare LEVELS there (the same bend on both, within a factor)
+    if live.std() < CHANGE_FLAT_STD or rem.std() < CHANGE_FLAT_STD:
+      ml, mr = float(np.mean(live)), float(np.mean(rem))
+      big = max(abs(ml), abs(mr))
+      bad = big >= CHANGE_BEND_K and (ml * mr < 0 or min(abs(ml), abs(mr)) < CHANGE_LEVEL_SHARE * big)
+      self.change_strikes = self.change_strikes + 1 if bad else 0
+      return self.change_strikes >= CHANGE_STRIKES
     best = -1.0
     n = len(live)
     k = int(CHANGE_SHIFT_M / self.mem.spacing)
@@ -583,6 +592,8 @@ class Planner:
           T = int(shed_to[j])
           D = float(dist[j]) - ENTRY_M
           buf = BUFFER_S
+          if set_mph and set_mph > mph:
+            buf += (set_mph - mph) * TAP_S                  # the taps from a set speed above the car's speed come first
           if grade is not None and dist[j] > 0:
             sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
             g = float(np.degrees(np.nanmean(grade[sel]))) if len(sel) else 0.0
@@ -668,6 +679,8 @@ class Planner:
       a_ = self.active.get(key)
       tc = a_["Tc"] if a_ is not None else c["Tc"]
       behind = a_ is not None and a_["mode"] == "behind"
+      if key in self.alerted and key not in self.alerting and mph > tc + ALERT_MARGIN_MPH + 3:
+        self.alerted.discard(key)                 # sped back up above the corner's speed before reaching it: may warn again
       if c.get("trim") or not (tc < floor or behind) or mph <= tc + ALERT_MARGIN_MPH:
         # (a corner known from ONE pass that the model's preview does not confirm never warns: memory alone is not enough)
         if key in self.alerting:

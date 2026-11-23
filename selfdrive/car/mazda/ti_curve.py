@@ -58,6 +58,7 @@ MAX_SHED_MPH = 15                # never more than this below the known speed li
 MIN_MPH = 20.0                   # no press of either kind below this speed, at standstill or with the cruise in its standstill hold
 MPH = 0.44704
 GAS_MAX_S = 1.0                  # gas held longer than this stops the intervention
+OTHER_BUTTON_PAUSE_S = 2.0       # after RES / distance / mode / cancel
 PAUSE_S = 10.0                   # after the driver's own cruise button (owner, first drive: 30 s was too long, "like 10 seconds")
 CLEAR_S = 2.0
 PLAN_STALE_S = 1.0               # planner output older than this is not used (it publishes at 5 Hz)
@@ -148,6 +149,7 @@ class Curve:
     self.restore_wait_since = None
     self.last_set_press = -10 ** 9    # frame of the driver's last SET+ / SET- press
     self.press_plus = False           # the driver's last SET press was SET+
+    self.alert_mph = None             # the on-road warning's corner speed (published; frogpilot shows it)
     self.kept_note = ""               # shown while restoring after a SET+ that stayed below their own set speed
     self.after_brake = False          # a pedal / cruise-off stop left the set speed lowered: restore promptly once the cruise is back
     self.trust_past = False           # trust was lost during an approach and the car has since passed where the corner ended
@@ -293,6 +295,7 @@ class Curve:
     if btn:
       if btn_rose:
         self._cut_tap()
+        self.tap_from = self.tap_to = None       # the driver's own press supersedes any read-back still awaited
         if inp.set_mph is not None and self.ref is not None and inp.set_mph < self.ref and self.left_at is None and \
            (self.intervening() or self.lowered_from is not None):
           # the set speed is below the driver's own: remember it as left lowered, so only their SET+ / SET- can make it the new choice
@@ -305,9 +308,11 @@ class Curve:
         if self.intervening() or self.state in ("ready", "stopped", "waiting"):
           self._ev("driver_button", frame, set_mph=inp.set_mph, ref=self.ref, during=self.state, set_button=bool(inp.driver_set))
         self._end_intervention(frame)
-        self.pause_until = t + PAUSE_S
+        # a SET+ / SET- pauses PAUSE_S; RES, distance, mode, cancel only briefly (after brake + RES the driver's own set speed is
+        # put back promptly, and a warning is never held back)
+        self.pause_until = t + (PAUSE_S if inp.driver_set else OTHER_BUTTON_PAUSE_S)
         self._to(frame, "paused", "you pressed a cruise button")
-      self.line1, self.line2 = "PAUSED: you pressed a cruise button", f"back in {PAUSE_S:.0f} s"
+      self.line1, self.line2 = "PAUSED: you pressed a cruise button", f"back in {max(0.0, (self.pause_until or t) - t):.0f} s"
       return None
     if self.state == "paused":
       if inp.set_mph is not None and inp.cruise_on and (frame - (self.set_stable_since or frame)) * DT >= 1.0:
@@ -487,6 +492,7 @@ class Curve:
       if needs_more and not self.needs_more:
         self._ev("needs_more", frame, ceil=ceil, corner=corner, floor=self.floor, mph=round(inp.mph, 1))
       self.needs_more = needs_more
+      self.alert_mph = self._alert_for(plan, int(corner), inp)
       if inp.set_mph > self.target:
         self._to(frame, "slowing")
         self._lines(inp)
@@ -537,6 +543,15 @@ class Curve:
       return None
     self._to(frame, "ready")
     return self._idle_text(plan, dead=dead)
+
+  def _alert_for(self, plan, corner, inp):
+    """The on-road warning, decided HERE with this side's floor: the corner's speed is below the floor (needs more than it may slow), or
+    the planner says the car will arrive too fast; and the car is above the corner's speed. Relayed through TiCurveStatus."""
+    if plan is None or inp.mph <= corner + P.ALERT_MARGIN_MPH:
+      return None
+    if self.needs_more or plan.get("alert"):
+      return int(plan.get("alert") or corner) if plan.get("alert") else corner
+    return None
 
   def _restore_ok(self, inp, plan):
     if inp.mph < MIN_MPH or inp.standstill:
@@ -684,6 +699,7 @@ class Curve:
       self.off_view(None, None, None, 0.0)
     return {"t": round(wall, 1), "v": 1, "state": self.state, "why": self.why, "line1": self.line1, "line2": self.line2,
             "ref": self.ref, "target": self.target, "floor": self.floor, "set": self.set_last, "needs_more": self.needs_more,
+            "alert": self.alert_mph if self.intervening() else None,
             "down": self.taps_down, "up": self.taps_up}
 
   def off_view(self, plan, plan_age, set_mph, mph):
@@ -716,16 +732,17 @@ class Curve:
 
 
 def read_curve_alert(params_memory, now):
-  """(corner speed mph to warn about, the monotonic time of the planner output) from curve slowing's planner output, or (None, 0)."""
+  """(corner speed mph to warn about, its time) from the CAR SIDE's status (TiCurveStatus: its own floor and needs_more), or (None, 0).
+  `now` is wall time (the status carries time.time())."""
   import json
   try:
-    raw = params_memory.get(PARAM_PLAN)
+    raw = params_memory.get(PARAM_STATUS)
     d = json.loads(raw) if raw else None
-    if not isinstance(d, dict) or d.get("mode") != "act" or not d.get("alert"):
+    if not isinstance(d, dict) or not d.get("alert"):
       return None, 0.0
-    m = float(d.get("m", 0.0))
-    if now - m > 1.0:
+    w = float(d.get("t", 0.0))
+    if now - w > 1.5:
       return None, 0.0
-    return int(d["alert"]), m
+    return int(d["alert"]), w
   except Exception:
     return None, 0.0

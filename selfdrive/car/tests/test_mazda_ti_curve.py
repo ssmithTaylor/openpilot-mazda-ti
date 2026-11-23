@@ -809,3 +809,29 @@ def test_h5_set_plus_from_a_lowered_speed_never_becomes_a_lower_choice():
     return 200 <= f < 210
   run(c2, car2, 2000, lambda f, car: plan(None), driver_button=setm, driver_set=True)
   assert c2.ref == 48
+
+
+def test_r1_warning_uses_the_car_sides_floor_after_brake_and_res():
+  # owner's set speed 55; a brake, RES at 40 with the car at 38; a corner needing 32 (below the car side's floor 40): the car side
+  # warns, from its own floor (the planner's own floor would have been 38 - 15 = 23 and stayed silent)
+  c, car = C.Curve(), Car(55, 55)
+  run(c, car, 2500, lambda f, car: plan(30, corner=30))
+  run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
+  car.mph = 38.0
+  f0 = car.k
+  run(c, car, 300, lambda f, car: plan(32, corner=32, dist=150.0), start=f0, driver_button=lambda f, car: f < f0 + 10,
+      mph=lambda f, car: 38.0)
+  st = c.status(0.0)
+  assert c.ref == 55 and c.floor == 40 and c.needs_more and st["alert"] == 32
+  # nothing to warn about once the car is at the corner's speed
+  run(c, car, 50, lambda f, car: plan(32, corner=32, dist=50.0), start=car.k, mph=lambda f, car: 33.0)
+  assert c.status(0.0)["alert"] is None
+
+
+def test_alert_text_shows_the_true_number():
+  import numpy as np_
+  from types import SimpleNamespace as NS
+  from openpilot.selfdrive.controls.lib import events as E
+  sm = {"frogpilotPlan": NS(steerAdvisorySpeed=float(np_.float32(30 * 0.44704)))}
+  a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
+  assert "needs 30 mph" in a.alert_text_1

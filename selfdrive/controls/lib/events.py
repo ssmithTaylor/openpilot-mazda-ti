@@ -259,7 +259,7 @@ def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   # and each change replayed the chime. Advice reads in round numbers; flooring never advises
   # faster than computed.
   unit_speed = sm['frogpilotPlan'].steerAdvisorySpeed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
-  shown = max(5 * int(unit_speed // 5), 5)
+  shown = max(int(unit_speed + 0.05), 5)       # the true number, rounded down to the unit (a float32 30 mph is 29.99..)
   return Alert(
     f"SLOW DOWN: corner ahead needs {shown} {'km/h' if metric else 'mph'}",
     "The steering cannot hold it at this speed",

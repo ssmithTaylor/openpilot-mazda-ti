@@ -50,7 +50,7 @@ def test_speed_limit_far_above_the_speed_is_not_used():
   assert D.fresh_limit(True, 70 * D.MPH, 45 * D.MPH, True, 0.0, {"t": None}) is None
 
 
-def test_frogpilot_reads_the_curve_warning_only_when_on_and_fresh():
+def test_frogpilot_reads_the_curve_warning_from_the_car_side_when_fresh():
   import json
   from openpilot.selfdrive.car.mazda.ti_curve import read_curve_alert
 
@@ -60,10 +60,9 @@ def test_frogpilot_reads_the_curve_warning_only_when_on_and_fresh():
 
     def get(self, k):
       return json.dumps(self.d).encode() if self.d is not None else None
-  assert read_curve_alert(P_({"mode": "act", "alert": 35, "m": 10.0}), 10.5) == (35, 10.0)
-  assert read_curve_alert(P_({"mode": "shadow", "alert": 35, "m": 10.0}), 10.5)[0] is None   # OFF: no warning
-  assert read_curve_alert(P_({"mode": "act", "alert": 35, "m": 10.0}), 12.0)[0] is None      # stale
-  assert read_curve_alert(P_({"mode": "act", "alert": None, "m": 10.0}), 10.5)[0] is None
+  assert read_curve_alert(P_({"state": "holding", "alert": 35, "t": 10.0}), 10.5) == (35, 10.0)
+  assert read_curve_alert(P_({"state": "off", "alert": None, "t": 10.0}), 10.5)[0] is None       # OFF: never an alert
+  assert read_curve_alert(P_({"state": "holding", "alert": 35, "t": 10.0}), 12.0)[0] is None     # stale
   assert read_curve_alert(P_(None), 10.5)[0] is None
 
 

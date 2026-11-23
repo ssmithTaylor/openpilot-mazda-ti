@@ -451,3 +451,26 @@ def test_h6_change_check_uses_the_median_not_the_conservative_figure():
   res = drive(mem, tr, 45, 150, yaw_fn=lambda t, s, k: k * 1.0 + 0.0003)
   assert not any(p.why == "road differs from memory" for _, _, p in res)
   assert P.CHANGE_HOLDOFF_M <= 150.0
+
+
+def test_r3_long_even_bend_keeps_trust():
+  for radius in (300.0, 450.0, 600.0):
+    tr = road((300, 0.0), (900, 1 / radius), (300, 0.0))
+    mem = M.synthetic([tr])
+    res = drive(mem, tr, 50, 120)
+    assert not any(p.why == "road differs from memory" for _, _, p in res), radius
+  # a real change on an even bend (remembered bend, now straight) is still found
+  tr = road((300, 0.0), (900, 1 / 300.0), (300, 0.0))
+  res = drive(M.synthetic([tr]), tr, 50, 120, yaw_fn=lambda t, s, k: 0.0)
+  assert any(p.why == "road differs from memory" for _, _, p in res)
+
+
+def test_alert_re_arms_when_the_car_speeds_up_again_before_the_corner():
+  tr = road((2500, 0.0), (120, 1 / 70.0), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  first = drive(mem, tr, 60, 30, planner=pl, closed=True)
+  pl.alerted.update(pl.alerting)
+  pl.alerting.clear()
+  res = drive(mem, tr, 60, 200, planner=pl, closed=True, start=first[-1][1])
+  assert any(p.alert_mph for t, s, p, v in res)

@@ -831,7 +831,7 @@ class CarController(CarControllerBase):
       return None
 
   def _curve_publish(self, cv, force=False):
-    key = (cv.state, cv.why, cv.line1, cv.line2)
+    key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph)
     if force or (key != self.curve_published and self.frame % 10 == 5) or self.frame % curve_mod.STATUS_EVERY == 5:
       self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps(cv.status(time.time())))
       self.curve_published = key
