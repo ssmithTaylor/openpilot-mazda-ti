@@ -116,8 +116,15 @@ BASELINE = {
 }
 
 
+# The snapshot is refreshed at most this often (2 Hz). Its sockets are conflated (each keeps only the newest message), so a slower
+# loop loses nothing a caller reads: it used to turn over on every carState message (100 Hz), about a fifth of a core onroad on the
+# core shared with the car controller and controlsd, for values nobody reads more than a few times a second. The park check's
+# SNAPSHOT_MAX_AGE_S (3 s) stays well above this period.
+SNAPSHOT_PERIOD_S = 0.5
+
+
 class Snapshot:
-  """Live values, refreshed on a background thread so HTTP handlers never block on messaging."""
+  """Live values, refreshed on a background thread (at most every SNAPSHOT_PERIOD_S) so HTTP handlers never block on messaging."""
 
   def __init__(self):
     self.lock = threading.Lock()
@@ -131,57 +138,67 @@ class Snapshot:
     with self.lock:
       self.data = data
 
-  def run(self):
-    try:
-      import cereal.messaging as messaging
-    except Exception as e:
-      self.set({"available": False, "reason": f"cereal unavailable: {e}"})
-      return
-
-    sm = messaging.SubMaster(["carState", "carControl", "controlsState",
-                              "liveTorqueParameters", "liveParameters", "liveDelay"])
-    while True:
+  def run(self, sm=None, clock=time.monotonic, sleep=time.sleep, cycles=None):
+    """The refresh loop. sm / clock / sleep / cycles: for the tests (a fake SubMaster and clock, a bounded number of turns)."""
+    if sm is None:
       try:
-        sm.update(1000)
-        cs, cc = sm["carState"], sm["carControl"]
-        ltp, lp, ctl = sm["liveTorqueParameters"], sm["liveParameters"], sm["controlsState"]
-        self.set({
-          "available": True,
-          # Monotonic stamp so a consumer can tell a fresh reading from the last one taken before
-          # this thread wedged. The park check refuses to act on a stale snapshot.
-          "ts": time.monotonic(),
-          "engaged": bool(cc.latActive),
-          "v_ego_ms": round(float(cs.vEgo), 2),
-          # Gear and standstill feed the park check in _refuse_if_driving. Mazda's carstate decodes
-          # both, and openpilot raises wrongGear off the same signal, so this is the car's own
-          # reading rather than something inferred from speed.
-          "gear_shifter": str(cs.gearShifter),
-          "standstill": bool(cs.standstill),
-          "steering_angle_deg": round(float(cs.steeringAngleDeg), 2),
-          "driver_torque": float(cs.steeringTorque),
-          "steer_fault_temporary": bool(cs.steerFaultTemporary),
-          "commanded_steer": round(float(cc.actuators.steer), 4),
-          "curvature": round(float(ctl.curvature), 6),
-          "desired_curvature": round(float(getattr(ctl, "desiredCurvature", 0.0)), 6),
-          "curvature_error": round(float(getattr(ctl, "desiredCurvature", 0.0)) - float(ctl.curvature), 6),
-          "learned_lat_accel_factor": round(float(ltp.latAccelFactorFiltered), 4),
-          "learned_friction": round(float(ltp.frictionCoefficientFiltered), 4),
-          "learned_valid": bool(ltp.liveValid),
-          "learned_in_use": bool(ltp.useParams),
-          "learned_bucket_points": float(ltp.totalBucketPoints),
-          "learned_decay": round(float(ltp.decay), 1),
-          "learned_steer_ratio": round(float(lp.steerRatio), 3),
-          # lagd's live estimate of steering actuator delay. The rate limiter looks exactly like
-          # actuator lag from the controller's point of view, so a learned delay well above the
-          # car port's static 0.1s is quantified evidence the ramp is starving the controller --
-          # and it should re-converge downward if raising the ramp rate genuinely helps.
-          "learned_lateral_delay": round(float(sm["liveDelay"].lateralDelay), 4),
-          "learned_lateral_delay_estimate": round(float(sm["liveDelay"].lateralDelayEstimate), 4),
-          "lateral_delay_status": str(sm["liveDelay"].status),
-          "lateral_delay_valid_blocks": int(sm["liveDelay"].validBlocks),
-        })
+        import cereal.messaging as messaging
       except Exception as e:
-        self.set({"available": False, "reason": str(e)})
+        self.set({"available": False, "reason": f"cereal unavailable: {e}"})
+        return
+      sm = messaging.SubMaster(["carState", "carControl", "controlsState",
+                                "liveTorqueParameters", "liveParameters", "liveDelay"])
+    n = 0
+    while cycles is None or n < cycles:
+      n += 1
+      due = clock() + SNAPSHOT_PERIOD_S
+      self._refresh(sm)
+      wait = due - clock()
+      if wait > 0:
+        sleep(wait)
+
+  def _refresh(self, sm):
+    try:
+      sm.update(1000)
+      cs, cc = sm["carState"], sm["carControl"]
+      ltp, lp, ctl = sm["liveTorqueParameters"], sm["liveParameters"], sm["controlsState"]
+      self.set({
+        "available": True,
+        # Monotonic stamp so a consumer can tell a fresh reading from the last one taken before
+        # this thread wedged. The park check refuses to act on a stale snapshot.
+        "ts": time.monotonic(),
+        "engaged": bool(cc.latActive),
+        "v_ego_ms": round(float(cs.vEgo), 2),
+        # Gear and standstill feed the park check in _refuse_if_driving. Mazda's carstate decodes
+        # both, and openpilot raises wrongGear off the same signal, so this is the car's own
+        # reading rather than something inferred from speed.
+        "gear_shifter": str(cs.gearShifter),
+        "standstill": bool(cs.standstill),
+        "steering_angle_deg": round(float(cs.steeringAngleDeg), 2),
+        "driver_torque": float(cs.steeringTorque),
+        "steer_fault_temporary": bool(cs.steerFaultTemporary),
+        "commanded_steer": round(float(cc.actuators.steer), 4),
+        "curvature": round(float(ctl.curvature), 6),
+        "desired_curvature": round(float(getattr(ctl, "desiredCurvature", 0.0)), 6),
+        "curvature_error": round(float(getattr(ctl, "desiredCurvature", 0.0)) - float(ctl.curvature), 6),
+        "learned_lat_accel_factor": round(float(ltp.latAccelFactorFiltered), 4),
+        "learned_friction": round(float(ltp.frictionCoefficientFiltered), 4),
+        "learned_valid": bool(ltp.liveValid),
+        "learned_in_use": bool(ltp.useParams),
+        "learned_bucket_points": float(ltp.totalBucketPoints),
+        "learned_decay": round(float(ltp.decay), 1),
+        "learned_steer_ratio": round(float(lp.steerRatio), 3),
+        # lagd's live estimate of steering actuator delay. The rate limiter looks exactly like
+        # actuator lag from the controller's point of view, so a learned delay well above the
+        # car port's static 0.1s is quantified evidence the ramp is starving the controller --
+        # and it should re-converge downward if raising the ramp rate genuinely helps.
+        "learned_lateral_delay": round(float(sm["liveDelay"].lateralDelay), 4),
+        "learned_lateral_delay_estimate": round(float(sm["liveDelay"].lateralDelayEstimate), 4),
+        "lateral_delay_status": str(sm["liveDelay"].status),
+        "lateral_delay_valid_blocks": int(sm["liveDelay"].validBlocks),
+      })
+    except Exception as e:
+      self.set({"available": False, "reason": str(e)})
 
 
 snapshot = Snapshot()
