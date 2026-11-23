@@ -32,7 +32,7 @@ SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$DEVICE")
 SCP=(scp -i "$KEY" -o BatchMode=yes)
 T0=$(date +%s)
 stage() { echo; echo "=== [install $(( $(date +%s) - T0 )) s] $*"; }
-run() { if [ $DRY = 1 ]; then printf 'DRY: %q ' "$@"; echo; else "$@"; fi; }
+run() { if [ $DRY = 1 ]; then echo "DRY: $*"; else "$@"; fi; }
 remote() { if [ $DRY = 1 ]; then echo "DRY: ssh $DEVICE $*"; else "${SSH[@]}" "$@"; fi; }
 
 PAUSED=0
@@ -57,7 +57,7 @@ stage "3 push $BRANCH:main"
 run git push origin "$BRANCH:main"
 
 stage "4 comma: pull"
-OLD=$(remote "cd $REMOTE_DIR && git rev-parse HEAD" || echo "")
+if [ $DRY = 1 ]; then OLD="<commit on the comma before the pull>"; else OLD=$(remote "cd $REMOTE_DIR && git rev-parse HEAD" || echo ""); fi
 remote "cd $REMOTE_DIR && git pull --ff-only"
 
 stage "5 comma: build (login shell)"
