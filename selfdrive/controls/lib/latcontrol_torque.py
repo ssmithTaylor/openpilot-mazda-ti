@@ -453,7 +453,7 @@ class LatControlTorque(LatControl):
     # identify tire grip or prove that another steering shape cannot recover. In the cited route
     # 00000283 plateau, changing internal boost was clipped away from the constant outgoing command.
     col_trq = abs(float(getattr(fp_car_state, "columnTorque", 0.0) or 0.0))
-    will_recover = 0.0 < col_trq < (BREAKAWAY_TORQUE - BREAKAWAY_MARGIN)
+    # (will_recover, the lateral-acceleration "rack will recover" test, no longer mutes Take Control: removed, PROPOSAL)
     at_authority_latch = col_trq >= BREAKAWAY_TORQUE
 
     # The breaker needs sustained tracking error, low wheel rate and no pressed/limiting gate.
@@ -487,8 +487,8 @@ class LatControlTorque(LatControl):
     self.break_boost += float(_clip(delta, -step, step))
     command = float(_clip(command + self.break_boost, -u_max, u_max))
 
-    # (col_trq / will_recover computed above the breaker. PROPOSAL: will_recover no longer mutes the saturation report; it is
-    # still computed and kept only for comparison in the diagnostics.)
+    # (PROPOSAL: the "will recover" mute of the saturation report is removed;
+    # a clip at the limit counts like any other.)
 
     # Optional output smoothing. The filter tracks the command even while it is switched off, so
     # turning it on mid-corner continues from where the command already is instead of stepping
