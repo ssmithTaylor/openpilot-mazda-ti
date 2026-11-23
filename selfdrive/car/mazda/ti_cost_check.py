@@ -4,13 +4,14 @@
     python3 selfdrive/car/mazda/ti_cost_check.py [--cycles 3000] [--budget-us 300]
 
 Times CarController.update (the real modules: carcontroller, ti_ident, ti_tests, ti_plan, ti_dither, ti_lag, ti_cruise_check,
-mazdacan) for a few thousand simulated 10 ms cycles in four modes, with an in-memory params store (nothing is read from or written to
+ti_curve, mazdacan) for a few thousand simulated 10 ms cycles in four modes, with an in-memory params store (nothing is read from or written to
 the device's params, no CAN is sent, no message queue is opened):
   plan off           TiPlanOn off: the controller as without the tests
   plan on, ab        the plan in its A/B mode: the tests held
   tests mode, idle   the plan in its tests mode, the car in a test window, the road too curved for any test: the scheduler runs, no signal
   tests mode, run    the plan in its tests mode on a straight road in a window: a test signal runs
-Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
+Then curve slowing (ti_curve.py, plan off) in three modes: off, on with no corner, on and tapping (exit 1 over budget, 2 when no tap
+was sent in the working mode). Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
 with a block running, plan on in its tests mode. Then controlsd's lateral controller (plan off) with its scalar helpers in plain
 Python and, for comparison, with the numpy calls they replaced; the two must give bit-identical outputs (exit 1 otherwise). Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
 budget on average (default 300 us per cycle), 2 when the measurement is not valid (the running mode never ran a test).
@@ -125,6 +126,56 @@ def run_mode(name, plan_mode, mph, curvature, cycles):
   times.sort()
   return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
           "max_us": round(times[-1], 1), "test_running_share": round(ran / len(times), 3)}
+
+
+def run_curve(name, mode, cycles, count=False, warm=300):
+  """Curve slowing (ti_curve.py) in the car controller, plan off: "off" (the switch off: the 10 Hz read only), "on, no corner" (on, the
+  planner says no corner ahead), "on, working" (on, a corner ceiling 15 mph below the set speed that is lifted and given again every
+  10 s, so taps are sent and read back all along). The planner's output is written to the in-memory store as the planner would (5 Hz).
+  count: calls per cycle (as count_mode) instead of times."""
+  from openpilot.selfdrive.car.mazda import ti_curve as tc
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  cc, mem = make_controller()
+  seen = {"taps": 0}
+  ccm.ti_curve_log = lambda ev: seen.__setitem__("taps", seen["taps"] + (ev.get("kind") == "tap"))   # this process only
+  clock = {"k": 0}
+  # the cycles run back to back here, faster than 10 ms apart: the car controller's monotonic clock is the simulated one (the tap
+  # machinery enforces its gaps on real time too, which would otherwise hold every tap after the first)
+  ccm.time = NS(monotonic=lambda: clock["k"] * 0.01, time=time.time, perf_counter=time.perf_counter)
+  toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
+  CC, CS = inputs(55.0, 0.0003)
+  cs = CS.out.cruiseState
+  times, py, c = [], 0, 0
+  for k in range(cycles + warm):
+    clock["k"] = k
+    if k % 20 == 0:
+      mem.put(tc.PARAM_ON, b"1" if mode != "off" else b"0")
+      corner = mode == "on, working" and (k // 1000) % 2 == 0
+      mem.put(tc.PARAM_PLAN, json.dumps({"m": k * 0.01, "seq": k, "mode": "act", "ceil": 40 if corner else None, "conf": 1.0,
+                                         "trusted": True, "known": True, "why": "", "dist": 100.0, "past": not corner,
+                                         "model_la": 0.1, "model_k": 0.0003, "capped": False, "limit": None, "kind": "corner",
+                                         "corner": 40 if corner else None}))
+    if k % 10 == 3:
+      CS.crz_btns_counter = (CS.crz_btns_counter + 1) % 16
+    cv = cc.curve
+    if cv is not None and cv.tap_to is not None and cv.tap_first is not None and k - cv.tap_first >= 8:
+      cs.speed = cv.tap_to * 0.44704                    # the car reads the step back 80 ms after the tap
+      CS.out.vEgo = cs.speed
+    if count and k >= warm:
+      _, p_, c_ = _counting(lambda: cc.update(CC, CS, k * 10_000_000, toggles))
+      py, c = py + p_, c + c_
+    else:
+      t0 = time.perf_counter_ns()
+      cc.update(CC, CS, k * 10_000_000, toggles)
+      dt = time.perf_counter_ns() - t0
+      if k >= warm:
+        times.append(dt / 1000.0)
+  ccm.time = time
+  if count:
+    return {"mode": name, "py": round(py / cycles, 1), "c": round(c / cycles, 1), "total": round((py + c) / cycles, 1), "taps": seen["taps"]}
+  times.sort()
+  return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
+          "max_us": round(times[-1], 1), "taps": seen["taps"], "state": cc.curve.state if cc.curve is not None else "absent"}
 
 
 def _counting(fn):
@@ -295,6 +346,17 @@ def main():
           f"  test running {100 * r['test_running_share']:.0f} %")
     if r["mode"].startswith("tests") and r["added_mean_us"] > a.budget_us:
       bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
+  cur = [run_curve("curve: off", "off", a.cycles), run_curve("curve: on, no corner", "on, no corner", a.cycles),
+         run_curve("curve: on, working", "on, working", max(a.cycles, 4000))]
+  for r in cur:
+    r["added_mean_us"] = round(r["mean_us"] - base, 1)
+    print(f"{r['mode']:22s} mean {r['mean_us']:8.1f} us  p99 {r['p99_us']:8.1f} us  max {r['max_us']:8.1f} us  added {r['added_mean_us']:7.1f} us"
+          f"  taps {r['taps']}  state {r['state']}")
+    if r["added_mean_us"] > a.budget_us:
+      bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
+  if cur[2]["taps"] < 10:
+    print("NOT VALID: curve slowing sent no taps in its working mode")
+    return 2
   ctl = [run_controls("controls: plan off", False, 45.0, a.cycles),
          run_controls("controls: plan on, ab", True, 45.0, a.cycles),
          run_controls("controls: plan on, tests", True, 70.0, a.cycles)]
@@ -317,7 +379,7 @@ def main():
       bad.append("the lateral controller's outputs differ between the numpy and the plain-Python helpers")
   except Exception as e:                                     # the car-side numbers stand without it
     print(f"lateral controller not timed: {type(e).__name__}: {e}")
-  print(json.dumps({"results": res, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
+  print(json.dumps({"results": res, "curve": cur, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
   if res[3]["test_running_share"] < 0.2:
     print("NOT VALID: no test signal ran in the running mode")
     return 2

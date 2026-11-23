@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Curve slowing planner process (ti_curve_plannerd): runs ti_curve_plan.Planner at 5 Hz, OUTSIDE the two 100 Hz control processes, at
+normal priority, kept off the control core (core 4: card and controlsd), and publishes its small output to the tmpfs param
+ti_curve.PARAM_PLAN for the car controller (ti_curve.py). It always runs while onroad: with curve slowing OFF it is the SHADOW mode (it
+plans and logs what it would have done; the car controller sends nothing).
+
+Reads: liveLocationKalman (position, heading, validity), carState (speed, set speed), modelV2 (the driving model's predicted curvature
+over the next seconds), frogpilotPlan.slcMapSpeedLimit (the road's speed limit from the offline maps; 0 = unknown), the car's yaw
+sensor from CAN 0x075 (bytes 4-5, -0.00017243 rad/s per count, offset 3.1032, right positive; the newest frame in the latest CAN
+batch, else liveLocationKalman's calibrated yaw rate). The road memory: MEMORY_PATH, copied to the device by hand (it is private: where
+the owner has driven); without it the planner publishes "no road memory on the device" and nothing happens.
+
+Logs (`ti_curve_plan` channel): every change of the decision (ceiling, kind, trusted, reason) and the planner's events (lock, lock lost,
+road changed, corner start with the planned and actual speed and the grade, mode changes, corner passed), and a summary every 5 s.
+Never a position: trace and point indices, distances, speeds and curvatures only.
+"""
+import json
+import math
+import os
+import time
+
+MEMORY_PATH = "/data/ti_curve/curve_memory_v1.npz"
+RATE_HZ = 5.0
+SUMMARY_S = 5.0
+CONTROL_CORE = 4
+MPH = 0.44704
+YAW_SCALE, YAW_OFF = -0.00017243215217366658, 3.103220229446863
+
+
+def yaw_from_can(can_msg):
+  """Left-positive yaw rate (rad/s) from the newest 0x075 frame on bus 0 of one CAN batch, or None."""
+  for f in reversed(can_msg):
+    if f.address == 0x75 and f.src == 0 and len(f.dat) >= 6:
+      raw = (f.dat[4] << 8) | f.dat[5]
+      return -(raw * YAW_SCALE + YAW_OFF)
+  return None
+
+
+def model_curvature(m):
+  """(seconds, curvature 1/m) of the model's preview: orientation rate z / speed x, or None."""
+  try:
+    z, vx, t = m.orientationRate.z, m.velocity.x, m.orientationRate.t
+    if len(z) < 2 or len(z) != len(vx) or len(z) != len(t):
+      return None
+    return [float(x) for x in t], [float(a) / max(float(b), 3.0) for a, b in zip(z, vx)]
+  except Exception:
+    return None
+
+
+def keep_off_control_core():
+  try:
+    cores = [c for c in os.sched_getaffinity(0) if c != CONTROL_CORE]
+    if cores:
+      os.sched_setaffinity(0, cores)
+  except Exception:
+    pass
+
+
+def main():
+  import cereal.messaging as messaging
+  from cereal import log
+  LLK_VALID = log.LiveLocationKalman.Status.valid
+  from openpilot.common.params import Params
+  from openpilot.common.realtime import Ratekeeper
+  from openpilot.common.swaglog import cloudlog
+  from openpilot.selfdrive.car.mazda import ti_curve as tc, ti_curve_memory as M, ti_curve_plan as P
+
+  keep_off_control_core()
+  params_memory = Params("/dev/shm/params")
+  mem, why_none = None, ""
+  t0 = time.monotonic()
+  try:
+    if os.path.exists(MEMORY_PATH):
+      mem = M.load(MEMORY_PATH)
+    else:
+      why_none = "no road memory on the device"
+  except Exception as e:
+    why_none = f"road memory unreadable: {type(e).__name__}"
+    cloudlog.exception("ti_curve_plan memory")
+  cloudlog.event("ti_curve_plan", kind="memory", loaded=mem is not None, why=why_none, seconds=round(time.monotonic() - t0, 2),
+                 traces=getattr(mem, "n_traces", 0), points=getattr(mem, "n", 0))
+  planner = P.Planner(mem)
+  sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can"])
+  rk = Ratekeeper(RATE_HZ, print_delay_threshold=None)
+  seq = 0
+  last_key, last_summary = None, 0.0
+  yaw, yaw_t = None, -1e9
+  cpu = []
+  while True:
+    sm.update(0)
+    t = time.monotonic()
+    c0 = time.process_time()
+    try:
+      if sm.updated["can"]:
+        y = yaw_from_can(sm["can"])
+        if y is not None:
+          yaw, yaw_t = y, t
+      llk = sm["liveLocationKalman"]
+      ok = bool(sm.alive["liveLocationKalman"] and llk.gpsOK and llk.positionGeodetic.valid and llk.status == LLK_VALID)
+      fix = P.Fix(False)
+      if ok and mem is not None:
+        x, y_ = mem.to_local(llk.positionGeodetic.value[0], llk.positionGeodetic.value[1])
+        fix = P.Fix(True, float(x), float(y_), P.bearing_to_hdg(math.degrees(llk.calibratedOrientationNED.value[2])))
+      cs = sm["carState"]
+      set_mph = cs.cruiseState.speed / MPH if cs.cruiseState.enabled and cs.cruiseState.speed > 0.5 else None
+      yaw_k = None
+      v = float(cs.vEgo)
+      if v > 3.0:
+        if yaw is not None and t - yaw_t < 0.5:
+          yaw_k = yaw / v
+        else:
+          try:
+            yaw_k = -float(llk.angularVelocityCalibrated.value[2]) / v
+          except Exception:
+            yaw_k = None
+      limit = None
+      try:
+        lim = float(sm["frogpilotPlan"].slcMapSpeedLimit)
+        limit = lim / MPH if lim > 0.5 else None
+      except Exception:
+        limit = None
+      plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit)
+      on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
+      d = P.plan_json(plan, t, seq, "act" if on else "shadow")
+      params_memory.put(tc.PARAM_PLAN, json.dumps(d))
+      seq += 1
+      for ev in planner.events:
+        cloudlog.event("ti_curve_plan", mode=d["mode"], **ev)
+      planner.events.clear()
+      key = (d["ceil"], d["kind"], d["trusted"], d["why"], d["capped"])
+      if key != last_key:
+        cloudlog.event("ti_curve_plan", kind="decision", **d, mph=round(v / MPH, 1), set_mph=set_mph, trace=plan.trace, point=plan.point)
+        last_key = key
+      cpu.append(time.process_time() - c0)
+      if t - last_summary >= SUMMARY_S:
+        cpu.sort()
+        cloudlog.event("ti_curve_plan", kind="summary", mode=d["mode"], trusted=d["trusted"], known=d["known"], why=d["why"],
+                       cpu_ms_mean=round(1000 * sum(cpu) / max(1, len(cpu)), 3), cpu_ms_max=round(1000 * cpu[-1], 3) if cpu else None,
+                       yaw_source="car" if (yaw is not None and t - yaw_t < 0.5) else "locationd")
+        cpu, last_summary = [], t
+    except Exception:
+      cloudlog.exception("ti_curve_plan step")       # the car controller treats a missing / old output as planner stopped
+    rk.keep_time()
+
+
+if __name__ == "__main__":
+  main()

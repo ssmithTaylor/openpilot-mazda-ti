@@ -1191,6 +1191,7 @@ void TestsWindow::refresh() {
   tests.poll(frogpilotUIState()->frogpilot_toggles);
   abPoll();                  // the plan line is on both pages
   cruisePoll();              // the cruise check: its page, and whether START and the switches wait for it
+  curvePoll();               // curve slowing: what the car controller reports (its page shows only that)
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
     // the tests are held for a reason of the plan or the alternation: say it, not "another test is on"
     const QString text = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
@@ -1234,6 +1235,9 @@ int TestsWindow::rowHeight() const {
 }
 
 ti_pages::Page TestsWindow::pageNow() const {
+  if (curve_page) {
+    return ti_pages::Page::Curve;
+  }
   if (cruise_page) {
     return ti_pages::Page::Cruise;
   }
@@ -1335,6 +1339,7 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
 void TestsWindow::goHome() {
   abOpen();                // the set-up page's unconfirmed draft is dropped: the first page shows, and START runs, what is saved
   cruise_page = false;
+  curve_page = false;
   home_page = true;
   setup_page = false;
   progress_page = false;
@@ -1434,6 +1439,11 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
   }
   if (control == CTL_NAV_CRUISE || control == CTL_CRUISE_RUN || control == CTL_CRUISE_STOP) {
     cruiseAct(control);
+    refresh();
+    return;
+  }
+  if (control == CTL_NAV_CURVE || control == CTL_CURVE_SWITCH) {
+    curveAct(control);
     refresh();
     return;
   }
@@ -2261,6 +2271,7 @@ void TestsWindow::cruiseOpen() {
   progress_page = false;
   ab_page = false;
   cruise_page = true;
+  curve_page = false;
 }
 
 void TestsWindow::cruisePoll() {
@@ -2367,6 +2378,75 @@ void TestsWindow::drawCruise(QPainter &p) {
   drawEngagedBadge(p, qr(HOME_BADGE));
 }
 
+// ---- curve slowing's page ---------------------------------------------------------------------------------------------------
+// The one control writes the switch (TiCurveOn, tmpfs) and nothing else. Everything shown, the control's label included, comes from
+// the car controller's report (TiCurveStatus); the switch is never read here.
+void TestsWindow::curveOpen() {
+  home_page = false;
+  setup_page = false;
+  progress_page = false;
+  ab_page = false;
+  cruise_page = false;
+  curve_page = true;
+}
+
+void TestsWindow::curvePoll() {
+  ti_pages::CurveView v;
+  const QJsonObject st = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(ti_pages::TI_CURVE_STATUS_KEY))).object();
+  v.have = st.value("state").isString();
+  if (v.have) {
+    const double age = QDateTime::currentMSecsSinceEpoch() / 1000.0 - st.value("t").toDouble(-1e9);
+    v.fresh = age > -ti_pages::CURVE_STALE_S && age < ti_pages::CURVE_STALE_S;
+    v.state = st.value("state").toString().toStdString();
+    v.line1 = st.value("line1").toString().toStdString();
+    v.line2 = st.value("line2").toString().toStdString();
+    v.needs_more = st.value("needs_more").toBool(false);
+  }
+  curve_view = v;
+}
+
+void TestsWindow::curveAct(int control) {
+  using namespace ti_pages;
+  if (control == CTL_NAV_CURVE) {
+    curveOpen();
+    return;
+  }
+  curvePoll();
+  if (control == CTL_CURVE_SWITCH) {
+    ab_memory.put(TI_CURVE_ON_KEY, curveLook(curve_view).write);   // "1" only when the car reports it off; else "0"
+  }
+}
+
+void TestsWindow::drawCurve(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  const CurveLook look = curveLook(curve_view);
+  drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< START\nPAGE"), NAV_PX);
+  drawTitle(p, qr(CURVE_TITLE), QString("CURVE SLOWING"), 90);
+  drawBox2(p, ctlRect(CTL_CURVE_SWITCH), look.write[0] == '1' ? toneQColor(Tone::Done) : QColor(201, 34, 49), white,
+           QString::fromStdString(look.button), STOP_PX, QString::fromStdString(look.button_sub), START_SUB_PX);
+
+  // the status band: orange to warn (stopped, a corner needing more, no report), green while on, grey while off
+  const Tone tone = look.warn ? Tone::Held : (look.on ? Tone::Running : Tone::Stopped);
+  const ToneColor tc = toneColor(tone);
+  const QColor ink = tc.light ? QColor(0, 0, 0) : white;
+  p.setPen(Qt::NoPen);
+  p.setBrush(tone == Tone::Stopped ? grey : toneQColor(tone));
+  p.drawRoundedRect(qr(CURVE_BAND), 24, 24);
+  p.setPen(ink);
+  p.setFont(InterFont(CURVE_PRIMARY_PX, QFont::Bold));
+  const QRect l1 = look.primary2.empty() ? QRect(CURVE_PRIMARY1.x, CURVE_PRIMARY1.y, CURVE_PRIMARY1.w, CURVE_PRIMARY2.bottom() - CURVE_PRIMARY1.y)
+                                         : qr(CURVE_PRIMARY1);
+  p.drawText(l1.adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.primary1));
+  if (!look.primary2.empty()) {
+    p.drawText(qr(CURVE_PRIMARY2).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.primary2));
+  }
+  p.setFont(InterFont(CURVE_SECOND_PX, QFont::DemiBold));
+  p.drawText(qr(CURVE_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.second));
+  drawEngagedBadge(p, qr(HOME_BADGE));
+}
+
 // The first page while the check runs: START is covered by what it waits for (the car's report decides, never this page)
 void TestsWindow::drawCruiseBusy(QPainter &p) {
   using namespace ti_pages;
@@ -2415,6 +2495,11 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     }
   };
 
+  if (curve_page) {
+    drawCurve(p);
+    lockBorder();
+    return;
+  }
   if (cruise_page) {
     drawCruise(p);
     lockBorder();
@@ -2434,6 +2519,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   if (progress_page) {
     drawProgress(p);
     drawBox(p, ctlRect(CTL_NAV_CRUISE), grey, white, QString("CRUISE\nCHECK >"), NAV_PX);   // the cruise check's own page
+    drawBox(p, ctlRect(CTL_NAV_CURVE), grey, white, QString("CURVE\nSLOWING >"), NAV_PX);   // curve slowing's own page
     lockBorder();
     return;
   }

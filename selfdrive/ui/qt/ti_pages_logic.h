@@ -76,7 +76,7 @@ inline int gapBetween(const Rect &a, const Rect &b) {
   return std::max(gx, gy);
 }
 
-enum class Page { Home, Setup, Tests, Overview, Ab, Progress, Cruise };
+enum class Page { Home, Setup, Tests, Overview, Ab, Progress, Cruise, Curve };
 
 // Control ids (also the ids the mouse handler works with)
 enum Ctl {
@@ -111,6 +111,8 @@ enum Ctl {
   CTL_NAV_CRUISE = 45,   // on the progress page: the cruise set-speed check's own page
   CTL_CRUISE_RUN = 60,   // the cruise check's page: RUN CHECK (one press arms one run)
   CTL_CRUISE_STOP = 61,  // ... STOP CHECK
+  CTL_NAV_CURVE = 46,    // on the progress page: curve slowing's own page
+  CTL_CURVE_SWITCH = 62, // curve slowing's page: TURN ON / TURN OFF (its label from the car controller's report)
 };
 
 struct Control {
@@ -177,6 +179,12 @@ inline int layout(Page pg, int error_lines, Control *out) {
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
       add(CTL_NAV_INDIV, 20, 330, 360, 180, "INDIVIDUAL TESTS");
       add(CTL_NAV_CRUISE, 20, 590, 360, 180, "CRUISE CHECK");
+      add(CTL_NAV_CURVE, 20, 850, 360, 180, "CURVE SLOWING");
+      break;
+    case Page::Curve:                         // curve slowing: its own page and one control, never START
+      add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
+      add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
+      add(CTL_CURVE_SWITCH, 20, 270, 2120, 230, "TURN ON / TURN OFF");
       break;
     case Page::Cruise:                        // the cruise set-speed check: its own page and its own two controls, never START
       add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
@@ -1507,6 +1515,107 @@ inline CruiseLook cruiseLook(const CruiseView &v, const std::string &others) {
   k.second = "Not run since controls started";
   k.detail1 = "Engage with stock cruise on at 30-70 mph, no car ahead, then tap RUN CHECK";
   k.detail2 = "Taps set-minus then set-plus, 3 times; stops itself after 40 s";
+  return k;
+}
+
+// ---- curve slowing's page (selfdrive/car/mazda/ti_curve.py) ---------------------------------------------------------------------
+// Everything shown comes from what the car controller publishes (TiCurveStatus: Curve.status()): its line1 is the primary line,
+// its line2 the second line, word for word (cut only when longer than the space). The one control writes the switch (TiCurveOn,
+// tmpfs: "1" on for this drive, "0" off) and nothing else; its label comes from the car's report, never from the switch: the state
+// "off" offers TURN ON, any other state TURN OFF. No fresh report: TURN OFF (it can always switch off, never on). Which other mode
+// keeps curve slowing waiting is decided by the car side and said in its lines.
+const char *const TI_CURVE_ON_KEY = "TiCurveOn";
+const char *const TI_CURVE_STATUS_KEY = "TiCurveStatus";
+constexpr Rect CURVE_TITLE = {400, 10, 1340, 180};
+constexpr Rect CURVE_BAND = {20, 540, 2120, 420};        // the status band: two primary lines and the second line
+constexpr Rect CURVE_PRIMARY1 = {20, 550, 2120, 125};
+constexpr Rect CURVE_PRIMARY2 = {20, 675, 2120, 125};
+constexpr Rect CURVE_SECOND = {20, 820, 2120, 120};
+constexpr int CURVE_PRIMARY_PX = 100;
+constexpr int CURVE_SECOND_PX = 64;
+constexpr int MAX_CURVE_PRIMARY_CHARS = 27;               // per line; line1 takes up to two lines
+constexpr int MAX_CURVE_SECOND_CHARS = 52;
+constexpr double CURVE_STALE_S = CRUISE_STALE_S;          // a report older than this is no report
+
+struct CurveView {
+  bool have = false;                // a status block could be read
+  bool fresh = false;               // ... and it is recent (CURVE_STALE_S)
+  std::string state;                // off ready slowing holding restoring paused stopped waiting (the controller's own word)
+  std::string line1, line2;
+  bool needs_more = false;
+};
+
+struct CurveLook {
+  std::string word;                 // the controller's state, or "noreport"
+  std::string primary1, primary2;   // line1 in very large type, on one or two lines
+  std::string second;               // line2 in large type
+  bool warn = false;                // warning colour: stopped, a corner that needs more than may be shed, or no report
+  bool on = false;                  // the band says curve slowing is on (any state but "off" in a fresh report)
+  std::string button;               // TURN ON / TURN OFF
+  std::string button_sub;
+  const char *write = "0";          // what the control writes to TiCurveOn
+};
+
+// A line cut to max characters: the cut end is "..." (the controller's lines are written to fit; this only guards the space)
+inline std::string curveCut(const std::string &t, int max) {
+  if ((int)t.size() <= max) {
+    return t;
+  }
+  return t.substr(0, std::max(0, max - 3)) + "...";
+}
+
+// line1 on at most two lines of max characters: one line when it fits; else broken after "STATE:" when both parts fit; else at the
+// last space that fits; what still does not fit is cut on the second line. Joined with one space the lines give line1 back
+// (or its start, when cut).
+inline void curveWrap(const std::string &t, int max, std::string &l1, std::string &l2) {
+  l1.clear();
+  l2.clear();
+  if ((int)t.size() <= max) {
+    l1 = t;
+    return;
+  }
+  const size_t colon = t.find(": ");
+  if (colon != std::string::npos && (int)colon + 1 <= max && (int)(t.size() - colon - 2) <= max) {
+    l1 = t.substr(0, colon + 1);
+    l2 = t.substr(colon + 2);
+    return;
+  }
+  size_t brk = t.rfind(' ', (size_t)max);
+  if (brk == std::string::npos || brk == 0) {
+    l1 = t.substr(0, max);
+    l2 = curveCut(t.substr(max), max);
+    return;
+  }
+  l1 = t.substr(0, brk);
+  l2 = curveCut(t.substr(brk + 1), max);
+}
+
+inline CurveLook curveLook(const CurveView &v) {
+  CurveLook k;
+  if (!v.have || !v.fresh) {
+    k.word = "noreport";
+    curveWrap("CURVE SLOWING: no report from the car", MAX_CURVE_PRIMARY_CHARS, k.primary1, k.primary2);
+    k.second = "TURN OFF still switches it off";
+    k.warn = true;
+    k.button = "TURN OFF";
+    k.button_sub = "No report from the car: this only switches it off";
+    k.write = "0";
+    return k;
+  }
+  k.word = v.state;
+  curveWrap(v.line1, MAX_CURVE_PRIMARY_CHARS, k.primary1, k.primary2);
+  k.second = curveCut(v.line2, MAX_CURVE_SECOND_CHARS);
+  k.warn = v.state == "stopped" || v.needs_more;
+  k.on = v.state != "off";
+  if (k.on) {
+    k.button = "TURN OFF";
+    k.button_sub = "Curve slowing is on: tap to switch it off";
+    k.write = "0";
+  } else {
+    k.button = "TURN ON";
+    k.button_sub = "For this drive: off again after every restart";
+    k.write = "1";
+  }
   return k;
 }
 

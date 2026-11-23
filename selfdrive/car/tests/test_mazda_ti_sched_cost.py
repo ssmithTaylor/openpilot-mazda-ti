@@ -334,3 +334,19 @@ def test_the_current_code_is_frame_for_frame_the_95e17e3_code_through_publish_re
     assert new[0] == old[0] and new[1] == old[1] and new[2] == old[2] and new[3] == old[3], mode
   assert len(new[4]) > 10                              # the version moved (credits, publishes, the reload, the reset, the failure)
   assert any(a is not None for a in old[0][:12000]) and all(a is None for a in old[0][12501:])   # ran, and nothing after the failure
+
+
+# Curve slowing (ti_curve.py) per car-controller cycle, plan off. Measured on the PC (Python 3.14) when added: switch off adds a few
+# calls on 1 frame in 10 only; on with no corner and on while tapping stay well under the tests mode's own additions.
+_CURVE_ADD_BOUNDS = {"curve: off": 6, "curve: on, no corner": 60, "curve: on, working": 60}
+
+
+def test_curve_slowing_operation_count_stays_under_its_bound():
+  spec = importlib.util.spec_from_file_location("ti_cost_check_for_curve", HERE.parents[0] / "mazda" / "ti_cost_check.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  base = mod.count_mode(None, 55.0, 0.0003, cycles=200)
+  got = {m: mod.run_curve(m, m.split(": ")[1], 2000, count=True) for m in _CURVE_ADD_BOUNDS}
+  assert got["curve: on, working"]["taps"] >= 5
+  for m, bound in _CURVE_ADD_BOUNDS.items():
+    assert got[m]["py"] - base["py"] <= bound, (m, got[m], base)

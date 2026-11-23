@@ -123,6 +123,9 @@ procs = [
   NativeProcess("classic_modeld", "frogpilot/classic_modeld", ["./classic_modeld"], run_classic_modeld),
   PythonProcess("comma_logs_notifier", "frogpilot.system.comma_logs_notifier", run_comma_logs_notifier),
   PythonProcess("frogpilot_process", "frogpilot.frogpilot_process", always_run),
+  # Curve slowing planner (selfdrive/car/mazda/ti_curve_plannerd.py): 5 Hz, normal priority, off the control core; shadow unless the
+  # Tests page switches curve slowing on, and the car controller alone sends any button
+  PythonProcess("ti_curve_plannerd", "selfdrive.car.mazda.ti_curve_plannerd", only_onroad),
   PythonProcess("mapd", "frogpilot.navigation.mapd", always_run),
   PythonProcess("speed_limit_filler", "frogpilot.system.speed_limit_filler", run_speed_limit_filler),
   PythonProcess("the_pond", "frogpilot.system.the_pond.the_pond", always_run),

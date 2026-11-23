@@ -344,3 +344,41 @@ def test_hold_ceiling_never_slows_and_caps_restore():
   c, car = C.Curve(), Car(55, 55)
   run(c, car, 6000, lambda f, car: plan(40) if f < 2000 else plan(41, kind="hold"))
   assert car.history[-1][1] == 40                       # under 2 mph: not worth a restore
+
+
+# ---- the car controller's hook (carcontroller.curve_step), with the cost check's in-memory params ---------------------------------
+def _controller():
+  import importlib.util
+  import pathlib
+  spec = importlib.util.spec_from_file_location("ti_cost_check_for_curve_hook",
+                                                pathlib.Path(__file__).parents[1] / "mazda" / "ti_cost_check.py")
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def test_controller_clears_the_switch_at_start_and_starts_off():
+  mod = _controller()
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  store = mod.MemParams({C.PARAM_ON: b"1", C.PARAM_STATUS: b"{}"})
+  orig = ccm.Params
+  ccm.Params = lambda path=None: store if path and "shm" in str(path) else mod.MemParams()
+  try:
+    from types import SimpleNamespace as NS
+    from openpilot.selfdrive.car.mazda.values import MazdaFlags
+    cc = ccm.CarController("mazda_2017", NS(flags=int(MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR), carFingerprint="MAZDA_CX5",
+                                            carName="mazda"), None)
+  finally:
+    ccm.Params = orig
+  assert C.PARAM_ON not in store.d and C.PARAM_STATUS not in store.d
+  assert cc.curve is not None and cc.curve.state == "off" and not cc.curve_on
+
+
+def test_controller_sends_taps_only_when_on_and_excludes_the_cruise_check():
+  mod = _controller()
+  on = mod.run_curve("curve: on, working", "on, working", 2000)
+  off = mod.run_curve("curve: off", "off", 2000)
+  assert on["taps"] >= 5 and off["taps"] == 0
+  cc, mem = mod.make_controller()
+  cc.curve_on = True
+  assert cc.cruise_others_on() == "curve slowing is on"

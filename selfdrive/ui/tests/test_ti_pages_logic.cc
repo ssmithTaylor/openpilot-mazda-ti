@@ -13,7 +13,7 @@ using namespace ti_pages;
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { if (failures < 40) std::printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
-static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress, Page::Cruise};
+static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress, Page::Cruise, Page::Curve};
 
 static int minDim(const Rect &r) { return std::min(r.w, r.h); }
 
@@ -33,7 +33,8 @@ static void layoutRules() {
           CHECK(!overlaps(c[i].r, c[j].r));
           CHECK(gapBetween(c[i].r, c[j].r) >= MIN_GAP);
           const bool stop = c[i].id == CTL_STOP || c[j].id == CTL_STOP || c[i].id == CTL_ALLOFF || c[j].id == CTL_ALLOFF ||
-                           c[i].id == CTL_CRUISE_STOP || c[j].id == CTL_CRUISE_STOP;
+                           c[i].id == CTL_CRUISE_STOP || c[j].id == CTL_CRUISE_STOP || c[i].id == CTL_CURVE_SWITCH ||
+                           c[j].id == CTL_CURVE_SWITCH;
           if (stop) {
             CHECK(gapBetween(c[i].r, c[j].r) >= STOP_GAP);
           }
@@ -815,8 +816,86 @@ static void cruiseRules() {
   CHECK(cruiseLook(cruiseView("idle"), "").run_enabled && cruiseLook(cruiseView("idle"), "").word == "idle");
 }
 
+// Curve slowing's page: one large control, its label from the car's report; the lines are the controller's, cut only to the space
+static void curveRules() {
+  Control c[MAX_CONTROLS];
+  const int n = layout(Page::Curve, 0, c);
+  Rect sw{};
+  for (int i = 0; i < n; i++) {
+    CHECK(c[i].id != CTL_START && c[i].id != CTL_STOP && c[i].id != CTL_CRUISE_RUN);
+    CHECK(minDim(c[i].r) >= BIG_MIN);
+    if (c[i].id == CTL_CURVE_SWITCH) sw = c[i].r;
+    for (const Rect &b : {CURVE_TITLE, CURVE_BAND, CURVE_PRIMARY1, CURVE_PRIMARY2, CURVE_SECOND, HOME_BADGE}) {
+      CHECK(!overlaps(b, c[i].r));
+    }
+  }
+  CHECK(sw.w * 10 >= SCREEN_W * 9 && sw.h >= 220);
+  CHECK(!overlaps(CURVE_BAND, HOME_BADGE) && CURVE_BAND.bottom() <= SCREEN_H);
+  Rect nav{}, cruise{};
+  CHECK(rectOf(Page::Progress, CTL_NAV_CURVE, 0, nav) && rectOf(Page::Progress, CTL_NAV_CRUISE, 0, cruise));
+  CHECK(minDim(nav) >= BIG_MIN && gapBetween(nav, cruise) >= 80);
+  Control h[MAX_CONTROLS];
+  const int hn = layout(Page::Home, 0, h);
+  for (int i = 0; i < hn; i++) CHECK(h[i].id != CTL_CURVE_SWITCH && h[i].id != CTL_NAV_CURVE);
+  CHECK(MAX_CURVE_PRIMARY_CHARS * CURVE_PRIMARY_PX * 0.75 <= CURVE_PRIMARY1.w);
+  CHECK(MAX_CURVE_SECOND_CHARS * CURVE_SECOND_PX * 0.62 <= CURVE_SECOND.w);
+  CHECK(CURVE_PRIMARY_PX >= 100 && CURVE_SECOND_PX >= 60);
+
+  // the longest lines ti_curve.py writes, and every state, fresh or not
+  const char *states[] = {"off", "ready", "slowing", "holding", "restoring", "paused", "stopped", "waiting"};
+  const char *l1s[] = {"CURVE SLOWING OFF", "ON: no known corner ahead", "ON: road not known here", "SLOWING FOR A CORNER: 100 -> 25 mph",
+                       "HOLDING FOR THE NEXT CORNER: 100 mph", "RESTORING: 25 -> 100 mph", "PAUSED: you changed the set speed",
+                       "STOPPED: set speed changed to 100 mph unexpectedly", "STOPPED: brake pressed", "ON: waiting", ""};
+  const char *l2s[] = {"", "CORNER NEEDS MORE THAN I MAY SLOW: be ready", "Set speed 100 mph (was 100): set it yourself",
+                       "shadow: the planner only logs", "next corner: holding what it needs", "the model sees a bend ahead"};
+  for (const char *st : states) {
+    for (const char *l1 : l1s) {
+      for (const char *l2 : l2s) {
+        for (bool fresh : {true, false}) {
+          for (bool more : {false, true}) {
+            CurveView v;
+            v.have = true;
+            v.fresh = fresh;
+            v.state = st;
+            v.line1 = l1;
+            v.line2 = l2;
+            v.needs_more = more;
+            const CurveLook k = curveLook(v);
+            CHECK((int)k.primary1.size() <= MAX_CURVE_PRIMARY_CHARS && (int)k.primary2.size() <= MAX_CURVE_PRIMARY_CHARS);
+            CHECK((int)k.second.size() <= MAX_CURVE_SECOND_CHARS);
+            if (fresh) {
+              // the controller's own words, whole (every line it writes fits)
+              CHECK((k.primary2.empty() ? k.primary1 : k.primary1 + " " + k.primary2) == l1);
+              CHECK(k.second == l2);
+              CHECK(k.word == st);
+              CHECK((k.button == "TURN OFF") == (std::string(st) != "off"));
+              CHECK(std::string(k.write) == (std::string(st) == "off" ? "1" : "0"));
+              CHECK(k.warn == (std::string(st) == "stopped" || more));
+            } else {
+              CHECK(k.word == "noreport" && k.button == "TURN OFF" && std::string(k.write) == "0" && k.warn);
+              CHECK(k.primary1 + " " + k.primary2 == "CURVE SLOWING: no report from the car");
+            }
+          }
+        }
+      }
+    }
+  }
+  CurveView none;
+  CHECK(curveLook(none).word == "noreport" && std::string(curveLook(none).write) == "0");
+  // a line longer than the space is cut, never wrapped past two lines
+  std::string a, b;
+  curveWrap("SLOWING FOR A CORNER: 55 -> 46 mph", MAX_CURVE_PRIMARY_CHARS, a, b);
+  CHECK(a == "SLOWING FOR A CORNER:" && b == "55 -> 46 mph");
+  curveWrap("STOPPED: set speed changed to 46 mph unexpectedly", MAX_CURVE_PRIMARY_CHARS, a, b);
+  CHECK(a == "STOPPED: set speed changed" && b == "to 46 mph unexpectedly");
+  curveWrap(std::string(80, 'X'), MAX_CURVE_PRIMARY_CHARS, a, b);
+  CHECK((int)a.size() == MAX_CURVE_PRIMARY_CHARS && (int)b.size() == MAX_CURVE_PRIMARY_CHARS && b.substr(b.size() - 3) == "...");
+  CHECK(curveCut(std::string(60, 'y'), MAX_CURVE_SECOND_CHARS).size() == (size_t)MAX_CURVE_SECOND_CHARS);
+}
+
 int main() {
   cruiseRules();
+  curveRules();
   layoutRules();
   homeRules();
   fontsFit();

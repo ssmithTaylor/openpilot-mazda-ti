@@ -36,6 +36,12 @@ try:
   from openpilot.selfdrive.car.mazda import ti_cruise_check as cruise_check_mod
 except Exception:
   cruise_check_mod = None
+try:
+  # Curve slowing (ti_curve.py): lowers the cruise set speed before remembered corners; switched on only by its own control on the
+  # Tests pages, for the drive. Optional: without the module nothing here changes (self.curve is None).
+  from openpilot.selfdrive.car.mazda import ti_curve as curve_mod
+except Exception:
+  curve_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -79,6 +85,15 @@ def ti_ident_log(event):
     cloudlog.event("ti_ident", **event)
   except Exception:
     pass
+
+def ti_curve_log(event):
+  """Curve slowing's steps (start, tap with its frames, step read back, stop with why, restored, needs_more, state) into the log."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_curve", **event)
+  except Exception:
+    pass
+
 
 def ti_cruise_log(event):
   """The cruise set-speed check's steps (armed, waiting, tap with its frames and counters, accepted, aborted, result) into the log."""
@@ -165,6 +180,20 @@ class CarController(CarControllerBase):
     self.cruise_started_wall = time.time()
     self.cruise_trigger = None
     self.cruise_published = None
+    # Curve slowing: gen1 with the interceptor only. OFF after every start of this process: the switch and the status are cleared here.
+    self.curve = (curve_mod.Curve()
+                  if curve_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CP.flags & MazdaFlags.GEN1 else None)
+    self.curve_on = False
+    self.curve_plan = None
+    self.curve_plan_age = None
+    self.curve_plan_read = None
+    self.curve_published = None
+    if self.curve is not None:
+      for key in (curve_mod.PARAM_ON, curve_mod.PARAM_STATUS):
+        try:
+          self.params_memory.remove(key)
+        except Exception:
+          pass
     if self.cruise_check is not None:
       for key in (cruise_check_mod.PARAM_TRIGGER, cruise_check_mod.PARAM_STATUS):
         try:
@@ -648,6 +677,8 @@ class CarController(CarControllerBase):
       return "a test is on"
     if self.ti_dither_enabled:
       return "the dither test is on"
+    if getattr(self, "curve_on", False):
+      return "curve slowing is on"
     return ""
 
   def cruise_check_step(self, CC, CS, ti_apply_steer):
@@ -709,6 +740,82 @@ class CarController(CarControllerBase):
       except Exception:
         pass
       return None
+
+  def curve_step(self, CC, CS):
+    """One frame of curve slowing: the button frame to send, or None. Reads the switch and the planner's output at 10 Hz (frames
+    ending in 5, apart from the other 10 Hz reads), publishes the status on change (at most 10 Hz) and every second, logs every step.
+    While the switch is off and nothing is in progress it does only the 10 Hz read. Never raises: after an error curve slowing is off
+    for the rest of this process and says so."""
+    cv = self.curve
+    if cv is None:
+      return None
+    read = self.frame % 10 == 5
+    if not read and not self.curve_on and cv.state == "off":
+      return None
+    try:
+      mod = curve_mod
+      now = time.monotonic()
+      if read:
+        self.curve_on = self.params_memory.get(mod.PARAM_ON) in (b"1", "1")
+        raw = self.params_memory.get(mod.PARAM_PLAN) if (self.curve_on or cv.state != "off") else None
+        plan = None
+        if raw:
+          try:
+            plan = json.loads(raw)
+          except Exception:
+            plan = None
+        if isinstance(plan, dict) and isinstance(plan.get("m"), (int, float)):
+          self.curve_plan, self.curve_plan_read = plan, now
+          self.curve_plan_age = max(0.0, now - float(plan["m"]))
+        elif raw is None:
+          self.curve_plan = None
+      if not self.curve_on and cv.state == "off":
+        if read and (self.curve_published is None or self.frame % 100 == 5):
+          self._curve_publish(cv, force=True)
+        return None
+      age = None
+      if self.curve_plan is not None and self.curve_plan_read is not None:
+        age = self.curve_plan_age + (now - self.curve_plan_read)
+      out = CS.out
+      cruise = out.cruiseState
+      speed = float(cruise.speed or 0.0)
+      counter = getattr(CS, "crz_btns_counter", None)
+      chk = self.cruise_check
+      inp = mod.Inputs(
+        on=self.curve_on, engaged=bool(CC.enabled), cruise_on=bool(cruise.enabled), cruise_available=bool(cruise.available),
+        mph=float(out.vEgo) * CV.MS_TO_MPH, set_mph=int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None,
+        brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
+        driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
+        cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
+        check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now)
+      button = cv.step(self.frame, inp)
+      if cv.events:
+        for ev in cv.events:
+          ti_curve_log(ev)
+        cv.events.clear()
+      self._curve_publish(cv)
+      if button is None or inp.cancel_req or inp.resume_req:
+        return None
+      return mazdacan.create_button_cmd(self.packer, self.CP, inp.counter, Buttons.SET_MINUS if button == "SET_MINUS" else Buttons.SET_PLUS)
+    except Exception:
+      self.curve = None
+      try:
+        self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps({"t": round(time.time(), 1), "v": 1, "state": "stopped",
+                                                                   "line1": "CURVE SLOWING STOPPED", "line2": "internal error: off until restart"}))
+      except Exception:
+        pass
+      try:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.exception("ti_curve disabled")
+      except Exception:
+        pass
+      return None
+
+  def _curve_publish(self, cv, force=False):
+    key = (cv.state, cv.why, cv.line1, cv.line2)
+    if force or (key != self.curve_published and self.frame % 10 == 5) or self.frame % curve_mod.STATUS_EVERY == 5:
+      self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps(cv.status(time.time())))
+      self.curve_published = key
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     can_sends = []
@@ -862,6 +969,10 @@ class CarController(CarControllerBase):
         cruise_msg = self.cruise_check_step(CC, CS, ti_apply_steer)
         if cruise_msg is not None:
           can_sends.append(cruise_msg)
+        # Curve slowing: SET_M / SET_P only, never on a frame the cruise check sends (one button frame per control frame at most)
+        curve_msg = self.curve_step(CC, CS)
+        if curve_msg is not None and cruise_msg is None:
+          can_sends.append(curve_msg)
 
       # send HUD alerts
       if self.frame % 50 == 0:
