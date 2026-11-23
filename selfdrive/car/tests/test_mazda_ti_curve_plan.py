@@ -324,3 +324,12 @@ def test_memory_roundtrip(tmp_path):
   M.save(p, bad, {})
   with pytest.raises(ValueError):
     M.load(p)
+
+
+def test_each_corner_is_started_once_even_when_the_car_does_not_slow():
+  # the driver holds the speed (gas, or the cruise cannot slow): the corner is started once, not again as its points are passed
+  tr = road((1500, 0.0), (100, 1 / 200.0), (60, 0.0), (100, -1 / 120.0), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  drive(mem, tr, 60, 200, planner=pl)
+  assert sum(1 for e in pl.events if e["kind"] == "start") <= 2

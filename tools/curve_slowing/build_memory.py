@@ -80,7 +80,9 @@ STUDY = 'E:/openpilot-mazda-ti-data/remembered-roads-20261123'
 SEG20 = 'E:/openpilot-mazda-ti-data/codex-designs-20261123/_work/seg20'
 OPEN_SEGS = 'E:/openpilot-mazda-ti-data/cruise-slowing-20261122/open_segs.json'
 RLOG_ROOT = 'E:/openpilot-mazda-ti-data'
-RELEASES = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'mazda_sim', 'releases'))
+# the simulator's release records (the reserved / kept-back segments the all-drives build must never open); --releases or the
+# CURVE_RELEASES environment variable (worker processes inherit it) when they are not beside this tool
+RELEASES = os.environ.get('CURVE_RELEASES') or os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'mazda_sim', 'releases'))
 KEPT_BACK = {'0000033b': lambda s: s % 3 == 1, '0000033c': lambda s: s % 3 == 1}   # releases g / h: kept back as test data, unread
 
 DT = 0.05
@@ -1020,7 +1022,11 @@ def main():
   ap.add_argument('--check', action='store_true', help='position-free validation printout')
   ap.add_argument('--source', choices=('gate', 'all'), default='gate',
                   help="gate: the seg20 gate-checked set (default; LOO and replay); all: every recorded drive on this PC (on-car memory)")
+  ap.add_argument('--releases', default=None, help='folder of the simulator release records (default: tools/mazda_sim/releases)')
   a = ap.parse_args()
+  if a.releases:
+    global RELEASES
+    RELEASES = os.environ['CURVE_RELEASES'] = a.releases
   low_priority()
   os.makedirs(_p('cache'), exist_ok=True)
   workers = max(1, min(a.workers, 6))

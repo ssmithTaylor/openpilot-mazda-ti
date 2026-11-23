@@ -492,7 +492,9 @@ class Planner:
       for s0, s1 in zip(starts, ends):
         run = tight[s0:s1 + 1]
         lowest = run[int(np.argmin(need[run]))]
-        key = int(idx[lowest])
+        # a corner is known by the END of its tight stretch: it stays the same while the car drives into the stretch (its first and
+        # lowest points ahead change as they are passed), so a corner is started once
+        key = int(idx[run[-1]])
         for j in {int(run[0]), int(lowest)}:
           T = int(shed_to[j])
           D = float(dist[j]) - ENTRY_M
