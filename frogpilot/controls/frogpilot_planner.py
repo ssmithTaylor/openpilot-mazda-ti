@@ -136,7 +136,8 @@ class FrogPilotPlanner:
       self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.time())
     if getattr(self, "curve_alert_mph", None) and time.time() - self.curve_alert_t < 1.5:
       curve_ms = self.curve_alert_mph * CV.MPH_TO_MS
-      self.steer_advisory_speed = min(self.steer_advisory_speed, curve_ms) if self.steer_advisory_speed > 0 else curve_ms
+      if self.steer_advisory_speed <= 0 or curve_ms <= self.steer_advisory_speed:
+        self.steer_advisory_speed = -curve_ms     # NEGATIVE marks the curve-slowing warning (its own text, its exact number)
 
     # NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
     # lateral acceleration sensor, about 96-103 counts per m/s^2 (so 202 counts is roughly 2.1 m/s^2), and it includes road

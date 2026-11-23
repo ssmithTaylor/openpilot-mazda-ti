@@ -231,7 +231,7 @@ class FrogPilotEvents:
     # Steering-authority advisory and the stopped-steering latch. The planner has computed and
     # published both on frogpilotPlan since the feature landed, but nothing ever consumed them --
     # the driver's "it never warns me" was literal. These adds are the entire display path.
-    if self.frogpilot_planner.steer_advisory_speed > 0:
+    if self.frogpilot_planner.steer_advisory_speed != 0:       # > 0 the corner advisory, < 0 curve slowing's warning
       self.events.add(FrogPilotEventName.steerAuthorityAdvisory)
 
     # TI dropout: the interceptor left RUN while lateral was active. On the recorded 0x11 event

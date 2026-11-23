@@ -273,6 +273,7 @@ class Plan(NamedTuple):
   end_m: Optional[float] = None   # a corner in progress: metres to the END of its tight stretch (dist_m is to its start)
   behind: bool = False            # the car is slowing less than planned (not the same as capped)
   alert_mph: Optional[int] = None # warn the driver: the corner ahead needs this speed and the feature will not get there
+  need_mph: Optional[int] = None  # the corner's TRUE need (envelope, proven speed), NOT clamped to the floor (corner_mph is)
   trace: int = -1
   point: int = -1
 
@@ -609,13 +610,14 @@ class Planner:
     for key, c in cands.items():
       if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
         self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
-                            "since": t, "start_t": t}
+                            "since": t, "start_t": t, "start_over": mph - c["va"]}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
                             "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
       self.events.append({"kind": "passed", "point": key, "T": self.active[key]["T"], "mph": round(mph, 1)})
       del self.active[key]
     ceil, cdist, cpt, kind, corner = None, None, -1, "", None
+    need_true = None
     cend = None
     behind = False
     for key, a_ in self.active.items():
@@ -629,7 +631,7 @@ class Planner:
       if mode != "target":
         if mph <= T + RAISE_AT_MPH:
           mode = "target"
-        elif mph > va + BEHIND_MPH and t - a_["start_t"] >= BEHIND_GRACE_S:
+        elif mph > va + BEHIND_MPH and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
           mode = "behind"
         elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
           mode = "coast"
@@ -645,6 +647,7 @@ class Planner:
         behind = True
       if ceil is None or cc < ceil:
         ceil, cdist, cpt, kind, corner = cc, round(max(0.0, a_["entry"] - self.odo), 1), key, "corner", T
+        need_true = a_["Tc"]
         cend = round(a_["at"] - self.odo, 1)
     if not self.active:
       # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
@@ -667,6 +670,7 @@ class Planner:
     why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if (cdist or 0) > 0 else "in the corner")
     self.end_m = cend
     self.behind = behind
+    self.need_out = need_true
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold")
 
@@ -712,8 +716,10 @@ class Planner:
     end, self.end_m = self.end_m, None
     behind, self.behind = self.behind, False
     alert, self.alert = self.alert, None
+    need, self.need_out = getattr(self, "need_out", None), None
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
-                self.limit, self.model_k, kind, end, behind, alert, self.trace, point)
+                self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
+                point)
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -722,4 +728,5 @@ def plan_json(plan, t_mono, seq, mode):
           "known": plan.known, "why": plan.why, "dist": plan.dist_m, "past": plan.past,
           "model_la": None if plan.model_la is None else round(plan.model_la, 2), "capped": plan.capped,
           "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
-          "corner": plan.corner_mph, "end": plan.end_m, "behind": plan.behind, "alert": plan.alert_mph}
+          "corner": plan.corner_mph, "end": plan.end_m, "behind": plan.behind, "alert": plan.alert_mph,
+          "need": None if plan.need_mph is None else int(plan.need_mph)}

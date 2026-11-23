@@ -787,7 +787,7 @@ def test_pause_after_a_driver_button_is_10_s():
   assert C.PAUSE_S == 10.0
 
 
-def test_h5_set_plus_from_a_lowered_speed_never_becomes_a_lower_choice():
+def test_m2_any_set_press_defines_the_drivers_speed():
   c, car = C.Curve(), Car(55, 55)
   run(c, car, 2500, lambda f, car: plan(30, corner=30))                     # lowered to 40
   run(c, car, 50, lambda f, car: plan(None), start=2500, brake=True, cruise_on=False)
@@ -799,7 +799,8 @@ def test_h5_set_plus_from_a_lowered_speed_never_becomes_a_lower_choice():
     return f < f0 + 10 or f0 + 295 <= f < f0 + 305
   run(c, car, 3000, lambda f, car: plan(None), start=f0, driver_button=res_then_setplus,
       driver_set=lambda f, car: f0 + 295 <= f < f0 + 305, driver_set_plus=lambda f, car: f0 + 295 <= f < f0 + 305)
-  assert c.ref == 55 and car.history[-1][1] == 55                           # their 55 stands, and comes back
+  # M2 (reviewed rule restored): any SET press defines their speed; the page says it went down; never raised above it
+  assert c.ref == 49 and max(h[1] for h in car.history if h[0] > f0 + 400) <= 49
   # SET- below is a real new choice
   c2, car2 = C.Curve(), Car(55, 55)
 
@@ -832,6 +833,9 @@ def test_alert_text_shows_the_true_number():
   import numpy as np_
   from types import SimpleNamespace as NS
   from openpilot.selfdrive.controls.lib import events as E
-  sm = {"frogpilotPlan": NS(steerAdvisorySpeed=float(np_.float32(30 * 0.44704)))}
+  sm = {"frogpilotPlan": NS(steerAdvisorySpeed=-float(np_.float32(30 * 0.44704)))}   # negative: curve slowing's warning
   a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
-  assert "needs 30 mph" in a.alert_text_1
+  assert a.alert_text_1 == "SLOW DOWN: corner ahead needs 30 mph"
+  sm = {"frogpilotPlan": NS(steerAdvisorySpeed=float(np_.float32(33 * 0.44704)))}    # the model advisory: 5-mph steps as before
+  a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
+  assert a.alert_text_1 == "Slow to 30 mph for the corner ahead"

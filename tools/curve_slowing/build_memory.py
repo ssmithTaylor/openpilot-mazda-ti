@@ -113,7 +113,7 @@ TK_M = 60.0
 TK_DRV = 5.0                   # driver-torque counts
 TK_SUSTAIN = 10               # 0.5 s at 20 Hz
 TK_FOLLOW = 40                # 2 s
-TK_STOP_MPH, TK_STOP_M = 10.0, 150.0
+TK_STOP_MPH, TK_STOP_M = 19.0, 150.0   # a takeover that ends in a stop or below 19 mph within 150 m is a stop, not trouble
 BEND_KAP = 0.002               # takeover and lane-line flags are spread only over points of a real bend (stored |kap| >= this)
 EVENT_SLACK = 20               # 20 Hz samples: an event belongs to a piece within 1 s of it (s5_pieces)
 LINK_DIST_M = 20.0
@@ -165,8 +165,8 @@ def run_events(ti, lat_act, pressed, en, drv, brk=None, v=None, s=None):
     w = slice(a, min(len(la), b + TK_FOLLOW))
     if not ((~la[w]).any() or (~e[w]).any()):
       continue
-    if brk is not None and (np.asarray(brk)[w] > .5).any():
-      continue
+    # M4: a brake in the window is the owner's protocol for taking over (brake to disengage), so it does NOT discard a takeover; only
+    # a brake that goes on to a stop or below TK_STOP_MPH (the stop rule below) does, and the flag is spread over real bends only
     if v is not None and s is not None:
       ahead = (np.asarray(s) >= s[a]) & (np.asarray(s) <= s[a] + TK_STOP_M)
       if (np.asarray(v)[ahead] < TK_STOP_MPH * 0.44704).any():

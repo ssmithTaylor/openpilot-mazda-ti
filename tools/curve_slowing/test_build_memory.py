@@ -286,11 +286,14 @@ def test_takeover_not_a_brake_to_a_stop():
   v = np.full(n, 15.0)
   s = np.r_[0, np.cumsum(v[:-1] * B.DT)]
   assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v, s=s)[1]) == [100]
-  brk2 = brk.copy(); brk2[125] = 1.0                            # disengaged by the brake
-  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v, s=s)[1]) == 0
-  v2 = v.copy(); v2[150:] = 2.0                                  # stops within 150 m (onset at 75 m, stop from ~111 m)
+  brk2 = brk.copy(); brk2[125] = 1.0                            # disengaged by the brake (the owner's protocol) at speed: STILL trouble
+  assert list(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v, s=s)[1]) == [100]
+  v2 = v.copy(); v2[150:] = 2.0                                  # ... but a brake that goes on to a stop within 150 m is not
   s2 = np.r_[0, np.cumsum(v2[:-1] * B.DT)]
-  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk, v=v2, s=s2)[1]) == 0
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v2, s=s2)[1]) == 0
+  v3 = v.copy(); v3[150:] = 7.0                                  # nor one that slows below 19 mph within 150 m (a junction)
+  s3 = np.r_[0, np.cumsum(v3[:-1] * B.DT)]
+  assert len(B.run_events(ti, lat, pressed, en, drv, brk=brk2, v=v3, s=s3)[1]) == 0
 
 
 def test_kap_med_and_loader_fallback(tmp_path):

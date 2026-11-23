@@ -312,7 +312,7 @@ def test_plan_json_has_no_position():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 30)
   d = P.plan_json(res[-1][2], 12.0, 7, "shadow")
-  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner", "end", "behind", "alert"}
+  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner", "end", "behind", "alert", "need"}
 
 
 def test_memory_roundtrip(tmp_path):
