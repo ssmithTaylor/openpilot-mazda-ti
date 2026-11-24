@@ -40,6 +40,16 @@ GENTLE_TAP_S = 1.0              # the car side's stage-3 tap pacing (about 1 mph
 TURN_MIN_LA = 0.3               # below this |desired| (else |measured|) lateral acceleration there is no turn to lose
 MPH = 0.44704
 VIOL_NAMES = {0x11: "stuck request"}
+# The stuck-request guard (ti_stuck_guard, carcontroller: on the FINAL command, before this monitor reads it) moves an unchanged sent
+# value STUCK_NUDGE counts toward zero for STUCK_NUDGE_FRAMES frames. Exactly +-600 is never nudged, but a saturated value at the
+# band's edge (590 / 591 at TiSteerMax 600: 588 / 589) and, below TiSteerMax 118, the clipped command itself would leave the band and
+# reset the hold. A dip of at most SAT_GRACE_COUNTS below the band lasting at most SAT_GRACE_FRAMES, straight after a saturated frame,
+# is therefore still "at the limit" (Job 4, 2026-11-24); a real fall off the limit (larger or longer) resets as before.
+try:
+  from openpilot.selfdrive.car.mazda import ti_stuck_guard as _SG
+  SAT_GRACE_COUNTS, SAT_GRACE_FRAMES = _SG.STUCK_NUDGE, _SG.STUCK_NUDGE_FRAMES
+except ImportError:                                   # the guard's module absent: its constants as merged (2 counts, 2 frames)
+  SAT_GRACE_COUNTS, SAT_GRACE_FRAMES = 2, 2
 ASK_LEADS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)   # the planner's Plan.ask profile leads (s)
 
 
@@ -92,6 +102,7 @@ class DeliveryMonitor:
     self.why = ""
     self.need = None
     self.sat_s = 0.0
+    self.grace_n = 0              # consecutive frames bridged by the guard-nudge grace
     self.lim_s = 0.0
     self.drop_s = 0.0
     self.off_s_ti = 0.0
@@ -105,6 +116,13 @@ class DeliveryMonitor:
   def _paths(self, inp):
     """(limit, dropout, ti_off) raw conditions this frame, and the remaining forecast seconds."""
     sat = inp.lat_active and inp.ti_max > 0 and abs(inp.ti_cmd) >= SAT_SHARE * inp.ti_max
+    if sat:
+      self.grace_n = 0
+    elif (inp.lat_active and inp.ti_max > 0 and self.sat_s > 0.0 and self.grace_n < SAT_GRACE_FRAMES and
+          abs(inp.ti_cmd) >= SAT_SHARE * inp.ti_max - SAT_GRACE_COUNTS - 1e-9):
+      sat, self.grace_n = True, self.grace_n + 1      # a stuck-guard nudge, not a fall off the limit
+    else:
+      self.grace_n = 0
     des = inp.desired_la if inp.desired_la is not None else 0.0
     now = inp.la_now if inp.la_now is not None else 0.0
     turn = _sign(des) if abs(des) >= TURN_MIN_LA else (_sign(now) if abs(now) >= TURN_MIN_LA else 0.0)

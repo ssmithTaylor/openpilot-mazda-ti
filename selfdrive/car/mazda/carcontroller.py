@@ -8,6 +8,7 @@ from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
 from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags, TI_STATE, TI_LIMIT_BOUNDS
 from openpilot.selfdrive.car.mazda.ti_dither import ACTIVE_PRESET as TI_DITHER_PRESET, TiDither, gate_reason, rate_room
+from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard
 try:
   # On-car tests: optional. If the module cannot be imported, the tests are off and this controller runs exactly as
   # without them (self.ti_tests is None).
@@ -87,6 +88,19 @@ def ti_ident_log(event):
   except Exception:
     pass
 
+# Stuck-request guard events: at most one per this many frames (10 s), each carrying the running burst count.
+TI_STUCK_LOG_EVERY_FRAMES = 1000
+
+
+def ti_stuck_log(event):
+  """A stuck-request guard nudge (ti_stuck_guard.py) into the log, rate limited by the caller: {kind, frame, value, sent, bursts}."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_stuck_guard", **event)
+  except Exception:
+    pass
+
+
 def ti_curve_log(event):
   """Curve slowing's steps (start, tap with its frames, step read back, stop with why, restored, needs_more, state) into the log."""
   try:
@@ -143,6 +157,9 @@ class CarController(CarControllerBase):
     self.ti_dither = TiDither()
     self.ti_dither_enabled = False
     self.ti_reported_last = 0
+    # Stuck-request guard (ti_stuck_guard.py): on the final TI command, just before it is packed. Interceptor cars only.
+    self.ti_stuck_guard = StuckGuard() if self.flag_ti else None
+    self.ti_stuck_logged = None        # frame of the last ti_stuck_guard event (rate limit)
     # On-car tests (ti_tests.py, definitions in ti_tests.json): counts each enabled test's metric for the Tests
     # screen. Outside the command path: it only reads what this controller already computed. None when the file
     # holds no valid test or the module is missing, and on every car without the interceptor.
@@ -911,6 +928,7 @@ class CarController(CarControllerBase):
     if is_ti is None:
       is_ti = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
     ti_apply_steer = 0
+    ti_unguarded = 0     # the TI command before the stuck-request guard (equal to the sent one except on a nudge frame)
     new_steer = ti_new_steer = 0
     ti_dither = 0
     ti_ident = 0         # the identification tests' counts (ti_ident.py); zero whenever none runs
@@ -997,6 +1015,18 @@ class CarController(CarControllerBase):
         # the TI has left RUN or is ramping down, which are the frames the health counters exist
         # to catch. Gating on it would make them structurally unreachable.
         self.record_ti_stats(CS, ti_new_steer, ti_apply_steer)
+    ti_unguarded = ti_apply_steer
+    guard = getattr(self, "ti_stuck_guard", None)   # getattr: the steering-block tests' minimal hosts have no guard
+    if is_ti and guard is not None:
+      # Stuck-request guard, on the FINAL command (after the limiters, the dither and the tests): a value other than 0 / +-600 sent
+      # unchanged for STUCK_HOLD_S is moved STUCK_NUDGE counts toward zero for STUCK_NUDGE_FRAMES frames, so the interceptor never
+      # sees the ~1.9 s unchanged request that trips its 0x11 fault. The value sent becomes the limiter's history below, so the step
+      # back up is the limiter's own.
+      ti_apply_steer = guard.update(ti_apply_steer, bool(CC.latActive and CS.ti_lkas_allowed), now=now_nanos * 1e-9)
+      if guard.burst_started and (self.ti_stuck_logged is None or self.frame - self.ti_stuck_logged >= TI_STUCK_LOG_EVERY_FRAMES):
+        self.ti_stuck_logged = self.frame
+        ti_stuck_log({"kind": "nudge", "frame": self.frame, "value": int(ti_unguarded), "sent": int(ti_apply_steer),
+                      "bursts": guard.bursts})
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
     if is_ti:
@@ -1156,7 +1186,9 @@ class CarController(CarControllerBase):
       # old expression, whenever the dither's envelope is zero (toggle off, gate closed and faded out, or a touch);
       # while the envelope is above zero it is set on every frame, including frames where the dither itself rounds
       # to zero.
-      new_actuators.steer = (ti_apply_steer if ti_reported is None else ti_reported) / self.ccp.TI_STEER_MAX
+      # The stuck-request guard's nudge is treated like the dither: `steer` is the command before it (the nudge is not a limit for
+      # controlsd to react to), steerOutputCan and mazdaDiagnostics.tiLimited are the value actually sent.
+      new_actuators.steer = (ti_unguarded if ti_reported is None else ti_reported) / self.ccp.TI_STEER_MAX
       new_actuators.steerOutputCan = ti_apply_steer
     else:
       new_actuators.steer = apply_steer / self.ccp.STEER_MAX

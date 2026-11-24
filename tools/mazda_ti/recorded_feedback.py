@@ -11,7 +11,45 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard, STUCK_HOLD_FRAMES, STUCK_NUDGE_FRAMES, TI_FW_CLIP, toward_zero
+
 from .applied_feedback import AppliedLateralFeedback, PreviousAppliedFeedback
+
+STUCK_GUARD_MODES = (False, True, 'auto')
+
+
+def _guard_key(g):
+  """Everything that decides a StuckGuard's future outputs (run only matters up to STUCK_HOLD_FRAMES)."""
+  return (g.last_out, min(g.run, STUCK_HOLD_FRAMES), g.since, g.held if g.nudge_left else None, g.nudge_left)
+
+
+def _initial_guards(previous, first_pre):
+  """Every guard state consistent with a window that opens on a frame whose previous SENT value was `previous`.
+
+  The recording does not carry the guard's state, only the value sent on the previous frame. Unknown: how many frames it
+  had been sent (1..STUCK_HOLD_FRAMES; more is the same as STUCK_HOLD_FRAMES), whether lateral was inactive (reset: only
+  when 0 was sent), and whether that frame was a nudge with nudge frames still to send for `first_pre`. `since` is
+  unknown too and left None: an earlier real-time trigger is the same behaviour as a longer run, which is enumerated.
+  Order = replay preference: the longest plausible hold first (the replayed guard nudges no later than the car could)."""
+  out = []
+  for run in range(STUCK_HOLD_FRAMES, 0, -1):
+    g = StuckGuard()
+    g.last_out, g.run = previous, run
+    out.append(g)
+  if previous == 0:
+    out.append(StuckGuard())
+  if first_pre not in (0, TI_FW_CLIP, -TI_FW_CLIP) and first_pre != previous and toward_zero(first_pre) == previous:
+    for left in range(1, STUCK_NUDGE_FRAMES):
+      g = StuckGuard()
+      g.last_out, g.run, g.held, g.nudge_left = previous, STUCK_NUDGE_FRAMES - left, first_pre, left
+      out.append(g)
+  return out
+
+
+def _copy_guard(g):
+  c = StuckGuard()
+  c.__dict__.update(g.__dict__)
+  return c
 
 
 def serialized_steer(value):
@@ -49,6 +87,7 @@ class Apply:
   ti_selected: bool = True
   stock_previous: int = 0
   stock_recorded: int = 0
+  reported: float = 0.0       # recorded carOutput.actuatorsOutput.steer
 
 
 class RecordedTiFeedback:
@@ -59,11 +98,36 @@ class RecordedTiFeedback:
   for every apply at/after activation published before end_ns. Stock fallback requires
   an explicit pinned stock limiter and GEN1 settings. Both limiter histories then run
   on every apply, including while the other path supplies the published feedback.
+
+  Stuck-request guard (selfdrive/car/mazda/ti_stuck_guard.py, commits 36ef39e/f87000a). The car
+  controller passes the TI limiter's output (pre) through StuckGuard.update(pre, latActive and
+  tiAllowed, now=appliedAtMonoTime * 1e-9); the value it returns is sent, recorded as tiLimited
+  and becomes the next tiPrevious, while actuatorsOutput.steer stays pre / 600. The recording
+  carries NO marker of the guard (mazdaDiagnostics.version is still 1; the `ti_stuck_guard`
+  cloudlog event is rate limited to one per 10 s and is not an input here), so the caller says:
+    stuck_guard=False (default): exactly the checks and replay of a pre-guard build.
+    stuck_guard=True: sent = guard(pre) is reproduced exactly on every apply, tiLimited == sent,
+      steer == pre / 600, sent is the history; replay runs the same guard on the candidate's
+      commands. A hold the guard would have nudged but the recording did not is rejected.
+    stuck_guard='auto': the whole window must reproduce exactly under one model: the False model
+      is tried first (so un-nudged drives behave exactly as before), then the True model.
+      `stuck_guard_present` reports the one that qualified. Trade-off: a window with no nudgeable
+      hold of STUCK_HOLD_S fits both and is replayed WITHOUT the guard, so a replayed controller
+      that holds a value would not be nudged; models are never mixed per frame (mixing would
+      accept a recording that skips a nudge the guard must send).
+  The clock is exact: card.py records appliedAtMonoTime = the now_nanos given to the controller.
+  The guard's state at the window start is NOT recorded (only the previous sent value): every
+  consistent start state is tried (held 1..STUCK_HOLD_FRAMES frames, reset, mid-burst) and only
+  exact reproductions survive; once the sent value changes they coincide. If several survive
+  the whole window, replay starts from the longest plausible hold. The stock path is not guarded.
   """
 
-  def __init__(self, outputs, commands, activation_ns, end_ns, limiter, *, stock_limiter=None, stock_limits=None):
+  def __init__(self, outputs, commands, activation_ns, end_ns, limiter, *, stock_limiter=None, stock_limits=None,
+               stuck_guard=False):
     if not 0 < activation_ns < end_ns:
       raise ValueError('Require 0 < activation_ns < end_ns')
+    if not any(stuck_guard is m for m in (False, True)) and stuck_guard != 'auto':
+      raise ValueError("stuck_guard must be False, True or 'auto'")
     self.activation_ns, self.end_ns, self.limiter = activation_ns, end_ns, limiter
     if (stock_limiter is None) != (stock_limits is None):
       raise ValueError('Provide both stock limiter and settings')
@@ -109,7 +173,8 @@ class RecordedTiFeedback:
         raise ValueError('Non-finite driver torque')
       apply = Apply(sequence, int(co.appliedAtMonoTime), int(cc.controlsStateMonoTime), int(co.appliedCarControlMonoTime), request, allowed,
                     int(d['tiPrevious']), int(d['tiLimited']), d['driverTorque'], limits_from_diagnostics(d),
-                    bool(cc.latActive), bool(d['tiAllowed']), int(d['stockPrevious']), int(d['stockLimited']))
+                    bool(cc.latActive), bool(d['tiAllowed']), int(d['stockPrevious']), int(d['stockLimited']),
+                    float(co.actuatorsOutput.steer))
       if not -600 <= apply.previous <= 600 or not -600 <= apply.recorded <= 600:
         raise ValueError('Recorded TI command outside qualified envelope')
       if self.stock_limiter is not None:
@@ -117,32 +182,68 @@ class RecordedTiFeedback:
           raise ValueError('Recorded stock request does not match applied carControl')
         if not -600 <= apply.stock_previous <= 600 or not -600 <= apply.stock_recorded <= 600:
           raise ValueError('Recorded stock command outside qualified envelope')
-      feedback = apply.recorded if self.stock_limiter is None or apply.ti_selected else apply.stock_recorded
-      if float(co.actuatorsOutput.steer) != serialized_steer(feedback / 600):
+      ti_feedback = self.stock_limiter is None or apply.ti_selected
+      feedback = apply.recorded if ti_feedback else apply.stock_recorded
+      # TI feedback under a guard model is checked against the PRE-nudge command in _verify (unknown here).
+      if (stuck_guard is False or not ti_feedback) and float(co.actuatorsOutput.steer) != serialized_steer(feedback / 600):
         raise ValueError('Recorded feedback does not represent the TI limited command')
       unique[sequence] = (apply, payload)
     self.applies = [pair[0] for _, pair in sorted(unique.items())]
     if not self.applies:
       raise ValueError('No recorded applies after activation')
+    if stuck_guard == 'auto':
+      try:
+        self.guard_start = self._verify(False)
+      except ValueError as exact_error:
+        try:
+          self.guard_start = self._verify(True)
+        except ValueError as guard_error:
+          raise ValueError(f'{exact_error}; under the stuck-guard model: {guard_error}') from None
+    else:
+      self.guard_start = self._verify(stuck_guard)
+    self.stuck_guard_present = self.guard_start is not None
+    self.guard = _copy_guard(self.guard_start) if self.stuck_guard_present else None
+    self.cursor, self.previous = 0, self.applies[0].previous
+    self.requests, self.counts, self.reported = {}, {}, {}
+    self.stock_previous, self.stock_counts = self.applies[0].stock_previous, {}
+
+  def _verify(self, guarded):
+    """Sequential exact verification; returns the guard start state for replay (None: no guard model)."""
     previous = self.applies[0].previous
     stock_previous = self.applies[0].stock_previous
+    guards = None
+    if guarded:
+      first = self.applies[0]
+      guards = [(g, _copy_guard(g)) for g in _initial_guards(previous, self._limit(first, first.request, previous))]
     for i, apply in enumerate(self.applies):
       if i and (apply.sequence != self.applies[i-1].sequence + 1 or apply.applied_at <= self.applies[i-1].applied_at):
         raise ValueError('Missing apply sequence or nonincreasing apply time')
       if apply.previous != previous:
         raise ValueError('Recorded previous TI command is inconsistent')
-      previous = self._limit(apply, apply.request, previous)
-      if previous != apply.recorded:
-        raise ValueError('Production limiter does not reproduce recorded TI command')
+      pre = self._limit(apply, apply.request, previous)
+      if guards is None:
+        previous = pre
+        if previous != apply.recorded:
+          raise ValueError('Production limiter does not reproduce recorded TI command')
+      else:
+        survivors, seen = [], set()
+        for start, g in guards:
+          if g.update(pre, apply.allowed, now=apply.applied_at * 1e-9) == apply.recorded and _guard_key(g) not in seen:
+            seen.add(_guard_key(g))
+            survivors.append((start, g))
+        if not survivors:
+          raise ValueError(f'Production limiter with stuck guard does not reproduce recorded TI command '
+                           f'(apply {apply.sequence}: limiter {pre}, recorded {apply.recorded})')
+        guards, previous = survivors, apply.recorded
+      if (self.stock_limiter is None or apply.ti_selected) and apply.reported != serialized_steer(pre / 600):
+        raise ValueError('Recorded feedback does not represent the TI limited command')
       if self.stock_limiter is not None:
         if apply.stock_previous != stock_previous:
           raise ValueError('Recorded previous stock command is inconsistent')
         stock_previous = self._stock_limit(apply, apply.request, stock_previous)
         if stock_previous != apply.stock_recorded:
           raise ValueError('Production limiter does not reproduce recorded stock command')
-    self.cursor, self.previous = 0, self.applies[0].previous
-    self.requests, self.counts = {}, {}
-    self.stock_previous, self.stock_counts = self.applies[0].stock_previous, {}
+    return guards[0][0] if guards is not None else None
 
   def _limit(self, apply, steer, previous):
     return self.limiter(int(round(steer * 600)), previous, apply.driver_torque, apply.limits) if apply.allowed else 0
@@ -168,8 +269,11 @@ class RecordedTiFeedback:
         if apply.controller not in self.requests:
           raise ValueError(f'Missing replay controller output: {apply.controller}')
         steer = self.requests[apply.controller]
-      self.previous = self._limit(apply, steer, self.previous)
+      pre = self._limit(apply, steer, self.previous)
+      # The car's stuck guard on the replayed command; what it sends is the next history, `steer` stays pre.
+      self.previous = self.guard.update(pre, apply.allowed, now=apply.applied_at * 1e-9) if self.guard is not None else pre
       self.counts[apply.sequence] = self.previous
+      self.reported[apply.sequence] = pre
       if self.stock_limiter is not None:
         self.stock_previous = self._stock_limit(apply, steer, self.stock_previous)
         self.stock_counts[apply.sequence] = self.stock_previous
@@ -188,7 +292,7 @@ class RecordedTiFeedback:
       apply = self.applies[sequence - self.applies[0].sequence]
       if not apply.ti_selected:
         return serialized_steer(self.stock_counts[sequence] / 600)
-    return serialized_steer(self.counts[sequence] / 600)
+    return serialized_steer(self.reported[sequence] / 600)
 
   def previous_applied_for_update(self, update_mono, output_mono, limiter_frozen=False):
     """Return only causally prior, candidate-owned apply state for ``update_mono``."""
@@ -203,10 +307,11 @@ class RecordedTiFeedback:
       return PreviousAppliedFeedback(int(update_mono), observed, None)
     stock = self.stock_counts.get(sequence) if self.stock_limiter is not None else None
     fallback = bool(apply.active and not apply.ti_selected)
-    selected = stock if fallback else self.counts[sequence]
+    # TI counts as reported to controlsd: the pre-nudge command (equal to the sent one whenever the guard did not nudge).
+    selected = stock if fallback else self.reported[sequence]
     snapshot = AppliedLateralFeedback(
       int(output_mono), apply.applied_at, apply.request_mono, apply.controller, sequence,
-      self.counts[sequence], stock, selected, observed, apply.active, apply.allowed,
+      self.reported[sequence], stock, selected, observed, apply.active, apply.allowed,
       apply.ti_selected, bool(apply.active and apply.ti_selected), fallback, bool(limiter_frozen),
     )
     return PreviousAppliedFeedback(int(update_mono), observed, snapshot)

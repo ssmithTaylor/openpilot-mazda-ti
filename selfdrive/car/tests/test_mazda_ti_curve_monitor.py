@@ -1,5 +1,6 @@
 """Curve slowing stage 3: the in-bend delivery monitor (ti_curve_monitor.py) and its wiring (plan T7, A2, A4). Synthetic inputs only."""
 import json
+import math
 from types import SimpleNamespace as NS
 
 import pytest
@@ -245,3 +246,56 @@ def test_stage3_text_is_short_and_fits():
     TC.run(c, car, 200, lambda f, car: TC.plan(None), start=300, deliver=True, deliver_need=45, deliver_why=why)
     assert "slowing gently" in c.line2 and len(c.line2) <= MAX_SECOND, c.line2
     assert len(why) <= 32
+
+
+# ---- the stuck-request guard (ti_stuck_guard) nudges the SENT command; the monitor reads the sent command (Job 4) ---------------
+def _guarded(ti_max, cmd, seconds=3.0):
+  """The monitor fed the guard's output for a constant command; -> (sat_s per frame, first alert frame, nudge frames)."""
+  from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard
+  g, mon, sat, first, nudges = StuckGuard(), TM.DeliveryMonitor(), [], None, 0
+  for f in range(int(round(seconds / DT))):
+    sent = g.update(int(cmd), True, now=f * DT)
+    nudges += g.nudged
+    o = mon.step(f, bend(ti_cmd=float(sent), ti_max=float(ti_max)))
+    sat.append(o.sat_s)
+    if first is None and o.phase == "alert":
+      first = f
+  return sat, first, nudges
+
+
+def test_guard_never_nudges_exactly_600_so_a_clipped_command_stays_saturated():
+  # the firmware exempts exactly +-600 (TI_FW_CLIP); the guard therefore never touches it: with TiSteerMax 600 a clipped command is
+  # sent unchanged and the monitor's hold runs uninterrupted
+  for cmd in (600, -600):
+    sat, first, nudges = _guarded(600, cmd)
+    assert nudges == 0 and all(b > a for a, b in zip(sat, sat[1:])) and first is not None
+
+
+@pytest.mark.parametrize("ti_max", [100, 110, 117, 118, 300, 600, 800, 1200])
+def test_a_guard_nudge_never_resets_the_monitor_hold(ti_max):
+  # a nudge of STUCK_NUDGE (2) counts toward zero for STUCK_NUDGE_FRAMES (2) frames, every STUCK_HOLD_S of an unchanged value. At
+  # TiSteerMax 600 the only saturated values it can move out of the monitor's band (>= 0.983 x 600 = 589.8) are 590 / 591 (-> 588 /
+  # 589); at a TiSteerMax below 118 even the clipped command (ti_max - 2 < 0.983 x ti_max) leaves it. The monitor bridges a dip of at
+  # most that size and length (SAT_GRACE_*), so its hold timer is never reset by a nudge: sat_s rises on every frame and the alert
+  # comes on the same frame as with no guard
+  from openpilot.selfdrive.car.mazda import ti_stuck_guard as SG
+  lo = math.ceil(TM.SAT_SHARE * ti_max - 1e-9)
+  for cmd in sorted({ti_max, lo, lo + 1}):
+    sat, first, nudges = _guarded(ti_max, cmd)
+    if ti_max != SG.TI_FW_CLIP or cmd != SG.TI_FW_CLIP:
+      assert nudges >= 2 * SG.STUCK_NUDGE_FRAMES, (ti_max, cmd)       # the guard really acted, twice, in 3 s
+    assert all(b > a for a, b in zip(sat, sat[1:])), (ti_max, cmd, [i for i, (a, b) in enumerate(zip(sat, sat[1:])) if b <= a][:3])
+    mon, ref = TM.DeliveryMonitor(), None
+    for f in range(300):
+      if mon.step(f, bend(ti_cmd=float(cmd), ti_max=float(ti_max))).phase == "alert":
+        ref = f
+        break
+    assert first == ref, (ti_max, cmd, first, ref)
+
+
+def test_grace_is_only_the_nudge():
+  # a real fall off the limit (more than STUCK_NUDGE counts, or longer than STUCK_NUDGE_FRAMES) still resets the hold
+  mon = TM.DeliveryMonitor()
+  seq = [600.0] * 30 + [589.0] * 3 + [600.0] * 10 + [587.0] + [600.0] * 5      # 589: inside the nudge band, but 3 frames; 587: below it
+  sat = [mon.step(f, bend(ti_cmd=c)).sat_s for f, c in enumerate(seq)]
+  assert sat[31] > sat[30] > sat[29] and sat[32] == 0.0 and sat[43] == 0.0
