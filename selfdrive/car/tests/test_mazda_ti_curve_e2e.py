@@ -6,6 +6,7 @@ import json
 import pathlib
 
 import numpy as np
+import pytest
 
 from openpilot.selfdrive.car.mazda import ti_curve as C, ti_curve_memory as M, ti_curve_plan as P
 from openpilot.selfdrive.car.mazda import ti_curve_plannerd as D
@@ -14,6 +15,7 @@ _spec = importlib.util.spec_from_file_location("tc_e2e_car", pathlib.Path(__file
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 DT = 0.01
+PREVIEW_S = 8.0     # the realistic preview (the real model previews 8-10 s; under-read by FC_RATIO, published right positive); was 4.0
 _KS = np.linspace(0.0005, 0.06, 12000)
 _SP = P.D.need_mph(_KS)   # plan T4: ti_curve_demand (left bends, CAP_RAW)
 
@@ -43,7 +45,7 @@ class _Store:
     return self.raw
 
 
-def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cls=None):
+def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cls=None, preview_s=PREVIEW_S):
   """segs: [(length m, need mph or None)]. events(f, car, s) -> Inputs overrides; it may also change car.mph / car.set (a lead,
   the driver's pedals). Returns rows every 0.1 s."""
   tr = M.synthetic_trace([(L, 0.0 if n is None else k_for(n)) for L, n in segs])
@@ -67,7 +69,7 @@ def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cl
       sj = s + ov.get("_jump", 0.0)                                     # a matcher miss: fixes somewhere else
       x, y = np.interp(sj, s_road, tr["x"]), np.interp(sj, s_road, tr["y"])
       i = min(int(sj // M.SPACING_M), len(tr["hdg"]) - 1)
-      ahead = np.arange(0, 4.01, 0.25)
+      ahead = np.arange(0, preview_s + 0.01, 0.25)
       kk = np.array([tr["kap"][min(int(q // M.SPACING_M), len(tr["kap"]) - 1)] for q in s + ahead * car.mph * P.MPH])
       # as the real model publishes it (plan T5): openpilot's curvature is RIGHT positive (P.MODEL_K_SIGN), and the preview under-reads
       # the bend by the measured FC_RATIO at each lead (the planner calibrates it back)
@@ -163,8 +165,14 @@ def _lead40(f, car, s):
   return {"lead": True}
 
 
-def test_b_lead_holds_the_car_at_40_corner_needs_24():
+@pytest.mark.parametrize("cap", [None, pytest.param(5, marks=pytest.mark.xfail(strict=True, reason=(
+  "R16 physical limit with the realistic 8 s preview (Job 2, 2026-11-24): lead-held at 40, the unconfirmed cap holds the dash at 35 "
+  "until the preview reaches the entry (~143 m), then 35 -> 25 cannot finish: 30.3 mph 50 m before the bend, 26.2 at its entry "
+  "(target 25, need 24), within the warning's need + 2.5 so no warning. Passed with the old 4 s preview, which never capped. "
+  "The owner is being asked about R16 (S1_UNCONFIRMED_MAX_MPH); strict: this flips to a failure when it passes")))])
+def test_b_lead_holds_the_car_at_40_corner_needs_24(monkeypatch, cap):
   # fourth review, item 4: the lead-held floor (min(ref, speed) - 15 = 25) is the planner's too, so the corner IS slowed for
+  monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", cap)
   log = e2e([(2500, None), (150, 24), (1200, None)], 55, mph0=40, events=_lead40)
   assert min(r["set"] for r in log if 2400 <= r["s"] <= 2650) <= 26
   assert not gaps(log, 2450, 2650, 24)
@@ -305,3 +313,19 @@ def test_item3_a_70pct_cruise_is_warned_for_early():
     if entry > need + P.ALERT_MARGIN_MPH + 1:
       lead = first_alert_lead_s(log, 2500)
       assert lead is not None and lead >= P.ALERT_LEAD_S, (need, lead)
+
+
+# ---- Job 2 (2026-11-24): a position gap INSIDE a remembered bend being slowed for, with the realistic 8 s preview ----------------
+@pytest.mark.parametrize("need,a,b", [(33, 2480, 2620), (40, 2470, 2600), (33, 2400, 2560)])
+def test_gps_gap_inside_a_slowed_bend_never_raises_the_set_speed(need, a, b):
+  # found by the previous builder: with an 8 s preview, stage 2's ceiling (55 - 5 = 50, started from the approach speed) replaced the
+  # memory's lower one once the fix was lost, and the set speed was walked back up to 50 inside the bend. The lower ceiling wins while
+  # any stage is active for a bend; the memory corner runs on by the odometer through the gap; no raise before end + HOLD_AFTER_M
+  def ev(f, car, s):
+    return {"_fix_valid": False} if a <= s <= b else {}
+  log = e2e([(2500, None), (150, need), (1200, None)], 55, events=ev, preview_s=8.0)
+  i0 = next(i for i, r in enumerate(log) if r["set"] < 55)
+  win = [r for r in log[i0:] if r["s"] <= 2650 + P.HOLD_AFTER_M]
+  rises = [(round(x["s"]), x["set"], y["set"]) for x, y in zip(win, win[1:]) if y["set"] > x["set"]]
+  assert not rises, rises
+  assert min(r["set"] for r in log if 2500 <= r["s"] <= 2650) == max(need, 55 - 15)

@@ -22,6 +22,7 @@ _spec = importlib.util.spec_from_file_location("tc_scen_car", pathlib.Path(__fil
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 DT = 0.01
+PREVIEW_S = 8.0     # the realistic preview (the real model previews 8-10 s; under-read by FC_RATIO, published right positive); was 4.0
 _KS = np.linspace(0.0005, 0.06, 12000)
 _SP = P.D.need_mph(_KS)   # plan T4: ti_curve_demand (left bends, CAP_RAW)
 R = [(2500, None), (150, 33), (1200, None)]      # the reference road: 2.5 km straight, a corner needing 33 mph, straight
@@ -73,7 +74,8 @@ def _check_press(b, kw):
   assert not kw.get("standstill"), "press at standstill"
 
 
-def e2e(segs, set_mph, mph0=None, seconds=400, events=None, single=False, car_cls=None, limit=None, status_lag_s=0.0):
+def e2e(segs, set_mph, mph0=None, seconds=400, events=None, single=False, car_cls=None, limit=None, status_lag_s=0.0,
+        preview_s=PREVIEW_S):
   """segs: [(length m, need mph or None)]. events(f, car, s, cv) -> Inputs overrides, plus controls starting with '_':
   _fix_valid, _skip_plan (planner stalls), _model_off, _jump (m added to the fix: matcher loss), _limit. `driver_set` events
   record the owner's new speed (their choice is the ceiling from then on)."""
@@ -110,7 +112,7 @@ def e2e(segs, set_mph, mph0=None, seconds=400, events=None, single=False, car_cl
       sj = s + ov.get("_jump", 0.0)
       x, y = np.interp(sj, s_road, tr["x"]), np.interp(sj, s_road, tr["y"])
       i = min(int(sj // M.SPACING_M), len(tr["hdg"]) - 1)
-      ahead = np.arange(0, 4.01, 0.25)
+      ahead = np.arange(0, preview_s + 0.01, 0.25)
       kk = np.array([tr["kap"][min(int(q // M.SPACING_M), len(tr["kap"]) - 1)] for q in s + ahead * car.mph * P.MPH])
       # as the real model publishes it (plan T5): openpilot's curvature is RIGHT positive (P.MODEL_K_SIGN), and the preview under-reads
       # the bend by the measured FC_RATIO at each lead (the planner calibrates it back)

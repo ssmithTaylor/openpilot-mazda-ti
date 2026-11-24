@@ -1142,3 +1142,49 @@ def test_map_bend_must_persist_a3():
   # at 45 mph the same 2.1 s showing acts at once (0 s persistence) when its start is due
   res = _drive_map(P.Planner(None), 45, 80, shown(64.0, 66.1))
   assert next(t for t, s, p in res if p.src == "map") == pytest.approx(64.0, abs=1e-6)
+
+
+def test_position_gap_keeps_an_active_corner_by_dead_reckoning():
+  # Job 2 (2026-11-24): a remembered corner being slowed for survives a lost position fix (well past FIX_LOST_S) by the odometer
+  # until passed; with the 8 s preview, stage 2's higher ceiling never replaces the memory's lower one inside the bend
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  mem = M.synthetic([tr])
+  want = max(int(D.need_mph(CORNER_K)[0]), 55 - 15)
+  pl = P.Planner(mem)
+  gap = (1420.0, 1640.0)
+  res = drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(tr, 55),
+              fix_fn=lambda t, s, f: P.Fix(False) if gap[0] <= s <= gap[1] else f)
+  inside = [(t, s, p) for t, s, p, v in res if gap[0] <= s <= 1650 + P.HOLD_AFTER_M]
+  assert inside and (inside[-1][0] - next(t for t, s, p in inside if s >= gap[0])) > P.FIX_LOST_S   # the gap outlasts FIX_LOST_S
+  assert all(p.ceil is not None and p.ceil <= want for t, s, p in inside if s <= 1650), \
+    [(round(s), p.ceil, p.stage, p.src) for t, s, p in inside if p.ceil is None or p.ceil > want][:5]
+  assert any(e["kind"] == "lock_lost" and e["why"] == "no position fix" for e in pl.events)
+  assert next(v for t, s, p, v in res if s >= 1500) <= want + 1.0
+  # passed: released by the odometer, not kept for ever
+  assert any(p.ceil is None for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)
+
+
+def test_other_lock_losses_still_drop_the_corner():
+  # only a lost FIX keeps the corner: a matcher that finds the car on another road (fixes leave the remembered road) drops it
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 160, closed=True, planner=pl,
+              fix_fn=lambda t, s, f: P.Fix(True, f.x + 400.0, f.y + 400.0, f.hdg) if 1450 <= s <= 1700 else f)
+  assert any(e["kind"] == "lock_lost" and e["why"] != "no position fix" for e in pl.events)
+  t_lost = next(i for i, e in enumerate(pl.events) if e["kind"] == "lock_lost")
+  assert t_lost is not None and any(p.ceil is None for t, s, p, v in res if 1560 <= s <= 1650)   # dropped (the warning latch stays)
+
+
+def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend():
+  # Job 2: the warning predicts what the ramp will DO (A11): a stage-1 bend whose preview went before reaching its entry stays
+  # "unconfirmed" and capped (dash >= start - 5) to its end, so a bend needing 38 from 50 is reached at about 45: warned for
+  k = k_needing(38)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  f8 = road_preview(tr, 50)
+  res = drive(mem, tr, 50, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 190 else None)
+  assert "s1_unconfirmed" in [e["kind"] for e in pl.events]
+  assert next(v for t, s, p, v in res if s >= 1500) > 38 + P.ALERT_MARGIN_MPH + 1      # the cap kept it fast
+  assert any(p.alert_mph == int(D.need_mph(k)[0]) for t, s, p, v in res if s <= 1500)  # and the driver is told, before the bend

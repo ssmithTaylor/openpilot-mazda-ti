@@ -384,14 +384,18 @@ class Planner:
     out.sort()
     return out
 
-  def _lose(self, why):
+  def _lose(self, why, keep_active=False):
+    """Drop the lock. keep_active (a lost position FIX, nothing said about the road): the corners in progress are kept and run on by
+    the odometer until passed (step: a GPS gap never releases a slowdown in progress); any other loss (another road, a changed road,
+    the remembered road ending) drops them."""
     if self.locked or self.cand is not None:
       self.events.append({"kind": "lock_lost", "why": why, "trace": self.trace})
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
     self.trace = -1
     self.alts, self.off_s = [], 0.0
     self.cmp = []
-    self.active = {}
+    if not keep_active:
+      self.active = {}
 
   def _advance(self, dist):
     """Move along the trace by `dist` metres; follows the continuation link at the end, or loses the lock."""
@@ -469,7 +473,7 @@ class Planner:
       if self.cand is not None and not self.locked:
         self.cand, self.stable_s = None, 0.0
       if self.locked and self.fix_age >= FIX_LOST_S:
-        self._lose("no position fix")
+        self._lose("no position fix", keep_active=True)
 
   def _either_road(self, need, dist, look, mph):
     """While the car may as well be on another remembered road (self.alts), a point's allowed speed is at least the lowest the other
@@ -632,6 +636,14 @@ class Planner:
       self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
       self.alert = self._warn(list(self.latch.values()), mph, v, floor, acting, set_mph, lowering=False)
       self._stage2(t, v, mph, set_mph, floor, None)
+      if self.active:
+        # a remembered corner in progress when the position fix went (a GPS gap: "position uncertain", then "no position fix", then
+        # "matching the remembered road" until the lock is back): it runs on by DEAD RECKONING on the odometer (its entry / end are
+        # odometer figures) until passed, with no fresh constraint and nothing new started; its ceiling is valid (trusted), and
+        # stage 2 merges below it in _out (the lower one wins), so a second source's higher opinion never raises the set speed
+        # inside the bend (Job 2, 2026-11-24)
+        self.map_active, self.map_bends = {}, {}
+        return self._dead_reckoned(t, v, mph, set_mph, floor, ref_mph, model_la, untrusted)
       if untrusted[1]:
         self.map_active, self.map_bends = {}, {}  # a remembered road is being matched here: no map (plan T6)
         return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
@@ -690,6 +702,20 @@ class Planner:
     self.cap_out = cap
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold", stage=stage, src="mem")
+
+  def _dead_reckoned(self, t, v, mph, set_mph, floor, ref_mph, model_la, untrusted):
+    """The memory corners in progress through a position gap (step): the ramp with no fresh candidates, by the odometer."""
+    u = max(mph, float(set_mph)) if set_mph else mph
+    u_ref = max(u, float(ref_mph) if ref_mph else 0.0)
+    r = self._ramp(t, v, mph, set_mph, floor, {}, self.active, u_ref)
+    if r["ceil"] is None:
+      return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
+    self.end_m, self.behind, self.need_out, self.cap_out = r["end"], r["behind"], r["need"], r["cap"]
+    capped = (bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor) or (
+      self.alert is not None and self.alert < floor)
+    why = "corner ahead" if (r["dist"] or 0) > 0 else "in the corner"
+    return self._out(int(r["ceil"]), untrusted[0], True, untrusted[1], why, r["dist"], r["corner"], model_la, capped=capped,
+                     point=r["point"], kind=r["kind"], stage=r["stage"], src="mem")
 
   def _map_out(self, t, v, mph, set_mph, floor, ref_mph, map_k, model_la, conf, known, why):
     """The output where no memory is known: the map stage's ramp (plan T6) if it has a ceiling, else none (stage 2 merges in _out)."""
