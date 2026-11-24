@@ -141,6 +141,74 @@ def _match(passes, s, lo_m, hi_m):
   return best
 
 
+# ---- the car side's own rules for when a slowdown can act (R13) ------------------------------------------------------------------
+# Mirrored from selfdrive/car/mazda/ti_curve.py WITHOUT importing it (another builder edits that file): its constants are read from the
+# source text, and the rules below restate its update(): (1) the gas pressed, or released less than GAS_RESUME_S ago (gas_hold): no tap
+# starts; (2) the gas held longer than GAS_MAX_S, the brake, openpilot not engaged, the cruise off (or no set speed): the intervention
+# stops (`_stop`; the set speed is walked back up). A slowdown the planner starts while (1) or (2) holds acts from the first sample
+# they clear, if that is before its bend's end (the planner's ceiling is still there and the car side taps toward it whenever it may);
+# one that is acting stops at the first sample (2) holds. Not modelled: a fresh intervention after such a stop (CLEAR_S later) on the
+# same bend, and the pause of taps during a short (< GAS_MAX_S) gas press mid-slowdown (the driver is accelerating then).
+TI_CURVE_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'selfdrive', 'car', 'mazda', 'ti_curve.py')
+
+
+def car_side_constants(path=TI_CURVE_SRC):
+  """{'GAS_MAX_S', 'GAS_RESUME_S'} as ti_curve.py defines them (read from its text; never imported)."""
+  import re
+  txt = open(path, encoding='utf-8').read()
+  out = {}
+  for name in ('GAS_MAX_S', 'GAS_RESUME_S'):
+    m = re.search(rf'^{name}\s*=\s*([0-9.]+)', txt, re.M)
+    if m is None:
+      raise RuntimeError(f'{name} not found in ti_curve.py: the replay cannot mirror the car side')
+    out[name] = float(m.group(1))
+  return out
+
+
+def car_gate(gas, brake, engaged, cruise_on, dt=DT, consts=None):
+  """Per sample: (can_start, stop) as the car side decides them (see above). Inputs are per-sample truthy arrays."""
+  c = consts or car_side_constants()
+  gas, brake = np.asarray(gas) > .5, np.asarray(brake) > .5
+  ok = (np.asarray(engaged) > .5) & (np.asarray(cruise_on) > .5)
+  n = len(gas)
+  hold, long_ = np.zeros(n, bool), np.zeros(n, bool)
+  since, off_at, h = None, None, False
+  for i in range(n):
+    if gas[i]:
+      since = i if since is None else since
+      off_at = None
+    else:
+      since = None
+      if h and off_at is None:
+        off_at = i
+    h = bool(gas[i]) or (off_at is not None and (i - off_at) * dt < c['GAS_RESUME_S'] - 1e-9)
+    hold[i] = h
+    long_[i] = since is not None and (i - since) * dt > c['GAS_MAX_S']
+  stop = brake | long_ | ~ok
+  return ~stop & ~hold, stop
+
+
+_CONSTS = {}
+
+
+def _consts():
+  if not _CONSTS:
+    _CONSTS.update(car_side_constants())
+  return _CONSTS
+
+
+def act_window(can_start, stop, i0, i_end):
+  """(j, k): the first sample in [i0, i_end) the slowdown can act from (None: never before its bend's end), and the first sample
+  after j (before i_end) the car side stops it (None: it runs to the end)."""
+  i_end = max(int(i_end), int(i0) + 1)
+  w = np.nonzero(can_start[i0:i_end])[0]
+  if not len(w):
+    return None, None
+  j = int(i0 + w[0])
+  ks = np.nonzero(stop[j + 1:i_end])[0]
+  return j, (int(j + 1 + ks[0]) if len(ks) else None)
+
+
 def speed_lost(prof, u, t_end):
   """mph-seconds below the start speed u: the profile from the start to t_end, then the way back up at ACCEL_MPH_S."""
   t = np.arange(0.0, max(t_end, 0.0) + 1e-9, 0.1)
@@ -148,6 +216,53 @@ def speed_lost(prof, u, t_end):
   lost = float(np.sum(np.maximum(0.0, u - vv)) * 0.1)
   d_end = max(0.0, u - float(prof.speed(t_end)))
   return lost + d_end * d_end / (2.0 * ACCEL_MPH_S)
+
+
+def account_row(x, Pm, s, v, kap, can_start, stop, s_end, opts):
+  """R13 (and R16 / R17) accounting of one slowdown row (stage 1, 2 or 3) in place: when the car side acts on it (act_window), the
+  speed it actually sheds under the ONE cruise model until its bend's end, its release (stage 1) or the car side's stop, the speed lost,
+  and the dwell. -> x. `x['T_target']` keeps the planner's target; `x['T']` becomes u - shed for a stopped / released one."""
+  x['T_target'], x['u_plan'] = x['T'], x['u']
+  # R13: when (and whether) the car side acts on it, and where it stops it
+  j, k_stop = act_window(can_start, stop, x['i'], int(np.searchsorted(s, s_end)) + 1)
+  stop_t = None if (j is None or k_stop is None) else (k_stop - j) * DT
+  if j is not None and x['stage'] == 1 and x.get('rel'):
+    t_rel = (x['i_dec'] - j) * DT
+    j = None if t_rel <= 0 else j                    # released before the car side could act on it: nothing happens
+    stop_t = t_rel if stop_t is None else min(stop_t, t_rel)
+  if j is None:
+    x['acts'], x['lost'], x['shed'] = False, 0.0, 0.0
+    return x
+  x['acts'] = x.get('acts', True)
+  x['defer_s'] = round((j - x['i']) * DT, 2)
+  u = round(float(v[j] / MPH), 1)
+  T = x['T']
+  floor = x.get('floor') or max(25, int(round(u)) - 15)
+  S1 = max(int(floor), T - Pm.DRIVE_GAP_MPH) if x['stage'] == 1 else None
+  cap = None
+  s1_cap = getattr(Pm, 'S1_UNCONFIRMED_MAX_MPH', None) if x['stage'] == 1 else None
+  if s1_cap is not None:
+    # R16: before the decision (confirmed) the dash goes no lower than the planner's start speed - S1_UNCONFIRMED_MAX_MPH
+    t_c = (x['i_dec'] - j) * DT if (x.get('i_dec') is not None and not x.get('rel')) else 1e9
+    cap = (Pm.s1_unconfirmed_ceiling(x['u_plan']), t_c)
+  x['u'] = u
+  prof = ED.Profile(u, T, S1=S1, cap=cap, stop_t=stop_t, tap_s=opts.get('tap_s')) if u > T else None
+  if prof is not None:
+    t_end = prof.t_at(max(0.0, s_end - s[j]))
+    x['lost'] = round(speed_lost(prof, u, t_end), 1)
+    x['shed'] = round(prof.shed(t_end), 1)
+  else:
+    x['lost'], x['shed'] = 0.0, 0.0
+  if stop_t is not None:
+    x['T'] = round(u - x['shed'], 1)                  # scored with the speed actually shed by its release / stop
+  elif cap is not None and cap[1] > 1e8:
+    x['T'] = max(T, cap[0])                          # never confirmed: the dash went no lower than the cap
+  if x['stage'] in (1, 2) and u > x['T'] and stop_t is None:
+    i_from = int(np.searchsorted(s, x['aim'] - LOAD_PRE_S * u * MPH))
+    kw = dict(cap=cap, tap_s=opts.get('tap_s'))
+    x['dwell'] = ED.dwell(u, T, s, kap, j, s_end + 100.0, DT, S1=S1, i_from=i_from, **kw)
+    x['dwell0'] = ED.dwell(u, T, s, kap, j, s_end + 100.0, DT, S1=S1, **kw)   # the old search, from the start (A5 comparison)
+  return x
 
 
 def replay_drive(args):
@@ -182,6 +297,8 @@ def replay_drive(args):
       if (all(st) if st else drive_std):
         res['eng_std_s'] += float(eng[off[sg]:off[sg + 1]].sum() * DT)
     lat = np.asarray(r['lat_act']) > .5
+    can_start, stop = car_gate(r['gas'], r['brk'], r['en'], (np.asarray(r['cr_en']) > .5) & (np.asarray(r['cr_set']) > .5),
+                               consts=_consts())
     st_arr, have = steer_arrays(r) if (new and not opts.get('no_s3')) else ({}, np.zeros(n, bool))
     la_now = kap * v * v + np.nan_to_num(bank_fixed(r['bank'], kap, v)) if have.any() else None
     pred, pred_t = r.get('pred_la'), r.get('pred_t')
@@ -204,10 +321,15 @@ def replay_drive(args):
           kw['blinker'] = bool(r['blink'][i] > .5)
         plan = planner.step(i * DT, fix, float(v[i]), **kw)
         mph = v[i] / MPH
-        acts = bool(set_mph is not None and r['en'][i] > .5)      # the car side taps only engaged with the cruise on
+        # (whether and when the car side acts on a start: car_gate / act_window at scoring, R13)
         for e in planner.events:
           k = e.get('kind')
-          if not acts and k in ('start', 's2_start'):
+          if k in ('s1_release', 's1_confirm'):
+            # the stage-1 bend's one decision (R13: a released bend is scored only up to its release; R16: the rest only after it)
+            for x in reversed(res['slow']):
+              if x['run'] == ri and x['stage'] == 1 and x['key'] == str(e.get('point')) and 'i_dec' not in x:
+                x['i_dec'], x['rel'] = i, k == 's1_release'
+                break
             continue
           if k == 'start' and mph - e['T'] >= (opts.get('min_drop') or 2):
             a_ = (planner.map_active if (new and not isinstance(e.get('point'), int)) else planner.active)
@@ -266,20 +388,7 @@ def replay_drive(args):
       w0, w1 = x['i'], int(np.searchsorted(s, (s[p['b'] - 1] if p else x.get('end', x.get('ent', s[x['i']]))) + 1.0))
       x['eng'] = float(lat[w0:max(w0 + 1, min(n, w1))].mean())
       if x['stage'] in (1, 2, 3):
-        T, u = x['T'], x['u']
-        floor = x.get('floor') or max(25, int(round(u)) - 15)
-        S1 = max(int(floor), T - Pm.DRIVE_GAP_MPH) if x['stage'] == 1 else None
-        prof = ED.Profile(u, T, S1=S1) if u > T else None
-        s_end = s[p['b'] - 1] if p else x.get('end', s[x['i']])
-        if prof is not None:
-          t_end = prof.at(max(0.0, s_end - s[x['i']]))[0]
-          x['lost'] = round(speed_lost(prof, u, t_end), 1)
-        else:
-          x['lost'] = 0.0
-        if x['stage'] in (1, 2) and u > T:
-          i_from = int(np.searchsorted(s, x['aim'] - LOAD_PRE_S * u * MPH))
-          x['dwell'] = ED.dwell(u, T, s, kap, x['i'], s_end + 100.0, DT, S1=S1, i_from=i_from)
-          x['dwell0'] = ED.dwell(u, T, s, kap, x['i'], s_end + 100.0, DT, S1=S1)   # the old search, from the start (A5 comparison)
+        account_row(x, Pm, s, v, kap, can_start, stop, s[p['b'] - 1] if p else x.get('end', s[x['i']]), opts)
     for p in passes:
       p['drive'] = drive
       p['s3cov'] = bool(have[p['a']:p['b']].all())
@@ -479,10 +588,12 @@ def main():
   ap.add_argument('--min-drop', type=int, default=None)
   ap.add_argument('--planner', default='', help='an older ti_curve_plan saved as a file (A5: the build on the car)')
   ap.add_argument('--no-s3', action='store_true')
+  ap.add_argument('--tap-s', type=float, default=None, help='the tap cycle the replay cruise model walks the dash with (R17; the planner is unchanged)')
   ap.add_argument('--out', default='')
   a = ap.parse_args()
   drives = a.drives or G.drives()
-  opts = dict(confirm_share=a.confirm_share, cap_scale=a.cap_scale, min_drop=a.min_drop, planner=a.planner or None, no_s3=a.no_s3)
+  opts = dict(confirm_share=a.confirm_share, cap_scale=a.cap_scale, min_drop=a.min_drop, planner=a.planner or None, no_s3=a.no_s3,
+              tap_s=a.tap_s)
   R = run(drives, a.mem, opts, a.workers)
   rep = dict(options={k: v for k, v in opts.items()}, memory=os.path.basename(a.mem), drives=len(drives),
              standard=score(R, True), all_builds=score(R, False), must_catch=must_catch(R))
