@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+from types import SimpleNamespace
 from PIL import Image, ImageDraw, ImageFont
 
 from cereal import log, car
@@ -11,6 +12,9 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.controls.lib.events import Alert, EVENTS, ET
 from openpilot.selfdrive.controls.lib.alertmanager import set_offroad_alert
 from openpilot.selfdrive.test.process_replay.process_replay import CONFIGS
+
+# What controlsd passes as frogpilot_toggles, at the stock defaults the alert callbacks read.
+FROGPILOT_TOGGLES = SimpleNamespace(current_holiday_theme="stock", has_cc_long=False, startup_alert_top="", startup_alert_bottom="")
 
 AlertSize = log.ControlsState.AlertSize
 
@@ -63,7 +67,8 @@ class TestAlerts:
 
     for alert in ALERTS:
       if not isinstance(alert, Alert):
-        alert = alert(self.CP, self.CS, self.sm, metric=False, soft_disable_time=100)
+        # FrogPilot callbacks take frogpilot_toggles (events.py passes it from controlsd); the stock defaults are used here.
+        alert = alert(self.CP, self.CS, self.sm, metric=False, soft_disable_time=100, frogpilot_toggles=FROGPILOT_TOGGLES)
 
       # for full size alerts, both text fields wrap the text,
       # so it's unlikely that they  would go past the max width

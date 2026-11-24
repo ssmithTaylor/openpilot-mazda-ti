@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.xdist_group("curve_screen")  # compiles C++ per call: never in parallel with itself
+
 from openpilot.selfdrive.car.mazda import ti_curve as C
 from openpilot.selfdrive.car.tests.test_mazda_ti_curve import Car, plan
 

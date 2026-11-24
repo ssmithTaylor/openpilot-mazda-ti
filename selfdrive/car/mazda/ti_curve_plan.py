@@ -550,12 +550,20 @@ class Planner:
     best = -1.0
     n = len(live)
     k = int(CHANGE_SHIFT_M / self.mem.spacing)
-    for sh in range(-k, k + 1):
+    # Pearson r by dot products (np.corrcoef costs ~50 us a call, and this ran up to 2k+1 times a tick: 60 % of the planner's time).
+    # Shift 0 first, then outward; stop at the first shift that matches, since only `best < CHANGE_MIN_CORR` is used.
+    for sh in sorted(range(-k, k + 1), key=abs):
       x = live[max(0, sh):n + min(0, sh)]
       y = rem[max(0, -sh):n - max(0, sh)]
-      if len(x) < 20 or x.std() < 1e-9 or y.std() < 1e-9:
+      if len(x) < 20:
         continue
-      best = max(best, float(np.corrcoef(x, y)[0, 1]))
+      xm, ym = x - x.mean(), y - y.mean()
+      sxx, syy = float(xm @ xm), float(ym @ ym)
+      if sxx < (1e-9 ** 2) * len(x) or syy < (1e-9 ** 2) * len(y):
+        continue
+      best = max(best, float(xm @ ym) / math.sqrt(sxx * syy))
+      if best >= CHANGE_MIN_CORR:
+        break
     bad = best < CHANGE_MIN_CORR
     self.change_strikes = self.change_strikes + 1 if bad else 0
     return self.change_strikes >= CHANGE_STRIKES
