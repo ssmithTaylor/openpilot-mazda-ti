@@ -701,7 +701,9 @@ class Planner:
           va = v_allow(D, T, S1, buf)
           # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
           # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
+          # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
           due = bool(set_mph and set_mph > mph + SETTLE_MPH and
+                     approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D and
                      approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D)
           c = cands.get(key)
           if c is None or va < c["va"] or (due and not c["due"]):

@@ -27,6 +27,8 @@ SETTLE_MPH = 0.3                 # within this of its set speed the cruise is ta
 ARRIVED_MPH = 1.5                # a manoeuvre is "done" within this of its target (the measured whole-manoeuvre definition)
 RAISE_SLACK_MPH = 0.1            # after a push below the target: raise the dash back to it once the speed, raised NOW, would bottom
                                  # out within this of the target (plan A9-R2a: the car keeps slowing for the dead time plus the lag)
+RAISE_CHECK_S = 0.1              # manoeuvre: the raise is judged only when a tap could go out, at most this often (A8-R6 cost) ...
+RAISE_CHECK_MPH = 5.0            # ... and only within this of the target (raises found at T + 1.1 .. 4.5 for 25-79 mph, 2-15 off)
 
 # gap nodes (mph): 0, 0.5, then the centres of the measured bands 1-2, 2-3, 3-4, 4-6, 6-8, 8-10, 10-14 (capped there)
 GAP_MPH = (0.0, 0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 9.0, 12.0)
@@ -134,15 +136,19 @@ def raise_due(car, set_now, T, tap_s=TAP_S):
 def manoeuvre(v0, T, S1=None, raise_at=None, arrived=ARRIVED_MPH, dt=0.05, variant=TIMING, tap_s=TAP_S, tmax=90.0, set0=None):
   """From the first tap, with the car settled at `v0` and the dash at `set0` (default `v0`; above v0: a car held below its set speed,
   e.g. by a lead, which needs set0 - T taps, not v0 - T, plan A8-R3): our taps walk the dash toward S1 (default: straight to T),
-  switching the goal to T when `raise_due` says (or, given `raise_at`, once the speed is within it of T: the old fixed rule).
+  switching the goal to T when `raise_due` says (judged when a tap could go out, every RAISE_CHECK_S at most, within
+  RAISE_CHECK_MPH of T) or, given `raise_at`, once the speed is within it of T (the old fixed rule).
   -> (seconds, metres) until the speed is within `arrived` of T."""
   goal1 = T if S1 is None else S1
   s0 = v0 if set0 is None else set0
   car = Cruise(v0, s0, dt, variant)
-  setn, tap_t, raised, t, x = int(round(s0)), 0.0, False, 0.0, 0.0
+  setn, tap_t, raised, t, x, chk = int(round(s0)), 0.0, False, 0.0, 0.0, 0.0
   while car.v > T + arrived and t < tmax:
     if not raised:
-      raised = car.v <= T + raise_at if raise_at is not None else raise_due(car, setn, T, tap_s)
+      if raise_at is not None:
+        raised = car.v <= T + raise_at
+      elif t >= tap_t - 1e-9 and t >= chk - 1e-9 and car.v <= T + RAISE_CHECK_MPH:
+        raised, chk = raise_due(car, setn, T, tap_s), t + RAISE_CHECK_S
     goal = T if raised else goal1
     if t >= tap_t - 1e-9 and setn != goal:
       setn += 1 if goal > setn else -1

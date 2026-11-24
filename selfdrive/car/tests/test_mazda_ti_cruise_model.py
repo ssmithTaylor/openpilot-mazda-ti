@@ -86,3 +86,27 @@ def test_r3_manoeuvre_walks_the_dash_from_the_real_set_speed():
   t1, x1 = CM.manoeuvre(40, 30, set0=55)
   assert t1 >= t0 + 15 * CM.TAP_S - 0.5 and x1 > x0
   assert CM.manoeuvre(40, 30, set0=40) == (t0, x0)
+
+
+def test_a8_r6_gated_raise_check_gives_the_same_manoeuvre():
+  # plan A8-R6 (cost): manoeuvre judges the raise only when a tap could go out, every RAISE_CHECK_S, within RAISE_CHECK_MPH of T.
+  # Against judging it every step: the same manoeuvre within 0.1 s and 2 m
+  def every_step(v0, T, S1, arrived, dt=0.05):
+    car = CM.Cruise(v0, v0, dt)
+    setn, tap_t, raised, t, x = v0, 0.0, False, 0.0, 0.0
+    while car.v > T + arrived and t < 90.0:
+      raised = raised or CM.raise_due(car, setn, T)
+      goal = T if raised else S1
+      if t >= tap_t - 1e-9 and setn != goal:
+        setn += 1 if goal > setn else -1
+        tap_t = t + CM.TAP_S
+      car.step(setn)
+      x += car.v * CM.MPH * dt
+      t += dt
+    return t, x
+  for v0 in (30, 45, 60, 75):
+    for drop in (3, 6, 10, 15):
+      T = v0 - drop
+      t1, x1 = CM.manoeuvre(v0, T, max(T - 6, 19), arrived=P.ARRIVED_MPH)
+      t0, x0 = every_step(v0, T, max(T - 6, 19), P.ARRIVED_MPH)
+      assert abs(t1 - t0) <= 0.1 + 1e-9 and abs(x1 - x0) <= 2.0, (v0, T, t1, t0, x1, x0)

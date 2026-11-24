@@ -634,9 +634,11 @@ def test_approach_ends_at_target_plus_arrived_with_the_measured_model():
   # T + ARRIVED_MPH (1.0; was ..._plus_1_5_... with the end hard-coded at T + 1.5)
   def ref(u, T, S1, dt=0.05):
     car = CM.Cruise(float(u), float(u), dt)
-    setn, t, d, tap_t, raised = u, 0.0, 0.0, 0.0, False
+    setn, t, d, tap_t, raised, chk = u, 0.0, 0.0, 0.0, False, 0.0
     while car.v > T + P.ARRIVED_MPH and t < 90.0:
-      raised = raised or CM.raise_due(car, setn, T)       # A9-R2a (was: within the fixed P.RAISE_AT_MPH of T)
+      # A9-R2a (was: within the fixed P.RAISE_AT_MPH of T): raised when the model says, judged when a tap could go out
+      if not raised and t >= tap_t - 1e-9 and t >= chk - 1e-9 and car.v <= T + CM.RAISE_CHECK_MPH:
+        raised, chk = CM.raise_due(car, setn, T), t + CM.RAISE_CHECK_S
       goal = T if raised else S1
       if t >= tap_t - 1e-9 and setn != goal:
         setn += 1 if goal > setn else -1
