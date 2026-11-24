@@ -46,6 +46,7 @@ car does not surge into the corner when the lead leaves).
 
 Pure: no clock, no params; the car controller does the I/O (carcontroller.py `curve_step`). Events go to the `ti_curve` log channel.
 """
+import math
 from typing import NamedTuple, Optional
 
 from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
@@ -1129,6 +1130,236 @@ class Curve:
   @property
   def active(self):
     return self.intervening()
+
+
+# ---- the SAFE EXIT (review C2, 2026-11-24) -----------------------------------------------------------------------------------------
+# Whenever curve slowing stops for any reason other than the driver's own cruise button (their value stands) or the cruise itself
+# going off, with the dash set speed below the EXIT LINE (max(ABS_FLOOR_MPH, ref - MAX_SHED_MPH, the intervention's floor), never above
+# the driver's reference `ref`), SET+ taps raise it back to that line and stop. Independent of the Curve object (which may have
+# failed): it keeps the minimal state itself (ref, floor, last dash value), has its own tap sender on the reviewed machinery
+# (ti_cruise_taps Tap / PressGuard: aligned 2-frame taps, 0.25 s gap, read back within ACCEPT_WAIT_S), and the car controller keeps it
+# outside the Curve. It waits (never fights) while the brake or gas is pressed, openpilot is disengaged, openpilot asks for cancel or
+# resume, the driver's button frame shows a press or is unreadable, the cruise check runs, at standstill or under MIN_MPH; it ends at
+# once on a driver cruise button or the cruise going off; a set speed moving in a way it did not ask is left to the driver.
+# A tap not read back ("set speed did not respond") is the one case it cannot fix: it says so on the page and on the road (I4).
+# Its marker ("exit" in the status key TiCurveStatus, params memory) is published whenever the dash is below the line while curve
+# slowing has it lowered, so a CONTROLS RESTART finds it (the car controller reads the old status before clearing it, as for the
+# restart note): the exit then runs from the marker's ref and floor (no ref in it: the car's speed rounded up, never above it).
+EXIT_RAISE_ON_SWITCH_OFF = True  # switching the feature off mid-push still sends these few taps (the owner is to confirm)
+EXIT_START_S = 0.3               # after arming: no tap before this, and the dash still this long (a tap in flight lands first)
+EXIT_WAIT_MAX_S = 60.0           # waiting longer than this (pedal, disengaged, ...) gives up: "set it yourself" (and the alert)
+EXIT_EXEMPT = ("cruise off", "cruise unavailable")
+
+
+def exit_line(ref, floor):
+  """The line the safe exit raises the dash back to: max(ABS_FLOOR_MPH, ref - MAX_SHED_MPH, floor), never above ref."""
+  if ref is None:
+    return None
+  return int(min(int(ref), max(ABS_FLOOR_MPH, int(ref) - MAX_SHED_MPH, int(floor) if floor else 0)))
+
+
+class SafeExit:
+  def __init__(self):
+    self.ref = self.floor = self.cmd = None   # held from the Curve every frame it runs fine (never cleared by a switch-off)
+    self.active = False
+    self.why = ""
+    self.line = None
+    self.ref_unknown = False
+    self.armed_f = None
+    self.wait_since = None
+    self.result = None            # None, "done", "driver", "cruise off", "changed", "failed", "gave up", "curve slowing back in charge"
+    self.guard = PressGuard()
+    self.tap = None
+    self.tap_to = None
+    self.tap_first = None
+    self.set_last, self.set_since = None, None
+    self.events = []
+    self.line1 = self.line2 = ""
+
+  def _ev(self, kind, frame, **kw):
+    self.events.append({"kind": kind, "frame": int(frame), **kw})
+
+  # ---- the state it keeps (outside the Curve) -----------------------------------------------------------------------------------
+  def hold_from(self, cv, inp):
+    """Every frame the Curve ran without error: keep its reference and floor (a switch-off cannot clear them here)."""
+    if cv is None or cv.ref is None or cv.state == "off":
+      return
+    self.ref = int(cv.ref)
+    fl = cv.floor if cv.floor is not None else cv.floor_now
+    if fl is not None:
+      self.floor = int(fl)
+    if inp.set_mph is not None:
+      self.cmd = int(inp.set_mph)
+    if cv.guard.last_frame is not None:
+      self.guard.last_frame, self.guard.last_mono = cv.guard.last_frame, cv.guard.last_mono   # the reviewed gap spans both senders
+
+  def marker(self, cv, set_mph):
+    """The persisted "pushed below the line" marker (for the status key), or None."""
+    line = self.line if self.active else exit_line(self.ref, self.floor)
+    lowered = self.active or (cv is not None and (cv.intervening() or cv.state == "stopped"))
+    if line is None or set_mph is None or set_mph >= line or not lowered:
+      return None
+    return {"ref": self.ref, "floor": self.floor, "line": line}
+
+  # ---- arming ------------------------------------------------------------------------------------------------------------------
+  def observe(self, frame, cv, inp):
+    """After the Curve's step (its events not yet cleared): arm on a stop / switch-off that left the dash below the line; end when
+    the Curve takes charge again (it intervenes) or the driver pressed a cruise button."""
+    for ev in cv.events:
+      k = ev.get("kind")
+      if k == "driver_button":
+        self.cancel(frame, "driver")
+      elif k == "stop" and ev.get("why") not in EXIT_EXEMPT:
+        self.arm(frame, inp, ev.get("why") or "stopped")
+      elif k == "switched_off" and EXIT_RAISE_ON_SWITCH_OFF:
+        self.arm(frame, inp, "switched off")
+    if self.active and cv.intervening():
+      self.cancel(frame, "curve slowing back in charge")
+
+  def arm(self, frame, inp, why, ref=None, floor=None, restart=False):
+    """Start the exit (if the dash is below the line). restart: from a persisted marker (ref / floor given, ref may be unknown)."""
+    if restart:
+      self.ref, self.floor = (None if ref is None else int(ref)), (None if floor is None else int(floor))
+    self.ref_unknown = self.ref is None
+    line = exit_line(self.ref, self.floor)
+    if line is None and not restart:
+      return False
+    if line is not None and inp is not None and inp.set_mph is not None and inp.set_mph >= line:
+      return False
+    if not restart and (inp is None or inp.set_mph is None):
+      return False
+    self.active, self.why, self.line, self.result = True, why, line, None
+    self.armed_f, self.wait_since = frame, None
+    self.tap = self.tap_to = self.tap_first = None
+    self._ev("exit_armed", frame, why=why, set_mph=None if inp is None else inp.set_mph, ref=self.ref, floor=self.floor, line=line)
+    return True
+
+  def cancel(self, frame, result):
+    if self.active:
+      self._finish(frame, result)
+
+  def _finish(self, frame, result, set_mph=None):
+    self.active = False
+    self.result = result
+    if self.tap is not None:
+      self.guard.end()
+    self.tap = self.tap_to = self.tap_first = None
+    self._ev("exit_end", frame, result=result, why=self.why, set_mph=set_mph, line=self.line, ref=self.ref)
+
+  # ---- one frame ----------------------------------------------------------------------------------------------------------------
+  @staticmethod
+  def _blocked(inp, gas_recent):
+    if inp.brake:
+      return "brake pressed"
+    if inp.gas or gas_recent:
+      return "gas pressed"
+    if not inp.engaged:
+      return "openpilot disengaged"
+    if inp.cancel_req or inp.resume_req or inp.driver_button is None or inp.counter is None:
+      return "buttons busy"
+    if inp.check_active:
+      return "the cruise check is running"
+    if inp.standstill or inp.mph < MIN_MPH:
+      return f"below {MIN_MPH:.0f} mph"
+    return ""
+
+  def step(self, frame, inp, gas_recent=False):
+    """The button to send this frame (only ever "SET_PLUS") or None."""
+    if inp.set_mph != self.set_last:
+      self.set_last, self.set_since = inp.set_mph, frame
+    if not self.active:
+      return None
+    if inp.driver_button:
+      self._finish(frame, "driver", inp.set_mph)
+      return None
+    if not inp.cruise_on or not inp.cruise_available:
+      self._finish(frame, "cruise off", inp.set_mph)
+      return None
+    if inp.set_mph is None:
+      return None
+    if self.line is None:
+      # restarted without the driver's set speed: the car's speed now rounded up to whole mph (the dash never goes above that, nor
+      # ever above a known reference), once the speed is above MIN_MPH
+      if inp.mph < MIN_MPH:
+        return None
+      self.line = int(math.ceil(inp.mph - 1e-6))
+      self._ev("exit_line", frame, line=self.line, ref_unknown=True)
+    cap = self.line if self.ref is None else min(self.line, self.ref)
+    self.line1 = f"RAISING SET SPEED: {inp.set_mph} -> {cap} mph"
+    self.line2 = ("your set speed is unknown: to the car's speed" if self.ref_unknown else f"curve slowing stopped: back to {cap}")
+    if self.tap is not None:
+      return self._send(frame, inp)
+    if self.tap_to is not None:
+      if inp.set_mph == self.tap_to:
+        self.tap_to = self.tap_first = None
+      elif inp.set_mph != self.tap_to - 1:
+        self._finish(frame, "changed", inp.set_mph)        # moved in a way it did not ask: left to the driver
+        return None
+      elif (frame - self.tap_first) * DT >= ACCEPT_WAIT_S:
+        self._finish(frame, "failed", inp.set_mph)         # "set speed did not respond": nothing more the code can do (I4 alert)
+        return None
+      else:
+        return None
+    if inp.set_mph >= cap:
+      self._finish(frame, "done", inp.set_mph)
+      return None
+    blocked = self._blocked(inp, gas_recent)
+    if not blocked and ((frame - self.armed_f) * DT < EXIT_START_S - 1e-9 or
+                        (frame - (self.set_since if self.set_since is not None else frame)) * DT < EXIT_START_S - 1e-9):
+      blocked = "the set speed settling"
+    if blocked:
+      self.wait_since = frame if self.wait_since is None else self.wait_since
+      self.line2 = ("set speed unknown: " if self.ref_unknown else "") + f"waiting: {blocked}"
+      if (frame - self.wait_since) * DT >= EXIT_WAIT_MAX_S:
+        self._finish(frame, "gave up", inp.set_mph)
+      return None
+    self.wait_since = None
+    self.tap = Tap("SET_PLUS", PRESSED_FRAMES, frame, inp.counter, inp.set_mph + 1)
+    self.tap_to, self.tap_first = inp.set_mph + 1, None
+    return self._send(frame, inp)
+
+  def _send(self, frame, inp):
+    tap = self.tap
+    out = None
+    if tap.due(frame, inp.counter) and (inp.set_mph == tap.target or self._blocked(inp, False)):
+      tap.n = len(tap.frames)
+    elif tap.due(frame, inp.counter):
+      if tap.first is None:
+        if not self.guard.begin(frame, inp.mono):
+          tap.counter0, tap.requested = inp.counter, frame
+          return None
+        tap.first = frame
+        self.tap_first = frame
+      if self.guard.allow(frame, inp.mono):
+        tap.frames.append((int(frame), inp.counter, (inp.counter + 1) % 16))
+        out = tap.button
+      else:
+        tap.n = len(tap.frames)
+    if tap.done:
+      self.guard.end()
+      self._ev("exit_tap", frame, frames=[list(f) for f in tap.frames], set_before=self.tap_to - 1, set_now=inp.set_mph)
+      if not tap.frames:
+        self.tap_to = self.tap_first = None
+      elif self.tap_first is None:
+        self.tap_first = frame
+      self.tap = None
+    return out
+
+
+def run_frame(cv, ex, frame, inp):
+  """The car controller's per-frame composition (pure; carcontroller.curve_step uses it): the Curve's step, then the safe exit (which
+  reads the Curve's events of this frame before the caller logs and clears them). cv None (after an internal error): the exit alone.
+  -> the button to send (the Curve's first; the exit only presses when the Curve does not)."""
+  button = None
+  if cv is not None:
+    button = cv.step(frame, inp)
+    if ex is not None:
+      ex.hold_from(cv, inp)
+      ex.observe(frame, cv, inp)
+  if ex is None:
+    return button
+  b2 = ex.step(frame, inp, gas_recent=bool(cv.gas_hold) if cv is not None else False)
+  return button if button is not None else b2
 
 
 ALERT_FRESH_S = 1.0               # the planner writes every 0.2 s: a warning older than this is dropped (no flicker, no re-chime)

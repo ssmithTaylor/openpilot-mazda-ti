@@ -215,6 +215,9 @@ class CarController(CarControllerBase):
     self.curve_plan_age = None
     self.curve_plan_read = None
     self.curve_published = None
+    # review C2: the safe exit lives OUTSIDE the Curve (an internal error there must not take it down), with the minimal state it needs
+    self.curve_exit = curve_mod.SafeExit() if self.curve is not None else None
+    self.curve_inp_last = None
     if self.curve is not None:
       # the previous run of this process may have left the set speed lowered (a restart mid-intervention): say so on the page
       try:
@@ -222,6 +225,14 @@ class CarController(CarControllerBase):
         if old.get("state") in ("slowing", "holding", "restoring") or (old.get("state") == "stopped" and
                                                                        (old.get("set") or 0) < (old.get("ref") or 0)):
           self.curve.restart_note = "Restarted: set speed may be lowered: check it"
+        mk = old.get("exit")
+        if isinstance(mk, dict):
+          # pushed below the line when the previous run ended: the safe exit raises the dash back to it (review C2)
+          ref_, fl_ = mk.get("ref"), mk.get("floor")
+          self.curve_exit.arm(0, None, "controls restarted", ref=ref_ if isinstance(ref_, int) else None,
+                              floor=fl_ if isinstance(fl_, int) else None, restart=True)
+          self.curve.restart_note = ("Restarted: raising the set speed back" if isinstance(ref_, int) else
+                                     "Restarted: set speed unknown: raising to the car's speed")
       except Exception:
         pass
       for key in (curve_mod.PARAM_ON, curve_mod.PARAM_STATUS):
@@ -820,8 +831,9 @@ class CarController(CarControllerBase):
     Runs stage 3's monitor every frame on the sent command (ti_apply_steer). While the switch is off and nothing is in progress it
     does only that and the 10 Hz read. Never raises: after an error curve slowing is off for the rest of this process and says so."""
     cv = self.curve
+    ex = getattr(self, "curve_exit", None)
     if cv is None:
-      return None
+      return self._curve_exit_only(CC, CS) if ex is not None and ex.active else None
     mon = None
     if getattr(self, "curve_mon_ok", True):
       try:
@@ -834,7 +846,8 @@ class CarController(CarControllerBase):
         except Exception:
           pass
     read = self.frame % 10 == 5
-    if not read and not self.curve_on and cv.state == "off":
+    exiting = ex is not None and ex.active
+    if not read and not self.curve_on and cv.state == "off" and not exiting:
       return None
     try:
       mod = curve_mod
@@ -855,7 +868,7 @@ class CarController(CarControllerBase):
           self.curve_plan_age = max(0.0, now - float(plan["m"]))
         elif raw is None and not off_idle:
           self.curve_plan = None
-      if not self.curve_on and cv.state == "off":
+      if not self.curve_on and cv.state == "off" and not exiting:
         if read and getattr(CS, "crz_btns_set", False) and (cv.restart_note or cv.off_note):
           cv.restart_note = cv.off_note = ""    # the driver's own SET+ / SET-: the "check it" note has been answered
           self.curve_published = None
@@ -869,38 +882,30 @@ class CarController(CarControllerBase):
       age = None
       if self.curve_plan is not None and self.curve_plan_read is not None:
         age = self.curve_plan_age + (now - self.curve_plan_read)
-      out = CS.out
-      cruise = out.cruiseState
-      speed = float(cruise.speed or 0.0)
-      counter = getattr(CS, "crz_btns_counter", None)
-      chk = self.cruise_check
-      inp = mod.Inputs(
-        on=self.curve_on, engaged=bool(CC.enabled), cruise_on=bool(cruise.enabled), cruise_available=bool(cruise.available),
-        mph=float(out.vEgo) * CV.MS_TO_MPH, set_mph=int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None,
-        brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
-        driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
-        cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
-        check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
-        standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
-        driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)),
-        deliver=bool(mon is not None and mon.phase == "alert"), deliver_need=None if mon is None else mon.need_mph,
-        deliver_why="" if mon is None else mon.why,
-        la_now=_finite_or_none(getattr(CS, "lat_accel", None)),
-        desired_la=_finite_or_none(-float(out.vEgo) ** 2 * float(CC.actuators.curvature)))   # curvature RIGHT positive: left + here
-      button = cv.step(self.frame, inp)
-      if cv.events:
-        for ev in cv.events:
+      inp = self._curve_inputs(CC, CS, now, age, mon)
+      self.curve_inp_last = inp
+      button = mod.run_frame(cv, ex, self.frame, inp)
+      for evs in (cv.events, ex.events if ex is not None else []):
+        for ev in evs:
           ti_curve_log(ev)
-        cv.events.clear()
+        evs.clear()
       self._curve_publish(cv)
       if button is None or inp.cancel_req or inp.resume_req:
         return None
       return mazdacan.create_button_cmd(self.packer, self.CP, inp.counter, Buttons.SET_MINUS if button == "SET_MINUS" else Buttons.SET_PLUS)
     except Exception:
       self.curve = None
+      if ex is not None:
+        try:
+          # review C2: the safe exit does not depend on the object that failed: it runs from its own state from the next frame
+          ex.arm(self.frame, self.curve_inp_last, "internal error")
+        except Exception:
+          pass
       try:
+        mk = None if ex is None else ex.marker(None, getattr(self.curve_inp_last, "set_mph", None))
         self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps({"t": round(time.time(), 1), "v": 1, "state": "stopped",
-                                                                   "line1": "CURVE SLOWING STOPPED", "line2": "internal error: off until restart"}))
+                                                                   "line1": "CURVE SLOWING STOPPED", "line2": "internal error: off until restart",
+                                                                   "exit": mk}))
       except Exception:
         pass
       try:
@@ -910,10 +915,67 @@ class CarController(CarControllerBase):
         pass
       return None
 
+  def _curve_inputs(self, CC, CS, now, age, mon):
+    """Curve slowing's car-side Inputs for this frame (the safe exit's too)."""
+    mod = curve_mod
+    out = CS.out
+    cruise = out.cruiseState
+    speed = float(cruise.speed or 0.0)
+    counter = getattr(CS, "crz_btns_counter", None)
+    chk = self.cruise_check
+    return mod.Inputs(
+      on=self.curve_on, engaged=bool(CC.enabled), cruise_on=bool(cruise.enabled), cruise_available=bool(cruise.available),
+      mph=float(out.vEgo) * CV.MS_TO_MPH, set_mph=int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None,
+      brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
+      driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
+      cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
+      check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
+      standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
+      driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)),
+      deliver=bool(mon is not None and mon.phase == "alert"), deliver_need=None if mon is None else mon.need_mph,
+      deliver_why="" if mon is None else mon.why,
+      la_now=_finite_or_none(getattr(CS, "lat_accel", None)),
+      desired_la=_finite_or_none(-float(out.vEgo) ** 2 * float(CC.actuators.curvature)))   # curvature RIGHT positive: left + here
+
+  def _curve_exit_only(self, CC, CS):
+    """After an internal error (self.curve is None): the safe exit alone, from its own state, until it ends; never raises."""
+    ex = self.curve_exit
+    try:
+      inp = self._curve_inputs(CC, CS, time.monotonic(), None, None)
+      b = curve_mod.run_frame(None, ex, self.frame, inp)
+      for ev in ex.events:
+        ti_curve_log(ev)
+      ex.events.clear()
+      if self.frame % 10 == 5 or not ex.active:
+        self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps({
+          "t": round(time.time(), 1), "v": 1, "state": "stopped", "why": "internal error",
+          "line1": ex.line1 if ex.active else "CURVE SLOWING STOPPED",
+          "line2": ex.line2 if ex.active else "internal error: off until restart",
+          "ref": ex.ref, "set": inp.set_mph, "exit": ex.marker(None, inp.set_mph)}))
+      if b is None or inp.cancel_req or inp.resume_req:
+        return None
+      return mazdacan.create_button_cmd(self.packer, self.CP, inp.counter, Buttons.SET_PLUS)
+    except Exception:
+      try:
+        ex.cancel(self.frame, "failed")
+      except Exception:
+        self.curve_exit = None
+      return None
+
   def _curve_publish(self, cv, force=False):
-    key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph)
-    if force or (key != self.curve_published and self.frame % 10 == 5) or self.frame % curve_mod.STATUS_EVERY == 5:
-      self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps(cv.status(time.time())))
+    ex = getattr(self, "curve_exit", None)
+    inp = getattr(self, "curve_inp_last", None)
+    mk = None if ex is None else ex.marker(cv, getattr(inp, "set_mph", None))
+    ex_lines = (ex.line1, ex.line2) if ex is not None and ex.active else None
+    key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph, json.dumps(mk), ex_lines)
+    # the exit marker is published at once when it changes (a controls restart must find it)
+    marker_changed = self.curve_published is not None and len(self.curve_published) > 5 and key[5] != self.curve_published[5]
+    if force or marker_changed or (key != self.curve_published and self.frame % 10 == 5) or self.frame % curve_mod.STATUS_EVERY == 5:
+      st = cv.status(time.time())
+      st["exit"] = mk
+      if ex_lines is not None:
+        st["line1"], st["line2"] = ex_lines
+      self.params_memory.put(curve_mod.PARAM_STATUS, json.dumps(st))
       self.curve_published = key
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
