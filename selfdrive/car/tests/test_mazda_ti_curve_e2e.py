@@ -69,6 +69,9 @@ def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cl
       i = min(int(sj // M.SPACING_M), len(tr["hdg"]) - 1)
       ahead = np.arange(0, 4.01, 0.25)
       kk = np.array([tr["kap"][min(int(q // M.SPACING_M), len(tr["kap"]) - 1)] for q in s + ahead * car.mph * P.MPH])
+      # as the real model publishes it (plan T5): openpilot's curvature is RIGHT positive (P.MODEL_K_SIGN), and the preview under-reads
+      # the bend by the measured FC_RATIO at each lead (the planner calibrates it back)
+      kk = P.MODEL_K_SIGN * kk * np.interp(ahead, P.D.FC_LEAD_S, P.D.FC_RATIO)
       p = pl.step(t, P.Fix(ov.get("_fix_valid", True), float(x), float(y), float(tr["hdg"][i])), car.mph * P.MPH,
                   set_mph=car.set if ov.get("cruise_on", True) else None, yaw_k=float(tr["kap"][i]), model_k=(ahead, kk),
                   ref_mph=ref, floor_mph=floor, acting=acting)

@@ -233,7 +233,8 @@ def main():
         limit = None
       ref_mph, floor_mph, acting = car_side(params_memory, time.time(), tc)
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit,
-                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting)
+                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting,
+                          blinker=bool(cs.leftBlinker or cs.rightBlinker))     # stage 2 is off with a blinker (plan T5)
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")
       params_memory.put(tc.PARAM_PLAN, json.dumps(d))

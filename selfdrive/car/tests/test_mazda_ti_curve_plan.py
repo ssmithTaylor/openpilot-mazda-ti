@@ -654,3 +654,115 @@ def test_a9_r2a_push_then_settle_at_target_no_dip_no_reacceleration(v0, need):
   vs = [v for t, s, p, v in res[start:] if s <= 1650]
   assert min(vs) >= T - 0.5, (min(vs), T)
   assert all(b <= a + 0.02 for a, b in zip(vs, vs[1:])), "sped up before the corner's end"
+
+
+# ---- stage 2: late, forecast-confirmed (plan T5) -----------------------------------------------------------------------------------
+_FC_T = np.arange(0.0, 8.01, 0.25)
+
+
+def preview(k_left, lead=3.0, width=0.5):
+  """The model preview as the model PUBLISHES it for a bend of true LEFT-positive curvature k_left centred `lead` s ahead: openpilot's
+  right-positive curvature (P.MODEL_K_SIGN), under-read by the measured FC_RATIO at each lead."""
+  k = np.where(np.abs(_FC_T - lead) <= width, k_left, 0.0)
+  return _FC_T, P.MODEL_K_SIGN * k * np.interp(_FC_T, D.FC_LEAD_S, D.FC_RATIO)
+
+
+def k_needing(mph, sign=1.0):
+  ks = np.linspace(0.0005, 0.05, 20000)
+  return float(sign * ks[np.argmin(np.abs(D.need_mph(sign * ks) - mph) + (D.need_mph(sign * ks) != mph) * 1e3)])
+
+
+def run_s2(pl, mph, fc_fn, seconds, set_mph=None, floor_mph=None, blink_fn=None):
+  """Planner (no memory) at a steady speed, 5 Hz; fc_fn(t) -> preview or None. -> [(t, Plan)]"""
+  out = []
+  for i in range(int(seconds / DT)):
+    t = i * DT
+    out.append((t, pl.step(t, P.Fix(False), mph * MPH, set_mph=set_mph or mph, model_k=fc_fn(t), floor_mph=floor_mph,
+                           blinker=bool(blink_fn and blink_fn(t)))))
+  return out
+
+
+def test_forecast_sign_left_positive():
+  # plan T5 / section 4: the model's orientationRate.z is in openpilot's frame (z down): a LEFT bend has NEGATIVE z, so
+  # ti_curve_plannerd.model_curvature (z / vx) is RIGHT positive, like openpilot's desired curvature (latcontrol_angle / _pid steer
+  # from -desired_curvature). The planner turns it LEFT positive (MODEL_K_SIGN), the sign of its yaw_k (CAN 0x075, left +).
+  from types import SimpleNamespace as NS
+  from openpilot.selfdrive.car.mazda import ti_curve_plannerd as PD
+  v, k_left = 20.0, 1 / 150.0
+  yaw_left = k_left * v                                     # rad/s, left positive (as ti_curve_plannerd.yaw_from_can returns)
+  m = NS(orientationRate=NS(z=[-yaw_left] * len(_FC_T), t=list(_FC_T)), velocity=NS(x=[v] * len(_FC_T)))
+  ts, km = PD.model_curvature(m)
+  assert km[5] < 0                                          # published right positive
+  pl = P.Planner(None)
+  p = pl.step(0.0, P.Fix(False), v, set_mph=v / MPH, yaw_k=yaw_left / v, model_k=(ts, km))
+  assert p.ahead_la is not None and p.ahead_la > 0 and np.sign(p.ahead_la) == np.sign(yaw_left / v)
+  assert p.ahead_la >= k_left * v * v - 1e-6                  # calibrated: never below the raw preview
+  need, lead, la, side = D.forecast_need(ts, P.MODEL_K_SIGN * np.asarray(km), v, P.FC_LO_S, P.CONFIRM_LEAD_S)
+  assert side == D.LEFT and la > 0
+  _, _, la_r, side_r = D.forecast_need(ts, -P.MODEL_K_SIGN * np.asarray(km), v, P.FC_LO_S, P.CONFIRM_LEAD_S)
+  assert side_r == D.RIGHT and la_r < 0
+
+
+def test_calibration_6s():
+  # plan section 3: FC_RATIO 0.783 at 6 s: a raw 1.57 m/s^2 there is 2.0 actual
+  assert D.calibrate([6.0], [1.57])[0] == pytest.approx(2.0, abs=0.01)
+  assert D.calibrate([0.0, 10.0, 12.0], [1.0, 1.0, 1.0]) == pytest.approx([1.0, 1 / 0.538, 1 / 0.538])
+  # the window: a bend only 1 s or 7 s ahead is not stage 2's
+  for lead in (1.0, 7.0):
+    need, _, _, _ = D.forecast_need(_FC_T, np.where(np.abs(_FC_T - lead) <= 0.25, 0.02, 0.0), 22.0, P.FC_LO_S, P.CONFIRM_LEAD_S)
+    assert need == P.MAX_MPH
+  assert (P.FC_LO_S, P.CONFIRM_LEAD_S, P.CONFIRM_TICKS, P.LATE_SHED_MPH) == (1.5, 6.0, 2, 5)
+
+
+def test_stage2_caps_at_5():
+  # plan T5: confirmed on the 2nd tick in a row; sheds at most LATE_SHED_MPH; a bend needing more than that (memory did not know it:
+  # here there is no memory) gets the 5 mph plus the warning; floors apply; never below 20 mph; released after the bend
+  k = k_needing(38)
+  res = run_s2(P.Planner(None), 50, lambda t: preview(k) if t < 3.0 else None, 12.0)
+  assert res[0][1].ceil is None                              # one tick is not a confirmation
+  p = res[1][1]
+  assert p.ceil == 45 and p.stage == 2 and p.src == "fc" and p.kind == "corner" and p.trusted and p.alert_mph == 38
+  assert p.need_mph == 38 and P.plan_json(p, 0.2, 1, "act")["stage"] == 2
+  assert all(q.ceil == 45 for t, q in res if 0.2 <= t < 3.0)
+  held = [t for t, q in res if q.ceil is not None]
+  assert 3.0 + 2.0 < held[-1] < 3.0 + 6.0                       # held lead x v + HOLD_AFTER_M past the last sighting, then released
+  # 3 below: the bend's own speed, no warning
+  res = run_s2(P.Planner(None), 50, lambda t: preview(k_needing(47)), 2.0)
+  assert res[-1][1].ceil == 47 and res[-1][1].alert_mph is None
+  # the floor applies (published by the car side)
+  res = run_s2(P.Planner(None), 50, lambda t: preview(k), 2.0, floor_mph=48)
+  assert res[-1][1].ceil == 48
+  # never below 20 mph
+  res = run_s2(P.Planner(None), 19, lambda t: preview(k_needing(15)), 2.0)
+  assert all(q.ceil is None for _, q in res)
+
+
+def test_fork_forecast_needs_3s_when_memory_straight():
+  # plan T5 / section 4 risk 4: on trusted remembered road that is STRAIGHT where the forecast shows a bend (a fork: the model may be
+  # showing the other road) stage 2 needs FORK_CONFIRM_S (3 s) in a row, not 2 ticks
+  tr = road((3000, 0.0))
+  mem = M.synthetic([tr])
+  k = k_needing(45)
+  on = 6.0
+  res = drive(mem, tr, 55, 14, model_fn=lambda t, s: preview(k) if t >= on else None)
+  assert all(p.trusted for t, s, p in res if t >= on - 1.0)
+  first = next(t for t, s, p in res if p.stage == 2)
+  assert P.FORK_CONFIRM_S - 1e-6 <= first - on <= P.FORK_CONFIRM_S + 2 * DT, first - on
+  # with no memory opinion (not trusted / no memory) 2 ticks are enough
+  res = run_s2(P.Planner(None), 55, lambda t: preview(k) if t >= on else None, 8.0)
+  assert next(t for t, p in res if p.stage == 2) - on == pytest.approx(DT)
+  # a flicker shorter than 3 s at the fork never acts
+  res = drive(mem, tr, 55, 14, model_fn=lambda t, s: preview(k) if on <= t < on + 2.4 else None)
+  assert not any(p.stage == 2 for t, s, p in res)
+
+
+def test_blinker_suppresses_stage2():
+  # plan T5 / section 4 risk 4: with a blinker on (a turn, a lane change) the forecast's bend is not stage 2's; BLINKER_HOLD_S after
+  k = k_needing(40)
+  res = run_s2(P.Planner(None), 50, lambda t: preview(k), 6.0, blink_fn=lambda t: t < 2.0)
+  assert all(p.ceil is None for t, p in res if t < 2.0 + P.BLINKER_HOLD_S)
+  first = next(t for t, p in res if p.stage == 2)
+  assert first == pytest.approx(2.0 - DT + P.BLINKER_HOLD_S + DT, abs=DT + 1e-6)
+  # a blinker during stage 2 drops it
+  res = run_s2(P.Planner(None), 50, lambda t: preview(k), 4.0, blink_fn=lambda t: t >= 2.0)
+  assert res[5][1].stage == 2 and all(p.ceil is None for t, p in res if t >= 2.0)

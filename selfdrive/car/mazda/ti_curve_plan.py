@@ -21,6 +21,10 @@ process and the tests feed it one tick at a time.
    from which the NEXT corner can still be made, so chained corners keep only what the next one needs. The ceiling is the lowest due speed; it holds through the
    corner and is released HOLD_AFTER_M after the last tight point has been passed.
 
+4. Stage 2 (late, forecast-confirmed; `_stage2`, constants FC_LO_S .. FORK_NEAR_M): the driving model's preview 1.5-6 s ahead,
+   calibrated, sets a ceiling at most LATE_SHED_MPH below the speed once confirmed, on any road (trusted memory or not); the lower
+   of the memory ramp (stage 1) and stage 2 wins.
+
 Output (`Plan`): ceiling in whole mph (None: no ceiling), confidence, trusted, known road, reason, distance to the limiting point, and the
 model's own preview (largest predicted lateral acceleration in the next MODEL_LOOK_S), which the car side needs before it restores.
 No position ever leaves this module: logs carry trace / point indices, distances and curvatures only.
@@ -41,6 +45,20 @@ MODEL_K_SIGN = -1.0             # the model preview (ti_curve_plannerd.model_cur
                                 # curvature, RIGHT positive (latcontrol_angle / _pid steer from -desired_curvature); the planner's yaw_k
                                 # and the memory are LEFT positive: preview curvature times this is left positive
 AHEAD_S = 3.0                   # Plan.ahead_la: the signed peak calibrated forecast demand within this lead
+# ---- stage 2: late, forecast-confirmed (plan T5). The model preview between FC_LO_S and CONFIRM_LEAD_S ahead, calibrated by FC_RATIO
+# (ti_curve_demand.forecast_need), judged against the capacity of its direction at the speed now; a bend it shows needing at least
+# MIN_DROP_MPH below the speed, CONFIRM_TICKS planner ticks in a row (FORK_CONFIRM_S while trusted memory says the road ahead is
+# straight: at a fork the model may be showing the other road), sets a ceiling at most LATE_SHED_MPH below the speed it began at
+# (never below the floor); a bend needing more gets that plus the warning. Held until the forecast has not shown it for HOLD_AFTER_M
+# past where it last did; suppressed while a blinker is on and BLINKER_HOLD_S after (a turn or a lane change).
+FC_LO_S = 1.5
+CONFIRM_LEAD_S = 6.0
+CONFIRM_TICKS = 2
+FORK_CONFIRM_S = 3.0
+LATE_SHED_MPH = 5
+BLINKER_HOLD_S = 2.0            # assumption (not in the plan's table)
+S2_MIN_MPH = 20.0               # never act below 19-20 mph (the cruise and the comma engage from ~19)
+FORK_NEAR_M = 30.0              # "memory straight" around the forecast's bend: no tight remembered point within this of its distance
 MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its sharpest curvature is at least this share of it
 HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if the next slowdown would start within this of now
 # The on-road warning (first drive, 2026-11-23: a corner needing ~35 mph was reached at 40 and the car crossed the lane line, with no
@@ -290,6 +308,11 @@ class Planner:
     self.latch = {}                     # key -> corner (need, entry / low / end on the odometer): warned for whatever the trust
     self.model_k = None
     self.events = []
+    self.fc = None
+    self.ahead_la = None
+    self.s2 = None                      # stage 2 in force: T, need, u0 (the speed it began at), until (odometer), alert
+    self.s2_run, self.s2_t0 = 0, 0.0    # consecutive ticks the forecast has shown a bend, and since when
+    self.blink_t = -1e9
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
   def _candidates(self, fix):
@@ -480,10 +503,11 @@ class Planner:
 
   # ---- one tick ------------------------------------------------------------------------------------------------------------------
   def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None, ref_mph=None, floor_mph=None, acting=True,
-           map_k=None):
+           map_k=None, blinker=False):
     """t: seconds (monotonic); fix: Fix; v: m/s; set_mph: the cruise set speed or None; yaw_k: live curvature (1/m, left +, from the
     car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview as it publishes it (RIGHT
-    positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (accepted; used from plan T6). -> Plan."""
+    positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (accepted; used from plan T6);
+    blinker: either turn signal on (suppresses stage 2). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
@@ -507,9 +531,14 @@ class Planner:
         model_la = float(kk[j] * max(v, 1.0) ** 2)
         self.model_k = float(kk[j])
         self.fc = (ts, MODEL_K_SIGN * ks)
+        self.fc_v = v
         _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S)
         self.ahead_la = None if la3 is None else round(la3, 2)
+    mph = v / MPH
+    if blinker:
+      self.blink_t = t
     if self.mem is None:
+      self._stage2(t, v, mph, set_mph, self._floor(floor_mph, ref_mph, set_mph, mph), None)
       return self._out(None, 0.0, False, False, "no road memory on the device", None, None, model_la)
     self._localise(dt, fix, v)
     if self.locked and yaw_k is not None and self.odo >= self.distrust_until and self._check_change():
@@ -537,6 +566,7 @@ class Planner:
       # miss never drops (or delays) a warning (fourth review, MUST 1). Nothing more is tapped down without trust: predicted so.
       self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
       self.alert = self._warn(list(self.latch.values()), mph, v, floor, acting, set_mph, lowering=False)
+      self._stage2(t, v, mph, set_mph, floor, None)
       return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
 
     # ---- the corners ahead -------------------------------------------------------------------------------------------------------
@@ -682,6 +712,7 @@ class Planner:
     self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
     corners = corners + [c for k, c in self.latch.items() if k not in keys]
     self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True)
+    self._stage2(t, v, mph, set_mph, floor, (need, dist, u_ref))
     # a warned corner whose need is below the floor is "capped" too, also on the tick before its slowdown starts
     warned_below_floor = self.alert is not None and self.alert < floor
     if ceil is None:
@@ -696,6 +727,57 @@ class Planner:
     self.cap_out = cap
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold", stage=1, src="mem")
+
+  @staticmethod
+  def _mem_tight(mem_ahead, lo_m, hi_m):
+    """Trusted memory (mem_ahead: (need, dist, u_ref) of the look-ahead, None when not trusted) has a point between lo_m and hi_m
+    ahead needing at least MIN_DROP_MPH below u_ref."""
+    if mem_ahead is None:
+      return False
+    need, dist, u_ref = mem_ahead
+    near = (dist >= lo_m) & (dist <= hi_m)
+    return bool(np.any(near & ((u_ref - need) >= MIN_DROP_MPH)))
+
+  def _stage2(self, t, v, mph, set_mph, floor, mem_ahead):
+    """Stage 2 (plan T5): late, forecast-confirmed, at most LATE_SHED_MPH. Updates self.s2 (merged into the output by _out).
+    mem_ahead: the trusted memory's look-ahead (need, dist, u_ref), or None (no memory, not trusted): with it, "memory straight" over
+    the forecast window asks FORK_CONFIRM_S of confirmation, and a bend memory knows (a tight remembered point within FORK_NEAR_M of
+    the forecast's bend) is the memory stage's to warn for: stage 2 adds no warning there."""
+    u = max(mph, float(set_mph)) if set_mph else mph
+    quiet = (self.fc is None or mph < S2_MIN_MPH or t - self.blink_t < BLINKER_HOLD_S)
+    need, lead = None, None
+    if not quiet:
+      need, lead, _, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S)
+    base = self.s2["u0"] if self.s2 is not None else u
+    hit = need is not None and need <= base - MIN_DROP_MPH
+    if hit:
+      if self.s2_run == 0:
+        self.s2_t0 = t
+      self.s2_run += 1
+    else:
+      self.s2_run = 0
+    if self.s2 is not None and (t - self.blink_t < BLINKER_HOLD_S or mph < S2_MIN_MPH):
+      # a blinker (or the speed under 20 mph) drops stage 2 at once; a missing preview only stops refreshing it (held to `until`)
+      self.events.append({"kind": "s2_off", "why": "blinker" if t - self.blink_t < BLINKER_HOLD_S else "slow", "T": self.s2["T"]})
+      self.s2 = None
+    mem_straight = mem_ahead is not None and not self._mem_tight(mem_ahead, FC_LO_S * v - FORK_NEAR_M, CONFIRM_LEAD_S * v + FORK_NEAR_M)
+    confirmed = hit and self.s2_run >= CONFIRM_TICKS and (not mem_straight or t - self.s2_t0 >= FORK_CONFIRM_S - 1e-6)
+    if confirmed:
+      T = int(max(need, int(round(base)) - LATE_SHED_MPH, floor))
+      until = self.odo + lead * v + HOLD_AFTER_M
+      knew = self._mem_tight(mem_ahead, lead * v - FORK_NEAR_M, lead * v + FORK_NEAR_M)
+      if self.s2 is None:
+        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew}
+        self.events.append({"kind": "s2_start", "T": T, "need": int(need), "mph": round(mph, 1), "lead": round(lead, 1),
+                            "floor": int(floor), "fork": bool(mem_straight)})
+      else:
+        self.s2.update(T=min(self.s2["T"], T), need=min(self.s2["need"], int(need)), until=max(self.s2["until"], until), lead=lead,
+                       knew=self.s2["knew"] or knew)
+    elif hit and self.s2 is not None:
+      self.s2["until"] = max(self.s2["until"], self.odo + lead * v + HOLD_AFTER_M)
+    if self.s2 is not None and self.odo > self.s2["until"]:
+      self.events.append({"kind": "s2_off", "why": "passed", "T": self.s2["T"]})
+      self.s2 = None
 
   @staticmethod
   def _raise_due(mph, set_mph, T):
@@ -827,11 +909,25 @@ class Planner:
     return out
 
   def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind="", stage=0, src=""):
+    """The Plan of this tick; stage 2 (self.s2) is merged here (the lower ceiling wins), so it acts on every path, trusted or not."""
     end, self.end_m = self.end_m, None
     behind, self.behind = self.behind, False
     alert, self.alert = self.alert, None
     need, self.need_out = getattr(self, "need_out", None), None
     cap, self.cap_out = getattr(self, "cap_out", None), None
+    s2 = getattr(self, "s2", None)
+    if s2 is not None and (ceil is None or s2["T"] < ceil or (kind == "hold" and s2["T"] <= ceil)):
+      # stage 2 binds: its source (the forecast) is valid whatever the memory's trust
+      ceil, cmph, kind, stage, src, trusted, past = s2["T"], s2["T"], "corner", 2, "fc", True, False
+      dist = round(max(0.0, s2["lead"] * self.fc_v), 1) if getattr(self, "fc_v", None) is not None else 0.0
+      end = round(max(0.0, s2["until"] - HOLD_AFTER_M - self.odo), 1)
+      need = s2["need"]
+      cap = None
+      capped = capped or s2["need"] < s2["T"]          # the bend wants more than stage 2 may shed
+      why = "bend ahead (forecast)"
+    if s2 is not None and s2["need"] < s2["T"] and not s2["knew"]:
+      # a bend needing more than stage 2 may shed (LATE_SHED_MPH, or the floor): the 5 mph plus the warning
+      alert = s2["need"] if alert is None else min(alert, s2["need"])
     if ceil is None:
       stage, src = 0, ""
     ahead = getattr(self, "ahead_la", None)
