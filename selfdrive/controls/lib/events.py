@@ -263,10 +263,10 @@ def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   if raw < 0:
     # curve slowing's warning (frogpilot_planner sends it negative): the corner's true need, to the unit (a float32 30 is 29.99..)
     shown = max(int(unit_speed + 0.05), 5)
-    title = f"SLOW DOWN: corner ahead needs {shown} {'km/h' if metric else 'mph'}"
+    title = f"SLOW DOWN: corner needs {shown} {'km/h' if metric else 'mph'}"
   else:
     shown = max(5 * int(unit_speed // 5), 5)   # the model advisory as before: 5-unit steps (its dither replayed the chime)
-    title = f"Slow to {shown} {'km/h' if metric else 'mph'} for the corner ahead"
+    title = f"Slow to {shown} {'km/h' if metric else 'mph'} for the corner"
   return Alert(
     title,
     "The steering cannot hold it at this speed",

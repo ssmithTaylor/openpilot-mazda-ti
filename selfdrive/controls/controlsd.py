@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import VCruiseHelper, clip_c
 from openpilot.selfdrive.controls.lib.events import Events, ET
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_CONTROL_SPEED
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
+from openpilot.selfdrive.controls.lib.lane_drift import lane_drift_evidence
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.car.mazda.lateral_diagnostics import record_inputs
@@ -855,7 +856,8 @@ class Controls:
       # PROPOSAL: Take Control only after the saturation has lasted 1.5 s in all (the 0.8 s steer limit timer plus
       # TAKE_CONTROL_HOLD_S = 0.7 s held here): on the 2026-11-23 drive the 14 clips at the TI limit lasted 0.13-6.1 s; 1.5 s chimes for the 4 longest
       # (2.0, 2.1, 2.8, 6.1 s), about 4.5 s before the end of the 6.1 s one, and never for the brief clips at corner entry
-      held = lac_log.saturated and undershooting and turning
+      # owner, 2026-11-23: at the limit on a bend the car holds is normal; the alert also needs a lane line close to or under the car's side
+      held = lac_log.saturated and undershooting and turning and lane_drift_evidence(model_v2)
       self.sat_alert_frames = self.sat_alert_frames + 1 if held else 0
       if held and self.sat_alert_frames * DT_CTRL >= TAKE_CONTROL_HOLD_S:
         if self.frogpilot_toggles.goat_scream_alert:

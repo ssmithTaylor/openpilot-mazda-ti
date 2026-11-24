@@ -979,10 +979,10 @@ def test_alert_text_shows_the_true_number():
   from openpilot.selfdrive.controls.lib import events as E
   sm = {"frogpilotPlan": NS(steerAdvisorySpeed=-float(np_.float32(30 * 0.44704)))}   # negative: curve slowing's warning
   a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
-  assert a.alert_text_1 == "SLOW DOWN: corner ahead needs 30 mph"
+  assert a.alert_text_1 == "SLOW DOWN: corner needs 30 mph"
   sm = {"frogpilotPlan": NS(steerAdvisorySpeed=float(np_.float32(33 * 0.44704)))}    # the model advisory: 5-mph steps as before
   a = E.steer_authority_advisory_alert(None, None, sm, False, 0, None)
-  assert a.alert_text_1 == "Slow to 30 mph for the corner ahead"
+  assert a.alert_text_1 == "Slow to 30 mph for the corner"
 
 
 def test_alert_precedence_steering_calls_over_the_curve_warning_over_lead_and_green():
