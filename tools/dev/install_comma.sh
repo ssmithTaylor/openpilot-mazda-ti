@@ -7,7 +7,7 @@
 # Stages (stop on first failure; the collector is ALWAYS resumed by the exit trap):
 #   1 preconditions: clean tree, branch is a fast-forward of origin/main, PC tests green (pc_test.py --changed)
 #   2 pause the collector      3 push <branch>:main      4 comma: git pull --ff-only      5 comma: build (login shell)
-#   6 comma: comma_checks.sh   7 optional road memory copy (previous kept as .prev)       8 reboot, wait, verify commit + processes
+#   6 comma: comma_checks.sh (login shell)   7 optional road memory copy (previous kept as .prev)       8 reboot, wait, verify commit + processes
 set -euo pipefail
 DEVICE="comma@192.168.15.100"; KEY="$HOME/.ssh/comma_key"; REMOTE_DIR="/data/openpilot"
 KCTL=(kubectl --context default -n utilities)
@@ -64,8 +64,11 @@ remote "cd $REMOTE_DIR && git pull --ff-only"
 stage "5 comma: build (login shell)"
 remote "cd $REMOTE_DIR && bash -lc 'scons -j\$(nproc) --cache-populate --minimal'"
 
-stage "6 comma: checks"
-remote "cd $REMOTE_DIR && bash tools/dev/comma_checks.sh ${OLD:+--base $OLD} ${RLOG:+--rlog $RLOG}"
+stage "6 comma: checks (login shell)"
+# a login shell, as stage 5: a plain ssh command gets the system python3 (3.8) and the first check dies on it. The values go inside
+# the single-quoted bash -lc script in double quotes, so neither may hold a quote of either kind.
+case "$OLD$RLOG" in *\'*|*\"*) echo "--base / --rlog must not contain quotes"; exit 1;; esac
+remote "cd $REMOTE_DIR && bash -lc 'cd $REMOTE_DIR && bash tools/dev/comma_checks.sh ${OLD:+--base \"$OLD\"} ${RLOG:+--rlog \"$RLOG\"}'"
 
 if [ -n "$MEMORY" ]; then
   stage "7 road memory"
