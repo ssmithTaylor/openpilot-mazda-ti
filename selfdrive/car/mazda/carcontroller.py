@@ -970,7 +970,7 @@ class CarController(CarControllerBase):
       # unchanged for STUCK_HOLD_S is moved STUCK_NUDGE counts toward zero for STUCK_NUDGE_FRAMES frames, so the interceptor never
       # sees the ~1.9 s unchanged request that trips its 0x11 fault. The value sent becomes the limiter's history below, so the step
       # back up is the limiter's own.
-      ti_apply_steer = guard.update(ti_apply_steer, bool(CC.latActive and CS.ti_lkas_allowed))
+      ti_apply_steer = guard.update(ti_apply_steer, bool(CC.latActive and CS.ti_lkas_allowed), now=now_nanos * 1e-9)
       if guard.burst_started and (self.ti_stuck_logged is None or self.frame - self.ti_stuck_logged >= TI_STUCK_LOG_EVERY_FRAMES):
         self.ti_stuck_logged = self.frame
         ti_stuck_log({"kind": "nudge", "frame": self.frame, "value": int(ti_unguarded), "sent": int(ti_apply_steer),

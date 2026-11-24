@@ -234,3 +234,30 @@ def test_controller_slowest_up_rate_the_return_is_inside_the_limiter(ti_max, ste
   assert longest_identical_run(bus) <= STUCK_HOLD_FRAMES
   for x, y in zip(bus, bus[1:]):
     assert abs(y) <= abs(x) + 1 if abs(y) > abs(x) else abs(x - y) <= max(STUCK_NUDGE, cc.ccp.TI_STEER_DELTA_DOWN)
+
+
+def test_a_stalled_loop_is_judged_in_real_time():
+  """Frames arriving late (a control-loop stall): the nudge comes when STUCK_HOLD_S of clock time has passed, not after 80 frames."""
+  from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard, STUCK_HOLD_S, STUCK_NUDGE
+  g = StuckGuard()
+  t, outs = 0.0, []
+  for _ in range(40):                      # 40 frames, each 0.05 s apart: 2.0 s of clock time, far fewer than 80 frames
+    outs.append((t, g.update(-570, True, now=t)))
+    t += 0.05
+  first = next(tt for tt, o in outs if o != -570)
+  assert first <= STUCK_HOLD_S + 0.05, first
+  assert all(abs(o - (-570)) <= STUCK_NUDGE and abs(o) <= 570 for _, o in outs)
+  longest, run, prev = 0.0, 0.0, None      # no value sent unchanged for longer than the hold plus one late frame
+  start = 0.0
+  for tt, o in outs:
+    if o != prev:
+      start, prev = tt, o
+    longest = max(longest, tt - start)
+  assert longest <= STUCK_HOLD_S + 0.05, longest
+
+
+def test_without_a_clock_the_frame_count_still_rules():
+  from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard, STUCK_HOLD_FRAMES
+  g = StuckGuard()
+  outs = [g.update(300, True) for _ in range(STUCK_HOLD_FRAMES + 3)]
+  assert outs[:STUCK_HOLD_FRAMES] == [300] * STUCK_HOLD_FRAMES and outs[STUCK_HOLD_FRAMES] == 298

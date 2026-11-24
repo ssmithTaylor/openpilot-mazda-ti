@@ -56,6 +56,7 @@ class StuckGuard:
   def __init__(self):
     self.last_out = None       # the value sent on the previous frame (None: lateral was inactive)
     self.run = 0               # consecutive frames last_out has been sent
+    self.since = None          # clock time (s) last_out was first sent; None without a clock
     self.held = None           # the value being nudged
     self.nudge_left = 0        # nudge frames still to send for `held`
     self.nudged = False
@@ -63,10 +64,12 @@ class StuckGuard:
     self.bursts = 0
 
   def reset(self):
-    self.last_out, self.run, self.held, self.nudge_left = None, 0, None, 0
+    self.last_out, self.run, self.held, self.nudge_left, self.since = None, 0, None, 0, None
 
-  def update(self, cmd, active):
-    """cmd: the final command about to be packed (int). active: lateral control active and the interceptor taking commands."""
+  def update(self, cmd, active, now=None):
+    """cmd: the final command about to be packed (int). active: lateral control active and the interceptor taking commands.
+    now: a monotonic clock in seconds (optional). With it the hold is ALSO judged in real time, so a stalled control loop
+    (frames arriving late) cannot stretch an unchanged value past STUCK_HOLD_S: whichever of frames or time is reached first."""
     self.nudged = self.burst_started = False
     if not active:
       self.reset()
@@ -78,7 +81,8 @@ class StuckGuard:
       self.nudged = True
     else:
       self.nudge_left = 0      # the command moved on its own during a burst: sent as it is, the burst is over
-      if cmd == self.last_out and self.run >= STUCK_HOLD_FRAMES and cmd != 0 and cmd != TI_FW_CLIP and cmd != -TI_FW_CLIP:
+      held_long = self.run >= STUCK_HOLD_FRAMES or (now is not None and self.since is not None and now - self.since >= STUCK_HOLD_S)
+      if cmd == self.last_out and held_long and cmd != 0 and cmd != TI_FW_CLIP and cmd != -TI_FW_CLIP:
         self.held = cmd
         self.nudge_left = STUCK_NUDGE_FRAMES - 1
         out = toward_zero(cmd)
@@ -87,5 +91,5 @@ class StuckGuard:
     if out == self.last_out:
       self.run += 1
     else:
-      self.last_out, self.run = out, 1
+      self.last_out, self.run, self.since = out, 1, now
     return out
