@@ -1652,7 +1652,7 @@ constexpr int BUTTONS_SECOND_PX = 60;
 constexpr int BUTTONS_RESULT_PX = 76;
 constexpr int MAX_BUTTONS_PRIMARY_CHARS = 26;            // = ti_button_tests.MAX_LINE1 (tested on both sides)
 constexpr int MAX_BUTTONS_SECOND_CHARS = 55;             // MAX_LINE2
-constexpr int MAX_BUTTONS_RESULT_CHARS = 42;             // MAX_RESULT
+constexpr int MAX_BUTTONS_RESULT_CHARS = 38;             // MAX_RESULT
 constexpr int MAX_BUTTONS_DETAIL_CHARS = 74;             // MAX_DETAIL
 constexpr int MAX_BUTTONS_SUB_CHARS = 24;                // a control's second line at START_SUB_PX in its 660 px box
 constexpr double BUTTONS_STALE_S = CRUISE_STALE_S;

@@ -768,3 +768,17 @@ def test_report_reads_the_events_and_the_raw_traces():
   assert "raw: 7" not in text or True
   hold = runs[0]
   assert hold["raw"]["frames"] == len([1 for _, b, _, _ in car.sent]) and hold["raw"]["set_path"][:3] == [45, 44, 40]
+
+
+def test_report_over_a_folder_without_logs(tmp_path, capsys):
+  from openpilot.selfdrive.car.mazda import ti_button_tests_report as rep
+  (tmp_path / "seg0").mkdir()
+  assert rep.main([str(tmp_path)]) == 0
+  assert capsys.readouterr().out.strip() == "No button test in these logs."
+
+
+def test_report_and_events_carry_no_position():
+  src = (ROOT / "selfdrive/car/mazda/ti_button_tests.py").read_text(encoding="utf-8") + \
+        (ROOT / "selfdrive/car/mazda/ti_button_tests_report.py").read_text(encoding="utf-8")
+  for word in ("latitude", "longitude", "gps", "liveLocation", "position"):
+    assert word not in src.replace("Nothing about where the car\nwas", "")

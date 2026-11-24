@@ -100,7 +100,7 @@ VERIFY_S = 1.0
 # ---- the page's line lengths (selfdrive/ui/qt/ti_pages_logic.h, BUTTONS_*: tested on both sides) ------------------------------------
 MAX_LINE1 = 26
 MAX_LINE2 = 55
-MAX_RESULT = 42
+MAX_RESULT = 38
 MAX_DETAIL = 74
 
 
@@ -440,8 +440,7 @@ class ButtonTests:
       lo, hi = self._bounds()
       self.unexpected = self.unexpected + 1 if not (lo <= inp.set_mph <= hi) else 0
       if self.unexpected >= UNEXPECTED_FRAMES:
-        why = f"set speed {inp.set_mph} mph not expected (expected {lo}-{hi})" if lo != hi else \
-              f"set speed {inp.set_mph} mph not expected (expected {lo})"
+        why = f"set speed {inp.set_mph} mph not expected ({lo}-{hi})" if lo != hi else f"set speed {inp.set_mph} mph not expected ({lo})"
     if not why and (frame - self.run_t0) * DT > RUN_LIMIT_S[self.test]:
       why = f"time limit {RUN_LIMIT_S[self.test]:.0f} s reached"
     if why:
