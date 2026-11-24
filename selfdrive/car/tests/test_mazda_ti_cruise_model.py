@@ -6,12 +6,15 @@ from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
 from openpilot.selfdrive.car.mazda import ti_curve_plan as P
 
 
-def test_measured_table_grade_corrected_capped_at_10_14():
-  # band centres: 1-2 0.21; 2-3 0.31; 3-4 0.41; 4-6 0.58; 6-8 0.64; 8-10 0.81; 10-14 0.90 m/s^2
-  for gap, a in ((1.5, 0.21), (2.5, 0.31), (3.5, 0.41), (5.0, 0.58), (7.0, 0.64), (9.0, 0.81), (12.0, 0.90)):
+def test_measured_table_grade_corrected_with_the_14_plus_band():
+  # band centres: 1-2 0.21; 2-3 0.31; 3-4 0.41; 4-6 0.58; 6-8 0.64; 8-10 0.81; 10-14 0.90; 14+ 1.21 m/s^2 (timing variant).
+  # Was "capped at 10-14" (A1); the owner's newer rule (RULES.md 2026-11-24, plan A10): plan on braking that keeps growing beyond a
+  # 14 mph gap; flat beyond 16; the conservative variant keeps its cap
+  for gap, a in ((1.5, 0.21), (2.5, 0.31), (3.5, 0.41), (5.0, 0.58), (7.0, 0.64), (9.0, 0.81), (12.0, 0.90), (16.0, 1.21)):
     assert CM.decel_ms2(gap) == pytest.approx(a)
   assert CM.decel_ms2(0.0) == 0.0 and CM.decel_ms2(-3.0) == 0.0
-  assert CM.decel_ms2(16.0) == CM.decel_ms2(30.0) == pytest.approx(0.90)     # the 14+ band (5 events) is not extrapolated
+  assert CM.decel_ms2(30.0) == pytest.approx(1.21) and CM.decel_ms2(14.0) == pytest.approx((0.90 + 1.21) / 2)
+  assert CM.decel_ms2(16.0, CM.CONSERVATIVE) == CM.decel_ms2(30.0, CM.CONSERVATIVE) == pytest.approx(0.65)
   gaps = [x / 4.0 for x in range(0, 80)]
   for v in (CM.TIMING, CM.CONSERVATIVE):
     a = [CM.decel_ms2(g, v) for g in gaps]

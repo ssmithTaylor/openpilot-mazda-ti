@@ -175,8 +175,11 @@ def test_no_kap_med_no_memory_stage():
 
 def test_approach_times_at_45():
   # plan T4 + A8-R4 + A9 / A11: the planner's own manoeuvre at 45 mph (push to T - DRIVE_GAP_MPH, model-timed raise), timing variant,
-  # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.86 / 10.44 s (A11, block two), pinned here
-  for drop, want in ((5, 4.99), (10, 7.86), (15, 10.44)):
+  # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.95 / 10.35 s, pinned here (15 off was 10.44
+  # before the 14+ mph band entered the timing table, plan A10: the push to 24 opens a gap beyond 14 mph; 10 off was 7.86, 15 off
+  # 10.25 with the
+  # raise judged every 0.1 s: RAISE_CHECK_S is now 0.05, which equals judging it every step, test_a8_r6)
+  for drop, want in ((5, 4.99), (10, 7.95), (15, 10.35)):
     T = 45 - drop
     t, _ = CM.manoeuvre(45.0, T, max(P.CAR_MIN_MPH, T - P.DRIVE_GAP_MPH), arrived=P.ARRIVED_MPH, tap_s=P.TAP_S)
     assert t == pytest.approx(want, abs=0.05), (drop, t)
@@ -191,7 +194,8 @@ def test_response_model_is_the_measured_one():
   # rewritten for plan amendment A1 (was test_response_model_saturates_at_6_mph, pinning the unmeasured 0.76 / 1.6 mph/s law)
   for g in (0, 1, 2, 3, 6, 12, 20):
     assert P.decel_mph_s(g) == CM.decel_mph_s(g)
-  assert P.decel_mph_s(20) * MPH == pytest.approx(0.90)  # capped at the 10-14 mph band: never assumes more
+  assert P.decel_mph_s(20) * MPH == pytest.approx(1.21)  # the 14+ band (plan A10; was capped at the 10-14 band, 0.90)
+  assert CM.decel_ms2(20, CM.CONSERVATIVE) == pytest.approx(0.65)   # the safety-check variant keeps its cap
   assert P.DRIVE_GAP_MPH >= 6
 
 
