@@ -119,6 +119,8 @@ def one(args):
         cls = 'NEEDED' if (tr or act <= T + 3) else ('UNNECESSARY' if act >= T + 5 else 'MARGINAL')
         # the limiting point: lowest need in the corner's memory stretch
         k = int(e['point'])
+        if k < 0:
+          continue                                             # the driving model's own preview, not a remembered bend
         t0 = int(np.searchsorted(mem.trace_start, k, side='right') - 1)
         span = int(max(1, (a_['at'] - a_['entry']) / mem.spacing)) + 2
         ks = np.arange(max(int(mem.trace_start[t0]), k - span), k + 1)
