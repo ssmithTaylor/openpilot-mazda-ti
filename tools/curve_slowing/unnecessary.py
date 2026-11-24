@@ -10,7 +10,10 @@ own detectors, +-3 s around the bend).
 Memory: one file for every drive (default v6, the file on the car; the drive is IN it, so this is in-sample: the old leave-one-out
 files predate v6 and are not used). Output is POSITION-FREE: segment+seconds, speeds, counts.
 
-  python tools/curve_slowing/unnecessary.py [--mem FILE] [--drives D ...] [--worst 20]
+  python tools/curve_slowing/unnecessary.py [--mem FILE] [--drives D ...] [--worst 20] [--dwell]
+
+--dwell also prints the PREDICTED EARLY DWELL of every slowdown (early_dwell.py: the measured cruise response from the start against
+the moment the recorded pass first loads the car at the target speed): median / p10 / p90 seconds, late arrivals, worst overshoot.
 """
 import argparse
 import json
@@ -29,6 +32,7 @@ except ImportError:
   from selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P   # type: ignore
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_memory as B   # noqa: E402
+import early_dwell as ED   # noqa: E402
 
 DATA_DIR = 'E:/openpilot-mazda-ti-data/curve-slowing/memory'
 MPH = 0.44704
@@ -138,7 +142,10 @@ def one(args):
         if len(okj):
           px, py = mem.to_local(R['lat'][okj].astype(float), R['lon'][okj].astype(float))
           miss = float(np.hypot(np.asarray(px) - mem.x[kk], np.asarray(py) - mem.y[kk]).min())
-        out.append(dict(drive=drive, seg=tag, sec=round(sec, 1), mph=e['mph'], T=T, act=round(act, 1), cls=cls, tr='+'.join(tr),
+        # predicted early dwell: from this start, the measured response against the first sample loading the car at T (up to 100 m
+        # past the corner's end)
+        dw = ED.dwell(float(e['mph']), T, s, R['kap'], i, s_end + 100.0, DT)
+        out.append(dict(drive=drive, seg=tag, sec=round(sec, 1), mph=e['mph'], T=T, act=round(act, 1), cls=cls, tr='+'.join(tr), dwell=dw,
                         waste=max(0.0, act - T) * dur if cls == 'UNNECESSARY' else 0.0, npass=int(mem.npass[kk]),
                         miss=round(miss, 1), eng=round(float((R['lat_act'][ww] > .5).mean()), 2), vmed=float(mem.v[kk] / MPH), vpro=float(mem.v_proven[kk] / MPH), rule=rule_of(planner, mem, kk)))
       planner.events.clear()
@@ -152,6 +159,7 @@ def main():
   ap.add_argument('--worst', type=int, default=20)
   ap.add_argument('--workers', type=int, default=6)
   ap.add_argument('--list', default='', help='also print every slowdown in these segments (prefix match)')
+  ap.add_argument('--dwell', action='store_true', help='also print the predicted early dwell (early_dwell.py)')
   a = ap.parse_args()
   drives = a.drives or sorted(os.path.basename(p)[6:-4] for p in glob.glob(f'{DATA_DIR}/cache/drive_*.npz'))
   with ProcessPoolExecutor(a.workers) as ex:
@@ -175,6 +183,12 @@ def main():
     print(f"  unnecessary where the pass came no nearer than {lim} m to the remembered corner (other road): {int((ms > lim).sum())} ({100.0 * (ms > lim).sum() / max(len(un), 1):.0f} %)")
   ne = sum(1 for x in un if x['eng'] < 0.9)
   print(f"  unnecessary where this pass was NOT steered by the car through the bend (a hand-driven pass proves nothing): {ne} ({100.0 * ne / max(len(un), 1):.0f} %)")
+  if a.dwell:
+    sm = ED.summary([x['dwell'] for x in allr])
+    nl = sum(1 for x in allr if x['dwell'] is None)
+    print(f"predicted early dwell (measured response {ED.DELAY_S} s, {ED.RATE_MPH_S} mph/s; arrived at T + {ED.ARRIVED_MPH} mph): "
+          f"n {sm.get('n', 0)} (+{nl} where the pass never loads {ED.LOAD_LA} m/s^2 at T); median {sm.get('median')} s, "
+          f"p10 {sm.get('p10')} s, p90 {sm.get('p90')} s; late {sm.get('late')}, worst {sm.get('worst_over_mph')} mph over T")
   json.dump(allr, open(os.environ.get('UNNEC_OUT', os.devnull), 'w'))
   print("worst unnecessary (segment+s | start mph -> target | actual clean min mph | memory passes, median, best clean | rule):")
   for x in sorted([x for x in allr if x['cls'] == 'UNNECESSARY'], key=lambda x: -(x['act'] - x['T']))[:a.worst]:
