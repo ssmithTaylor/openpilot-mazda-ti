@@ -1218,3 +1218,160 @@ def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend():
   assert "s1_unconfirmed" in [e["kind"] for e in pl.events]
   assert next(v for t, s, p, v in res if s >= 1500) > 38 + P.ALERT_MARGIN_MPH + 1      # the cap kept it fast
   assert any(p.alert_mph == int(D.need_mph(k)[0]) for t, s, p, v in res if s <= 1500)  # and the driver is told, before the bend
+
+
+# ---- road matching: is the car ON the locked trace or BESIDE it (owner, 2026-11-24: wrong-road cases are solved by matching on
+# position and heading, not by caps) ----------------------------------------------------------------------------------------------
+def _beside(off_fn):
+  """fix_fn: the car `off_fn(t, s)` = (offset m, left +; heading difference rad) from the trace, along the trace's left normal."""
+  def f(t, s, fx):
+    o, dh = off_fn(t, s)
+    return P.Fix(True, fx.x - o * math.sin(fx.hdg), fx.y + o * math.cos(fx.hdg), M.wrap(fx.hdg + dh))
+  return f
+
+
+def _rm_events(pl, kind="rm_off"):
+  return [e for e in pl.events if e["kind"] == kind]
+
+
+def _beside_ticks(res):
+  return [(t, s) for t, s, p, *_ in res if p.why == "beside the remembered road"]
+
+
+def test_rm_constants_are_the_measured_ones():
+  # from the noise floor on raw fixes (2026-11-24); a change here must be measured again
+  assert (P.RM_TAU_S, P.RM_DIV_M, P.RM_PRED_M, P.RM_LEAD_S, P.RM_STEADY_S, P.RM_STEADY_M, P.RM_STEADY_DEG, P.RM_ABS_M) == \
+    (1.0, 4.5, 5.5, 1.0, 4.0, 1.0, 1.5, 7.0)
+  assert P.RM_ON
+
+
+def test_rm_lane_change_does_not_trip():
+  # one lane (3.7 m) over 4 s at 65 mph, then steady in the new lane: the car is still on the road, nothing changes
+  tr = road((4000, 0.0))
+  mem = M.synthetic([tr])
+  v = 65 * MPH
+  t0, T, W = 20.0, 4.0, 3.7
+
+  def lc(t, s):
+    if t < t0:
+      return 0.0, 0.0
+    if t >= t0 + T:
+      return W, 0.0
+    x = (t - t0) / T
+    return W * (1 - math.cos(math.pi * x)) / 2, math.atan2(W * math.pi / (2 * T) * math.sin(math.pi * x), v)
+  for sign in (1.0, -1.0):
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 65, 50, planner=pl, fix_fn=_beside(lambda t, s: tuple(sign * q for q in lc(t, s))))
+    assert not _rm_events(pl) and not _beside_ticks(res)
+    assert all(p.trusted for t, s, p in res if t >= P.STABLE_S + 0.5)
+
+
+def test_rm_ramp_departure_trips_within_4_s():
+  # a ramp leaving the remembered highway: the offset grows 1 m per 25 m at 75 mph (heading ~2.3 deg off): beside within 4 s
+  tr = road((4000, 0.0))
+  mem = M.synthetic([tr])
+  v = 75 * MPH
+  t0 = 20.0
+  for sign in (1.0, -1.0):
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 75, 30, planner=pl,
+                fix_fn=_beside(lambda t, s: (0.0, 0.0) if t < t0 else (sign * v * (t - t0) / 25.0, sign * math.atan(1 / 25.0))))
+    ev = _rm_events(pl)
+    assert ev and ev[0]["why"] in ("dev", "lead")
+    t_off = next(t for t, s in _beside_ticks(res))
+    assert t0 < t_off <= t0 + 4.0, t_off - t0
+    assert pl.locked                                             # the lock keeps tracking (it is lost only when the fixes leave it)
+
+
+def test_rm_steady_offset_beyond_7_m_trips_and_starts_nothing():
+  # a steady 7.5 m offset (more than two lanes: another road beside the remembered one): beside from the lock, no memory slowdown for
+  # the remembered corner ahead; the tick log says why
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (7.5, 0.0)))
+  assert pl.locked and _rm_events(pl) and _rm_events(pl)[0]["why"] == "far"
+  assert all(p.ceil is None and not p.trusted for t, s, p in res)
+  assert not any(e["kind"] == "start" for e in pl.events)
+  beside = [p for t, s, p in res if p.why == "beside the remembered road"]
+  assert beside and all(p.diag.get("rm") == "far" for p in beside)
+  # an ordinary lane offset (3 m, steady) is on the road: slowed for as ever, no "rm" in the log
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (3.0, 0.0)))
+  assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res)
+  assert not any("rm" in (p.diag or {}) for t, s, p in res)
+  # ... and one below the limit (6.5 m) too
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (6.5, 0.0)))
+  assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res)
+
+
+def test_rm_jump_of_11_m_at_a_trace_link_trips_at_once():
+  # the remembered road continues on a linked trace that lies 11 m to the side; the car drives straight on (it did not follow the
+  # link): beside on the first tick the match is on the linked trace
+  a = road((1000, 0.0))
+  b = M.synthetic_trace([(1500, 0.0)], x0=a["x"][-1] + M.SPACING_M, y0=a["y"][-1] + 11.0, h0=a["hdg"][-1])
+  mem = M.synthetic([a, b], nexts=[1, -1])
+  straight = road((2500, 0.0))
+  pl = P.Planner(mem)
+  res = drive(mem, straight, 55, 70, planner=pl)
+  first_b = next(t for t, s, p in res if p.trace == 1)
+  ev = _rm_events(pl)
+  assert ev and ev[0]["why"] == "link"
+  t_off = next(t for t, s in _beside_ticks(res))
+  assert first_b <= t_off <= first_b + DT + 1e-6, (t_off, first_b)
+  assert all(p.trusted for t, s, p in res if P.STABLE_S + 0.5 <= t < first_b)
+  # the same link with the linked trace in line: no trip (the reference carries across the link)
+  b2 = M.synthetic_trace([(1500, 0.0)], x0=a["x"][-1] + M.SPACING_M, y0=a["y"][-1], h0=a["hdg"][-1])
+  mem2 = M.synthetic([a, b2], nexts=[1, -1])
+  pl = P.Planner(mem2)
+  res = drive(mem2, straight, 55, 70, planner=pl)
+  assert not _rm_events(pl) and pl.trace == 1 and all(p.trusted for t, s, p in res if t >= P.STABLE_S + 0.5)
+  # in line but the car 3 m to the side all along: across the link the reference carries (no re-seed needed, no trip)
+  pl = P.Planner(mem2)
+  res = drive(mem2, straight, 55, 70, planner=pl, fix_fn=_beside(lambda t, s: (3.0, 0.0)))
+  assert not _rm_events(pl) and pl.trace == 1
+
+
+def test_rm_corner_in_progress_is_kept_when_it_trips():
+  # the slowing for a remembered corner has started when the car's offset starts growing (a ramp the memory does not know): the
+  # corner is KEPT by dead reckoning to its end (never a ceiling above its own inside the bend), and nothing new starts
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  s0 = 1380.0
+  res = drive(mem, tr, 55, 160, closed=True, planner=pl,
+              fix_fn=_beside(lambda t, s: (0.0, 0.0) if s < s0 else (min(12.0, (s - s0) / 25.0), math.atan(1 / 25.0) if s < s0 + 300 else 0.0)))
+  kinds = [e["kind"] for e in pl.events]
+  assert "rm_off" in kinds and "start" in kinds and kinds.index("start") < kinds.index("rm_off")
+  i_off = kinds.index("rm_off")
+  assert pl.events[i_off + 1]["kind"] == "dead_reckon" and pl.events[i_off + 1]["why"] == "beside the remembered road"
+  assert "start" not in kinds[i_off:]
+  want = max(int(D.need_mph(CORNER_K)[0]), 55 - 15)
+  assert all(p.ceil is not None and p.ceil <= want for t, s, p, v in res if 1560 <= s <= 1650)
+  assert next(v for t, s, p, v in res if s >= 1500) <= want + 1.0
+  assert any(p.ceil is None or p.kind == "hold" for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)
+
+
+def test_rm_returning_to_the_trace_restores_trust():
+  # out to 6 m (trips), then back on the trace and steady: trusted again once steady RM_STEADY_S, not before. Steady is judged against
+  # the 3 s average (RM_SLOW_TAU_S), which itself needs a few seconds to come back: about 7.6 s from settling here
+  tr = road((4000, 0.0))
+  mem = M.synthetic([tr])
+  v = 60 * MPH
+  t0, t1, t2 = 20.0, 24.0, 27.0           # out over 4 s, back over 3 s, then on the trace
+
+  def f(t, s):
+    if t < t0 or t >= t2:
+      return 0.0, 0.0
+    if t < t1:
+      return 6.0 * (t - t0) / (t1 - t0), math.atan2(6.0 / (t1 - t0), v)
+    return 6.0 * (t2 - t) / (t2 - t1), -math.atan2(6.0 / (t2 - t1), v)
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 60, 50, planner=pl, fix_fn=_beside(f))
+  assert _rm_events(pl) and _rm_events(pl, "rm_on")
+  b = _beside_ticks(res)
+  t_back = next(t for t, s, p in res if t > b[0][0] and p.why != "beside the remembered road")
+  assert t2 + P.RM_STEADY_S - DT <= t_back <= t2 + P.RM_STEADY_S + 4.0, t_back - t2
+  assert all(p.trusted for t, s, p in res if t >= t_back)
+  assert pl.locked

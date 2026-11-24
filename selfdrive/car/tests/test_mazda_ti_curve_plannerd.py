@@ -240,6 +240,16 @@ def _worst_plan():
                  alert_mph=-88, stage=2, src="map", ahead_la=-88.88, cap=-8.88, released=True, diag=diag, kind="corner")
 
 
+def test_tick_log_says_why_the_car_is_beside_the_remembered_road():
+  # road matching (2026-11-24): the tick log carries why the planner judged the car beside the locked trace; absent otherwise
+  p = _worst_plan()
+  assert "rm" not in D.tick_log(p, _worst_extras())
+  p = p._replace(diag=dict(p.diag, rm="link"))
+  d = D.tick_log(p, _worst_extras())
+  assert d["rm"] == "link"
+  assert len(json.dumps(d, separators=(",", ":"))) <= D.TICK_MAX_B
+
+
 def test_tick_log_size_bound():
   # plan T8: <= TICK_MAX_B bytes per message (TICK_MAP_MAX_B on a tick whose map list changed), every field at its widest
   e = _worst_extras()
