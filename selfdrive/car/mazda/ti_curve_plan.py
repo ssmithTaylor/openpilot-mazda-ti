@@ -62,7 +62,11 @@ SIM_DT_S = 0.2                  # the arrival prediction's time step
 ACCEL_MPH_S = 0.7               # the stock cruise speeding up toward its set speed (measured: 5 mph in 7-9 s)
 SPEED_WINDOW_MPH = 0.75         # a speed fits only if every speed within this of it fits (band edges, speed error)
 FLAGGED_DROP_MPH = 10           # where a pass hit the limit or had a takeover: at least this far below the speed it was driven at
-FLAG_MIN_LA = 1.0               # ... only where the remembered bend needed at least this lateral acceleration (m/s^2) at that speed
+FLAG_MIN_LA = 1.3               # ... only where the remembered bend needed at least this lateral acceleration (m/s^2) at that speed
+                                # (1.0 until 2026-11-24: with flags spread 60-80 m ahead of the event, gentle lead-ins were capped too)
+AIM_MIN_LA = 1.3                # aim the approach at the first point of a corner where the remembered bend needs at least this lateral
+                                # acceleration (m/s^2) at the corner's own target speed (owner, 2026-11-24: arrive just in time; it aimed
+                                # at the first flagged point, 5-9 s early on 00000342). None reaches it: the corner's sharpest point
 CAR_MIN_MPH = 19                # the car's own lowest set speed
 MAX_MPH = 90
 
@@ -75,13 +79,14 @@ MAX_MPH = 90
 # still arrives by ENTRY_M before the corner with RESP_FACTOR of the measured deceleration and BUFFER_S of margin. CLOSED LOOP every
 # tick: the car's speed is compared with the highest speed from which it can still make it (`v_allow`); a car slowing less than planned
 # (downhill or anything else) is pushed to the floor; one slowing more (uphill) is let off to the corner speed (with hysteresis).
-REACTION_S = 0.5
+REACTION_S = 1.3               # measured on 00000342 / 00000343 (2026-11-24): first tap to the car slowing 0.9-3.4 s, median 1.5 s
 TAP_S = 0.3                     # one set-speed tap per this (2 pressed frames + the reviewed 0.25 s gap)
 DRIVE_GAP_MPH = 6                # a gap of 6 mph or more gives the most deceleration the cruise has; more does nothing
 RAISE_AT_MPH = 1.5
-RESP_FACTOR = 0.9               # plan with 90 % of the measured deceleration
-BUFFER_S = 1.0                  # extra seconds of start-early margin (chosen from the replay's buffer / early / late curve)
-ENTRY_M = 10.0                  # be at the corner speed this far before the first point that needs it
+ARRIVED_MPH = 1.5               # the approach counts as done at the corner speed + this (was 0.5: ~0.7 s more early dwell; 2026-11-24)
+RESP_FACTOR = 1.0               # plan with the measured deceleration (was 0.9; measured for drops of 8+ mph: 1.36 mph/s, 2026-11-24)
+BUFFER_S = 0.3                  # extra seconds of start-early margin (was 1.0; 2026-11-24, arrive just in time)
+ENTRY_M = 0.0                   # be at the corner speed this far before the aim point (was 10 m; 2026-11-24)
 COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
 REPUSH_MPH = 1.0                # ... and push again when back within this of v_allow
 BEHIND_GRACE_S = 3.0            # not "behind" in the first seconds of a start: a start fires AT the latest-start speed and the cruise
@@ -115,7 +120,7 @@ _APPROACH = {}
 
 
 def approach_m(u, T, S1, dt=0.05):
-  """Metres from the first press until the speed is within 0.5 mph of T, starting at u mph with the set speed at u, tapping down to S1
+  """Metres from the first press until the speed is within ARRIVED_MPH of T, starting at u mph with the set speed at u, tapping down to S1
   (one tap per TAP_S), raising to T once within RAISE_AT_MPH of it; the cruise acts REACTION_S after the set speed changes, with
   RESP_FACTOR of the measured deceleration. Cached by whole mph."""
   key = (int(u), int(T), int(S1))
@@ -130,7 +135,7 @@ def approach_m(u, T, S1, dt=0.05):
   tap_t = 0.0
   raised = False
   lag = int(round(REACTION_S / dt))
-  while v > T + 0.5 and t < 90.0:
+  while v > T + ARRIVED_MPH and t < 90.0:
     if not raised and v <= T + RAISE_AT_MPH:
       raised = True
     goal = T if raised else S1
@@ -292,6 +297,14 @@ def needed_mph(kap, flags, v_flag, v_proven=None):
   return np.minimum(need, np.maximum(cap, CAR_MIN_MPH))
 
 
+def aim_point(run, kabs, T):
+  """The point of a tight run (array of look-ahead indices) to aim the approach at: the first whose remembered |curvature| needs at
+  least AIM_MIN_LA at the corner's target T (mph); none does: the run's sharpest point (the first of equals)."""
+  la = kabs[run] * (T * MPH) ** 2
+  hit = np.nonzero(la >= AIM_MIN_LA)[0]
+  return int(run[hit[0]]) if len(hit) else int(run[int(np.argmax(kabs[run]))])
+
+
 class Fix(NamedTuple):
   valid: bool
   x: float = 0.0                  # local metres (Memory.to_local)
@@ -344,6 +357,7 @@ class Planner:
       self.proven = np.where(trouble, 0.0, self.proven)
       self.single = np.asarray(memory.npass) <= 1
       self.kabs = np.abs(memory.kap)
+      self.env_need = corner_mph(memory.kap)          # what the steering envelope alone allows (no trouble cap): the aim guard
       # the road-change check compares shape with the MEDIAN pass (memory kap_med), never with the conservative figure
       self.kmed = np.asarray(getattr(memory, "kap_med", memory.kap), np.float64)
     self.skipped = set()
@@ -668,20 +682,34 @@ class Planner:
     # already slowed for still bounds the way back up (a "hold")
     u_ref = max(u, self.int_base or 0.0)
     tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
-    # corners: runs of consecutive tight points; per run, its first point and its lowest-speed point
+    # corners: runs of consecutive tight points; per run, its aim point (aim_point), its lowest-speed point, and the guard points
     cands = {}
     if len(tight):
       breaks = np.nonzero(np.diff(tight) > 1)[0]
       starts = np.r_[0, breaks + 1]
       ends = np.r_[breaks, len(tight) - 1]
+      # the |curvature| of every look-ahead point (the driving model's own point: its preview) and what the envelope alone allows there
+      kab = np.where(mem_pt, self.kabs[np.clip(idx, 0, None)], self.model_k or 0.0)
+      phys = np.maximum(shed_to, np.where(mem_pt, np.maximum(np.maximum(self.env_need[np.clip(idx, 0, None)], floor), proven), shed_to))
       for s0, s1 in zip(starts, ends):
         run = tight[s0:s1 + 1]
         lowest = run[int(np.argmin(need[run]))]
         # a corner is known by the END of its tight stretch: it stays the same while the car drives into the stretch (its first and
         # lowest points ahead change as they are passed), so a corner is started once
         key = int(idx[run[-1]])
-        for j in {int(run[0]), int(lowest)}:
-          T = int(shed_to[j])
+        # aimed where the bend really loads the car at the corner's speed (aim_point), not at the run's first point (often a trouble
+        # flag spread ahead of the event). GUARD: every point before the aim whose ENVELOPE speed (phys: no trouble cap, never below
+        # the floor or the proven speed) is itself tight is a constraint of its own at that speed and distance, so the car is never
+        # planned to arrive at an earlier point faster than the physics there allows. The lowest point is always a constraint.
+        aim = aim_point(run, kab, int(shed_to[run].min()))
+        # the lowest speed of the run: among equals (a trouble cap spread over the lead-in) the first at or after the aim point; a
+        # strictly lower point before the aim is still a constraint where it is
+        tied = run[(need[run] <= need[lowest]) & (run >= aim)]
+        lowest = int(tied[0]) if len(tied) else int(lowest)
+        pts = {int(aim), int(lowest)}
+        pts.update(int(j) for j in run[run < aim] if (u_ref - phys[j]) >= MIN_DROP_MPH)
+        for j in sorted(pts):
+          T = int(shed_to[j]) if j in (aim, int(lowest)) else int(phys[j])
           D = float(dist[j]) - ENTRY_M
           buf = BUFFER_S
           if set_mph and set_mph > mph:

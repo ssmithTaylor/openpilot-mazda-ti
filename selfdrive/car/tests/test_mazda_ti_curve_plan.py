@@ -534,3 +534,111 @@ def test_taking_the_ramp_is_still_slowed_for_its_bend():
   ramp, hwy, mem = _fork()
   res = drive(mem, ramp, 55, 60)
   assert any(p.ceil is not None for _, _, p in res)
+
+
+# ---- arrival just in time (owner, 2026-11-24: "curve slowing must arrive just in time"; measured on 00000342 / 00000343: the car
+# reached the corner speed a median 8.5 s before the bend began) ---------------------------------------------------------------------
+def _first_corner_s(mem, tr, v_mph, planner=None):
+  """Along-road metres where the first corner ceiling appears (open loop, constant speed)."""
+  res = drive(mem, tr, v_mph, 200, planner=planner or P.Planner(mem))
+  return next(s for t, s, p in res if p.ceil is not None and p.kind == "corner")
+
+
+def _spread_flags(segments, flagged, vf_mph):
+  """A road from `segments` with FLAG_TAKEOVER | FLAG_LANE at `vf_mph` on the pieces whose index is in `flagged`."""
+  tr = road(*segments)
+  fl, vf = [], []
+  for i, (length, _) in enumerate(segments):
+    n = int(round(length / M.SPACING_M))
+    fl.append(np.full(n, (M.FLAG_TAKEOVER | M.FLAG_LANE) if i in flagged else 0, np.uint8))
+    vf.append(np.full(n, vf_mph * MPH if i in flagged else np.nan))
+  return tr, M.synthetic([tr], flags=[np.concatenate(fl)], v_flag=[np.concatenate(vf)])
+
+
+def test_arrival_constants_are_the_approved_ones():
+  assert P.AIM_MIN_LA == 1.3 and P.FLAG_MIN_LA == 1.3
+  assert P.BUFFER_S == 0.3 and P.ENTRY_M == 0.0
+  assert P.ARRIVED_MPH == 1.5
+  assert P.REACTION_S == 1.3 and P.RESP_FACTOR == 1.0
+
+
+def test_aim_is_where_the_bend_loads_the_car_not_where_the_flags_begin():
+  # the memory builder spreads a takeover's flags 60-80 m ahead of the real event: here 80 m of gentle approach (1.43 m/s^2 at the
+  # failing 50 mph, so a real-trouble cap; 0.91 at the 40 mph target) before the bend itself (1.45 at 40). The slowdown must start
+  # where it would for the bend alone, not 80 m earlier.
+  segs = [(1500, 0.0), (80, 1 / 350.0), (150, 1 / 220.0), (800, 0.0)]
+  tr, spread = _spread_flags(segs, {1, 2}, 50)
+  _, bend_only = _spread_flags(segs, {2}, 50)
+  s_spread, s_bend = _first_corner_s(spread, tr, 55), _first_corner_s(bend_only, tr, 55)
+  assert abs(s_spread - s_bend) <= 2 * M.SPACING_M + 1.0, (s_spread, s_bend)
+
+
+def test_aim_falls_back_to_the_runs_sharpest_point():
+  # no point of the run reaches AIM_MIN_LA at the target (the cap, 40 mph: 1.23 m/s^2 at the bend): aim at its sharpest point
+  segs = [(1500, 0.0), (80, 1 / 350.0), (150, 1 / 260.0), (800, 0.0)]
+  tr, spread = _spread_flags(segs, {1, 2}, 50)
+  _, bend_only = _spread_flags(segs, {2}, 50)
+  assert abs(_first_corner_s(spread, tr, 55) - _first_corner_s(bend_only, tr, 55)) <= 2 * M.SPACING_M + 1.0
+
+
+def test_flag_cap_only_where_the_bend_needs_1_3():
+  kap = np.array([1.15 / (50 * MPH) ** 2, 1.35 / (50 * MPH) ** 2])
+  flags = np.array([M.FLAG_TAKEOVER | M.FLAG_LANE] * 2, np.uint8)
+  need = P.needed_mph(kap, flags, np.array([50 * MPH] * 2))
+  assert need[0] == P.corner_mph(kap[:1])[0]                  # 1.15 m/s^2 at the failing speed: not a corner for the cap any more
+  assert need[1] == 40
+
+
+def test_a_lower_physics_speed_before_the_aim_point_is_still_honoured(monkeypatch):
+  # A (60 m, 1/150: the envelope allows ~38 mph) then B (1/120), both flagged at 45 (cap 35). With the aim raised so that it lands on B,
+  # the car must still be down to A's own envelope speed when it reaches A: no later start than for A alone (A is not flagged there,
+  # B is straight), whose envelope speed binds earlier than B's 35 mph 60 m further on.
+  monkeypatch.setattr(P, "AIM_MIN_LA", 1.7)
+  segs = [(1500, 0.0), (60, 1 / 150.0), (150, 1 / 120.0), (800, 0.0)]
+  tr, mem = _spread_flags(segs, {1, 2}, 45)
+  tr_a = road((1500, 0.0), (60, 1 / 150.0), (950, 0.0))
+  s_aim, s_a = _first_corner_s(mem, tr, 50), _first_corner_s(M.synthetic([tr_a]), tr_a, 50)
+  assert s_aim <= s_a + 1.0, (s_aim, s_a)
+
+
+def test_approach_ends_at_target_plus_1_5_after_the_measured_reaction():
+  # the planner's approach: reaction 1.3 s at the start speed, then the full measured deceleration, done at T + 1.5 mph
+  def ref(u, T, S1, dt=0.05):
+    v, setn, t, d, tap_t, raised, hist = float(u), u, 0.0, 0.0, 0.0, False, []
+    lag = int(round(1.3 / dt))
+    while v > T + 1.5 and t < 90.0:
+      raised = raised or v <= T + P.RAISE_AT_MPH
+      goal = T if raised else S1
+      if t >= tap_t and setn != goal:
+        setn += 1 if goal > setn else -1
+        tap_t = t + P.TAP_S
+      hist.append(setn)
+      eff = hist[-1 - lag] if len(hist) > lag else float(u)
+      v = max(0.0, v - P.decel_mph_s(v - eff) * dt)
+      d += v * MPH * dt
+      t += dt
+    return d
+  for u, T in ((55, 40), (50, 38), (65, 50), (45, 41)):
+    assert abs(P.approach_m(u, T, max(T - 6, 19)) - ref(u, T, max(T - 6, 19))) < 1e-6, (u, T)
+
+
+def test_reaction_1_3_s_is_in_the_start_distance(monkeypatch):
+  d13 = P.approach_m(55, 40, 34)
+  monkeypatch.setattr(P, "REACTION_S", 0.0)
+  monkeypatch.setattr(P, "_APPROACH", {})
+  d0 = P.approach_m(55, 40, 34)
+  assert abs((d13 - d0) - 1.3 * 55 * MPH) < 0.05 * 55 * MPH + 1e-6
+  assert P.slow_distance_m(55, 40) == pytest.approx(P.approach_m(55, 40, 34) + 0.3 * 55 * MPH)
+
+
+def test_single_corner_arrives_just_in_time():
+  # a car that behaves as measured (the harness: REACTION_S late, the full measured deceleration) is at T + 1.5 mph by the bend, and
+  # reaches it no more than ~BUFFER_S plus a planner tick or two before
+  tr, mem = single_corner()
+  res = drive(mem, tr, 55, 160, closed=True)
+  need = max(P.corner_mph(CORNER_K)[0], 55 - 15)
+  at_entry = [v for t, s, p, v in res if s >= 1500][0]
+  assert at_entry <= need + P.ARRIVED_MPH + 0.05, at_entry
+  reached = [t for t, s, p, v in res if v <= need + P.ARRIVED_MPH + 0.05][0]
+  t_entry = [t for t, s, p, v in res if s >= 1500][0]
+  assert t_entry - reached < 2.0, t_entry - reached
