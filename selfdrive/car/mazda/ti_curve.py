@@ -1238,7 +1238,9 @@ class SafeExit:
       k = ev.get("kind")
       if k == "driver_button":
         self.cancel(frame, "driver")
-      elif k == "stop" and ev.get("why") not in EXIT_EXEMPT:
+      elif k == "stop" and ev.get("why") not in EXIT_EXEMPT and not cv.left_doubt:
+        # (left_doubt: the set speed moved unexpectedly, possibly the driver's own press the button flag missed: nothing is pressed
+        # until the driver acts; the set-speed-left record / on-road alert shows instead)
         self.arm(frame, inp, ev.get("why") or "stopped")
       elif k == "switched_off" and EXIT_RAISE_ON_SWITCH_OFF:
         self.arm(frame, inp, "switched off")
