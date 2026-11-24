@@ -663,8 +663,9 @@ class Planner:
       late, on_plan = mph > va + BEHIND_MPH, mph <= va
       if c is not None and set_mph and mode in ("push", "behind"):
         # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
-        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting
-        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True)
+        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting,
+        # with the SAME push-and-raise manoeuvre as the warning (R8, plan A12)
+        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True, T=T)
         late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
       if mode != "target":
         if self._raise_due(mph, set_mph, T):
@@ -745,9 +746,9 @@ class Planner:
     the forecast's bend) is the memory stage's to warn for: stage 2 adds no warning there."""
     u = max(mph, float(set_mph)) if set_mph else mph
     quiet = (self.fc is None or mph < S2_MIN_MPH or t - self.blink_t < BLINKER_HOLD_S)
-    need, lead = None, None
+    need, lead, side = None, None, D.UNKNOWN
     if not quiet:
-      need, lead, _, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S)
+      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
     if hit:
@@ -767,10 +768,12 @@ class Planner:
       until = self.odo + lead * v + HOLD_AFTER_M
       knew = self._mem_tight(mem_ahead, lead * v - FORK_NEAR_M, lead * v + FORK_NEAR_M)
       if self.s2 is None:
-        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew}
+        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew, "side": side}
         self.events.append({"kind": "s2_start", "T": T, "need": int(need), "mph": round(mph, 1), "lead": round(lead, 1),
                             "floor": int(floor), "fork": bool(mem_straight)})
       else:
+        if int(need) < self.s2["need"]:
+          self.s2["side"] = side
         self.s2.update(T=min(self.s2["T"], T), need=min(self.s2["need"], int(need)), until=max(self.s2["until"], until), lead=lead,
                        knew=self.s2["knew"] or knew)
     elif hit and self.s2 is not None:
@@ -922,7 +925,7 @@ class Planner:
       dist = round(max(0.0, s2["lead"] * self.fc_v), 1) if getattr(self, "fc_v", None) is not None else 0.0
       end = round(max(0.0, s2["until"] - HOLD_AFTER_M - self.odo), 1)
       need = s2["need"]
-      cap = None
+      cap = round(D.capacity(s2["T"], s2.get("side", D.UNKNOWN)), 2)   # R9: the raw capacity of the forecast's side at the target
       capped = capped or s2["need"] < s2["T"]          # the bend wants more than stage 2 may shed
       why = "bend ahead (forecast)"
     if s2 is not None and s2["need"] < s2["T"] and not s2["knew"]:

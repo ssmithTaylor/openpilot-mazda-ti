@@ -90,10 +90,13 @@ def test_need_mph_examples():
 
 
 def test_capacity_right_below_left_from_35():
-  # plan T4 / section 3: measured per direction; the car holds less to the right from 35 mph
-  assert D.capacity(45, D.RIGHT, banked=True) == 1.91 and D.capacity(45, D.LEFT, banked=True) == 2.47
-  for mph in (35, 40, 45, 50, 55, 65):
-    for banked in (True, False):
+  # plan T4 / section 3: measured per direction; the car holds less to the right from 35 mph. R7 (A12): the measured figures hold at
+  # the band CENTRES (45-54: 49.5 mph); between centres the capacity is linear. The raw table's 32-34 band holds MORE to the right
+  # (2.30 vs 2.23), so with R7 the raw right side is below the left only from about 36.6 mph: the raw check starts at 39.5 (the
+  # 35-44 band's centre); the banked one still from 35.
+  assert D.capacity(49.5, D.RIGHT, banked=True) == pytest.approx(1.91) and D.capacity(49.5, D.LEFT, banked=True) == pytest.approx(2.47)
+  for banked, speeds in ((True, (35, 39.5, 40, 45, 49.5, 50, 55, 60, 65)), (False, (39.5, 40, 45, 49.5, 50, 55, 60, 65))):
+    for mph in speeds:
       assert D.capacity(mph, D.RIGHT, banked) < D.capacity(mph, D.LEFT, banked), (mph, banked)
       assert D.capacity(mph, D.UNKNOWN, banked) == D.capacity(mph, D.RIGHT, banked)
   assert D.capacity(25, D.LEFT) == D.capacity(25, D.RIGHT) == 1.41
@@ -102,19 +105,30 @@ def test_capacity_right_below_left_from_35():
 
 
 def test_a6_graded_10_percent_over_capacity_costs_about_2_mph():
-  # plan A6 (owner, 2026-11-24): the target is where demand equals capacity; nothing forces the old 10 mph minimum drop. A left bend
-  # whose demand at 45 mph is 10 % over the capacity there (2.56 m/s^2, CAP_RAW): demand equals capacity at 42.9 mph; the whole-mph
-  # target over the +-0.75 mph window (and the 35-44 band's 2.49) is 41: 4 mph lower. Right: 44 (the 35-44 band holds more to the
-  # right than 45-54 does): 1 mph lower. Never 35.
+  # plan A6 (owner, 2026-11-24): the target is where demand equals capacity; nothing forces the old 10 mph minimum drop. A bend whose
+  # demand at 45 mph is 10 % over the capacity there (CAP_RAW, continuous per R7: left 2.53, right 2.29 m/s^2 at 45 mph). R7 (A12):
+  # 2-3 mph on BOTH sides (was 4 left / 1 right with the band steps): the whole-mph target over the +-0.75 mph window is 42 left
+  # and 42 right, 3 mph lower. Never 35.
   k = 1.1 * D.capacity(45, D.LEFT) / (45 * MPH) ** 2
-  assert D.demand(45, k) == pytest.approx(1.1 * 2.56)
-  assert D.need_mph(k)[0] == 41
+  assert D.demand(45, k) == pytest.approx(1.1 * D.capacity(45, D.LEFT))
+  assert D.need_mph(k)[0] == 42
   kr = -1.1 * D.capacity(45, D.RIGHT) / (45 * MPH) ** 2
-  assert D.need_mph(kr)[0] == 44
+  assert D.need_mph(kr)[0] == 42
+  for kk in (k, kr):
+    assert 2 <= 45 - D.need_mph(kk)[0] <= 3
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   res = drive(M.synthetic([tr]), tr, 45, 120)
   ceils = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
-  assert ceils and min(ceils) == 41
+  assert ceils and min(ceils) == 42
+
+
+def test_capacity_continuous_from_32():
+  # R7 (A12): no step between 32 and 90 mph (only the real one at 32); steps of 0.1 mph change it by at most 0.01 m/s^2
+  for banked in (False, True):
+    for side in (D.LEFT, D.RIGHT, D.UNKNOWN):
+      c = [D.capacity(32 + 0.1 * i, side, banked) for i in range(580)]
+      assert max(abs(b - a) for a, b in zip(c, c[1:])) <= 0.01, (banked, side)
+      assert D.capacity(31.9, side, banked) == 1.41 and D.capacity(32.0, side, banked) > 2.0
 
 
 def test_need_from_median_not_sharpest():
@@ -723,6 +737,10 @@ def test_stage2_caps_at_5():
   p = res[1][1]
   assert p.ceil == 45 and p.stage == 2 and p.src == "fc" and p.kind == "corner" and p.trusted and p.alert_mph == 38
   assert p.need_mph == 38 and P.plan_json(p, 0.2, 1, "act")["stage"] == 2
+  # R9 (A12): Plan.cap for stage 2 is the raw capacity of the forecast's side (left here) at the target speed
+  assert p.cap == pytest.approx(round(D.capacity(45, D.LEFT), 2)) and P.plan_json(p, 0.2, 1, "act")["cap"] == p.cap
+  pr = run_s2(P.Planner(None), 50, lambda t: preview(k_needing(38, -1.0)), 1.0)[-1][1]
+  assert pr.stage == 2 and pr.cap == pytest.approx(round(D.capacity(pr.ceil, D.RIGHT), 2))
   assert all(q.ceil == 45 for t, q in res if 0.2 <= t < 3.0)
   held = [t for t, q in res if q.ceil is not None]
   assert 3.0 + 2.0 < held[-1] < 3.0 + 6.0                       # held lead x v + HOLD_AFTER_M past the last sighting, then released
@@ -766,3 +784,19 @@ def test_blinker_suppresses_stage2():
   # a blinker during stage 2 drops it
   res = run_s2(P.Planner(None), 50, lambda t: preview(k), 4.0, blink_fn=lambda t: t >= 2.0)
   assert res[5][1].stage == 2 and all(p.ceil is None for t, p in res if t >= 2.0)
+
+
+def test_r8_behind_plan_predicts_with_the_push_and_raise_manoeuvre():
+  # R8 (A12): behind-plan detection mid-approach predicts with the same push-and-raise manoeuvre as the warning (_arrive with T)
+  tr, mem = single_corner()
+  pl = P.Planner(mem)
+  calls = []
+  orig = pl._arrive
+
+  def spy(v, d, set0, s1, lowering, T=None):
+    calls.append((s1, T))
+    return orig(v, d, set0, s1, lowering, T=T)
+  pl._arrive = spy
+  res = drive(mem, tr, 55, 120, closed=True, planner=pl)
+  assert any(p.kind == "corner" for t, s, p, v in res)
+  assert calls and all(T is not None and T >= s1 for s1, T in calls)

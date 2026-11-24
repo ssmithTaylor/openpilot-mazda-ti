@@ -21,7 +21,7 @@ MAX_MPH = 90
 SPEED_WINDOW_MPH = 0.75
 LEFT, RIGHT, UNKNOWN = 1, -1, 0
 
-# (lowest mph of the band, left m/s^2, right m/s^2); a band holds from its lowest mph up to the next band's
+# (lowest mph of the band, left m/s^2, right m/s^2); the figure is the band CENTRE value (capacity() interpolates between centres, R7)
 CAP_BANKED = ((0.0, 1.41, 1.41), (32.0, 2.20, 2.20), (35.0, 2.48, 2.01), (45.0, 2.47, 1.91), (55.0, 2.51, 1.83))
 CAP_RAW = ((0.0, 1.41, 1.41), (32.0, 2.23, 2.30), (35.0, 2.49, 2.42), (45.0, 2.56, 2.19), (55.0, 2.48, 2.07))   # under 32: the banked figure
 # the model preview's lateral acceleration, raw over actual, per lead (s); flat beyond the last
@@ -29,18 +29,35 @@ FC_LEAD_S = (0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0)
 FC_RATIO = (1.0, 0.951, 0.888, 0.839, 0.783, 0.700, 0.538)
 
 
+# Ruling R7 (plan A12): capacity is CONTINUOUS in speed from 32 mph: linear between the band centres (32-34: 33, 35-44: 39.5, 45-54:
+# 49.5, 55+: 60 mph), flat between 32 and 33 and beyond 60; the one real step stays at STEP_MPH (below it the stock lane-keep path is
+# blocked: 1.41). Band steps turned a bend 10 % over capacity at 45 mph into a 4 mph drop to the left and 1 to the right.
+STEP_MPH = 32.0
+BAND_CENTRES_MPH = (33.0, 39.5, 49.5, 60.0)
+
+
+def _centre_table(table):
+  return (np.array([r[1] for r in table[1:]], np.float64), np.array([r[2] for r in table[1:]], np.float64))
+
+
+_CENTRE = {False: _centre_table(CAP_RAW), True: _centre_table(CAP_BANKED)}
+
+
 def capacity(mph, side, banked=False):
-  """m/s^2 the steering holds at `mph` turning to `side` (+1 left, -1 right, 0 unknown: the LOWER of the two)."""
+  """m/s^2 the steering holds at `mph` turning to `side` (+1 left, -1 right, 0 unknown: the LOWER of the two). Continuous from
+  STEP_MPH (R7): linear between the band centres; below STEP_MPH the lowest band's figure."""
   table = CAP_BANKED if banked else CAP_RAW
-  row = table[0]
-  for r in table:
-    if mph >= r[0]:
-      row = r
+  if mph < STEP_MPH:
+    left, right = table[0][1], table[0][2]
+  else:
+    cl, cr = _CENTRE[bool(banked)]
+    left = float(np.interp(mph, BAND_CENTRES_MPH, cl))
+    right = float(np.interp(mph, BAND_CENTRES_MPH, cr))
   if side > 0:
-    return row[1]
+    return left
   if side < 0:
-    return row[2]
-  return min(row[1], row[2])
+    return right
+  return min(left, right)
 
 
 def demand(mph, k, g_bank=0.0):
