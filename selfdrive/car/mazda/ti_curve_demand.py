@@ -43,10 +43,18 @@ def _centre_table(table):
 _CENTRE = {False: _centre_table(CAP_RAW), True: _centre_table(CAP_BANKED)}
 
 
-def capacity(mph, side, banked=False):
+# Ruling R14 (plan A15): no slowing INTO the low-capacity zone. The step at STEP_MPH is real, but a bend that fits at or above
+# STEP_MPH on the capacity just above the step is never planned below STEP_MPH because the capacity steps down there: need_mph(...,
+# hold_step=True) judges every speed below STEP_MPH on the capacity AT STEP_MPH, and need_hi() keeps that figure only where it is at
+# least STEP_MPH (a bend too sharp even for that capacity must be taken below the step anyway, where the low-speed capacity is what
+# counts: its stepped figure). The planner uses need_hi() while the car is at or above STEP_MPH (or a bend it started from there is
+# still in progress); a car already below STEP_MPH plans on the stepped capacity (need_mph as always).
+def capacity(mph, side, banked=False, hold_step=False):
   """m/s^2 the steering holds at `mph` turning to `side` (+1 left, -1 right, 0 unknown: the LOWER of the two). Continuous from
-  STEP_MPH (R7): linear between the band centres; below STEP_MPH the lowest band's figure."""
+  STEP_MPH (R7): linear between the band centres; below STEP_MPH the lowest band's figure (hold_step: the figure at STEP_MPH, R14)."""
   table = CAP_BANKED if banked else CAP_RAW
+  if hold_step and mph < STEP_MPH:
+    mph = STEP_MPH
   if mph < STEP_MPH:
     left, right = table[0][1], table[0][2]
   else:
@@ -73,18 +81,27 @@ def _window(r):
   return (max(float(CAR_MIN_MPH), r - SPEED_WINDOW_MPH), float(r), r + SPEED_WINDOW_MPH)
 
 
-def _kmax_table(side, banked):
+def _kmax_table(side, banked, hold_step=False):
   """For every rung: the largest |k| (no bank term) whose demand fits the capacity at every speed of the rung's window."""
-  return np.array([min(capacity(s, side, banked) / (s * MPH) ** 2 for s in _window(int(r))) for r in _RUNGS])
+  return np.array([min(capacity(s, side, banked, hold_step) / (s * MPH) ** 2 for s in _window(int(r))) for r in _RUNGS])
 
 
 _KMAX = {(s, b): _kmax_table(s, b) for s in (LEFT, RIGHT, UNKNOWN) for b in (False, True)}
+_KMAX_HOLD = {(s, b): _kmax_table(s, b, True) for s in (LEFT, RIGHT, UNKNOWN) for b in (False, True)}
 
 
-def need_mph(k, g_bank=None):
+def need_hi(k, g_bank=None):
+  """R14: the need of a car at or above STEP_MPH: on the capacity held at its STEP_MPH figure below the step where that need is at
+  least STEP_MPH, else (the bend asks to go below the step whatever the step) the stepped need. -> int array."""
+  hold = need_mph(k, g_bank, hold_step=True)
+  return np.where(hold >= STEP_MPH, hold, need_mph(k, g_bank))
+
+
+def need_mph(k, g_bank=None, hold_step=False):
   """Highest whole mph (CAR_MIN_MPH .. MAX_MPH) at which each signed curvature k fits its direction's capacity over the speed window;
   CAR_MIN_MPH when none does. g_bank None: no bank term, CAP_RAW; else the bank term (m/s^2, per point or scalar) and CAP_BANKED.
-  Vectorised. -> int array."""
+  hold_step: below STEP_MPH judged on the capacity at STEP_MPH (R14; use need_hi). Vectorised. -> int array."""
+  kmax = _KMAX_HOLD if hold_step else _KMAX
   k = np.atleast_1d(np.asarray(k, np.float64))
   ka = np.abs(k)
   out = np.full(len(k), CAR_MIN_MPH, np.int64)
@@ -93,7 +110,7 @@ def need_mph(k, g_bank=None):
       sel = (k > 0) if side == LEFT else (k <= 0)
       if not sel.any():
         continue
-      ok = ka[sel, None] <= _KMAX[(side, False)][None, :] + 1e-12
+      ok = ka[sel, None] <= kmax[(side, False)][None, :] + 1e-12
       first = np.where(ok.any(axis=1), ok.argmax(axis=1), len(_RUNGS) - 1)
       out[sel] = _RUNGS[first]
     return out
@@ -104,7 +121,7 @@ def need_mph(k, g_bank=None):
   for r in _RUNGS:
     ok = ~done
     for s in _window(int(r)):
-      cap = np.where(side == LEFT, capacity(s, LEFT, True), capacity(s, RIGHT, True))
+      cap = np.where(side == LEFT, capacity(s, LEFT, True, hold_step), capacity(s, RIGHT, True, hold_step))
       ok &= (s * MPH) ** 2 * ka + sg * g <= cap + 1e-9
     out[ok] = r
     done |= ok
@@ -121,9 +138,10 @@ def calibrate(ts, la_raw):
   return np.asarray(la_raw, np.float64) / np.interp(np.asarray(ts, np.float64), FC_LEAD_S, FC_RATIO)
 
 
-def forecast_need(ts, k, v, lo_s, hi_s):
+def forecast_need(ts, k, v, lo_s, hi_s, hi=False):
   """The forecast's sharpest bend between leads lo_s and hi_s (s): ts, k (signed curvature, LEFT POSITIVE) of the preview, v (m/s)
-  the speed now. -> (need mph, lead s, calibrated signed demand m/s^2 at the speed now, side +1 / -1), or (None, None, None, 0)."""
+  the speed now; hi: the need as need_hi (R14: a car at or above STEP_MPH). -> (need mph, lead s, calibrated signed demand m/s^2 at
+  the speed now, side +1 / -1), or (None, None, None, 0)."""
   ts = np.asarray(ts, np.float64)
   k = np.asarray(k, np.float64)
   sel = (ts >= lo_s - 1e-9) & (ts <= hi_s + 1e-9) & np.isfinite(k)
@@ -137,4 +155,4 @@ def forecast_need(ts, k, v, lo_s, hi_s):
   if side == UNKNOWN:
     return MAX_MPH, float(ts[sel][j]), 0.0, UNKNOWN
   keff = math.copysign(float(la[j]) / (v * v), kj)
-  return int(need_mph(keff)[0]), float(ts[sel][j]), math.copysign(float(la[j]), kj), side
+  return int((need_hi if hi else need_mph)(keff)[0]), float(ts[sel][j]), math.copysign(float(la[j]), kj), side

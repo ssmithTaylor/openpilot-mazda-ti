@@ -173,6 +173,51 @@ def test_no_kap_med_no_memory_stage():
   assert M.synthetic([tr]).has_kap_med and M.synthetic([tr]).bank_v == 1
 
 
+def _mem_n(tr, npass):
+  mem = M.synthetic([tr])
+  mem.npass = np.full(mem.n, npass, np.int32)
+  return mem
+
+
+def test_r14_need_hi_never_into_the_low_zone_because_of_the_step():
+  # R14 (A15): k 0.0100 is 2 % over the left capacity at 33 mph (over the +-0.75 mph window): stepped need 25 (the 1.41 step below 32
+  # catches every window that touches it), held need 32; to the right (higher capacity) 33 either way
+  assert int(D.need_mph(0.0100)[0]) == 25 and int(D.need_hi(0.0100)[0]) == 32
+  assert int(D.need_mph(-0.0100)[0]) == int(D.need_hi(-0.0100)[0]) == 33
+  # a bend too sharp even for the capacity at the step keeps its stepped (low-speed) need: it must be taken below the step anyway
+  for k in (0.012, 0.015, -0.014, 0.02):
+    assert int(D.need_hi(k)[0]) == int(D.need_mph(k)[0]) < D.STEP_MPH
+  # nothing changes at or above the step
+  ks = np.linspace(-0.009, 0.009, 400)
+  hi, lo = D.need_hi(ks), D.need_mph(ks)
+  assert np.all(hi[lo >= D.STEP_MPH] == lo[lo >= D.STEP_MPH]) and np.all(hi >= lo)
+
+
+def test_r14_33_mph_bend_2_percent_over_costs_at_most_1_mph():
+  # the diagnosis case (A14): a 20-pass bend, remembered median curvature 0.0100, 2 % over capacity at 33 mph: the target was 25 to
+  # the left; now at most 1 mph (32: under MIN_DROP_MPH, so no slowdown at all), and nothing to the right
+  for sign in (1.0, -1.0):
+    tr = road((1500, 0.0), (150, sign * 0.0100), (800, 0.0))
+    res = drive(_mem_n(tr, 20), tr, 33, 80)
+    corner = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
+    assert not corner or min(corner) >= 32, (sign, corner)
+    assert all(p.ceil is None or p.ceil >= 32 for _, _, p in res)
+  # from 40 mph (a stage-1 drop): one slowdown to 32 (not 25), closed loop; a dip below 32 on the way does not re-plan it to the stepped 25
+  tr = road((1500, 0.0), (150, 0.0100), (800, 0.0))
+  res = drive(_mem_n(tr, 20), tr, 40, 120, closed=True)
+  corner = [p.corner_mph for t, s, p, v in res if p.kind == "corner"]
+  assert corner and min(corner) == 32
+  assert min(v for t, s, p, v in res if s <= 1650) >= 31.4
+
+
+def test_r14_car_already_below_32_uses_the_low_speed_capacity():
+  # a car already below the step (e.g. held by a lead at 30) plans on the stepped capacity: the same bend asks for 25 there
+  tr = road((1500, 0.0), (150, 0.0100), (800, 0.0))
+  res = drive(_mem_n(tr, 20), tr, 30, 120, set_mph=40)
+  corner = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
+  assert corner and min(corner) == 25
+
+
 def test_approach_times_at_45():
   # plan T4 + A8-R4 + A9 / A11: the planner's own manoeuvre at 45 mph (push to T - DRIVE_GAP_MPH, model-timed raise), timing variant,
   # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.86 / 10.44 s (A11, block two), pinned here
@@ -839,7 +884,7 @@ def test_45_to_30_arrives_at_entry():
   # point whose demand reaches ENTRY_LA at T): within T + 1.5 mph there, and no early dwell (<= 1 s) by the closed loop and by
   # early_dwell.Profile
   from openpilot.tools.curve_slowing import early_dwell as E
-  k = k_needing(25)
+  k = k_needing(24)                                            # R14: was k_needing(25), the step-edge bend now planned at 32
   T = 30                                                       # the floor (45 - 15) binds
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   assert D.demand(T, k) >= P.ENTRY_LA                          # the entry is the bend's first point

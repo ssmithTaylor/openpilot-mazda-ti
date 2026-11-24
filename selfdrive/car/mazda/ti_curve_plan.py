@@ -291,6 +291,8 @@ class Planner:
   def __init__(self, memory):
     self.mem = memory
     self.need = None
+    self.need_hi = None
+    self.hi = True                      # R14: this tick plans on D.need_hi (the car at or above STEP_MPH, or a bend started there)
     self.mem_stage = False
     if memory is not None:
       # plan from the MEDIAN pass only (plan T4: never the sharpest-pass kap); the same figure serves the road-change check
@@ -298,6 +300,8 @@ class Planner:
       self.mem_stage = bool(getattr(memory, "has_kap_med", True))
       # bank = 0 and CAP_RAW until the memory carries the corrected bank (Memory.bank_v >= 2; plan section 5, default 4)
       self.need = D.need_mph(self.kmed).astype(np.float64) if self.mem_stage else np.full(memory.n, float(MAX_MPH))
+      # R14: the need of a car at or above D.STEP_MPH (never planned into the low-capacity zone merely because capacity steps there)
+      self.need_hi = D.need_hi(self.kmed).astype(np.float64) if self.mem_stage else self.need
       self.kabs = np.abs(self.kmed)
     self.limit = None
     self.reset()
@@ -455,7 +459,7 @@ class Planner:
       if not len(idx2):
         continue
       d2 = d2 - (p - i0) * self.mem.spacing
-      eff = self.need[idx2]
+      eff = (self.need_hi if self.hi else self.need)[idx2]
       for j in tight:
         if dist[j] > d2[-1]:
           continue                                   # the other road's record ends before here: nothing known against the corner
@@ -565,6 +569,11 @@ class Planner:
         la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1])
         self.ask = tuple(round(float(x), 2) for x in np.interp(ASK_LEADS, ts, la_all))
     mph = v / MPH
+    # R14: plan on the capacity above the step (D.need_hi) while the car is at or above D.STEP_MPH, or while a bend (stage 1, map or
+    # stage 2) that started with it there is still in progress (so a car slowed to 32 that dips under it is not re-planned to 25); a
+    # car already below STEP_MPH otherwise plans on the stepped, low-speed capacity
+    self.hi = bool(mph >= D.STEP_MPH or any(a_.get("hi") for a_ in list(self.active.values()) + list(self.map_active.values()))
+                   or (self.s2 is not None and self.s2.get("hi")))
     if blinker:
       self.blink_t = t
     self.released = {k: at for k, at in self.released.items() if self.odo <= at + HOLD_AFTER_M}
@@ -611,7 +620,7 @@ class Planner:
     i0 = int(math.floor(self.pos))
     idx, dist = self.mem.ahead(self.trace, i0, look)
     dist = dist - (self.pos - i0) * self.mem.spacing
-    need = self._either_road(self.need[idx].astype(np.float64), dist, look, mph)
+    need = self._either_road((self.need_hi if self.hi else self.need)[idx].astype(np.float64), dist, look, mph)
     # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
     # (kept from the first corner of a chain until the car is back near the speed it started from, as the car side does)
     # ONE source with the car side (2026-11-23 drive: a floor kept here from an earlier 55 mph episode clamped every corner for 11 min
@@ -751,7 +760,7 @@ class Planner:
       if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
-                       "side": c["side"]}
+                       "side": c["side"], "hi": self.hi}
         self.events.append({"kind": "start", "point": key if isinstance(key, int) else -1, "T": c["T"], "need": c["need"],
                             "floor": floor, "mph": round(mph, 1), "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
@@ -844,7 +853,8 @@ class Planner:
     if not ok:
       self.map_active, self.map_bends = {}, {}
       return None
-    need = np.minimum(D.need_mph(k), D.need_mph(-k)).astype(np.float64)     # side unknown: the lower capacity
+    nf = D.need_hi if self.hi else D.need_mph                                # R14
+    need = np.minimum(nf(k), nf(-k)).astype(np.float64)                     # side unknown: the lower capacity
     u = max(mph, float(set_mph)) if set_mph else mph
     u_ref = max(u, float(ref_mph) if ref_mph else 0.0)
     shed_to = np.maximum(need, floor)
@@ -888,7 +898,7 @@ class Planner:
     quiet = (self.fc is None or mph < S2_MIN_MPH or t - self.blink_t < BLINKER_HOLD_S)
     need, lead, side = None, None, D.UNKNOWN
     if not quiet:
-      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S)
+      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
     if hit:
@@ -908,7 +918,7 @@ class Planner:
       until = self.odo + lead * v + HOLD_AFTER_M
       knew = self._mem_tight(mem_ahead, lead * v - FORK_NEAR_M, lead * v + FORK_NEAR_M)
       if self.s2 is None:
-        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew, "side": side}
+        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew, "side": side, "hi": self.hi}
         self.events.append({"kind": "s2_start", "T": T, "need": int(need), "mph": round(mph, 1), "lead": round(lead, 1),
                             "floor": int(floor), "fork": bool(mem_straight)})
       else:

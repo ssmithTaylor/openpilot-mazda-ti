@@ -103,8 +103,10 @@ def apply_options(Pm, confirm_share=None, cap_scale=1.0, min_drop=None):
   if cap_scale and abs(cap_scale - 1.0) > 1e-9 and Pm is P:
     base = getattr(CD, '_capacity_base', CD.capacity)
     CD._capacity_base = base
-    CD.capacity = lambda mph, side, banked=False, _b=base, _f=float(cap_scale): _f * _b(mph, side, banked)
+    CD.capacity = lambda mph, side, banked=False, hold_step=False, _b=base, _f=float(cap_scale): _f * _b(mph, side, banked, hold_step)
     CD._KMAX = {k: CD._kmax_table(*k) for k in CD._KMAX}
+    if hasattr(CD, '_KMAX_HOLD'):
+      CD._KMAX_HOLD = {k: CD._kmax_table(*k, True) for k in CD._KMAX_HOLD}
 
 
 def steer_arrays(r):

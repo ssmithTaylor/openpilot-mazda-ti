@@ -171,10 +171,15 @@ def test_b_lead_holds_the_car_at_40_corner_needs_24():
 
 
 def test_item4_lead_held_corners_24_to_30_are_slowed_for():
+  # R14 (A15) changed the expected figure for 27 and 30: the stepped need has no value between 25 and 33, so k_for(27) and k_for(30)
+  # are the gentlest stepped-25 bend (k ~ 0.0099, at the step's edge), which fits at 32 on the capacity above the step: from 40 mph
+  # it is now planned at 32, not 25 (old: set <= 28 / 31 and no gap above 30 / 33; new: set <= 33, no gap above 35). 24 is unchanged.
   for need in (24, 27, 30):
+    planned = int(P.D.need_hi(k_for(need))[0])
     log = e2e([(2500, None), (150, need), (1200, None)], 55, mph0=40, events=_lead40)
-    assert min(r["set"] for r in log if 2400 <= r["s"] <= 2650) <= max(need, 25) + 1, need
-    assert not gaps(log, 2500, 2650, need), need                            # in the corner: slowed, or warned
+    assert min(r["set"] for r in log if 2400 <= r["s"] <= 2650) <= max(planned, 25) + 1, need
+    assert not gaps(log, 2500, 2650, planned), need                         # in the corner: slowed, or warned
+  assert int(P.D.need_hi(k_for(24))[0]) == 24 and int(P.D.need_hi(k_for(27))[0]) == 32
 
 
 def test_b2_lead_held_corner_below_the_floor_warns():
