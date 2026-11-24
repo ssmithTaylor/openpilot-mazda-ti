@@ -1196,6 +1196,7 @@ class SafeExit:
     self.ref_unknown = False
     self.armed_f = None
     self.wait_since = None
+    self.left_cleared = False     # a driver cruise button was seen while the Curve was gone: the set-speed-left record is answered
     self.result = None            # None, "done", "driver", "cruise off", "changed", "failed", "gave up", "curve slowing back in charge"
     self.guard = PressGuard()
     self.tap = None
@@ -1260,6 +1261,7 @@ class SafeExit:
     if not restart and (inp is None or inp.set_mph is None):
       return False
     self.active, self.why, self.line, self.result = True, why, line, None
+    self.left_cleared = False
     self.armed_f, self.wait_since = frame, None
     self.tap = self.tap_to = self.tap_first = None
     self._ev("exit_armed", frame, why=why, set_mph=None if inp is None else inp.set_mph, ref=self.ref, floor=self.floor, line=line)
@@ -1389,6 +1391,8 @@ def run_frame(cv, ex, frame, inp):
       ex.observe(frame, cv, inp)
   if ex is None:
     return button
+  if cv is None and inp.driver_button:
+    ex.left_cleared = True        # as the live Curve does: any driver cruise button answers the set-speed-left record
   b2 = ex.step(frame, inp, gas_recent=bool(cv.gas_hold) if cv is not None else False)
   return button if button is not None else b2
 
@@ -1483,7 +1487,7 @@ def set_left(cv, ex, set_mph):
   if set_mph is None or ref is None or int(set_mph) >= int(ref):
     return None
   if cv is None:
-    return int(set_mph), int(ref)
+    return None if ex is not None and ex.left_cleared else (int(set_mph), int(ref))
   if cv.state == "stopped" and not cv.after_brake:
     return int(set_mph), int(ref)
   if cv.state == "off" and cv.off_note:

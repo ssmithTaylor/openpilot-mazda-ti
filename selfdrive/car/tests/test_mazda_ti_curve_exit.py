@@ -361,3 +361,16 @@ def test_fault1_doubt_stop_does_not_arm_and_keeps_the_alert_until_a_driver_butto
                  driver_button=True, counter=car.counter, plan=T.plan(C.ABS_FLOOR_MPH, corner=fl, dist=300.0), plan_age=0.1, mono=99.0)
   C.run_frame(cv, ex, 99999, inp)
   assert C.set_left(cv, ex, 33) is None                         # the driver pressed a cruise button: the alert clears
+
+
+def test_fault2_driver_button_clears_the_record_after_an_internal_error():
+  ex = C.SafeExit()
+  ex.ref, ex.floor = 55, 40
+  assert C.set_left(None, ex, 34) == (34, 55)
+  for i, kw in enumerate(({"driver_set": True, "driver_set_plus": False}, {"driver_set": True, "driver_set_plus": True}, {})):
+    ex = C.SafeExit()
+    ex.ref, ex.floor = 55, 40
+    assert C.set_left(None, ex, 34) == (34, 55)
+    C.run_frame(None, ex, 10 * i, C.Inputs(on=True, engaged=True, cruise_on=True, set_mph=34, mph=45.0, driver_button=True, counter=3, **kw))
+    assert C.set_left(None, ex, 34) is None                     # SET-, SET+, RES / CANCEL: any cruise button
+    assert C.set_left(None, ex, 30) is None                     # and it stays cleared when the driver then picks a lower speed
