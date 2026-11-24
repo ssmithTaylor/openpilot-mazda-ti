@@ -227,10 +227,13 @@ def test_longest_controller_lines_fit():
   line1 = [f"STOPPED: {r}" for r in reasons] + ["SLOWING FOR A CORNER: 100 -> 100 mph", "HOLDING FOR A CORNER: 100 -> 100 mph",
                                                "HOLDING FOR THE NEXT CORNER: 100 mph", "RESTORING: 100 -> 100 mph",
                                                "PAUSED: you pressed a cruise button", "ON: planner not running", "ON: matching the road",
+                                               "HOLDING: 100 mph",
                                                "CURVE SLOWING OFF"]
   line2 = ["CORNER NEEDS MORE THAN I MAY SLOW: be ready", "Set speed 100 mph (was 100): set it yourself", "Nothing was changed",
            "shadow: the planner only logs", "back in 30 s", "the model sees a bend ahead", "next corner: holding what it needs",
-           "matching the remembered road", "road differs from memory", "the cruise check is running", "back to 100 mph after it"]
+           "matching the remembered road", "road differs from memory", "the cruise check is running", "back to 100 mph after it",
+           "planner stopped: restoring your set speed", "planner stopped: waiting until past the corner",
+           "planner output late: holding"]
   rows = [(True, True, {"state": "ready", "line1": a, "line2": b}) for a in line1 for b in line2[:1]]
   rows += [(True, True, {"state": "ready", "line1": line1[0], "line2": b}) for b in line2]
   for (_, _, s), (word, p1, p2, second, *_r) in zip(rows, page(rows)):
