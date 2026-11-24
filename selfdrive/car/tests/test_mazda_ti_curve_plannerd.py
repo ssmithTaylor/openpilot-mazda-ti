@@ -216,3 +216,98 @@ def test_map_input_passes_the_profile_only_when_fresh_and_positioned(tmp_path):
   assert D.map_input(PM(None), True, 0.0, 0.0, 0.0, now=now, path=str(f)) is None
   assert D.map_input(PM(_map_json().encode()), True, 0.0, 0.0, 0.0, now=now + D.MAP_STALE_S, path=str(f)) is None
   assert D.map_input(PM(_map_json().encode()), True, 0.0, 0.0, 0.0, now=now, path=str(tmp_path / "absent")) is None
+
+
+# ---- plan T8: the per-tick log ---------------------------------------------------------------------------------------------------
+from openpilot.selfdrive.car.mazda import ti_curve_memory as TM  # noqa: E402
+from openpilot.selfdrive.car.mazda import ti_curve_plan as TP  # noqa: E402
+
+
+def _worst_extras():
+  """Every field of the tick log at its widest (signed, most digits) value."""
+  return dict(seq=9999999, v=-88.88, set=-88, gap=-88.88, a=-8.888, dec=-8.888,
+              mem={"pk": -9999, "pkd": -9999, "pkn": 255, "s": [-9999] * 8},
+              fc=[-99.99] * 7, s1=[99, -99, 2, "behind", 1], s2=[-99, -99, -99.9],
+              mon=["assist off: 0x11 stuck request", -99], car=["restoring", -99, -999, -999],
+              lay=-99.99, lacc=-99.99, des=-99.99, rate=-9999.9, cmd=-9999, ti=[255, 255],
+              ln=[-9.99, 0.99, -9.99, 0.99], drv=63, tq=-999, cpu=99999, side=-1)
+
+
+def _worst_plan():
+  diag = {"stage": 2, "ceil": 88, "kind": "corner", "need": -88, "cap": -8.88, "ahead": -88.88, "behind": True, "alert": -88,
+          "src": "map", "rel": 99}
+  return TP.Plan(88, 1.0, True, True, "next bend (map): holding what it needs", -9999.9, 88, False, -88.88, True, need_mph=-88,
+                 alert_mph=-88, stage=2, src="map", ahead_la=-88.88, cap=-8.88, released=True, diag=diag, kind="corner")
+
+
+def test_tick_log_size_bound():
+  # plan T8: <= TICK_MAX_B bytes per message (TICK_MAP_MAX_B on a tick whose map list changed), every field at its widest
+  e = _worst_extras()
+  d = D.tick_log(_worst_plan(), e)
+  assert len(json.dumps(d, separators=(",", ":"))) <= D.TICK_MAX_B == 700
+  e["map"] = [[-9999, -9999]] * 12
+  d = D.tick_log(_worst_plan(), e)
+  assert "map" in d and len(d["map"]) == 12
+  assert len(json.dumps(d, separators=(",", ":"))) <= D.TICK_MAP_MAX_B == 900
+  # more than the log may carry (a longer map list, a long string): trimmed to the bound, never over it
+  e["map"] = [[-99999, -99999]] * 40
+  e["mon"] = ["x" * 2000, 1]
+  d = D.tick_log(_worst_plan(), e)
+  assert len(json.dumps(d, separators=(",", ":"))) <= D.TICK_MAP_MAX_B
+  assert len(d.get("map", [])) <= 12
+  # the fields later analysis needs are there on a normal tick (A10: gap and deceleration after every drive)
+  d = D.tick_log(_worst_plan(), _worst_extras())
+  for k in ("gap", "dec", "a", "set", "v", "st", "ceil", "need", "cap", "side", "fc", "s1", "s2", "mon", "ti", "lay", "lacc", "ln",
+            "drv", "tq", "cpu", "rate", "cmd", "des", "rel", "alert"):
+    assert k in d, k
+
+
+def _memory_far_from_origin():
+  # synthetic road (never a recorded position): a straight then a left bend, at a recognisable origin
+  tr = TM.synthetic_trace([(200.0, 0.0), (150.0, 0.01), (300.0, 0.0)])
+  mem = TM.synthetic([tr])
+  mem.lat0, mem.lon0 = 10.37, -71.73
+  return mem, tr
+
+
+def test_tick_log_has_no_position():
+  mem, tr = _memory_far_from_origin()
+  pl = TP.Planner(mem)
+  for k in range(60):
+    s = 5.0 + k * 0.2 * 20.0
+    j = min(int(s // TM.SPACING_M), len(tr["x"]) - 1)
+    p = pl.step(k * 0.2, TP.Fix(True, float(tr["x"][j]), float(tr["y"][j]), float(tr["hdg"][j])), 20.0, set_mph=45.0,
+                yaw_k=float(tr["kap"][j]), ref_mph=45.0)
+  ms = D.mem_summary(pl)
+  assert ms is not None and set(ms) == {"pk", "pkd", "pkn", "s"} and len(ms["s"]) == 8
+  e = _worst_extras()
+  e.update(mem=ms, lat=mem.lat0, lon=mem.lon0, latitude=mem.lat0, longitude=mem.lon0, x=float(tr["x"][10]), y=float(tr["y"][10]),
+           map=[[10, 5], [20, 7]])
+  d = D.tick_log(p, e)
+  coords = {mem.lat0, mem.lon0}
+  text = json.dumps(d)
+  for bad in ("lat", "lon", '"x"', '"y"', "hdg"):
+    assert bad not in text, bad
+
+  def walk(o):
+    if isinstance(o, dict):
+      for v in o.values():
+        yield from walk(v)
+    elif isinstance(o, (list, tuple)):
+      for v in o:
+        yield from walk(v)
+    elif isinstance(o, (int, float)) and not isinstance(o, bool):
+      yield float(o)
+  for x in walk(d):
+    assert all(abs(x - c) > 1e-3 for c in coords), x          # no latitude / longitude passes through
+  assert set(d) <= set(D.TICK_KEYS)
+
+
+def test_tick_log_decodes_the_interceptor_and_accelerometer():
+  # TI_FEEDBACK (0x24A, body bus 1): STATE byte 3, VIOL byte 4; 0x075 bus 0 lateral acceleration (ay_raw - 2000 + 14.31) / 93.857
+  assert D.ti_from_can([frame(0x24A, [0, 0, 0, 3, 0x11, 0, 0, 0], src=1)]) == (3, 0x11)
+  assert D.ti_from_can([frame(0x24A, [0, 0, 0, 3, 0x11, 0, 0, 0], src=0)]) is None
+  raw = 2000 + 188
+  la = D.lat_accel_from_can([frame(0x75, [0, 0, (raw >> 8) & 0x0F, raw & 0xFF, 0, 0, 0, 0])])
+  assert abs(la - (188 + 14.31) / 93.857) < 1e-9
+  assert D.lat_accel_from_can([frame(0x76, [0] * 8)]) is None

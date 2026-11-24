@@ -11,7 +11,8 @@ batch, else liveLocationKalman's calibrated yaw rate). The road memory: MEMORY_P
 the owner has driven); without it the planner publishes "no road memory on the device" and nothing happens.
 
 Logs (`ti_curve_plan` channel): every change of the decision (ceiling, kind, trusted, reason) and the planner's events (lock, lock lost,
-road changed, corner start with the planned and actual speed and the grade, mode changes, corner passed), and a summary every 5 s.
+road changed, corner start with the planned and actual speed and the grade, mode changes, corner passed), a summary every 5 s, and
+(plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed).
 Never a position: trace and point indices, distances, speeds and curvatures only.
 """
 import json
@@ -167,6 +168,172 @@ def car_side(params_memory, now_wall, tc):
     return None, None, False
 
 
+# ---- plan T8: the per-tick log (5 Hz, `ti_curve_plan` channel, kind "tick"); never a position ----------------------------------------
+TICK_MAX_B = 700                # bytes per message (json.dumps default separators: what cloudlog writes is no larger)
+TICK_MAP_MAX_B = 900            # ... on a tick that carries a changed map list
+TICK_FC_LEADS = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0)   # calibrated forecast demand at these leads (s)
+TICK_MEM_STEP_M, TICK_MEM_N = 50.0, 8                  # the road memory's median curvature every 50 m to 400 m
+TICK_MAP_N = 12
+TICK_STR_MAX = 40
+TI_FEEDBACK_ADDR, TI_FEEDBACK_BUS = 0x24A, 1
+CAR_HALF_WIDTH_M = 0.92
+# every key the tick log may carry (anything else given is dropped: a position can never pass through)
+TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
+             "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu")
+DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
+
+
+def lat_accel_from_can(can_msg):
+  """Left-positive lateral acceleration (m/s^2) from the newest 0x075 frame on bus 0 (STEER_RELATED.STEER_TORQUE, the car's
+  accelerometer: (ay_raw - 2000 + 14.31) / 93.857, as carstate.lat_accel), or None."""
+  for f in reversed(can_msg):
+    if f.address == 0x75 and f.src == 0 and len(f.dat) >= 4:
+      raw = ((f.dat[2] & 0x0F) << 8) | f.dat[3]
+      return (raw - 2000 + 14.31) / 93.857
+  return None
+
+
+def ti_from_can(can_msg):
+  """(STATE, VIOL) of the interceptor from the newest TI_FEEDBACK frame (0x24A, body bus 1), or None."""
+  for f in reversed(can_msg):
+    if f.address == TI_FEEDBACK_ADDR and f.src == TI_FEEDBACK_BUS and len(f.dat) >= 5:
+      return int(f.dat[3]), int(f.dat[4])
+  return None
+
+
+def mem_summary(planner, look_m=TICK_MEM_STEP_M * TICK_MEM_N):
+  """The remembered road ahead while locked: peak |kap_med| (signed, x1e4), its distance (m) and pass count, and kap_med (x1e4) every
+  TICK_MEM_STEP_M to look_m. None when not locked or there is no memory stage. Point indices and positions never leave here."""
+  mem = getattr(planner, "mem", None)
+  if mem is None or not getattr(planner, "locked", False) or not getattr(planner, "mem_stage", False) or planner.trace < 0:
+    return None
+  i0 = int(math.floor(planner.pos))
+  idx, dist = mem.ahead(planner.trace, i0, look_m)
+  if not len(idx):
+    return None
+  dist = dist - (planner.pos - i0) * mem.spacing
+  k = planner.kmed[idx]
+  j = int(abs(k).argmax())
+  grid = [TICK_MEM_STEP_M * (n + 1) for n in range(TICK_MEM_N)]
+  import numpy as np
+  s = np.interp(grid, dist, k, right=float("nan"))
+  return {"pk": int(round(float(k[j]) * 1e4)), "pkd": int(round(float(dist[j]))), "pkn": int(mem.npass[idx[j]]),
+          "s": [None if not math.isfinite(x) else int(round(float(x) * 1e4)) for x in s]}
+
+
+def fc_summary(planner):
+  """The calibrated signed (left +) forecast demand (m/s^2) at TICK_FC_LEADS from this tick's preview, or None."""
+  fc, v = getattr(planner, "fc", None), getattr(planner, "fc_v", None)
+  if fc is None or v is None:
+    return None
+  import numpy as np
+  from openpilot.selfdrive.car.mazda import ti_curve_demand as CD
+  ts = np.asarray(fc[0], np.float64)
+  la = CD.calibrate(ts, max(float(v), 1.0) ** 2 * np.asarray(fc[1], np.float64))
+  return [round(float(x), 2) for x in np.interp(TICK_FC_LEADS, ts, la, right=float("nan"))]
+
+
+def stage_summary(planner):
+  """Stage 1 (bends in progress: count, lowest target, its phase, mode, release decided), stage 2 (T, need, lead s) and the
+  limiting bend's side (+1 left, -1 right, 0 unknown)."""
+  act = dict(getattr(planner, "active", {}) or {})
+  act.update(getattr(planner, "map_active", {}) or {})
+  s1, side = None, 0
+  if act:
+    a_ = min(act.values(), key=lambda a: a["T"])
+    s1 = [len(act), int(a_["T"]), int(a_.get("phase", 1)), str(a_.get("mode", "")), int(bool(a_.get("decided")))]
+    side = int(a_.get("side", 0) or 0)
+  s2 = getattr(planner, "s2", None)
+  s2o = None
+  if s2 is not None:
+    s2o = [int(s2["T"]), int(s2["need"]), round(float(s2.get("lead") or 0.0), 1)]
+    if s1 is None or s2["T"] < s1[1]:
+      side = int(s2.get("side", 0) or 0)
+  return s1, s2o, side
+
+
+def lane_summary(model):
+  """[clearance left, probability left, clearance right, probability right]: the car's side to the near lane line (m, negative =
+  over it; CAR_HALF_WIDTH_M from the centre) at the car, or None."""
+  try:
+    ll, pr = model.laneLines, model.laneLineProbs
+    if len(ll) < 3 or len(pr) < 3 or not len(ll[1].y) or not len(ll[2].y):
+      return None
+    return [round(-float(ll[1].y[0]) - CAR_HALF_WIDTH_M, 2), round(float(pr[1]), 2),
+            round(float(ll[2].y[0]) - CAR_HALF_WIDTH_M, 2), round(float(pr[2]), 2)]
+  except Exception:
+    return None
+
+
+def _r(x, nd):
+  try:
+    if x is None or isinstance(x, bool):
+      return x
+    x = float(x)
+    return round(x, nd) if math.isfinite(x) else None
+  except (TypeError, ValueError):
+    return None
+
+
+def _clip_str(o):
+  if isinstance(o, str):
+    return o[:TICK_STR_MAX]
+  if isinstance(o, list):
+    return [_clip_str(x) for x in o]
+  if isinstance(o, dict):
+    return {k: _clip_str(v) for k, v in o.items()}
+  return o
+
+
+def tick_log(plan, extras):
+  """One tick's record (plan T8): the plan's decision and the inputs later analysis needs. extras: the plannerd-side figures (speed,
+  set speed, gap, deceleration, memory / map / forecast summaries, stage 1 / 2, stage 3's alert, car side, lateral accelerations,
+  lane clearance, driver flags, interceptor state, CPU). Only TICK_KEYS pass; bounded to TICK_MAX_B (TICK_MAP_MAX_B with a map list):
+  over it, the memory samples, then the forecast, then the map are dropped."""
+  e = dict(extras or {})
+  d = {k: e[k] for k in TICK_KEYS if k in e}
+  d.update(st=plan.stage, src=plan.src, ceil=plan.ceil, kind=plan.kind, need=plan.need_mph, cap=_r(plan.cap, 2),
+           ahead=_r(plan.ahead_la, 2), alert=plan.alert_mph, beh=int(bool(plan.behind)),
+           rel=(plan.diag or {}).get("rel", int(bool(plan.released))))
+  for k, nd in (("v", 1), ("gap", 1), ("a", 2), ("dec", 2), ("lay", 2), ("lacc", 2), ("des", 2), ("rate", 1)):
+    if k in d:
+      d[k] = _r(d[k], nd)
+  if "map" in d:
+    # a changed list (an empty one: the map has no opinion any more)
+    d["map"] = [[int(round(float(a))), int(round(float(b)))] for a, b in list(d["map"] or [])[:TICK_MAP_N]]
+  d = _clip_str(d)
+  bound = TICK_MAP_MAX_B if "map" in d else TICK_MAX_B
+  for drop in ("mem.s", "fc", "map", "mem", "ln", "car", "s1", "s2"):
+    if len(json.dumps(d)) <= bound:
+      break
+    if drop == "mem.s":
+      if isinstance(d.get("mem"), dict):
+        d["mem"] = {k: v for k, v in d["mem"].items() if k != "s"}
+    else:
+      d.pop(drop, None)
+    bound = TICK_MAP_MAX_B if "map" in d else TICK_MAX_B
+  return d
+
+
+def side_status(params_memory, now_wall, now_mono, tc):
+  """For the tick log: (car side [state, target, taps down, taps up] or None, stage 3 [why, need] while it alerts or None), from
+  TiCurveStatus (fresh within 3 s) and TiCurveDeliver (fresh within 1 s)."""
+  car = mon = None
+  try:
+    st = json.loads(params_memory.get(tc.PARAM_STATUS) or b"null")
+    if isinstance(st, dict) and now_wall - float(st.get("t", 0.0)) <= 3.0:
+      car = [str(st.get("state", "")), st.get("target"), st.get("down"), st.get("up")]
+  except Exception:
+    car = None
+  try:
+    dv = json.loads(params_memory.get(tc.PARAM_DELIVER) or b"null")
+    if isinstance(dv, dict) and dv.get("need") is not None and now_mono - float(dv.get("m", -1e9)) <= 1.0:
+      mon = [str(dv.get("why", "")), dv.get("need")]
+  except Exception:
+    mon = None
+  return car, mon
+
+
 def keep_off_control_core():
   """Cores 0-3 only (never the control core 4, nor 5-7 where plannerd / radard / modeld run real-time), a little below normal
   priority: a slow tick of this process can never delay a process the communication checks watch (it publishes no message)."""
@@ -206,11 +373,14 @@ def main():
   cloudlog.event("ti_curve_plan", kind="memory", loaded=mem is not None, why=why_none, seconds=round(time.monotonic() - t0, 2),
                  traces=getattr(mem, "n_traces", 0), points=getattr(mem, "n", 0))
   planner = P.Planner(mem)
-  sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can"])
+  sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can", "carOutput"])
   rk = Ratekeeper(RATE_HZ, print_delay_threshold=None)
   seq = 0
   last_key, last_summary = None, 0.0
   yaw, yaw_t = None, -1e9
+  lacc, lacc_t, ti_fb, ti_t = None, -1e9, None, -1e9
+  vhist = []                      # (t, m/s) over the last ~1.2 s: the measured deceleration (A10)
+  last_map, cpu_us = None, None
   lim_state = {"t": None}
   cpu = []
   while True:
@@ -222,6 +392,12 @@ def main():
         y = yaw_from_can(sm["can"])
         if y is not None:
           yaw, yaw_t = y, t
+        la_ = lat_accel_from_can(sm["can"])
+        if la_ is not None:
+          lacc, lacc_t = la_, t
+        tf = ti_from_can(sm["can"])
+        if tf is not None:
+          ti_fb, ti_t = tf, t
       llk = sm["liveLocationKalman"]
       ok = bool(sm.alive["liveLocationKalman"] and llk.gpsOK and llk.positionGeodetic.valid and llk.status == LLK_VALID)
       fix = P.Fix(False)
@@ -265,6 +441,38 @@ def main():
         cloudlog.event("ti_curve_plan", **log_payload(d, kind="decision", feature=d["mode"], mph=round(v / MPH, 1), set_mph=set_mph,
                                                        trace=plan.trace, point=plan.point))
         last_key = key
+      # plan T8: one tick record, 5 Hz (positions never: the helpers return distances, curvatures, speeds and flags only)
+      vhist.append((t, v))
+      while len(vhist) > 2 and t - vhist[1][0] >= 1.0:
+        vhist.pop(0)
+      dec = (vhist[0][1] - v) / (t - vhist[0][0]) if t - vhist[0][0] >= 0.8 else None
+      mk = None
+      if map_k is not None:
+        dd, kk = map_k
+        sel = [j for j in range(len(dd)) if dd[j] >= 0.0]
+        if len(sel) > TICK_MAP_N:
+          sel = [sel[int(round(q * (len(sel) - 1) / (TICK_MAP_N - 1)))] for q in range(TICK_MAP_N)]
+        mk = [[int(round(dd[j])), int(round(kk[j] * 1e4))] for j in sel]
+      s1, s2, side = stage_summary(planner)
+      car_st, mon_st = side_status(params_memory, time.time(), t, tc)
+      co = sm["carOutput"]
+      diag_ = co.mazdaDiagnostics if sm.alive["carOutput"] else None
+      extras = dict(seq=seq, v=v / MPH, set=None if set_mph is None else int(round(set_mph)),
+                    gap=None if set_mph is None else v / MPH - set_mph, a=float(cs.aEgo), dec=dec,
+                    mem=mem_summary(planner), fc=fc_summary(planner), s1=s1, s2=s2, side=side, mon=mon_st, car=car_st,
+                    lay=None if yaw_k is None else yaw_k * v * v, lacc=lacc if t - lacc_t < 0.5 else None,
+                    des=(-v * v * float(co.actuatorsOutput.curvature)) if sm.alive["carOutput"] else None,
+                    rate=float(cs.steeringRateDeg),
+                    cmd=int(diag_.tiLimited) if diag_ is not None and diag_.version else None,
+                    ti=list(ti_fb) if ti_fb is not None and t - ti_t < 0.5 else None, ln=lane_summary(sm["modelV2"]),
+                    drv=(DRV_PRESSED * bool(cs.steeringPressed) | DRV_BRAKE * bool(cs.brakePressed) | DRV_GAS * bool(cs.gasPressed) |
+                         DRV_BUTTON * bool(len(cs.buttonEvents)) | DRV_LBLINK * bool(cs.leftBlinker) | DRV_RBLINK * bool(cs.rightBlinker)),
+                    tq=int(round(float(cs.steeringTorque))), cpu=cpu_us)
+      if mk != last_map:
+        extras["map"] = mk or []
+        last_map = mk
+      cloudlog.event("ti_curve_plan", **log_payload(tick_log(plan, extras), kind="tick"))
+      cpu_us = int(round(1e6 * (time.process_time() - c0)))     # logged on the next tick (this tick's own cost, log included)
       cpu.append(time.process_time() - c0)
       if t - last_summary >= SUMMARY_S:
         cpu.sort()
