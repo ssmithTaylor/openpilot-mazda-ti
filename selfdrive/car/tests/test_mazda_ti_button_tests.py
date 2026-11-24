@@ -351,7 +351,8 @@ def test_waits_for_three_steady_seconds_then_gives_up_after_a_minute():
   car.mph_override = 40.0                                   # 5 mph under the set speed: never steady
   chk, ev, st = run(car, "hold", frames=int(70 / DT))
   assert chk.state == "aborted" and chk.why == "not started: speed not steady at the set speed" and not car.sent
-  assert st[-1]["line1"] == "HOLD TEST STOPPED" and st[-1]["result"] == ""
+  assert st[-1]["line1"] == "HOLD TEST NOT RUN" and st[-1]["result"] == "" and st[-1]["d1"] == "Nothing was pressed"
+  assert st[-1]["line2"] == "Gave up: speed not steady at the set speed"
 
 
 @pytest.mark.parametrize("field,value,why", [

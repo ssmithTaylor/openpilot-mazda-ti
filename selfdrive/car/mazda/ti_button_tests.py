@@ -257,7 +257,7 @@ def classify_hold(s0, d, changes):
   if len(changes) == 1 and deltas[0][1] == d:
     return "ONE TAP", f"{steps} ({changes[0][0]:.2f} s): one step only"
   times = ", ".join(f"{t:.2f}" for t, _ in changes[:4])
-  return "OTHER", f"{steps} ({times} s)"
+  return "OTHER", f"{steps} ({times} s): other"
 
 
 def press_stats(presses, changes, d, end_frame):
@@ -836,7 +836,8 @@ class ButtonTests:
       issues.append(f"{double} double")
     if c.get("cut"):
       issues.append("cut short")
-    word = "all 1 mph" if c.get("clean") else (", ".join(issues) if issues else "not clean")
+    done = c.get("up") is not None or c.get("cut")
+    word = "all 1 mph" if c.get("clean") else (", ".join(issues) if issues else ("not clean" if done else "so far"))
     per = f"{steps / sent:.2f}" if sent else "0.00"
     med = f"{ms[len(ms) // 2]} ms" if ms else "no step"
     return cut(f"{c['cycle']:.1f} s: {sent} sent, {steps} steps ({per}/press), {med}: {word}", MAX_DETAIL)
@@ -900,6 +901,9 @@ class ButtonTests:
         result = "YOUR SET SPEED STANDS"
       elif not not_back:
         result = cut(f"SET SPEED {'PUT BACK' if self.restore.get('taps') else 'UNCHANGED'}: {self.orig} MPH", MAX_RESULT)
+      if self.orig is None and self.abort_why.startswith("not started: "):
+        return (cut(name + " NOT RUN", MAX_LINE1), cut("Gave up: " + self.abort_why[len("not started: "):], MAX_LINE2),
+                "", "Nothing was pressed", "", "")
       return cut(name + " STOPPED", MAX_LINE1), cut("Stopped: " + self.abort_why, MAX_LINE2), result, d[0], d[1], d[2]
     return cut(name + " DONE", MAX_LINE1), cut(self.restore.get("note", ""), MAX_LINE2), result, d[0], d[1], d[2]
 
