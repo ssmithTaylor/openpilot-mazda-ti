@@ -37,6 +37,7 @@ import numpy as np
 from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
 from openpilot.selfdrive.car.mazda import ti_curve_demand as D
 from openpilot.selfdrive.car.mazda import ti_curve_memory as M
+from openpilot.selfdrive.car.mazda import ti_curve_monitor as TM
 
 MPH = 0.44704
 fits = D.fits                   # re-exported: the car side's restore check (ti_curve.py)
@@ -45,6 +46,7 @@ MODEL_K_SIGN = -1.0             # the model preview (ti_curve_plannerd.model_cur
                                 # curvature, RIGHT positive (latcontrol_angle / _pid steer from -desired_curvature); the planner's yaw_k
                                 # and the memory are LEFT positive: preview curvature times this is left positive
 AHEAD_S = 3.0                   # Plan.ahead_la: the signed peak calibrated forecast demand within this lead
+ASK_LEADS = TM.ASK_LEADS        # Plan.ask: the calibrated signed forecast demand at these leads (stage 3's MON_REMAIN_S)
 # ---- stage 2: late, forecast-confirmed (plan T5). The model preview between FC_LO_S and CONFIRM_LEAD_S ahead, calibrated by FC_RATIO
 # (ti_curve_demand.forecast_need), judged against the capacity of its direction at the speed now; a bend it shows needing at least
 # MIN_DROP_MPH below the speed, CONFIRM_TICKS planner ticks in a row (FORK_CONFIRM_S while trusted memory says the road ahead is
@@ -274,6 +276,7 @@ class Plan(NamedTuple):
   cap: Optional[float] = None     # the capacity (m/s^2) the limiting bend was judged against, at its target and side
   released: bool = False          # a bend ahead was released by the forecast (plan T6; kept until passed)
   diag: Optional[dict] = None     # small per-tick decision record for the tick log (plan T8); never a position
+  ask: Optional[tuple] = None     # calibrated signed (left +) forecast demand at ASK_LEADS, m/s^2 (stage 3, plan T7); None: no preview
 
 
 def bearing_to_hdg(bearing_deg):
@@ -545,6 +548,7 @@ class Planner:
     self.model_k = None
     self.fc = None                      # (lead times, LEFT-positive curvature) of the model preview this tick
     self.ahead_la = None
+    self.ask = None
     if model_k is not None:
       ts, ks = model_k
       ts, ks = np.asarray(ts, np.float64), np.asarray(ks, np.float64)
@@ -558,6 +562,8 @@ class Planner:
         self.fc_v = v
         _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S)
         self.ahead_la = None if la3 is None else round(la3, 2)
+        la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1])
+        self.ask = tuple(round(float(x), 2) for x in np.interp(ASK_LEADS, ts, la_all))
     mph = v / MPH
     if blinker:
       self.blink_t = t
@@ -1083,7 +1089,7 @@ class Planner:
             "rel": len(getattr(self, "released", {}) or {})}
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
                 self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
-                point, stage, src, ahead, cap, bool(getattr(self, "released", None)), diag)
+                point, stage, src, ahead, cap, bool(getattr(self, "released", None)), diag, getattr(self, "ask", None))
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -1094,4 +1100,4 @@ def plan_json(plan, t_mono, seq, mode):
           "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
           "corner": plan.corner_mph, "end": plan.end_m, "behind": plan.behind, "alert": plan.alert_mph,
           "need": None if plan.need_mph is None else int(plan.need_mph), "stage": plan.stage, "src": plan.src,
-          "ahead": plan.ahead_la, "cap": plan.cap, "rel": plan.released}
+          "ahead": plan.ahead_la, "cap": plan.cap, "rel": plan.released, "ask": None if plan.ask is None else list(plan.ask)}

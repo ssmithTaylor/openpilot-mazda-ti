@@ -182,6 +182,39 @@ def run_curve(name, mode, cycles, count=False, warm=300):
           "max_us": round(times[-1], 1), "taps": seen["taps"], "state": cc.curve.state if cc.curve is not None else "absent"}
 
 
+def run_monitor(name, cycles, warm=300):
+  """Curve slowing stage 3 (plan T7): the car controller's per-frame delivery monitor (CarController._curve_monitor, on the sent
+  command), curve slowing on, through bends that saturate (the command at its maximum, the angle stalled, the bend asking more) and
+  release, so it watches, alerts, clears and re-arms all along. Times only the monitor's own call."""
+  from openpilot.selfdrive.car.mazda import ti_curve as tc
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  cc, mem = make_controller()
+  ccm.ti_curve_log = lambda ev: None
+  clock = {"k": 0}
+  ccm.time = NS(monotonic=lambda: clock["k"] * 0.01, time=time.time, perf_counter=time.perf_counter)
+  CC, CS = inputs(45.0, -0.004)
+  CS.lat_accel, CS.lkas_effective = 1.0, 100.0
+  CS.out.steeringRateDeg = 0.0
+  cc.curve_on = True
+  times, alerts = [], 0
+  for k in range(cycles + warm):
+    clock["k"] = k
+    phase = (k // 400) % 3                    # 4 s at the limit, 8 s free
+    if k % 20 == 0:
+      cc.curve_plan = {"m": k * 0.01, "ahead": 2.0 + 0.01 * (k // 20 % 3), "ask": [2.0] * 6, "mode": "act"}
+    ti = 600 if phase == 0 else 200
+    t0 = time.perf_counter_ns()
+    r = cc._curve_monitor(CC, CS, ti)
+    dt = time.perf_counter_ns() - t0
+    alerts += r.phase == "alert"
+    if k >= warm:
+      times.append(dt / 1000.0)
+  ccm.time = time
+  times.sort()
+  return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
+          "max_us": round(times[-1], 1), "alert_share": round(alerts / (cycles + warm), 3), "written": tc.PARAM_DELIVER in mem.d}
+
+
 def _counting(fn):
   """(result, python calls, C calls) of fn() under sys.setprofile: the operation count, deterministic for one Python version."""
   n = [0, 0]
@@ -360,6 +393,15 @@ def main():
       bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
   if cur[2]["taps"] < 10:
     print("NOT VALID: curve slowing sent no taps in its working mode")
+    return 2
+  mon = run_monitor("curve: monitor", max(a.cycles, 4000))      # stage 3 (plan T7): its own cost, budget per cycle
+  print(f"{mon['mode']:22s} mean {mon['mean_us']:8.1f} us  p99 {mon['p99_us']:8.1f} us  max {mon['max_us']:8.1f} us"
+        f"  alerting {100 * mon['alert_share']:.0f} %")
+  cur.append(mon)
+  if mon["mean_us"] > a.budget_us:
+    bad.append(f"{mon['mode']} costs {mon['mean_us']} us per cycle (budget {a.budget_us:g})")
+  if mon["alert_share"] <= 0.0 or not mon["written"]:
+    print("NOT VALID: the monitor never alerted")
     return 2
   ctl = [run_controls("controls: plan off", False, 45.0, a.cycles),
          run_controls("controls: plan on, ab", True, 45.0, a.cycles),

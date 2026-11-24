@@ -54,6 +54,8 @@ from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, FRAME_SPACING, Pres
 PARAM_ON = "TiCurveOn"           # tmpfs, the page: "1" on for this drive, "0" / absent off
 PARAM_PLAN = "TiCurvePlan"       # tmpfs, the planner (ti_curve_plannerd.py): its output, 5 Hz
 PARAM_STATUS = "TiCurveStatus"   # tmpfs, the car controller: what the page shows, on change (at most 10 Hz) and every second
+PARAM_DELIVER = "TiCurveDeliver"  # tmpfs, the car controller: stage 3's alert {"m", "need", "why"} at onset, clear, and every 0.2 s
+GENTLE_TAP_S = 1.0               # stage 3 (ti_curve_monitor): at most one SET- per this, about 1 mph/s (plan A2)
 STATUS_EVERY = 100
 
 PRESSED_FRAMES = 2               # a real tap (the cruise check's recipe A, accepted 3 of 3 on the car)
@@ -109,6 +111,9 @@ class Inputs(NamedTuple):
   driver_set: bool = False        # the driver's pressed button is SET+ or SET- (the buttons that CHOOSE a speed); RES, DISTANCE, MODE
                                   # and CANCEL never are
   driver_set_plus: bool = False   # ... and it is SET+ (a SET+ from a lowered set speed never makes a LOWER speed their choice)
+  deliver: bool = False           # stage 3 (ti_curve_monitor): the steering is at its limit and losing the bend (plan T7)
+  deliver_need: Optional[int] = None   # ... the speed it walks toward, gently (GENTLE_TAP_S per tap), within the floor
+  deliver_why: str = ""           # ... why ("limit", "dropout", "assist off: 0x11 stuck request"), for the page
 
 
 class Curve:
@@ -128,6 +133,7 @@ class Curve:
     self.tap_first = None
     self.last_plus = -10 ** 9
     self.taps_down = 0
+    self.deliver_tap_f = -10 ** 9     # stage 3's last SET- (gentle pacing)
     self.taps_up = 0
     self.gas_since = None
     self.gas_off_at = None            # frame the gas was last released
@@ -457,7 +463,8 @@ class Curve:
 
     if self.tap is not None and self.tap.first is None and self.tap.button == "SET_MINUS" and not self.tap_correcting:
       p_ = inp.plan if plan_ok else None
-      if not (p_ and p_.get("trusted") and p_.get("ceil") is not None and p_.get("kind", "corner") != "hold"):
+      corner_on = bool(p_ and p_.get("trusted") and p_.get("ceil") is not None and p_.get("kind", "corner") != "hold")
+      if not corner_on and not (inp.deliver and inp.deliver_need is not None):
         self._cut_tap()                     # a SET_MINUS not yet sent whose corner ceiling has gone: not sent
     out = self._send(frame, inp)
     if out is not None or self.tap is not None:
@@ -491,6 +498,16 @@ class Curve:
     ceil = plan.get("ceil") if plan else None
     trusted = bool(plan.get("trusted")) if plan else False
     kind = plan.get("kind", "corner") if plan else ""
+    gentle = False
+    if inp.deliver and inp.deliver_need is not None and plan is not None:
+      # stage 3 (plan T7): the steering is losing the bend: walk toward its need, gently, as one more corner ceiling (the lower wins;
+      # floors and the driver's set speed apply as for any corner)
+      dn = int(inp.deliver_need)
+      if ceil is None or not trusted or kind == "hold" or dn < int(ceil):
+        end = plan.get("end") if (trusted and kind != "hold" and plan.get("end") is not None) else 0.0
+        plan = dict(plan, ceil=dn, corner=dn, need=dn, trusted=True, kind="corner", end=end)
+        ceil, trusted, kind, gentle = dn, True, "corner", True
+    self.gentle_why = inp.deliver_why if gentle else ""
     if ceil is not None and trusted and kind != "hold" and (plan.get("end") is not None or plan.get("dist") is not None):
       # where the remembered tight stretch ENDS (the planner's "end"; "dist" is to its start)
       self.corner_end_odo = self.odo + max(0.0, float(plan["end"] if plan.get("end") is not None else plan["dist"]))
@@ -543,7 +560,12 @@ class Curve:
       if inp.set_mph > self.target:
         self._to(frame, "slowing")
         self._lines(inp)
-        return self._start(frame, inp, "SET_MINUS")
+        if gentle and (frame - self.deliver_tap_f) * DT < GENTLE_TAP_S - 1e-9:
+          return None                          # stage 3: gently (about 1 mph/s)
+        b = self._start(frame, inp, "SET_MINUS")
+        if gentle and self.tap is not None:
+          self.deliver_tap_f = frame
+        return b
       near = inp.mph <= self.shown + HOLDING_AT_MPH + (1.0 if self.state == "holding" else 0.0)   # hysteresis
       self._to(frame, "holding" if near else "slowing")
       self._lines(inp)
@@ -672,7 +694,9 @@ class Curve:
     if self.state == "slowing" or self.state == "holding":
       word = "SLOWING FOR A CORNER" if self.state == "slowing" else "HOLDING FOR A CORNER"
       self.line1 = f"{word}: {self.lowered_from} -> {self.shown} mph"
-      self.line2 = ("CORNER NEEDS MORE THAN I MAY SLOW: be ready" if self.needs_more else
+      gw = getattr(self, "gentle_why", "")
+      self.line2 = (("assist off: slowing gently" if gw.startswith("assist off") else "steering at its limit: slowing gently") if gw else
+                    "CORNER NEEDS MORE THAN I MAY SLOW: be ready" if self.needs_more else
                     "slowing as fast as the cruise allows" if getattr(self, "behind", False) else f"set speed now {inp.set_mph} mph")
     elif self.after_brake:
       self.line1 = f"RESTORING YOUR SET SPEED: {inp.set_mph} -> {self.ref} mph"
@@ -828,6 +852,35 @@ class Curve:
 
 
 ALERT_FRESH_S = 1.0               # the planner writes every 0.2 s: a warning older than this is dropped (no flicker, no re-chime)
+
+
+DELIVER_FRESH_S = 1.0             # stage 3's record is rewritten every 0.2 s while it alerts: older than this, it is gone
+
+
+def read_deliver_alert(params_memory, now):
+  """(stage 3's need mph, its monotonic time) from the car controller's TiCurveDeliver while it alerts and is fresh, or (None, 0).
+  The car controller writes it only while curve slowing is on (TiCurveOn). `now` is time.monotonic()."""
+  import json
+  try:
+    raw = params_memory.get(PARAM_DELIVER)
+    d = json.loads(raw) if raw else None
+    if not isinstance(d, dict) or not d.get("need"):
+      return None, 0.0
+    m = float(d.get("m", 0.0))
+    if now - m > DELIVER_FRESH_S:
+      return None, 0.0
+    return int(d["need"]), m
+  except Exception:
+    return None, 0.0
+
+
+def curve_alert_mph(params_memory, now):
+  """The Level 1 curve warning's need (mph) and time: the planner's pre-bend warning or stage 3's, the LOWER need wins; (None, 0)."""
+  a, ta = read_curve_alert(params_memory, now)
+  b, tb = read_deliver_alert(params_memory, now)
+  if b is not None and (a is None or b < a):
+    return b, tb
+  return a, ta
 
 
 def read_curve_alert(params_memory, now):

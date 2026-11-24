@@ -612,6 +612,7 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiCurveOn", CLEAR_ON_MANAGER_START},            // tmpfs: curve slowing switch for this drive (the Tests pages); the car controller clears it at start
     {"TiCurvePlan", CLEAR_ON_MANAGER_START},          // tmpfs: the curve planner's output, 5 Hz (ti_curve_plannerd): ceiling, confidence, no position
     {"TiCurveStatus", CLEAR_ON_MANAGER_START},        // tmpfs: what curve slowing is doing (car controller, on change and 1 Hz)
+    {"TiCurveDeliver", CLEAR_ON_MANAGER_START},       // tmpfs: curve slowing stage 3 alert {m, need, why} (car controller, at onset / clear)
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},

@@ -120,6 +120,10 @@ class CarState(CarStateBase):
     # Either due to low speed or hands off
     lkas_blocked = cp.vl["STEER_RATE"]["LKAS_BLOCK"] == 1
     self.lkas_blocked = bool(lkas_blocked)   # the steering regime, for the identification tests (ti_ident.py)
+    self.lkas_effective = float(cp.vl["STEER_RATE"]["LKAS_EFFECTIVE"])   # curve slowing stage 3's dropout path (ti_curve_monitor)
+    # the car's lateral acceleration (0x075 STEER_TORQUE is the lateral sensor, not torque: see the note below), m/s^2 left +,
+    # including bank (ti_curve_plannerd's conversion, plan section 1); stage 3's la_now
+    self.lat_accel = (float(cp.vl["STEER_RELATED"]["STEER_TORQUE"]) + 14.31) / 93.857
 
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down

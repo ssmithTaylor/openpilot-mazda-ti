@@ -40,8 +40,9 @@ try:
   # Curve slowing (ti_curve.py): lowers the cruise set speed before remembered corners; switched on only by its own control on the
   # Tests pages, for the drive. Optional: without the module nothing here changes (self.curve is None).
   from openpilot.selfdrive.car.mazda import ti_curve as curve_mod
+  from openpilot.selfdrive.car.mazda import ti_curve_monitor as curve_mon_mod, ti_curve_demand as curve_demand_mod   # stage 3
 except Exception:
-  curve_mod = None
+  curve_mod = curve_mon_mod = curve_demand_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -749,14 +750,63 @@ class CarController(CarControllerBase):
         pass
       return None
 
-  def curve_step(self, CC, CS):
+  def _curve_monitor(self, CC, CS, ti_apply_steer):
+    """Curve slowing stage 3 (ti_curve_monitor, plan T7): every frame, on the SENT interceptor command. While curve slowing is on,
+    writes TiCurveDeliver {"m", "need", "why"} at the alert's onset, every 0.2 s while it lasts, and at its clear. -> MonOut."""
+    TM = curve_mon_mod
+    mon = getattr(self, "curve_mon", None)
+    if mon is None:
+      mon = self.curve_mon = TM.DeliveryMonitor()
+      self.curve_deliver, self.curve_need_key, self.curve_need_val = None, None, None
+    out = CS.out
+    v = float(out.vEgo)
+    plan = self.curve_plan or {}
+    ahead, ask = plan.get("ahead"), plan.get("ask")
+    if ahead and v > 1.0:
+      key = (ahead, int(v * CV.MS_TO_MPH))
+      if key != self.curve_need_key:      # at most when the plan (5 Hz) or the whole mph changes
+        self.curve_need_key, self.curve_need_val = key, int(curve_demand_mod.need_mph(float(ahead) / (v * v))[0])
+    else:
+      self.curve_need_key = self.curve_need_val = None
+    r = mon.step(self.frame, TM.MonInputs(
+      mph=v * CV.MS_TO_MPH, ti_cmd=float(ti_apply_steer), ti_max=float(self.ccp.TI_STEER_MAX), lat_active=bool(CC.latActive),
+      ti_active=bool(getattr(CS, "ti_lkas_allowed", False)), steering_pressed=bool(out.steeringPressed),
+      angle_rate_deg=float(getattr(out, "steeringRateDeg", 0.0) or 0.0), la_now=getattr(CS, "lat_accel", None),
+      desired_la=-v * v * float(CC.actuators.curvature),    # openpilot's curvature is RIGHT positive (ti_curve_plan.MODEL_K_SIGN)
+      ahead_la=ahead, ahead_need=self.curve_need_val, lkas_blocked=getattr(CS, "lkas_blocked", None),
+      lkas_effective=getattr(CS, "lkas_effective", None), ti_state=int(CS.ti_state) if hasattr(CS, "ti_state") else None,
+      ti_viol=int(getattr(CS, "ti_violation", 0) or 0), ahead_prof=(TM.ASK_LEADS, ask) if ask else None))
+    for ev in mon.events:
+      ti_curve_log(ev)
+    mon.events.clear()
+    alerting = r.phase == "alert" and self.curve_on
+    if alerting and (self.curve_deliver is None or self.frame % 20 == 0):
+      self.curve_deliver = {"m": round(time.monotonic(), 2), "need": r.need_mph, "why": r.why}
+      self.params_memory.put(curve_mod.PARAM_DELIVER, json.dumps(self.curve_deliver))
+    elif not alerting and self.curve_deliver is not None:
+      self.curve_deliver = None
+      self.params_memory.put(curve_mod.PARAM_DELIVER, json.dumps({"m": round(time.monotonic(), 2), "need": None, "why": ""}))
+    return r
+
+  def curve_step(self, CC, CS, ti_apply_steer=0):
     """One frame of curve slowing: the button frame to send, or None. Reads the switch and the planner's output at 10 Hz (frames
     ending in 5, apart from the other 10 Hz reads), publishes the status on change (at most 10 Hz) and every second, logs every step.
-    While the switch is off and nothing is in progress it does only the 10 Hz read. Never raises: after an error curve slowing is off
-    for the rest of this process and says so."""
+    Runs stage 3's monitor every frame on the sent command (ti_apply_steer). While the switch is off and nothing is in progress it
+    does only that and the 10 Hz read. Never raises: after an error curve slowing is off for the rest of this process and says so."""
     cv = self.curve
     if cv is None:
       return None
+    mon = None
+    if getattr(self, "curve_mon_ok", True):
+      try:
+        mon = self._curve_monitor(CC, CS, ti_apply_steer)
+      except Exception:
+        self.curve_mon_ok, mon = False, None    # stage 3 off for the rest of this process; the rest of curve slowing is unchanged
+        try:
+          from openpilot.common.swaglog import cloudlog
+          cloudlog.exception("ti_curve monitor disabled")
+        except Exception:
+          pass
     read = self.frame % 10 == 5
     if not read and not self.curve_on and cv.state == "off":
       return None
@@ -806,7 +856,9 @@ class CarController(CarControllerBase):
         cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
         check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
         standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
-        driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)))
+        driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)),
+        deliver=bool(mon is not None and mon.phase == "alert"), deliver_need=None if mon is None else mon.need_mph,
+        deliver_why="" if mon is None else mon.why)
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:
@@ -989,7 +1041,7 @@ class CarController(CarControllerBase):
         if cruise_msg is not None:
           can_sends.append(cruise_msg)
         # Curve slowing: SET_M / SET_P only, never on a frame the cruise check sends (one button frame per control frame at most)
-        curve_msg = self.curve_step(CC, CS)
+        curve_msg = self.curve_step(CC, CS, ti_apply_steer)
         if curve_msg is not None and cruise_msg is None:
           can_sends.append(curve_msg)
 

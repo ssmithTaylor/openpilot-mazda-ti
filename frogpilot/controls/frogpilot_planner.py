@@ -18,7 +18,8 @@ from openpilot.frogpilot.controls.lib.conditional_experimental_mode import Condi
 from openpilot.frogpilot.controls.lib.frogpilot_acceleration import FrogPilotAcceleration
 from openpilot.frogpilot.controls.lib.frogpilot_events import FrogPilotEvents
 try:
-  from openpilot.selfdrive.car.mazda.ti_curve import read_curve_alert   # curve slowing's on-road warning (optional)
+  # curve slowing's on-road warning (optional): the pre-bend warning or stage 3's, the lower need wins (plan T7)
+  from openpilot.selfdrive.car.mazda.ti_curve import curve_alert_mph as read_curve_alert
 except Exception:
   def read_curve_alert(params_memory, now):
     return None, 0.0
@@ -129,10 +130,12 @@ class FrogPilotPlanner:
     advisory_kph = self.advisory_trigger.update(advisory_on, forecast_la, v_kph)
     self.steer_advisory_speed = advisory_kph * CV.KPH_TO_MS if advisory_kph > 0 else 0.0
     # Curve slowing's warning (selfdrive/car/mazda/ti_curve_plan.py): a remembered corner ahead needs a speed the feature will not
-    # reach. Read from its planner's output (tmpfs TiCurvePlan) at 4 Hz, used while fresh and only when curve slowing is on; shown
-    # through the same on-road alert as the advisory (lower speed wins). A driver warning only: nothing is sent to the car.
+    # reach, or (stage 3, ti_curve_monitor.py) the steering is at its limit and losing the bend. Read from the planner's output
+    # (tmpfs TiCurvePlan) and the car controller's TiCurveDeliver at 10 Hz (plan T7: within 1 s of the limit), the lower need wins,
+    # used while fresh and only when curve slowing is on; shown through the same on-road alert as the advisory (lower speed wins).
+    # A driver warning only: nothing is sent to the car.
     self.curve_tick = getattr(self, "curve_tick", 0) + 1
-    if self.curve_tick % 5 == 0:
+    if self.curve_tick % 2 == 0:
       self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.monotonic())
     if getattr(self, "curve_alert_mph", None) and time.monotonic() - self.curve_alert_t < 1.0:
       curve_ms = self.curve_alert_mph * CV.MPH_TO_MS
