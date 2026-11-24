@@ -16,8 +16,9 @@ def _pass(v_mph, bend_at_m, k, length_m=3000.0):
 
 
 def test_profile_measured_response():
-  # rewritten for plan amendment A1 (was the 1.5 s + 1.36 mph/s profile): the profile is ti_cruise_model's walk straight to T
-  p = E.Profile(55, 40)
+  # rewritten for plan amendment A1 (was the 1.5 s + 1.36 mph/s profile): the profile is ti_cruise_model's walk straight to T; R11:
+  # the default "arrived" is now the planner's 0.5 mph, so this comparison with the measured manoeuvre definition passes 1.5 explicitly
+  p = E.Profile(55, 40, arrived=CM.ARRIVED_MPH)
   t, x = CM.manoeuvre(55, 40)
   assert p.t_arr == pytest.approx(t, abs=0.051) and p.d_arr == pytest.approx(x, abs=1.5)
   t0, v0 = p.at(0.5 * 55 * MPH * 0.99)
@@ -26,6 +27,35 @@ def test_profile_measured_response():
   assert v == pytest.approx(41.5, abs=0.1) and t == pytest.approx(p.t_arr)
   t, v = p.at(p.d_arr + p.v_arr * MPH * 2.0)
   assert v == pytest.approx(p.v_arr) and t == pytest.approx(p.t_arr + 2.0)
+
+
+def test_arrived_is_the_planners():
+  # plan R11 / A11: early dwell's "arrived" is the planner's ARRIVED_MPH (0.5), not the measured manoeuvre definition (1.5)
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+  assert E.ARRIVED_MPH == P.ARRIVED_MPH == 0.5
+  p = E.Profile(55, 40)
+  assert p.v_arr <= 40.5 + 1e-9 and p.t_arr > E.Profile(55, 40, arrived=1.5).t_arr
+
+
+def test_profile_push_and_raise_arrives_sooner_without_undershoot():
+  # the planner's own manoeuvre (push to S1, model-timed raise): earlier arrival than the straight walk, the speed never more than
+  # 0.5 mph below T afterwards (A9 / A10)
+  straight, push = E.Profile(50, 35), E.Profile(50, 35, S1=29)
+  assert push.t_arr < straight.t_arr - 0.5
+  assert float(push.vs.min()) >= 35 - 0.5
+
+
+def test_load_searched_from_the_planned_bend():
+  # plan A5: a bend the car is still in at the start (or one before the planned bend) is not the planned bend's load: searched from
+  # i_from (the planned bend's approach), the dwell is early; from the start it would read as LATE
+  p = E.Profile(55, 40)
+  k = 1.6 / (40 * MPH) ** 2
+  s, kap = _pass(55, p.d_arr + 5.0 * p.v_arr * MPH, k)
+  kap[s < 40.0] = k                                 # in a bend at the start
+  assert E.dwell(55, 40, s, kap, 0, s[-1], DT)['late']
+  i_from = int(np.searchsorted(s, p.d_arr))
+  r = E.dwell(55, 40, s, kap, 0, s[-1], DT, i_from=i_from)
+  assert not r['late'] and r['dwell_s'] == pytest.approx(5.0, abs=0.1)
 
 
 def test_dwell_early_and_late():
