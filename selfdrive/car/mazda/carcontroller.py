@@ -812,7 +812,8 @@ class CarController(CarControllerBase):
       desired_la=-v * v * float(CC.actuators.curvature),    # openpilot's curvature is RIGHT positive (ti_curve_plan.MODEL_K_SIGN)
       ahead_la=ahead, ahead_need=self.curve_need_val, lkas_blocked=getattr(CS, "lkas_blocked", None),
       lkas_effective=getattr(CS, "lkas_effective", None), ti_state=int(CS.ti_state) if hasattr(CS, "ti_state") else None,
-      ti_viol=int(getattr(CS, "ti_violation", 0) or 0), ahead_prof=(TM.ASK_LEADS, ask) if ask else None))
+      ti_viol=int(getattr(CS, "ti_violation", 0) or 0), ahead_prof=(TM.ASK_LEADS, ask) if ask else None,
+      floor_mph=getattr(self.curve, "floor_now", None) if self.curve is not None else None))
     for ev in mon.events:
       ti_curve_log(ev)
     mon.events.clear()

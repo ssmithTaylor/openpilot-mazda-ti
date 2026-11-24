@@ -252,6 +252,22 @@ def below_steer_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
     Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 0.4)
 
 
+# Curve slowing's FIXED on-road texts (review I1 / I4, 2026-11-24), carried by frogpilotPlan.steerAdvisorySpeed at or below
+# -CURVE_CODE_UNIT as -(CURVE_CODE_UNIT x code + 1000 x a + b) (selfdrive/car/mazda/ti_curve.py ALERT_CODE_UNIT / CODE_*: the same
+# numbers, pinned by a test). Speeds are mph: the feature only runs on this car, in mph.
+CURVE_CODE_UNIT = 1_000_000
+
+
+def curve_code_alert(v: int) -> Alert:
+  code, a, b = v // CURVE_CODE_UNIT, (v // 1000) % 1000, v % 1000
+  if code == 4:
+    return Alert(f"CRUISE SET TO {a}, WAS {b}", "Curve slowing stopped: set it yourself",
+                 AlertStatus.userPrompt, AlertSize.mid, Priority.MID, VisualAlert.none, AudibleAlert.prompt, 0.4)
+  second = {2: "Interceptor stuck: take the wheel", 3: "Steering has no effect: take the wheel"}.get(code, "Interceptor off: take the wheel")
+  return Alert("STEERING ASSIST OFF: slow down", second,
+               AlertStatus.userPrompt, AlertSize.mid, Priority.MID, VisualAlert.steerRequired, AudibleAlert.prompt, 0.4)
+
+
 def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
   # The number is the point: the cruise setpoint is the only lever this car has for a corner
   # beyond its steering, and the driver needs it before the corner, not a feeling during it.
@@ -259,6 +275,8 @@ def steer_authority_advisory_alert(CP: car.CarParams, CS: car.CarState, sm: mess
   # and each change replayed the chime. Advice reads in round numbers; flooring never advises
   # faster than computed.
   raw = sm['frogpilotPlan'].steerAdvisorySpeed
+  if raw <= -CURVE_CODE_UNIT:
+    return curve_code_alert(int(round(-raw)))
   unit_speed = abs(raw) * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
   if raw < 0:
     # curve slowing's warning (frogpilot_planner sends it negative): the corner's true need, to the unit (a float32 30 is 29.99..)

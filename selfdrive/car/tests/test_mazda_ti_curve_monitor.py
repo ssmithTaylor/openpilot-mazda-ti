@@ -92,7 +92,10 @@ def test_ti_not_in_run_alert_names_the_code():
   res = run(TM.DeliveryMonitor(), 1.0, lambda t: bend(ti_state=1, ti_viol=0x11, ti_active=False, ti_cmd=0.0))
   o = res[-1][1]
   assert o.phase == "alert" and o.why == "assist off: 0x11 stuck request"
+  # review I1 (2026-11-24) changed this (was: ti_state=2 alerted "assist off"): DRIVER_OVER is firm driver torque, never "assist off"
   res = run(TM.DeliveryMonitor(), 1.0, lambda t: bend(ti_state=2, ti_viol=0, ti_active=False, ti_cmd=0.0))
+  assert not any(o.phase == "alert" for _, o in res)
+  res = run(TM.DeliveryMonitor(), 1.0, lambda t: bend(ti_state=1, ti_viol=0, ti_active=False, ti_cmd=0.0))
   assert res[-1][1].why == "assist off"
   res = run(TM.DeliveryMonitor(), 2.0, lambda t: bend(ti_state=1, ti_viol=0x11, ti_active=False, ti_cmd=0.0, lat_active=False))
   assert not any(o.phase == "alert" for _, o in res)
@@ -299,3 +302,71 @@ def test_grace_is_only_the_nudge():
   seq = [600.0] * 30 + [589.0] * 3 + [600.0] * 10 + [587.0] + [600.0] * 5      # 589: inside the nudge band, but 3 frames; 587: below it
   sat = [mon.step(f, bend(ti_cmd=c)).sat_s for f, c in enumerate(seq)]
   assert sat[31] > sat[30] > sat[29] and sat[32] == 0.0 and sat[43] == 0.0
+
+
+
+# ---- review I1 (2026-11-24): the assist-off path is not the driver steering; nothing below 20 mph; the need never below the floor ---
+def test_i1_driver_over_on_a_straight_at_70_never_alerts():
+  # the reviewer's probe 3a: a firm steer on a straight at 70 mph gave "SLOW DOWN: corner needs 65 mph"
+  inp = TM.MonInputs(mph=70.0, ti_cmd=120.0, ti_max=600.0, lat_active=True, ti_active=False, steering_pressed=True,
+                     angle_rate_deg=8.0, la_now=0.1, desired_la=0.0, ahead_la=0.0, ahead_need=None, lkas_blocked=False,
+                     lkas_effective=100.0, ti_state=2, ti_viol=0)
+  assert not any(o.phase == "alert" for _, o in run(TM.DeliveryMonitor(), 2.0, lambda t: inp))
+
+
+def test_i1_limit_path_at_a_junction_at_12_mph_never_alerts():
+  # the reviewer's probe 3b: a junction turn at 12 mph gave "corner needs 7 mph"
+  inp = TM.MonInputs(mph=12.0, ti_cmd=600.0, ti_max=600.0, lat_active=True, ti_active=True, steering_pressed=False,
+                     angle_rate_deg=0.0, la_now=1.0, desired_la=1.6, ahead_la=1.6, ahead_need=None, lkas_blocked=True,
+                     lkas_effective=0.0, ti_state=3, ti_viol=0, ahead_prof=(TM.ASK_LEADS, (1.6,) * 6))
+  assert not any(o.phase == "alert" for _, o in run(TM.DeliveryMonitor(), 2.0, lambda t: inp))
+
+
+@pytest.mark.parametrize("path", ["limit", "dropout", "assist off"])
+def test_i1_no_path_below_20_mph(path):
+  kw = {"limit": {}, "dropout": dict(lkas_blocked=True, lkas_effective=0.0),
+        "assist off": dict(ti_state=1, ti_active=False, ti_cmd=0.0)}[path]
+  for mph, fires in ((19.5, False), (45.0, True)):
+    res = run(TM.DeliveryMonitor(), 3.0, lambda t, mph=mph: bend(mph=mph, **kw))
+    assert any(o.phase == "alert" for _, o in res) == fires, (path, mph)
+
+
+def test_i1_assist_off_needs_no_driver_steering_within_1_s():
+  res = run(TM.DeliveryMonitor(), 3.0, lambda t: bend(ti_state=1, ti_active=False, ti_cmd=0.0, steering_pressed=t < 0.5))
+  first = next(t for t, o in res if o.phase == "alert")
+  assert first >= 0.5 + TM.STEER_QUIET_S + TM.MON_HOLD_S - 0.03, first
+
+
+def test_i1_assist_off_needs_a_turn_and_discover_only_after_run():
+  straight = dict(ti_state=1, ti_active=False, ti_cmd=0.0, la_now=0.1, desired_la=0.1, ahead_la=0.1,
+                  ahead_prof=(TM.ASK_LEADS, [0.1] * len(TM.ASK_LEADS)))
+  assert not any(o.phase == "alert" for _, o in run(TM.DeliveryMonitor(), 2.0, lambda t: bend(**straight)))
+  # DISCOVER (0) from the start of the drive: not "off"; after RUN this drive: it is
+  assert not any(o.phase == "alert" for _, o in run(TM.DeliveryMonitor(), 2.0, lambda t: bend(ti_state=0, ti_active=False, ti_cmd=0.0)))
+  res = run(TM.DeliveryMonitor(), 2.0, lambda t: bend(ti_state=3 if t < 0.2 else 0, ti_active=t < 0.2, ti_cmd=0.0))
+  assert any(o.phase == "alert" and o.why.startswith("assist off") for _, o in res)
+
+
+def test_i1_need_never_below_the_floor():
+  res = run(TM.DeliveryMonitor(), 3.0, lambda t: bend(mph=28.0, ahead_need=20))
+  assert min(o.need_mph for _, o in res if o.phase == "alert") == TM.MIN_NEED_MPH
+  res = run(TM.DeliveryMonitor(), 3.0, lambda t: bend(mph=50.0, ahead_need=30, floor_mph=40))
+  assert min(o.need_mph for _, o in res if o.phase == "alert") == 40
+
+
+@pytest.mark.parametrize("why,code", [("assist off", 1), ("assist off: 0x11 stuck request", 2), ("dropout", 3), ("limit", None)])
+def test_i1_dropout_text_is_not_a_corner_speed(why, code):
+  import time as _t
+  class M:
+    def __init__(self, d):
+      self.d = d
+    def get(self, k):
+      return self.d.get(k)
+  now = _t.monotonic()
+  m = M({C.PARAM_DELIVER: json.dumps({"m": now, "need": 40, "why": why}).encode()})
+  need, _ = C.read_deliver_alert(m, now)
+  val, _ = C.read_curve_code(m, now)
+  if code is None:
+    assert need == 40 and val is None
+  else:
+    assert need is None and val == C.alert_code_value(code)

@@ -1377,12 +1377,56 @@ def read_deliver_alert(params_memory, now):
     d = json.loads(raw) if raw else None
     if not isinstance(d, dict) or not d.get("need"):
       return None, 0.0
+    if str(d.get("why") or "limit") != "limit":
+      return None, 0.0                 # review I1: an interceptor dropout / assist off is never "corner needs N mph" (its own text)
     m = float(d.get("m", 0.0))
     if now - m > DELIVER_FRESH_S:
       return None, 0.0
     return int(d["need"]), m
   except Exception:
     return None, 0.0
+
+
+# ---- fixed on-road texts carried by frogpilotPlan.steerAdvisorySpeed (review I1 / I4, 2026-11-24) ---------------------------------
+# The on-road alert path (frogpilot_planner -> frogpilotPlan.steerAdvisorySpeed -> events.steer_authority_advisory_alert) carries one
+# float: > 0 the model's corner advisory (m/s), < 0 curve slowing's corner warning (m/s). A value at or below -ALERT_CODE_UNIT carries
+# a FIXED text instead: -(ALERT_CODE_UNIT x code + 1000 x a + b), a and b two whole numbers under 1000 (exact in float32 up to code 15).
+# No schema change; events.py decodes it (its constants pinned to these by test_mazda_ti_alert_text.py).
+ALERT_CODE_UNIT = 1_000_000
+CODE_ASSIST_OFF = 1               # stage 3, the interceptor OFF in a bend
+CODE_ASSIST_STUCK = 2             # ... with its stuck-request code (0x11)
+CODE_DROPOUT = 3                  # stage 3, the steering command saturated with no effect (lane-keep path blocked)
+CODE_SET_LEFT = 4                 # I4: curve slowing (or a test) stopped and the cruise set speed is lower than the driver set it
+
+
+def alert_code_value(code, a=0, b=0):
+  return -float(ALERT_CODE_UNIT * int(code) + 1000 * max(0, min(999, int(a))) + max(0, min(999, int(b))))
+
+
+def deliver_code(why):
+  """The fixed-text code of a stage-3 alert reason other than the limit path, or None."""
+  if not why or why == "limit":
+    return None
+  if why == "dropout":
+    return CODE_DROPOUT
+  return CODE_ASSIST_STUCK if "stuck" in why else CODE_ASSIST_OFF
+
+
+def read_curve_code(params_memory, now):
+  """(steerAdvisorySpeed value of a fixed-text curve alert, its monotonic time) or (None, 0): stage 3's dropout / assist off
+  (TiCurveDeliver, fresh). I4's set-speed-left alert is added in its own commit."""
+  import json
+  try:
+    raw = params_memory.get(PARAM_DELIVER)
+    d = json.loads(raw) if raw else None
+    if isinstance(d, dict) and d.get("need"):
+      code = deliver_code(str(d.get("why") or "limit"))
+      m = float(d.get("m", 0.0))
+      if code is not None and now - m <= DELIVER_FRESH_S:
+        return alert_code_value(code), m
+  except Exception:
+    pass
+  return None, 0.0
 
 
 def curve_alert_mph(params_memory, now):

@@ -20,6 +20,7 @@ from openpilot.frogpilot.controls.lib.frogpilot_events import FrogPilotEvents
 try:
   # curve slowing's on-road warning (optional): the pre-bend warning or stage 3's, the lower need wins (plan T7)
   from openpilot.selfdrive.car.mazda.ti_curve import curve_alert_mph as read_curve_alert
+  from openpilot.selfdrive.car.mazda.ti_curve import read_curve_code
 except Exception:
   def read_curve_alert(params_memory, now):
     return None, 0.0
@@ -137,10 +138,13 @@ class FrogPilotPlanner:
     self.curve_tick = getattr(self, "curve_tick", 0) + 1
     if self.curve_tick % 2 == 0:
       self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.monotonic())
+      self.curve_code, self.curve_code_t = read_curve_code(params_memory, time.monotonic())
     if getattr(self, "curve_alert_mph", None) and time.monotonic() - self.curve_alert_t < 1.0:
       curve_ms = self.curve_alert_mph * CV.MPH_TO_MS
       if self.steer_advisory_speed <= 0 or curve_ms <= self.steer_advisory_speed:
         self.steer_advisory_speed = -curve_ms     # NEGATIVE marks the curve-slowing warning (its own text, its exact number)
+    if getattr(self, "curve_code", None) and time.monotonic() - self.curve_code_t < 1.0:
+      self.steer_advisory_speed = self.curve_code   # a fixed curve-slowing text (ti_curve.ALERT_CODE_UNIT): wins over a number
 
     # NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
     # lateral acceleration sensor, about 96-103 counts per m/s^2 (so 202 counts is roughly 2.1 m/s^2), and it includes road

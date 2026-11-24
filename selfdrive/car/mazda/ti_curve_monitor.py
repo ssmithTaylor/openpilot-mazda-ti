@@ -31,6 +31,13 @@ ASK_MARGIN = 0.3                # m/s^2 (per-pass scatter)
 MON_REMAIN_S = 1.5              # the trouble definition (2 s at the limit) minus the hold
 DROPOUT_MIN_MPH = 32.0
 TI_RUN = 3                      # TI_FEEDBACK STATE: RUN
+TI_DISCOVER, TI_OFF, TI_DRIVER_OVER = 0, 1, 2   # the other states (DRIVER_OVER: firm driver torque, never "assist off")
+MIN_MON_MPH = 20.0              # review I1: no stage-3 alert of any path below this (junction turns; the engage floor is ~19 mph)
+STEER_QUIET_S = 1.0             # review I1: no "assist off" while the driver steers nor within this after it
+ASSIST_TURN_LA = 0.8            # review I1: "assist off" only with a turn in progress or imminent: |desired| or |measured| lateral
+                                # acceleration, or the forecast (ahead_la / its profile), at least this (m/s^2): the limit path's
+                                # "bend asks" evidence at a lower bar (no margin over what the car does: the assist is gone)
+MIN_NEED_MPH = 25               # review I1: a need is never below the feature's absolute floor (ti_curve.ABS_FLOOR_MPH)
 ALERT_MIN_S = 2.0
 CLEAR_OFF_S = 1.0
 REARM_M = 100.0
@@ -70,6 +77,7 @@ class MonInputs(NamedTuple):
   ti_state: Optional[int] = None  # TI_FEEDBACK STATE (A2), None unknown
   ti_viol: int = 0                # TI_FEEDBACK VIOL
   ahead_prof: Optional[tuple] = None   # (leads s, calibrated signed demand m/s^2) of the forecast, for MON_REMAIN_S
+  floor_mph: Optional[int] = None      # the car side's floor now (ti_curve floor_now); the need never goes below it (review I1)
 
 
 class MonOut(NamedTuple):
@@ -112,8 +120,10 @@ class DeliveryMonitor:
     self.last_onset = None        # (frame, need)
     self.onsets = 0
     self.events = []
+    self.was_run = False          # the interceptor has been in RUN during this drive (DISCOVER counts as "off" only after that)
+    self.steer_f = None           # last frame the driver was steering
 
-  def _paths(self, inp):
+  def _paths(self, inp, frame=0):
     """(limit, dropout, ti_off) raw conditions this frame, and the remaining forecast seconds."""
     sat = inp.lat_active and inp.ti_max > 0 and abs(inp.ti_cmd) >= SAT_SHARE * inp.ti_max
     if sat:
@@ -139,11 +149,24 @@ class DeliveryMonitor:
     wheel_stall = (inp.angle_rate_deg * turn < ANGLE_STALL) if turn != 0.0 else (abs(inp.angle_rate_deg) < ANGLE_STALL)
     dropout = bool(sat and inp.mph >= DROPOUT_MIN_MPH and inp.lkas_blocked and inp.lkas_effective is not None
                    and inp.lkas_effective == 0 and wheel_stall)
-    ti_off = bool(inp.lat_active and inp.ti_state is not None and inp.ti_state != TI_RUN)
+    # review I1: the interceptor really OFF (state 1, or DISCOVER after RUN this drive), never DRIVER_OVER; never while the driver
+    # steers or within STEER_QUIET_S of it; and only with a turn in progress or imminent
+    if inp.ti_state == TI_RUN:
+      self.was_run = True
+    if inp.steering_pressed:
+      self.steer_f = frame
+    quiet = self.steer_f is None or (frame - self.steer_f) * DT >= STEER_QUIET_S - 1e-9
+    prof = inp.ahead_prof[1] if inp.ahead_prof is not None and inp.ahead_prof[1] is not None else ()
+    turning = max([abs(x) for x in (inp.desired_la, inp.la_now, inp.ahead_la) if x is not None and math.isfinite(x)] +
+                  [abs(x) for x in prof if x is not None and math.isfinite(x)] + [0.0]) >= ASSIST_TURN_LA
+    off_state = inp.ti_state == TI_OFF or (inp.ti_state == TI_DISCOVER and self.was_run)
+    fast = inp.mph >= MIN_MON_MPH
+    ti_off = bool(inp.lat_active and off_state and not inp.steering_pressed and quiet and turning and fast)
+    limit, dropout = limit and fast, dropout and fast          # review I1: the same speed gate on the other paths
     return sat, limit, dropout, ti_off, rem
 
   def step(self, frame, inp):
-    sat, limit, dropout, ti_off, rem = self._paths(inp)
+    sat, limit, dropout, ti_off, rem = self._paths(inp, frame)
     self.sat_s = self.sat_s + DT if sat else 0.0
     self.lim_s = self.lim_s + DT if limit else 0.0
     self.drop_s = self.drop_s + DT if dropout else 0.0
@@ -176,6 +199,7 @@ class DeliveryMonitor:
     need = int(math.floor(inp.mph)) - MON_SHED_MPH
     if inp.ahead_need is not None:
       need = min(need, int(inp.ahead_need))
+    need = max(need, MIN_NEED_MPH, int(inp.floor_mph) if inp.floor_mph else 0)   # review I1: never below the feature's floor
     if self.last_onset is not None and self.last_onset[1] == need and (frame - self.last_onset[0]) * DT < CHIME_REPEAT_S:
       self.phase = "watch"
       return self._out()                       # the same need chimed within CHIME_REPEAT_S: no new onset

@@ -85,3 +85,23 @@ def test_the_longest_curve_text_is_actually_measured():
   """Guard against the test passing because it measured nothing: the 3-digit km/h curve warning is the widest string."""
   a = call(ev.steer_authority_advisory_alert, True, advisory=-69.6)   # 250 km/h
   assert "250" in a.alert_text_1 and width(a, 0) > 1000
+
+
+# ---- review I1 / I4 (2026-11-24): curve slowing's fixed texts, carried as codes ----------------------------------------------------
+def test_curve_code_constants_match_the_feature():
+  from openpilot.selfdrive.car.mazda import ti_curve as C
+  assert ev.CURVE_CODE_UNIT == C.ALERT_CODE_UNIT
+  assert (C.CODE_ASSIST_OFF, C.CODE_ASSIST_STUCK, C.CODE_DROPOUT, C.CODE_SET_LEFT) == (1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("code", [1, 2, 3, 4])
+@pytest.mark.parametrize("a,b", [(0, 0), (25, 40), (999, 999)])
+def test_curve_code_alerts_fit_and_never_say_corner_needs(code, a, b):
+  from openpilot.selfdrive.car.mazda import ti_curve as C
+  al = call(ev.steer_authority_advisory_alert, False, advisory=C.alert_code_value(code, a, b))
+  check(al, f"curve code {code} {a} {b}")
+  assert "corner needs" not in al.alert_text_1
+  if code == 4:
+    assert al.alert_text_1 == f"CRUISE SET TO {a}, WAS {b}"
+  else:
+    assert al.alert_text_1 == "STEERING ASSIST OFF: slow down"
