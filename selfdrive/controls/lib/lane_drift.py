@@ -60,6 +60,14 @@ def lane_drift_evidence(model, curvature=None):
   if k is not None and math.isfinite(k) and abs(k) >= STRAIGHT_CURVATURE:
     e_left, e_right = edge_clearances(model)
     out = (left, e_left) if k > 0 else (right, e_right)      # right turn: runs wide to the LEFT; left turn: to the RIGHT
+    # The model re-indexes laneLines[1]/[2] by the car's CENTRE: once the centre has passed the outside line, that line is reported
+    # as the INSIDE-adjacent one and the "outside" line is a lane away, so looking only at the outside slot goes quiet exactly when
+    # the car has crossed the line. So also take the inside-indexed line: when its clearance from the car's side is <= 0 (the line is
+    # within half a car width of the centre, or on the other side of it) the car is straddling or past a line, which can only be the
+    # one it ran wide over, so the gate is open. An inside line further than that is ignored, as before.
+    inside = right if k > 0 else left
+    if inside is not None and inside <= 0.0:
+      return True
     seen = [c for c in out if c is not None]
     if not seen:
       return True
