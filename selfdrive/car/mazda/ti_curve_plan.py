@@ -367,6 +367,12 @@ class Planner:
     self.blink_t = -1e9
     self.released = {}                  # plan T6: bend key -> its end (odometer); released by the forecast, kept until passed
     self.map_active, self.map_bends, self.map_seq = {}, {}, 0   # the map stage's bends in progress / seen (A3 persistence)
+    self.dr_why = ""                    # why the corners in progress are being dead-reckoned (the last lock loss), for the log
+    # review C1 (2026-11-24): the published ceiling per corner in progress, whatever its source: key -> {cap (the lowest non-push
+    # ceiling published for it), until (its end + HOLD_AFTER_M, odometer), entry (odometer), ref (the driver's set speed then)}; while
+    # one is alive the published ceiling is never above its cap (_guard_apply)
+    self.guard = {}
+    self.s2_seq = 0
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
   def _candidates(self, fix):
@@ -384,10 +390,13 @@ class Planner:
     out.sort()
     return out
 
-  def _lose(self, why, keep_active=False):
-    """Drop the lock. keep_active (a lost position FIX, nothing said about the road): the corners in progress are kept and run on by
-    the odometer until passed (step: a GPS gap never releases a slowdown in progress); any other loss (another road, a changed road,
-    the remembered road ending) drops them."""
+  def _lose(self, why, keep_active=True):
+    """Drop the lock. The corners in progress (slowing started, or the car inside the bend) are KEPT whatever the reason (a lost
+    position fix, another road, a changed road, the remembered road ending, the fixes leaving it): they run on by DEAD RECKONING on the
+    odometer to their end + HOLD_AFTER_M (bounded: their entry / end are odometer figures), with the reason recorded (review C1,
+    2026-11-24: a lock loss inside a bend being slowed for must never raise the set speed there). A corner is only dropped early by
+    the explicit release decision (_ramp) or by the driver (the guard, `_guard_apply`). keep_active=False is kept for a caller that
+    must start afresh (none in the planner itself)."""
     if self.locked or self.cand is not None:
       self.events.append({"kind": "lock_lost", "why": why, "trace": self.trace})
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
@@ -396,6 +405,10 @@ class Planner:
     self.cmp = []
     if not keep_active:
       self.active = {}
+    elif self.active:
+      self.dr_why = why
+      self.events.append({"kind": "dead_reckon", "why": why, "n": len(self.active),
+                          "T": int(min(a_["T"] for a_ in self.active.values()))})
 
   def _advance(self, dist):
     """Move along the trace by `dist` metres; follows the continuation link at the end, or loses the lock."""
@@ -473,7 +486,7 @@ class Planner:
       if self.cand is not None and not self.locked:
         self.cand, self.stable_s = None, 0.0
       if self.locked and self.fix_age >= FIX_LOST_S:
-        self._lose("no position fix", keep_active=True)
+        self._lose("no position fix")
 
   def _either_road(self, need, dist, look, mph):
     """While the car may as well be on another remembered road (self.alts), a point's allowed speed is at least the lowest the other
@@ -569,6 +582,7 @@ class Planner:
     blinker: either turn signal on (suppresses stage 2). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
+    self.ref_now = int(ref_mph) if ref_mph else None
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
     v = max(0.0, float(v))
     self.odo += v * dt
@@ -701,7 +715,7 @@ class Planner:
     self.need_out = need_true
     self.cap_out = cap
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
-                     past=kind == "hold", stage=stage, src="mem")
+                     past=kind == "hold", stage=stage, src="mem", gkey=r["key"], guntil=r["until"])
 
   def _dead_reckoned(self, t, v, mph, set_mph, floor, ref_mph, model_la, untrusted):
     """The memory corners in progress through a position gap (step): the ramp with no fresh candidates, by the odometer."""
@@ -715,7 +729,7 @@ class Planner:
       self.alert is not None and self.alert < floor)
     why = "corner ahead" if (r["dist"] or 0) > 0 else "in the corner"
     return self._out(int(r["ceil"]), untrusted[0], True, untrusted[1], why, r["dist"], r["corner"], model_la, capped=capped,
-                     point=r["point"], kind=r["kind"], stage=r["stage"], src="mem")
+                     point=r["point"], kind=r["kind"], stage=r["stage"], src="mem", gkey=r["key"], guntil=r["until"])
 
   def _map_out(self, t, v, mph, set_mph, floor, ref_mph, map_k, model_la, conf, known, why):
     """The output where no memory is known: the map stage's ramp (plan T6) if it has a ceiling, else none (stage 2 merges in _out)."""
@@ -727,7 +741,7 @@ class Planner:
     why = "next bend (map): holding what it needs" if r["kind"] == "hold" else "bend ahead (map)"
     # trusted: this ceiling's source (the map, persisted, matched by plannerd) is valid
     return self._out(int(r["ceil"]), conf, True, known, why, r["dist"], r["corner"], model_la, capped=capped, point=-1,
-                     kind=r["kind"], past=r["kind"] == "hold", stage=r["stage"], src="map")
+                     kind=r["kind"], past=r["kind"] == "hold", stage=r["stage"], src="map", gkey=r["key"], guntil=r["until"])
 
   @staticmethod
   def _grade(grade, idx, dist, j):
@@ -828,7 +842,7 @@ class Planner:
       self.events.append({"kind": "passed", "point": key if isinstance(key, int) else -1, "T": active[key]["T"], "mph": round(mph, 1)})
       del active[key]
     out = {"ceil": None, "dist": None, "point": -1, "kind": "", "corner": None, "need": None, "cap": None, "end": None,
-           "behind": False, "stage": 1}
+           "behind": False, "stage": 1, "key": None, "until": None}
     for key, a_ in list(active.items()):
       c = cands.get(key)
       mode = a_["mode"]
@@ -865,6 +879,7 @@ class Planner:
           rel = "unconfirmed"
         if rel is True:
           self.released[key] = a_["at"]
+          self.guard.pop(key, None)               # the explicit release decision: the one early drop of a corner in progress
           self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
           del active[key]
           continue
@@ -902,7 +917,7 @@ class Planner:
       if out["ceil"] is None or cc < out["ceil"]:
         out.update(ceil=cc, dist=round(max(0.0, a_["entry"] - self.odo), 1), point=key if isinstance(key, int) else -1,
                    kind="corner", corner=T, need=a_["Tc"], cap=a_.get("cap"), end=round(a_["at"] - self.odo, 1),
-                   stage=a_["phase"])
+                   stage=a_["phase"], key=key, until=a_["at"] + HOLD_AFTER_M)
     if not active:
       # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
       # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
@@ -986,6 +1001,8 @@ class Planner:
     if self.s2 is not None and (t - self.blink_t < BLINKER_HOLD_S or mph < S2_MIN_MPH):
       # a blinker (or the speed under 20 mph) drops stage 2 at once; a missing preview only stops refreshing it (held to `until`)
       self.events.append({"kind": "s2_off", "why": "blinker" if t - self.blink_t < BLINKER_HOLD_S else "slow", "T": self.s2["T"]})
+      if t - self.blink_t < BLINKER_HOLD_S:
+        self.guard.pop(self.s2.get("key"), None)   # the driver's blinker: their decision (a turn off the road), the corner is theirs
       self.s2 = None
     mem_straight = mem_ahead is not None and not self._mem_tight(mem_ahead, FC_LO_S * v - FORK_NEAR_M, CONFIRM_LEAD_S * v + FORK_NEAR_M)
     confirmed = hit and self.s2_run >= CONFIRM_TICKS and (not mem_straight or t - self.s2_t0 >= FORK_CONFIRM_S - 1e-6)
@@ -994,7 +1011,9 @@ class Planner:
       until = self.odo + lead * v + HOLD_AFTER_M
       knew = self._mem_tight(mem_ahead, lead * v - FORK_NEAR_M, lead * v + FORK_NEAR_M)
       if self.s2 is None:
-        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew, "side": side, "hi": self.hi}
+        self.s2_seq += 1
+        self.s2 = {"T": T, "need": int(need), "u0": base, "until": until, "lead": lead, "knew": knew, "side": side, "hi": self.hi,
+                   "key": ("s2", self.s2_seq)}
         self.events.append({"kind": "s2_start", "T": T, "need": int(need), "mph": round(mph, 1), "lead": round(lead, 1),
                             "floor": int(floor), "fork": bool(mem_straight)})
       else:
@@ -1147,7 +1166,42 @@ class Planner:
       self.alerted.add(key)
     return out
 
-  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind="", stage=0, src=""):
+  def _guard_apply(self, ceil, trusted, kind, cmph, dist, end, gkey, guntil=None):
+    """Review C1 (b), 2026-11-24: the invariant on the PUBLISHED ceiling. A corner ceiling published (trusted, not a "hold") is
+    recorded for its corner (`gkey`: the memory point, the map bend, or stage 2's run) as its cap: the lowest NON-PUSH value published
+    for it (max(ceiling, corner speed): the push below the corner speed and the raise back to it stay allowed), kept to the corner's
+    end + HOLD_AFTER_M. While any is alive, the published ceiling is never HIGHER than the lowest cap, whatever source proposes it
+    (stage 2, the map, a new match, nothing at all). Dropped early only by the explicit release decision (_ramp), the driver's blinker
+    (stage 2) or the driver choosing a new set speed (their reference changes). -> (ceil, trusted, kind, cmph, dist, end, bound)."""
+    odo, ref = self.odo, getattr(self, "ref_now", None)
+    for k in [k for k, g in self.guard.items() if odo > g["until"] or (ref is not None and g["ref"] is not None and ref != g["ref"])]:
+      g = self.guard.pop(k)
+      self.events.append({"kind": "guard_off", "why": "passed" if odo > g["until"] else "driver set speed", "cap": g["cap"]})
+    if ceil is not None and trusted and kind != "hold" and gkey is not None:
+      cap = int(max(int(ceil), int(cmph) if cmph is not None else int(ceil)))
+      # the corner's own release point (its end + HOLD_AFTER_M, exact), else from the published end
+      until = float(guntil) if guntil is not None else odo + max(0.0, float(end or 0.0)) + HOLD_AFTER_M
+      g = self.guard.get(gkey)
+      if g is None:
+        self.guard[gkey] = {"cap": cap, "until": until, "entry": odo + max(0.0, float(dist or 0.0)), "ref": ref}
+      else:
+        g["cap"], g["until"] = min(g["cap"], cap), max(g["until"], until)
+    if not self.guard:
+      self._gb = False
+      return ceil, trusted, kind, cmph, dist, end, False
+    g = min(self.guard.values(), key=lambda g_: g_["cap"])
+    if ceil is not None and trusted and int(ceil) <= g["cap"]:
+      self._gb = False
+      return ceil, trusted, kind, cmph, dist, end, False
+    if not getattr(self, "_gb", False):
+      self.events.append({"kind": "guard_bind", "cap": g["cap"], "proposed": None if ceil is None else int(ceil), "src_kind": kind,
+                          "why": self.dr_why})
+    self._gb = True
+    return (g["cap"], True, "corner", g["cap"], round(max(0.0, g["entry"] - odo), 1),
+            round(max(0.0, g["until"] - HOLD_AFTER_M - odo), 1), True)
+
+  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind="", stage=0, src="",
+           gkey=None, guntil=None):
     """The Plan of this tick; stage 2 (self.s2) is merged here (the lower ceiling wins), so it acts on every path, trusted or not."""
     end, self.end_m = self.end_m, None
     behind, self.behind = self.behind, False
@@ -1164,6 +1218,12 @@ class Planner:
       cap = round(D.capacity(s2["T"], s2.get("side", D.UNKNOWN)), 2)   # R9: the raw capacity of the forecast's side at the target
       capped = capped or s2["need"] < s2["T"]          # the bend wants more than stage 2 may shed
       why = "bend ahead (forecast)"
+      gkey, guntil = s2.get("key"), s2["until"]
+    ceil, trusted, kind, cmph, dist, end, bound = self._guard_apply(ceil, trusted, kind, cmph, dist, end, gkey, guntil)
+    if bound:
+      # review C1 (b): a corner in progress holds the published ceiling (no source may raise it inside the bend)
+      stage, src, past = max(int(stage or 0), 1), (src or "guard"), False
+      why = "in the corner: holding" + (f" ({self.dr_why})" if self.dr_why and not self.locked else "")
     if s2 is not None and s2["need"] < s2["T"] and not s2["knew"]:
       # a bend needing more than stage 2 may shed (LATE_SHED_MPH, or the floor): the 5 mph plus the warning
       alert = s2["need"] if alert is None else min(alert, s2["need"])

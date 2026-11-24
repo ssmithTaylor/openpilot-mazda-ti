@@ -1000,3 +1000,29 @@ def test_alert_precedence_steering_calls_over_the_curve_warning_over_lead_and_gr
     assert a.audible_alert != curve.audible_alert, name                  # never silent behind the curve warning's chime
   for name in ("leadDeparting", "greenLight"):
     assert E.FROGPILOT_EVENTS[getattr(F, name)][ET.PERMANENT].priority < curve.priority, name
+
+
+# ---- review C1 (c), 2026-11-24: in a bend (the car's own lateral acceleration) no SET+ toward a higher ceiling ----------------------
+@pytest.mark.parametrize("later", ["higher_corner", "restore"])
+def test_c1_car_side_no_raise_above_the_corner_speed_inside_a_bend(later):
+  car, curve = Car(55.0, 55), C.Curve()
+  run(curve, car, 3000, lambda f, c: plan(40, dist=300.0), la_now=0.2, desired_la=0.2)
+  assert car.set == 40 and curve.intervening()
+  # in the bend: a planner raising the ceiling (or ending the corner) must not raise the dash inside it
+  nxt = (lambda f, c: plan(50, dist=0.0)) if later == "higher_corner" else (lambda f, c: plan(None))
+  run(curve, car, 1000, nxt, start=3000, la_now=2.2, desired_la=2.2)
+  assert car.set == 40, car.set
+  assert any(e["kind"] == "bend_hold" for e in curve.events)
+  # out of the bend (under BEND_IN_LA - BEND_HYST_LA for BEND_OUT_S): the raise goes ahead
+  run(curve, car, 1500, nxt, start=4000, la_now=0.2, desired_la=0.2)
+  assert car.set > 40
+
+
+def test_c1_car_side_raise_back_to_target_after_a_push_is_allowed_in_a_bend():
+  car, curve = Car(55.0, 55), C.Curve()
+  # the push below the corner speed (ceil 42, corner 48; floor 40) while still on the straight
+  run(curve, car, 800, lambda f, c: plan(42, corner=48, dist=300.0), la_now=0.2, desired_la=0.2)
+  assert car.set == 42
+  # the bend begins; the planner asks for the raise back to the target 48: allowed (48 is the corner speed shown)
+  run(curve, car, 1500, lambda f, c: plan(48, corner=48, dist=0.0), start=800, la_now=2.2, desired_la=2.2)
+  assert car.set == 48

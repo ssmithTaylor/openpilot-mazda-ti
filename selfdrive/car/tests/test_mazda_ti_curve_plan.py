@@ -1115,11 +1115,15 @@ def test_map_absent_or_stale_no_map_stage():
   assert all(p.ceil is None for t, s, p in res)
   good = json.dumps([{"latitude": 0.0, "longitude": 0.0, "curvature": 0.0}, {"latitude": 0.001, "longitude": 0.0, "curvature": k}])
   assert PD.map_profile(good, 0.5, 0.0, 0.0, 0.0) is not None and PD.map_profile(good, PD.MAP_STALE_S + 0.1, 0.0, 0.0, 0.0) is None
-  # the map going away mid-approach drops its ceiling
+  # the map going away mid-approach: review C1 (2026-11-24) changed this (was: its ceiling dropped at once). A bend whose slowdown has
+  # started is a corner in progress: its published ceiling is held (the guard, by the odometer) to its end + HOLD_AFTER_M, then released
   t_on = next(t for t, s, p in _drive_map(P.Planner(None), 45, 90, lambda t, s: _map_profile(s, 1500.0, 150.0, k))
               if p.src == "map" and p.kind == "corner")
   res = _drive_map(P.Planner(None), 45, 90, lambda t, s: _map_profile(s, 1500.0, 150.0, k) if t < t_on + 1.0 else None)
-  assert any(p.src == "map" for t, s, p in res) and all(p.ceil is None for t, s, p in res if t >= t_on + 1.0)
+  lo = min(p.ceil for t, s, p in res if t < t_on + 1.0 and p.ceil is not None)
+  assert any(p.src == "map" for t, s, p in res)
+  assert all(p.ceil is not None and p.ceil <= max(lo, p.corner_mph or 0) for t, s, p in res if t >= t_on + 1.0 and s <= 1650)
+  assert all(p.ceil is None for t, s, p in res if s > 1650 + P.HOLD_AFTER_M + 5)
   # trusted memory (a straight remembered road): the map's bend is ignored
   tr = road((3000, 0.0))
   pl = P.Planner(M.synthetic([tr]))
@@ -1185,8 +1189,10 @@ def test_position_gap_keeps_an_active_corner_by_dead_reckoning():
   assert any(p.ceil is None for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)
 
 
-def test_other_lock_losses_still_drop_the_corner():
-  # only a lost FIX keeps the corner: a matcher that finds the car on another road (fixes leave the remembered road) drops it
+def test_other_lock_losses_keep_the_corner_too():
+  # review C1 (2026-11-24) changed this (was test_other_lock_losses_still_drop_the_corner: only a lost FIX kept the corner and a
+  # matcher finding the car elsewhere dropped it, ceiling None inside the bend). Now EVERY lock loss keeps a corner in progress by
+  # dead reckoning to its end + HOLD_AFTER_M: never a ceiling above the corner's inside the bend; released once passed
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
@@ -1194,7 +1200,10 @@ def test_other_lock_losses_still_drop_the_corner():
               fix_fn=lambda t, s, f: P.Fix(True, f.x + 400.0, f.y + 400.0, f.hdg) if 1450 <= s <= 1700 else f)
   assert any(e["kind"] == "lock_lost" and e["why"] != "no position fix" for e in pl.events)
   t_lost = next(i for i, e in enumerate(pl.events) if e["kind"] == "lock_lost")
-  assert t_lost is not None and any(p.ceil is None for t, s, p, v in res if 1560 <= s <= 1650)   # dropped (the warning latch stays)
+  want = max(int(D.need_mph(CORNER_K)[0]), 55 - 15)
+  assert t_lost is not None and all(p.ceil is not None and p.ceil <= want for t, s, p, v in res if 1560 <= s <= 1650)
+  assert any(e["kind"] == "dead_reckon" for e in pl.events)
+  assert any(p.ceil is None or p.kind == "hold" for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)
 
 
 def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend():

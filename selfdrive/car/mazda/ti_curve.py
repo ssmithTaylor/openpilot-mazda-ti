@@ -113,6 +113,16 @@ NET_CHECK_S = 0.1
 NET_DELAY_S = 0.0                # the raise modelled from now, as the planner's raise_due (swept: 0.1 / 0.2 s fire before an on-time planner)
 NET_MARGIN_MPH = 0.0             # ... and acting when it would bottom out AT the floor: the planner's raise (T + 0.1) always comes first
 
+# ---- in a bend: no raise toward a higher ceiling (review C1 (c), 2026-11-24) ----------------------------------------------------------
+# Defensive, on the car's OWN signals (whatever the planner publishes): the car is "in a bend" while max(|measured|, |desired|) lateral
+# acceleration is at least BEND_IN_LA (the planner's corner-entry demand, ti_curve_plan.ENTRY_LA); it is out again once that has been
+# under BEND_IN_LA - BEND_HYST_LA for BEND_OUT_S. In a bend a SET+ may only bring the dash up to the lowest corner speed this side has
+# shown since the bend began (the raise back to the target after a push), or be the push net / the safe exit (back to the floor);
+# a restore, or a raise toward a ceiling a planner raised inside the bend, waits until the bend is over.
+BEND_IN_LA = P.ENTRY_LA
+BEND_HYST_LA = 0.3
+BEND_OUT_S = 1.0
+
 
 class HoldRun:
   """One hold in flight (or settling after its release)."""
@@ -161,6 +171,8 @@ class Inputs(NamedTuple):
   deliver: bool = False           # stage 3 (ti_curve_monitor): the steering is at its limit and losing the bend (plan T7)
   deliver_need: Optional[int] = None   # ... the speed it walks toward, gently (GENTLE_TAP_S per tap), within the floor
   deliver_why: str = ""           # ... why ("limit", "dropout", "assist off: 0x11 stuck request"), for the page
+  la_now: Optional[float] = None       # the car's measured lateral acceleration (m/s^2, the monitor's input), None unknown
+  desired_la: Optional[float] = None   # the controller's desired lateral acceleration now (v^2 x desired curvature), None unknown
 
 
 class Curve:
@@ -229,6 +241,10 @@ class Curve:
     self.net_f = -10 ** 9             # its last update / check
     self.net_chk = -10 ** 9
     self.net_up = False               # the push net acted: the dash back to the floor, no push below it for this intervention
+    self.in_bend = False              # review C1 (c): the car's own signals say it is in a bend (BEND_*)
+    self.bend_low_f = None            # frame the lateral acceleration first fell under the exit level
+    self.bend_lo = None               # the highest a SET+ may bring the dash while in this bend (None: no limit known)
+    self.bend_held = False            # a SET+ was held back by the bend rule (logged once per bend)
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -349,6 +365,7 @@ class Curve:
     btn_rose = btn and not self.btn_was
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
+    self._bend_track(frame, inp)
     if inp.gas:
       self.gas_off_at = None
     elif self.gas_hold and self.gas_off_at is None:
@@ -655,6 +672,8 @@ class Curve:
         self.press_floor = self.floor           # the push net acted: no push below the floor for the rest of this intervention
         self.target = max(self.target, min(self.floor, self.ref))
       self.shown = min(max(int(corner), self.floor), self.ref)
+      if self.in_bend:
+        self.bend_lo = self.shown if self.bend_lo is None else min(self.bend_lo, self.shown)
       need_true = plan.get("need") if plan.get("need") is not None else corner
       needs_more = int(need_true) < self.floor        # ONE meaning: the corner's TRUE need is below the floor (never "behind")
       self.behind = bool(plan.get("behind"))
@@ -747,7 +766,7 @@ class Curve:
       return None
     self.target = fl
     self._to(frame, "slowing", "raising to the floor")
-    return self._start(frame, inp, "SET_PLUS")
+    return self._start(frame, inp, "SET_PLUS", exempt=True)
 
   def _floor_for(self, inp, plan):
     """The floor a new intervention would take NOW: max(ABS_FLOOR_MPH, (ref, or min(ref, speed) when a lead holds the car under the
@@ -855,7 +874,40 @@ class Curve:
     return not (inp.cancel_req or inp.resume_req or inp.driver_button or inp.driver_button is None or inp.counter is None
                 or inp.check_active or inp.standstill or inp.mph < MIN_MPH)
 
-  def _start(self, frame, inp, button, correcting=False, allow_hold=False):
+  def _bend_track(self, frame, inp):
+    """Review C1 (c): in a bend or not, from the car's own lateral acceleration (measured and desired); see BEND_*."""
+    vals = [abs(x) for x in (inp.la_now, inp.desired_la) if x is not None]
+    la = max(vals) if vals else None
+    if la is None:
+      self.in_bend, self.bend_low_f, self.bend_lo, self.bend_held = False, None, None, False
+      return
+    if la >= BEND_IN_LA:
+      self.bend_low_f = None
+      if not self.in_bend:
+        self.in_bend, self.bend_held = True, False
+        # the dash may come up to the corner speed being slowed for (a raise after a push), else it stays where it is
+        self.bend_lo = self.shown if (self.state in ("slowing", "holding") and self.shown is not None) else inp.set_mph
+      return
+    if self.in_bend and la < BEND_IN_LA - BEND_HYST_LA:
+      self.bend_low_f = frame if self.bend_low_f is None else self.bend_low_f
+      if (frame - self.bend_low_f) * DT >= BEND_OUT_S - 1e-9:
+        self.in_bend, self.bend_low_f, self.bend_lo, self.bend_held = False, None, None, False
+    else:
+      self.bend_low_f = None
+
+  def _bend_blocks(self, frame, inp, button, exempt):
+    """True: a SET+ that would take the dash above what the bend allows (BEND_*); the push net and the safe exit are exempt."""
+    if button != "SET_PLUS" or exempt or not self.in_bend or inp.set_mph is None:
+      return False
+    lo = self.bend_lo if self.bend_lo is not None else inp.set_mph
+    if inp.set_mph + 1 <= lo:
+      return False
+    if not self.bend_held:
+      self.bend_held = True
+      self._ev("bend_hold", frame, set_mph=inp.set_mph, allowed=lo, target=self.target, state=self.state)
+    return True
+
+  def _start(self, frame, inp, button, correcting=False, allow_hold=False, exempt=False):
     """Request one tap. Like the reviewed cruise check (ti_cruise_check._start_tap / _send): the tap waits for a new car button frame
     (a counter change, at most PHASE_WAIT_S), so both pressed frames fall between two of the car's own idle frames and register as
     ONE press; then PRESSED_FRAMES frames FRAME_SPACING apart, each re-checked, under PressGuard. With `allow_hold` (slowing for a
@@ -864,6 +916,10 @@ class Curve:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
+    if not correcting and self._bend_blocks(frame, inp, button, exempt):
+      return None
+    if self.in_bend and button == "SET_PLUS":
+      allow_hold = False                  # in a bend a raise is tapped, one step at a time, each checked against the bend's limit
     if allow_hold and not correcting and self._start_hold(frame, inp, button):
       _, out = self._hold_step(frame, inp)
       return out

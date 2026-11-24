@@ -110,6 +110,15 @@ def ti_curve_log(event):
     pass
 
 
+def _finite_or_none(x):
+  """A float that is finite, else None (curve slowing's car-side inputs never carry a NaN or a non-number)."""
+  try:
+    x = float(x)
+  except (TypeError, ValueError):
+    return None
+  return x if x == x and abs(x) != float("inf") else None
+
+
 def ti_cruise_log(event):
   """The cruise set-speed check's steps (armed, waiting, tap with its frames and counters, accepted, aborted, result) into the log."""
   try:
@@ -875,7 +884,9 @@ class CarController(CarControllerBase):
         standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
         driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)),
         deliver=bool(mon is not None and mon.phase == "alert"), deliver_need=None if mon is None else mon.need_mph,
-        deliver_why="" if mon is None else mon.why)
+        deliver_why="" if mon is None else mon.why,
+        la_now=_finite_or_none(getattr(CS, "lat_accel", None)),
+        desired_la=_finite_or_none(-float(out.vEgo) ** 2 * float(CC.actuators.curvature)))   # curvature RIGHT positive: left + here
       button = cv.step(self.frame, inp)
       if cv.events:
         for ev in cv.events:

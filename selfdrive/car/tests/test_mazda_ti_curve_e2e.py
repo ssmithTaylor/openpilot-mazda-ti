@@ -45,9 +45,10 @@ class _Store:
     return self.raw
 
 
-def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cls=None, preview_s=PREVIEW_S):
+def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cls=None, preview_s=PREVIEW_S, car_la=False):
   """segs: [(length m, need mph or None)]. events(f, car, s) -> Inputs overrides; it may also change car.mph / car.set (a lead,
-  the driver's pedals). Returns rows every 0.1 s."""
+  the driver's pedals). car_la: the car side is also given the car's own lateral acceleration (the road's curvature here x v^2,
+  measured and desired alike: review C1 (c)). Returns rows every 0.1 s."""
   tr = M.synthetic_trace([(L, 0.0 if n is None else k_for(n)) for L, n in segs])
   mem = M.synthetic([tr])
   if single:
@@ -81,6 +82,9 @@ def e2e(segs, set_mph, mph0=None, seconds=300, events=None, single=False, car_cl
       seq += 1
     kw = dict(on=True, engaged=True, cruise_on=True, cruise_available=True, mph=car.mph, set_mph=car.set, lead=False,
               driver_button=False, counter=car.counter, plan=plan_d, plan_age=None if plan_t is None else t - plan_t, mono=t)
+    if car_la:
+      la = float(tr["kap"][min(int(s // M.SPACING_M), len(tr["kap"]) - 1)]) * (car.mph * P.MPH) ** 2
+      kw.update(la_now=la, desired_la=la)
     kw.update({k: v for k, v in ov.items() if not k.startswith("_")})
     b = cv.step(f, C.Inputs(**kw))
     if b:
@@ -334,3 +338,101 @@ def test_gps_gap_inside_a_slowed_bend_never_raises_the_set_speed(need, a, b):
   rises = [(round(x["s"]), x["set"], y["set"]) for x, y in zip(bend, bend[1:]) if y["set"] > x["set"]]
   assert not rises, rises
   assert min(r["set"] for r in log if 2500 <= r["s"] <= 2650) == T
+
+
+# ---- review C1 (2026-11-24): ANY lock loss inside a bend being slowed for never raises the set speed there -------------------------
+LOSS_REASONS = ("road differs from memory", "remembered road ends", "fixes left the remembered road", "a nearer remembered road",
+                "no position fix")
+
+
+def _lock_loss_run(monkeypatch, why, need, at, keep=True, guard=True, car_la=False):
+  """The real planner and car side; at `at` metres the lock is lost for `why` (as the planner itself would: a changed road also
+  distrusts the road for CHANGE_HOLDOFF_M). keep=False / guard=False switch off the planner's two layers (dead reckoning on every
+  loss; the published-ceiling guard), to show each layer (and the car side's bend rule) holds by itself."""
+  st = {"s": 0.0, "done": False}
+  orig_step, orig_lose, orig_guard = P.Planner.step, P.Planner._lose, P.Planner._guard_apply
+
+  def step(self, *a, **k):
+    if not st["done"] and st["s"] >= at and self.locked:
+      st["done"] = True
+      if why == "road differs from memory":
+        self.distrust_until = self.odo + P.CHANGE_HOLDOFF_M
+        self.distrust_why = why
+      self._lose(why)
+    return orig_step(self, *a, **k)
+
+  monkeypatch.setattr(P.Planner, "step", step)
+  if not keep:
+    monkeypatch.setattr(P.Planner, "_lose", lambda self, w, keep_active=True: orig_lose(self, w, keep_active=False))
+  if not guard:
+    monkeypatch.setattr(P.Planner, "_guard_apply", lambda self, c, tr_, k, cm, d, e, g, u=None: (c, tr_, k, cm, d, e, False))
+
+  def ev(f, car, s):
+    st["s"] = s
+    return {}
+
+  log = e2e([(2500, None), (150, need), (1200, None)], 55, events=ev, preview_s=8.0, car_la=car_la)
+  assert st["done"]
+  return log
+
+
+def _bend_rises(log, need, end_m=2650 + P.HOLD_AFTER_M - M.SPACING_M):
+  """Rises of the dash set speed from bend entry to its end + HOLD_AFTER_M (on the memory grid; or `end_m`) that go above the target
+  (the push-raise back to the target is the one allowed rise)."""
+  T = max(need, 55 - 15)
+  win = [r for r in log if 2500 <= r["s"] < end_m]
+  return T, [(round(x["s"]), x["set"], y["set"]) for x, y in zip(win, win[1:]) if y["set"] > x["set"] and y["set"] > T]
+
+
+@pytest.mark.parametrize("why", ["road differs from memory", "road ended"])
+@pytest.mark.parametrize("need,at", [(33, 2520), (40, 2520), (33, 2560)])
+def test_c1_review_probe_lock_loss_inside_bend_never_raises(monkeypatch, why, need, at):
+  # the reviewer's six cases (probe 2): before the fix the set speed walked 40 -> 46+ inside the bend in all six
+  log = _lock_loss_run(monkeypatch, why, need, at)
+  bend = [r for r in log if 2500 <= r["s"] <= 2650]
+  rises = [(round(x["s"]), x["set"], y["set"]) for x, y in zip(bend, bend[1:]) if y["set"] > x["set"]]
+  assert not rises, rises
+
+
+@pytest.mark.parametrize("why", LOSS_REASONS)
+def test_c1_each_lock_loss_reason_keeps_the_corner(monkeypatch, why):
+  log = _lock_loss_run(monkeypatch, why, 33, 2530)
+  T, rises = _bend_rises(log, 33)
+  assert not rises, rises
+  assert min(r["set"] for r in log if 2500 <= r["s"] <= 2650) <= T
+
+
+@pytest.mark.parametrize("why", LOSS_REASONS)
+def test_c1_planner_dead_reckons_every_loss_and_records_why(why):
+  pl = P.Planner(None)
+  pl.active = {7: {"T": 40, "at": 100.0}}
+  pl.locked = True
+  pl._lose(why)
+  assert 7 in pl.active and pl.dr_why == why
+  assert any(e["kind"] == "dead_reckon" and e["why"] == why for e in pl.events)
+
+
+@pytest.mark.parametrize("layer", ["guard_only", "car_side_only"])
+@pytest.mark.parametrize("why", ["road differs from memory", "remembered road ends"])
+def test_c1_each_layer_holds_by_itself(monkeypatch, layer, why):
+  # guard_only: the corner is DROPPED on the loss (the old behaviour): the published-ceiling guard alone keeps the ceiling;
+  # car_side_only: neither planner layer: the car side's own bend rule alone holds the dash (the loss is inside the bend)
+  if layer == "guard_only":
+    log = _lock_loss_run(monkeypatch, why, 33, 2530, keep=False)
+  else:
+    log = _lock_loss_run(monkeypatch, why, 33, 2530, keep=False, guard=False, car_la=True)
+  # the car side knows the bend only from its own signals: it holds to the bend's END (HOLD_AFTER_M past it is the planner's layer)
+  T, rises = _bend_rises(log, 33, end_m=2650 if layer == "car_side_only" else 2650 + P.HOLD_AFTER_M - M.SPACING_M)
+  assert not rises, rises
+
+
+def test_c1_property_random_loss_points_and_reasons(monkeypatch):
+  rng = np.random.default_rng(20261124)
+  for _ in range(10):
+    why = str(rng.choice(LOSS_REASONS))
+    need = int(rng.choice([30, 33, 36, 40, 44]))
+    at = float(rng.uniform(2380, 2640))
+    with monkeypatch.context() as mp:
+      log = _lock_loss_run(mp, why, need, at, car_la=bool(rng.integers(0, 2)))
+    T, rises = _bend_rises(log, need)
+    assert not rises, (why, need, round(at), rises)
