@@ -220,8 +220,11 @@ def test_r14_car_already_below_32_uses_the_low_speed_capacity():
 
 def test_approach_times_at_45():
   # plan T4 + A8-R4 + A9 / A11: the planner's own manoeuvre at 45 mph (push to T - DRIVE_GAP_MPH, model-timed raise), timing variant,
-  # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.86 / 10.44 s (A11, block two), pinned here
-  for drop, want in ((5, 4.99), (10, 7.86), (15, 10.44)):
+  # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.95 / 10.35 s, pinned here (15 off was 10.44
+  # before the 14+ mph band entered the timing table, plan A10: the push to 24 opens a gap beyond 14 mph; 10 off was 7.86, 15 off
+  # 10.25 with the
+  # raise judged every 0.1 s: RAISE_CHECK_S is now 0.05, which equals judging it every step, test_a8_r6)
+  for drop, want in ((5, 4.99), (10, 7.95), (15, 10.35)):
     T = 45 - drop
     t, _ = CM.manoeuvre(45.0, T, max(P.CAR_MIN_MPH, T - P.DRIVE_GAP_MPH), arrived=P.ARRIVED_MPH, tap_s=P.TAP_S)
     assert t == pytest.approx(want, abs=0.05), (drop, t)
@@ -236,7 +239,8 @@ def test_response_model_is_the_measured_one():
   # rewritten for plan amendment A1 (was test_response_model_saturates_at_6_mph, pinning the unmeasured 0.76 / 1.6 mph/s law)
   for g in (0, 1, 2, 3, 6, 12, 20):
     assert P.decel_mph_s(g) == CM.decel_mph_s(g)
-  assert P.decel_mph_s(20) * MPH == pytest.approx(0.90)  # capped at the 10-14 mph band: never assumes more
+  assert P.decel_mph_s(20) * MPH == pytest.approx(1.21)  # the 14+ band (plan A10; was capped at the 10-14 band, 0.90)
+  assert CM.decel_ms2(20, CM.CONSERVATIVE) == pytest.approx(0.65)   # the safety-check variant keeps its cap
   assert P.DRIVE_GAP_MPH >= 6
 
 
@@ -315,10 +319,14 @@ def test_push_opens_the_gap_then_raises_to_target():
   need = D.need_mph(CORNER_K)[0]                     # 36: floor 50 binds at 65 mph; use a faster start to see the push
   ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
   T = max(need, 50)
-  assert min(ceils) == max(T - P.DRIVE_GAP_MPH, 50) and ceils[-1] == T
+  # owner rule 2026-11-24 (RULES.md: the set speed may pass the 15 mph line, the car's speed may not): the PUSH may go below the
+  # floor 50 by the push depth (was: clamped at 50, min(ceils) == 50; now 50 - DRIVE_GAP_MPH = 44); the TARGET stays at the floor
+  # and the car's speed never goes below it
+  assert min(ceils) == max(T - P.DRIVE_GAP_MPH, CM.push_floor(50, P.DRIVE_GAP_MPH)) == 50 - P.DRIVE_GAP_MPH and ceils[-1] == T
+  assert min(v for t, s, p, v in res) >= 50 - 0.05
   res = drive(mem, tr, 50, 160, closed=True)
   ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
-  assert min(ceils) == max(need - P.DRIVE_GAP_MPH, 35) and ceils[-1] == need   # pushed 1 below, then raised to the target
+  assert min(ceils) == max(need - P.DRIVE_GAP_MPH, CM.push_floor(35, P.DRIVE_GAP_MPH)) and ceils[-1] == need   # pushed, then raised
 
 
 def test_downhill_slow_car_is_flagged_not_pushed_lower():
@@ -337,7 +345,10 @@ def test_corner_right_after_long_straight_is_seen_far_ahead():
   mem = M.synthetic([tr])
   res = drive(mem, tr, 70, 120)
   on = [s for t, s, p in res if p.ceil is not None and p.kind == "corner"]
-  assert on and 2500 - on[0] >= P.approach_m(70, 55, 55) - 10
+  # owner rule 2026-11-24: the push may go below the floor 55 (to CM.push_floor(55, DRIVE_GAP_MPH) = 49), so the approach it plans
+  # is the shorter push-to-49 one (was approach_m(70, 55, 55) = 373 m, seen 378 m ahead; now approach_m(70, 55, 49) = 295 m, 303 m)
+  assert on and 2500 - on[0] >= P.approach_m(70, 55, CM.push_floor(55, P.DRIVE_GAP_MPH)) - 10
+  assert min(p.ceil for t, s, p in res if p.ceil is not None and p.kind == "corner") == CM.push_floor(55, P.DRIVE_GAP_MPH)
 
 
 def test_s_bends_both_on_target():
@@ -1003,7 +1014,9 @@ def test_r16_unconfirmed_sheds_at_most_5_confirmed_gets_the_full_ramp():
   # the preview there at the start, then gone before it reaches the entry: unconfirmed at CONFIRM_LEAD_S, stage 1 keeps the cap
   pl = P.Planner(mem)
   f8 = road_preview(tr, 45)
-  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 220 else None)
+  # (cutoff 1500 - 220 before the hold-branch merge; the push below the floor, CM.push_floor 30 -> 25, shortens the approach, so the
+  # start moved to ~1316 m: the cutoff must fall between the start and where an 8 s preview first reaches the entry, ~1339 m)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 175 else None)
   assert "s1_unconfirmed" in [e["kind"] for e in pl.events] and "s1_confirm" not in [e["kind"] for e in pl.events]
   assert all(p.ceil >= 40 for t, s, p, v in res if p.ceil is not None and p.src == "mem")
   # PHYSICAL LIMIT (reported, not met): a preview that confirms only at CONFIRM_LEAD_S (6 s) cannot deliver the 10 mph left after the
@@ -1063,8 +1076,16 @@ def test_release_at_6s_restores_and_no_reslow():
   flick = road_preview(tr, 55)
   flat = road_preview(straight, 55)
   res = drive(mem, tr, 55, 160, closed=True, model_fn=lambda t, s: flick(t, s) if int(t / 0.6) % 2 else flat(t, s))
-  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, s, p, v in res if s <= 1650 + P.HOLD_AFTER_M]
-  assert _reversals(sets) <= 2                                   # at most one down-up-down
+  win = [(t, p) for t, s, p, v in res if s <= 1650 + P.HOLD_AFTER_M]
+  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, p in win]
+  # owner rule 2026-11-24 (push below the floor): the deeper push shortens the approach, so stage 1 now starts later and its
+  # release (CONFIRM_LEAD_S before the entry) can come one or two planner cycles BEFORE stage 2's forecast takes the bend over: the
+  # ceiling shows one down-up-down and then the restore up (was <= 2 reversals, seen 1: [55, 45, 40, 41, 55]; now <= 3, seen 3:
+  # [55, 45, 34, 55, 46, 55]). Never more than that, and the "up" of that hand-over lasts at most 2 planner cycles (0.4 s).
+  assert _reversals(sets) <= 3                                   # at most one down-up-down, then the restore
+  firsts = [i for i, (t, p) in enumerate(win) if p.ceil is not None and p.kind == "corner"]
+  gaps = [i for i in range(firsts[0], firsts[-1] + 1) if not (win[i][1].ceil is not None and win[i][1].kind == "corner")]
+  assert len(gaps) <= 2, [round(win[i][0], 1) for i in gaps]
 
 
 def _map_profile(s, bend_at, bend_len, k):
@@ -1184,7 +1205,7 @@ def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend():
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
   f8 = road_preview(tr, 50)
-  res = drive(mem, tr, 50, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 190 else None)
+  res = drive(mem, tr, 50, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 183 else None)   # start ~1314 m, reach ~1321 m
   assert "s1_unconfirmed" in [e["kind"] for e in pl.events]
   assert next(v for t, s, p, v in res if s >= 1500) > 38 + P.ALERT_MARGIN_MPH + 1      # the cap kept it fast
   assert any(p.alert_mph == int(D.need_mph(k)[0]) for t, s, p, v in res if s <= 1500)  # and the driver is told, before the bend

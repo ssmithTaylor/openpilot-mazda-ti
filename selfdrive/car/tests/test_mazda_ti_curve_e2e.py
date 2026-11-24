@@ -324,8 +324,13 @@ def test_gps_gap_inside_a_slowed_bend_never_raises_the_set_speed(need, a, b):
   def ev(f, car, s):
     return {"_fix_valid": False} if a <= s <= b else {}
   log = e2e([(2500, None), (150, need), (1200, None)], 55, events=ev, preview_s=8.0)
-  i0 = next(i for i, r in enumerate(log) if r["set"] < 55)
-  win = [r for r in log[i0:] if r["s"] <= 2650 + P.HOLD_AFTER_M]
-  rises = [(round(x["s"]), x["set"], y["set"]) for x, y in zip(win, win[1:]) if y["set"] > x["set"]]
+  # (after the hold-branch merge the push may take the dash below the floor 40 to 34 and the model-timed raise brings it back to the
+  # target 40 before the bend: that planned raise is allowed; nothing above the target, and no rise at all inside the bend)
+  T = max(need, 55 - 15)
+  i0 = next(i for i, r in enumerate(log) if r["set"] <= T)
+  win = [r for r in log[i0:] if r["s"] < 2650 + P.HOLD_AFTER_M - M.SPACING_M]   # the release (end + HOLD_AFTER_M, on the memory grid)
+  assert max(r["set"] for r in win) <= T, [(round(r["s"]), r["set"]) for r in win if r["set"] > T][:5]
+  bend = [r for r in win if r["s"] >= 2500]
+  rises = [(round(x["s"]), x["set"], y["set"]) for x, y in zip(bend, bend[1:]) if y["set"] > x["set"]]
   assert not rises, rises
-  assert min(r["set"] for r in log if 2500 <= r["s"] <= 2650) == max(need, 55 - 15)
+  assert min(r["set"] for r in log if 2500 <= r["s"] <= 2650) == T

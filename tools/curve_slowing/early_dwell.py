@@ -43,7 +43,11 @@ class Profile:
   intervention: brake, gas held, disengaged, cruise off), so the speed actually shed is what the model gives by then plus its dead time
   and lag; `tap_s`: the tap cycle (R17: 0.20 s for the approved faster taps; default the model's own)."""
 
-  def __init__(self, u, T, arrived=ARRIVED_MPH, dt=0.05, S1=None, set0=None, tail_s=20.0, cap=None, stop_t=None, tap_s=None):
+  def __init__(self, u, T, arrived=ARRIVED_MPH, dt=0.05, S1=None, set0=None, tail_s=20.0, cap=None, stop_t=None, tap_s=None,
+               hold=None):
+    # hold: the walk the planner plans with (CM.HOLD: the held button where CM.hold_landing allows it, then taps), as the planner's
+    # approach_m / raise_due / _arrive call the model; taps only (the exact pre-merge walk) when it is off
+    hold = CM.HOLD if hold is None else bool(hold)
     self.u, self.goal = float(u), float(T) + arrived
     tap_s = CM.TAP_S if tap_s is None else float(tap_s)
     s0 = self.u if set0 is None else float(set0)
@@ -54,19 +58,26 @@ class Profile:
     if self.u <= self.goal:
       t_arr, d_arr, v_arr = 0.0, 0.0, self.u
     back = int(round(self.u))
+    walk = None
     while t < 120.0 and (t_arr is None or t < t_arr + tail_s):
       stopped = stop_t is not None and t >= stop_t - 1e-9
       if stopped and t > stop_t + 2.0 and car.v >= self.u - 0.05:
         break                             # back up to the start speed after a stop: nothing more to follow
       capped = cap is not None and t < cap[1] - 1e-9 and cap[0] >= T
       if not stopped and not capped and not raised and t >= tap_t - 1e-9 and t >= chk - 1e-9 and car.v <= T + CM.RAISE_CHECK_MPH:
-        raised, chk = CM.raise_due(car, setn, T, tap_s), t + CM.RAISE_CHECK_S
+        raised, chk = CM.raise_due(car, setn, T, tap_s, hold), t + CM.RAISE_CHECK_S
       goal = int(T) if raised else int(S1)
       if cap is not None and t < cap[1] - 1e-9:
         goal = max(goal, int(cap[0]))
       if stopped:
         goal = back
-      if t >= tap_t - 1e-9 and setn != goal:
+      if hold:
+        if walk is None or walk.goal != goal:
+          walk = CM.Walk(setn, goal, max(t, tap_t), tap_s, True) if setn != goal else None
+        if walk is not None:
+          setn = walk.at(t)
+          tap_t = walk.next_t(t)
+      elif t >= tap_t - 1e-9 and setn != goal:
         setn += 1 if goal > setn else -1
         tap_t = t + tap_s
       car.step(setn)

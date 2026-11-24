@@ -248,7 +248,10 @@ def account_row(x, Pm, s, v, kap, can_start, stop, s_end, opts):
   u = round(float(v[j] / MPH), 1)
   T = x['T']
   floor = x.get('floor') or max(25, int(round(u)) - 15)
-  S1 = max(int(floor), T - Pm.DRIVE_GAP_MPH) if x['stage'] == 1 else None
+  # the planner's own push floor (hold-branch merge: the push may pass the 15 mph line by its depth, CM.push_floor; an older planner
+  # file without it: the floor)
+  pf = Pm.CM.push_floor(int(floor), Pm.DRIVE_GAP_MPH) if hasattr(getattr(Pm, 'CM', None), 'push_floor') else int(floor)
+  S1 = max(pf, T - Pm.DRIVE_GAP_MPH) if x['stage'] == 1 else None
   cap = None
   s1_cap = getattr(Pm, 'S1_UNCONFIRMED_MAX_MPH', None) if x['stage'] == 1 else None
   if s1_cap is not None and x.get('capped'):

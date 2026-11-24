@@ -123,3 +123,17 @@ def test_options_switch_min_passes_and_unconfirmed_cap():
   assert (m.S1_MIN_PASSES, m.S1_UNCONFIRMED_MAX_MPH) == (3, None)
   U.apply_options(m, unconfirmed_cap=5)
   assert m.S1_UNCONFIRMED_MAX_MPH == 5
+
+
+def test_replay_push_uses_the_planner_push_floor():
+  # hold-branch merge: the replay's stage-1 push goes as deep as the planner's (CM.push_floor: below the 15 mph line by the push
+  # depth, never below 25), not clamped at the floor
+  from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
+  pm = NS(DRIVE_GAP_MPH=6, CM=CM)
+  v, s, kap, can, stop = _run()
+  x = U.account_row(_row(), pm, s, v, kap, can, stop, 750.0, {})
+  y = U.account_row(_row(), PM, s, v, kap, can, stop, 750.0, {})
+  assert CM.push_floor(30, 6) == 25 and x['T'] == y['T'] == 30
+  # the deeper push reaches T sooner, so slightly more time is spent slowed before the bend's end (862.1 vs 850.9 mph-s here)
+  assert x['shed'] == pytest.approx(y['shed'], abs=0.6) and x['lost'] != y['lost']
+  assert E.Profile(45.0, 30, S1=25).t_arr < E.Profile(45.0, 30, S1=30).t_arr

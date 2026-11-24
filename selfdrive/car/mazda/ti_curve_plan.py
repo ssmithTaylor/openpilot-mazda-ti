@@ -141,7 +141,7 @@ MAX_MPH = 90
 REACTION_S = CM.DELAY_S         # the model's dead time on the gap (0.5 s); the measured ~1.4 s from the first tap to the car slowing
                                 # 0.5 mph is not a separate constant: it comes out of the model (dead time, lag, weak small-gap decel)
 TAP_S = CM.TAP_S                # one set-speed tap per this (measured walk: 0.30 s per tap, 0 of 293 taps missed)
-DRIVE_GAP_MPH = 6                # push this far below the corner speed
+DRIVE_GAP_MPH = 10 if CM.HOLD else 6   # push this far below the corner speed (plan A10: 10 with the held button, 6 with taps only)
 RAISE_AT_MPH = 1.5              # only when the dash is NOT below the corner speed (no push under way): "on target" within this
 RAISE_SIM_DT_S = 0.1            # the planner's raise prediction steps (CM.raise_due)
 ARRIVED_MPH = 0.5               # plan A8-R1: at the corner speed + this (was 1.5, the measured manoeuvre definition CM.ARRIVED_MPH;
@@ -179,7 +179,7 @@ def approach_m(u, T, S1, dt=0.05, set0=None):
   if r is not None:
     return r
   _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=None, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S,
-                         set0=float(key[3]))
+                         set0=float(key[3]), hold=CM.HOLD)
   _APPROACH[key] = dist
   return dist
 
@@ -214,7 +214,7 @@ def slow_distance_m(from_mph, to_mph, floor_mph=CAR_MIN_MPH):
   """Metres before the corner at which slowing from `from_mph` to `to_mph` must start (approach + buffer + ENTRY_M)."""
   if from_mph - to_mph <= 0:
     return ENTRY_M
-  S1 = max(floor_mph, to_mph - DRIVE_GAP_MPH)
+  S1 = max(CM.push_floor(floor_mph, DRIVE_GAP_MPH), to_mph - DRIVE_GAP_MPH)
   return approach_m(from_mph, to_mph, S1) + BUFFER_S * from_mph * MPH + ENTRY_M
 
 
@@ -784,7 +784,7 @@ class Planner:
         T = int(shed_to[j])
         D_ = float(dist[j]) - ENTRY_M
         buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0)
-        S1 = max(floor, T - DRIVE_GAP_MPH)
+        S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)
         va = v_allow(D_, T, S1, buf)
         # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
         # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
@@ -838,7 +838,7 @@ class Planner:
         if mode == "target":
           mode = "push"
       T = a_["T"]
-      S1 = max(floor, T - DRIVE_GAP_MPH)
+      S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)
       va = c["va"] if c is not None else float(T)
       late, on_plan = mph > va + BEHIND_MPH, mph <= va
       if c is not None and set_mph and mode in ("push", "behind"):
@@ -1013,7 +1013,7 @@ class Planner:
     """Switch a corner to its target: with the dash pushed below T, when the model says the car raised now bottoms out at T
     (CM.raise_due from the car settled on its current gap); otherwise within RAISE_AT_MPH of T."""
     if set_mph is not None and set_mph < T:
-      return CM.raise_due(CM.Cruise(mph, float(set_mph), RAISE_SIM_DT_S), float(set_mph), T)
+      return CM.raise_due(CM.Cruise(mph, float(set_mph), RAISE_SIM_DT_S), float(set_mph), T, hold=CM.HOLD)
     return mph <= T + RAISE_AT_MPH
 
   def _floor(self, floor_mph, ref_mph, set_mph, mph):
@@ -1089,7 +1089,7 @@ class Planner:
     its slowing scaled by the share of it the car is observed to give now if less (`_observe`; kept under plan amendment A1 because
     it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5). With T
     (above s1): the planner's own manoeuvre, a push to s1 and the model-timed raise back to T (plan A11)."""
-    return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T)
+    return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T, hold=CM.HOLD)
 
   def _warn(self, corners, mph, v, floor, acting, set_mph, lowering, u_ref=None):
     """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,
@@ -1124,7 +1124,7 @@ class Planner:
         arrive = self._arrive(v, d_low - d1, float(set_mph), min(float(set_mph), T2), True)
       elif acting and lowering and u_ref - max(need, int(floor)) > LATE_SHED_MPH:
         T = max(need, int(floor))
-        arrive = self._arrive(v, d_low, float(set_mph), float(max(floor, T - DRIVE_GAP_MPH)), True, T=T)
+        arrive = self._arrive(v, d_low, float(set_mph), float(max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)), True, T=T)
       else:
         arrive = self._arrive(v, d_low, float(set_mph), float(set_mph), False)
       if key in self.alerting:

@@ -85,3 +85,15 @@ def test_summary():
   rows = [dict(dwell_s=d, over_mph=o, late=d < 0) for d, o in ((5, 1.5), (8, 1.5), (-1, 4.0), (-2, 6.5))] + [None]
   sm = E.summary(rows)
   assert sm['n'] == 4 and sm['late'] == 2 and sm['worst_over_mph'] == 6.5 and sm['median'] == 2.0
+
+
+def test_profile_follows_the_planner_walk_with_the_hold():
+  # hold-branch merge: the replay profile walks the dash as the planner plans (CM.HOLD; off today: the taps-only walk, unchanged);
+  # with the hold on it matches the planner's own manoeuvre (CM.manoeuvre(hold=True)) to the arrival
+  from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
+  assert E.Profile(45.0, 30, S1=24).t_arr == E.Profile(45.0, 30, S1=24, hold=CM.HOLD).t_arr
+  for u, T, S1 in ((45.0, 30, 20), (55.0, 40, 30), (45.0, 35, 25)):
+    p = E.Profile(u, T, S1=S1, hold=True)
+    t_m, _ = CM.manoeuvre(u, T, S1, arrived=E.ARRIVED_MPH, hold=True)
+    assert p.t_arr == pytest.approx(t_m, abs=0.3), (u, T, p.t_arr, t_m)
+    assert p.t_arr <= E.Profile(u, T, S1=S1, hold=False).t_arr + 1e-6

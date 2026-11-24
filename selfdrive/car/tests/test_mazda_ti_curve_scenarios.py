@@ -135,7 +135,8 @@ def e2e(segs, set_mph, mph0=None, seconds=400, events=None, single=False, car_cl
     if f % 10 == 0:
       st = cv.status(t)
       log.append(dict(t=round(t, 2), s=round(s, 1), state=cv.state, why=cv.why, set=car.set, mph=round(car.mph, 2), alert=st["alert"],
-                      need=(plan_d or {}).get("need"), ref=cv.ref))
+                      need=(plan_d or {}).get("need"), ref=cv.ref, stage=(plan_d or {}).get("stage"), floor=cv.floor,
+                      gentle=getattr(cv, "gentle_why", "")))
   return log, car, cv
 
 
@@ -318,3 +319,33 @@ def test_sweep_cruise_variants_never_unwarned_in_corner(cls):
       log, car, cv = e2e([(2500, None), (150, need), (800, None)], st, car_cls=cls)
       nd = next((r["need"] for r in log if r["need"] is not None), None) or need
       assert corner(log, 2500, 2650, nd)["unc_in"] == 0, (cls.__name__, st, need)
+
+
+# ---------------------------------------------------------------- the push net with all three stages active (hold-branch merge)
+@pytest.mark.parametrize("stall", [False, True])
+def test_push_net_closed_loop_all_three_stages(stall):
+  # 55 mph, a remembered corner needing 25 (floor 40: the target is 40, the push may take the DASH to 34), the 8 s preview on (stage 2
+  # sees the bend too), and stage 3 reporting the steering at its limit in the bend. stall: the planner stops publishing once the
+  # dash is below the floor (late, then dead), so only the car side's push net can bring the dash back. Either way the car's
+  # ACTUAL speed never goes below the floor (owner, 2026-11-24), and with the planner stalled the net is what acted
+  st = {}
+
+  def ev(f, car, s, cv):
+    ov = {}
+    if cv.floor is not None and car.set < cv.floor and "below" not in st:
+      st["below"] = f
+    if stall and "below" in st and s < 2500:
+      ov["_skip_plan"] = True
+    if 2520 <= s <= 2600:
+      ov.update(deliver=True, deliver_need=30, deliver_why="limit")
+    return ov
+  log, car, cv = e2e([(2500, None), (150, 25), (1200, None)], 55, events=ev)
+  assert "below" in st, "the push never took the dash below the floor"
+  assert min(r["set"] for r in log) >= C.CM.push_floor(40, P.DRIVE_GAP_MPH)
+  assert any(r["stage"] == 1 for r in log) and any(r["stage"] == 2 for r in log), sorted({r["stage"] for r in log}, key=str)
+  assert any(r["gentle"] == "limit" for r in log if 2520 <= r["s"] <= 2600)          # stage 3 reached the car side in the bend
+  assert min(r["mph"] for r in log if r["s"] <= 2700) >= 40 - 0.05, min(r["mph"] for r in log)
+  nets = [e for e in cv.events if e["kind"] == "push_net"]
+  if stall:
+    assert nets, "planner stalled below the floor: the push net must act"
+  assert cv.state != "stopped" or not stall
