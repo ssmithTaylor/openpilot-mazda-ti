@@ -13,7 +13,8 @@ using namespace ti_pages;
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { if (failures < 40) std::printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
-static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress, Page::Cruise, Page::Curve};
+static const Page PAGES[] = {Page::Home, Page::Setup, Page::Tests, Page::Overview, Page::Ab, Page::Progress, Page::Cruise, Page::Curve,
+                             Page::Buttons};
 
 static int minDim(const Rect &r) { return std::min(r.w, r.h); }
 
@@ -34,7 +35,7 @@ static void layoutRules() {
           CHECK(gapBetween(c[i].r, c[j].r) >= MIN_GAP);
           const bool stop = c[i].id == CTL_STOP || c[j].id == CTL_STOP || c[i].id == CTL_ALLOFF || c[j].id == CTL_ALLOFF ||
                            c[i].id == CTL_CRUISE_STOP || c[j].id == CTL_CRUISE_STOP || c[i].id == CTL_CURVE_SWITCH ||
-                           c[j].id == CTL_CURVE_SWITCH;
+                           c[j].id == CTL_CURVE_SWITCH || c[i].id == CTL_BUTTONS_STOP || c[j].id == CTL_BUTTONS_STOP;
           if (stop) {
             CHECK(gapBetween(c[i].r, c[j].r) >= STOP_GAP);
           }
@@ -893,7 +894,93 @@ static void curveRules() {
   CHECK(curveCut(std::string(60, 'y'), MAX_CURVE_SECOND_CHARS).size() == (size_t)MAX_CURVE_SECOND_CHARS);
 }
 
+// The cruise button tests' page: its own page and controls (never the first page's START), boxes clear of controls, the car's lines
+// shown whole (they are written to fit: ti_button_tests.py MAX_*), the test controls only when the car's fresh report says no test
+// runs and nothing else is on, STOP only while one runs, "running" only from the car
+static void buttonsRules() {
+  Control c[MAX_CONTROLS];
+  const int n = layout(Page::Buttons, 0, c);
+  Rect hold{}, taps{}, stop{};
+  for (int i = 0; i < n; i++) {
+    CHECK(c[i].id != CTL_START && c[i].id != CTL_STOP && c[i].id != CTL_CRUISE_RUN);
+    CHECK(minDim(c[i].r) >= BIG_MIN);
+    if (c[i].id == CTL_BUTTONS_HOLD) hold = c[i].r;
+    if (c[i].id == CTL_BUTTONS_TAPS) taps = c[i].r;
+    if (c[i].id == CTL_BUTTONS_STOP) stop = c[i].r;
+    for (const Rect &b : {BUTTONS_TITLE, BUTTONS_BAND, BUTTONS_RESULT, BUTTONS_DETAIL1, BUTTONS_DETAIL2, BUTTONS_DETAIL3, HOME_BADGE}) {
+      CHECK(!overlaps(b, c[i].r));
+    }
+  }
+  CHECK(hold.w >= 640 && taps.w >= 640 && stop.w >= 640 && hold.h >= 220 && gapBetween(taps, stop) >= STOP_GAP);
+  // every control's labels fit its box: the label at START_PX (bold capitals), the second line at START_SUB_PX
+  for (const Rect &r : {hold, taps, stop}) {
+    CHECK(9 * START_PX * 0.75 <= r.w - 48);                     // "HOLD TEST" / "STOP TEST" (9 characters), "TAP TEST"
+    CHECK(MAX_BUTTONS_SUB_CHARS * START_SUB_PX * 0.62 <= r.w - 48);
+  }
+  for (const Rect &b : {BUTTONS_DETAIL1, BUTTONS_DETAIL2, BUTTONS_DETAIL3}) {
+    CHECK(!overlaps(b, HOME_BADGE) && b.bottom() <= SCREEN_H);
+  }
+  CHECK(MAX_BUTTONS_PRIMARY_CHARS * BUTTONS_PRIMARY_PX * 0.75 <= BUTTONS_PRIMARY.w - 48);
+  CHECK(MAX_BUTTONS_SECOND_CHARS * BUTTONS_SECOND_PX * 0.62 <= BUTTONS_SECOND.w - 48);
+  CHECK(MAX_BUTTONS_RESULT_CHARS * BUTTONS_RESULT_PX * 0.62 <= BUTTONS_RESULT.w - 48);
+  CHECK(MAX_BUTTONS_DETAIL_CHARS * DETAIL_PX * 0.62 <= BUTTONS_DETAIL1.w);
+  CHECK(BUTTONS_PRIMARY_PX >= 100 && BUTTONS_RESULT_PX >= 70);
+  // the progress page leads to it; the first page has none of its controls; the progress page's four links are clear of each other
+  Control h[MAX_CONTROLS];
+  const int hn = layout(Page::Home, 0, h);
+  for (int i = 0; i < hn; i++) CHECK(h[i].id != CTL_BUTTONS_HOLD && h[i].id != CTL_BUTTONS_TAPS && h[i].id != CTL_NAV_BUTTONS);
+  Rect nav{}, curve{};
+  CHECK(rectOf(Page::Progress, CTL_NAV_BUTTONS, 0, nav) && rectOf(Page::Progress, CTL_NAV_CURVE, 0, curve));
+  CHECK(nav.h >= 150 && nav.w >= 300 && gapBetween(nav, curve) >= MIN_GAP && nav.bottom() <= SCREEN_H);
+
+  const char *states[] = {"idle", "refused", "waiting", "running", "restoring", "finished", "aborted", "bogus"};
+  const char *others[] = {"", "the drive plan is on", "the A/B switch is on", "a test is on", "the cruise check is running",
+                          "curve slowing is on"};
+  const std::string long1(40, 'X'), long2(80, 'y'), longr(60, 'Z'), longd(120, 'd');
+  for (const char *st : states) {
+    for (const char *oth : others) {
+      for (bool fresh : {true, false}) {
+        for (bool lng : {false, true}) {
+          ButtonsView v;
+          v.have = true;
+          v.fresh = fresh;
+          v.state = st;
+          v.test = "hold";
+          v.line1 = lng ? long1 : "HOLD TEST DONE";
+          v.line2 = lng ? long2 : "Set speed back at 45 mph and checked";
+          v.result = lng ? longr : (std::string(st) == "aborted" ? "SET IT YOURSELF: NOW 40 MPH, WAS 45" : "SET-: HOLD   SET+: HOLD");
+          v.d1 = lng ? longd : "SET-: 45 -> 44 -> 40 (0.05, 0.55 s): a hold";
+          v.d2 = v.d1;
+          v.d3 = v.d1;
+          const ButtonsLook k = buttonsLook(v, oth);
+          CHECK((int)k.primary.size() <= MAX_BUTTONS_PRIMARY_CHARS && (int)k.second.size() <= MAX_BUTTONS_SECOND_CHARS);
+          CHECK((int)k.result.size() <= MAX_BUTTONS_RESULT_CHARS);
+          for (const std::string *d : {&k.detail1, &k.detail2, &k.detail3}) CHECK((int)d->size() <= MAX_BUTTONS_DETAIL_CHARS);
+          CHECK((int)k.hold_sub.size() <= MAX_BUTTONS_SUB_CHARS && (int)k.taps_sub.size() <= MAX_BUTTONS_SUB_CHARS);
+          CHECK((int)k.stop_sub.size() <= MAX_BUTTONS_SUB_CHARS);
+          const bool active = buttonsActive(v);
+          if (!fresh) CHECK(k.word == "noreport" && !k.run_enabled && !k.stop_enabled && k.tone == Tone::Held);
+          if (fresh && active) CHECK(k.word == st && !k.run_enabled && k.stop_enabled);
+          if (fresh && !active) CHECK(!k.stop_enabled && k.run_enabled == (oth[0] == 0));
+          if (fresh && !active && oth[0] != 0) CHECK(k.word == "unavailable" && k.second.find("STOP") != std::string::npos);
+          if (fresh && !active && oth[0] == 0) CHECK(k.word == st);
+          if (fresh && (active || oth[0] == 0) && !lng) CHECK(k.primary == v.line1 && k.second == v.line2 && k.detail1 == v.d1);
+          CHECK((k.tone == Tone::Running) == (fresh && std::string(st) == "running"));
+          CHECK(buttonsBusy(v) == (fresh && active));
+          // the last result stays readable without a report; nothing else does
+          const bool final_state = std::string(st) == "finished" || std::string(st) == "aborted";
+          if (!fresh && !final_state) CHECK(k.result.empty() && k.detail1.empty());
+          if (!lng && fresh) CHECK(k.result_warn == (std::string(st) == "aborted"));
+        }
+      }
+    }
+  }
+  ButtonsView none;
+  CHECK(buttonsLook(none, "").word == "noreport" && !buttonsLook(none, "").run_enabled && !buttonsBusy(none));
+}
+
 int main() {
+  buttonsRules();
   cruiseRules();
   curveRules();
   layoutRules();

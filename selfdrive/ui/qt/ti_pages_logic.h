@@ -76,7 +76,7 @@ inline int gapBetween(const Rect &a, const Rect &b) {
   return std::max(gx, gy);
 }
 
-enum class Page { Home, Setup, Tests, Overview, Ab, Progress, Cruise, Curve };
+enum class Page { Home, Setup, Tests, Overview, Ab, Progress, Cruise, Curve, Buttons };
 
 // Control ids (also the ids the mouse handler works with)
 enum Ctl {
@@ -113,6 +113,10 @@ enum Ctl {
   CTL_CRUISE_STOP = 61,  // ... STOP CHECK
   CTL_NAV_CURVE = 46,    // on the progress page: curve slowing's own page
   CTL_CURVE_SWITCH = 62, // curve slowing's page: TURN ON / TURN OFF (its label from the car controller's report)
+  CTL_NAV_BUTTONS = 47,  // on the progress page: the cruise button tests' own page
+  CTL_BUTTONS_HOLD = 63, // the button tests' page: HOLD TEST (one press arms one run)
+  CTL_BUTTONS_TAPS = 64, // ... TAP TEST
+  CTL_BUTTONS_STOP = 65, // ... STOP TEST
 };
 
 struct Control {
@@ -177,9 +181,17 @@ inline int layout(Page pg, int error_lines, Control *out) {
     case Page::Progress:
       add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
       add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
-      add(CTL_NAV_INDIV, 20, 330, 360, 180, "INDIVIDUAL TESTS");
-      add(CTL_NAV_CRUISE, 20, 590, 360, 180, "CRUISE CHECK");
-      add(CTL_NAV_CURVE, 20, 850, 360, 180, "CURVE SLOWING");
+      add(CTL_NAV_INDIV, 20, 230, 360, 170, "INDIVIDUAL TESTS");
+      add(CTL_NAV_CRUISE, 20, 440, 360, 170, "CRUISE CHECK");
+      add(CTL_NAV_CURVE, 20, 690, 360, 180, "CURVE SLOWING");
+      add(CTL_NAV_BUTTONS, 20, 910, 360, 160, "BUTTON TESTS");
+      break;
+    case Page::Buttons:                       // the cruise button tests: their own page and controls, never START
+      add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
+      add(CTL_LOCK, 1780, 10, 360, 180, "LOCK");
+      add(CTL_BUTTONS_HOLD, 20, 270, 660, 230, "HOLD TEST");
+      add(CTL_BUTTONS_TAPS, 720, 270, 660, 230, "TAP TEST");
+      add(CTL_BUTTONS_STOP, 1460, 270, 680, 230, "STOP TEST");
       break;
     case Page::Curve:                         // curve slowing: its own page and one control, never START
       add(CTL_BACK, 20, 10, 360, 180, "< START PAGE");
@@ -1616,6 +1628,109 @@ inline CurveLook curveLook(const CurveView &v) {
     k.button_sub = "For this drive: off again after every restart";
     k.write = "1";
   }
+  return k;
+}
+
+// ---- the cruise button tests' page (selfdrive/car/mazda/ti_button_tests.py) ------------------------------------------------------
+// The hold test and the tap-rate test, one page. Every line on it is the car controller's own (TiButtonTestStatus: ButtonTests.status(),
+// written there to fit these boxes; cut here only if longer than the space). HOLD TEST / TAP TEST write the trigger (TiButtonTest:
+// {"cmd": "hold" | "taps"}) and nothing else, and are offered only while the car's fresh report says no test runs and the screen
+// knows of no other mode on; STOP TEST writes {"cmd": "stop"} while one runs. The page never shows a test running unless the car's
+// fresh report says so.
+const char *const TI_BUTTON_TRIGGER_KEY = "TiButtonTest";
+const char *const TI_BUTTON_STATUS_KEY = "TiButtonTestStatus";
+constexpr Rect BUTTONS_TITLE = {400, 10, 1340, 180};
+constexpr Rect BUTTONS_BAND = {20, 520, 2120, 240};      // the status band: primary line and second line
+constexpr Rect BUTTONS_PRIMARY = {20, 520, 2120, 130};
+constexpr Rect BUTTONS_SECOND = {20, 650, 2120, 100};
+constexpr Rect BUTTONS_RESULT = {20, 775, 2120, 105};    // the answer, in large type
+constexpr Rect BUTTONS_DETAIL1 = {480, 890, 1660, 50};   // the steps seen / the three cycles' rows
+constexpr Rect BUTTONS_DETAIL2 = {480, 942, 1660, 50};
+constexpr Rect BUTTONS_DETAIL3 = {480, 994, 1660, 50};
+constexpr int BUTTONS_PRIMARY_PX = 100;
+constexpr int BUTTONS_SECOND_PX = 60;
+constexpr int BUTTONS_RESULT_PX = 76;
+constexpr int MAX_BUTTONS_PRIMARY_CHARS = 26;            // = ti_button_tests.MAX_LINE1 (tested on both sides)
+constexpr int MAX_BUTTONS_SECOND_CHARS = 55;             // MAX_LINE2
+constexpr int MAX_BUTTONS_RESULT_CHARS = 42;             // MAX_RESULT
+constexpr int MAX_BUTTONS_DETAIL_CHARS = 74;             // MAX_DETAIL
+constexpr int MAX_BUTTONS_SUB_CHARS = 24;                // a control's second line at START_SUB_PX in its 660 px box
+constexpr double BUTTONS_STALE_S = CRUISE_STALE_S;
+
+struct ButtonsView {
+  bool have = false;                // a status block could be read
+  bool fresh = false;               // ... and it is recent
+  std::string state;                // idle refused waiting running restoring finished aborted (the controller's own word)
+  std::string test;                 // hold taps ("" before the first run)
+  std::string line1, line2, result, d1, d2, d3;
+};
+
+struct ButtonsLook {
+  std::string word;                 // the controller's state, "unavailable" or "noreport"
+  std::string primary, second, result, detail1, detail2, detail3;
+  Tone tone = Tone::Stopped;
+  bool result_warn = false;         // the large line asks the driver to set the speed (warning colour)
+  bool run_enabled = false;         // HOLD TEST and TAP TEST
+  std::string hold_sub, taps_sub;
+  bool stop_enabled = false;
+  std::string stop_sub;
+};
+
+inline bool buttonsActive(const ButtonsView &v) {
+  return v.state == "waiting" || v.state == "running" || v.state == "restoring";
+}
+
+// A button test is in progress by the car's own fresh report: START, the A/B switch and the tests wait while it is
+inline bool buttonsBusy(const ButtonsView &v) {
+  return v.have && v.fresh && buttonsActive(v);
+}
+
+inline ButtonsLook buttonsLook(const ButtonsView &v, const std::string &others) {
+  ButtonsLook k;
+  k.stop_sub = "or press the brake";
+  k.hold_sub = "One 0.7 s hold each way";
+  k.taps_sub = "5 down, 5 up, 3 rates";
+  const bool final_state = v.have && (v.state == "finished" || v.state == "aborted");
+  if (v.have) {
+    k.result = curveCut(v.result, MAX_BUTTONS_RESULT_CHARS);
+    k.detail1 = curveCut(v.d1, MAX_BUTTONS_DETAIL_CHARS);
+    k.detail2 = curveCut(v.d2, MAX_BUTTONS_DETAIL_CHARS);
+    k.detail3 = curveCut(v.d3, MAX_BUTTONS_DETAIL_CHARS);
+    k.result_warn = v.result.rfind("SET IT YOURSELF", 0) == 0;
+  }
+  if (!v.have || !v.fresh) {
+    k.word = "noreport";
+    k.primary = "NO REPORT FROM THE CAR";
+    k.tone = Tone::Held;
+    k.second = final_state ? "Last result below; kept until controls restart" : "The tests run only while driving";
+    if (!final_state) {
+      k.result.clear();
+      k.detail1.clear();
+      k.detail2.clear();
+      k.detail3.clear();
+    }
+    k.hold_sub = k.taps_sub = "Needs the car's report";
+    return k;
+  }
+  k.word = v.state;
+  k.primary = curveCut(v.line1, MAX_BUTTONS_PRIMARY_CHARS);
+  k.second = curveCut(v.line2, MAX_BUTTONS_SECOND_CHARS);
+  if (buttonsActive(v)) {
+    k.tone = v.state == "running" ? Tone::Running : Tone::Waiting;
+    k.stop_enabled = true;
+    k.hold_sub = k.taps_sub = "Running: one at a time";
+    return k;
+  }
+  if (!others.empty()) {
+    k.word = "unavailable";
+    k.primary = "UNAVAILABLE";
+    k.tone = Tone::Held;
+    k.second = curveCut(upperFirst(others) + ": tap STOP on the START page", MAX_BUTTONS_SECOND_CHARS);
+    k.hold_sub = k.taps_sub = "Another mode is on";
+    return k;
+  }
+  k.run_enabled = true;
+  k.tone = v.state == "finished" ? Tone::Done : ((v.state == "aborted" || v.state == "refused") ? Tone::Held : Tone::Stopped);
   return k;
 }
 

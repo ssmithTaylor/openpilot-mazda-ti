@@ -111,7 +111,7 @@ EXCLUDED_KEYS = {
   "AvailableModels", "AvailableModelNames", "CalibratedLateralAcceleration", "CalibrationProgress", "CarParamsPersistent",
   "CurvatureData", "ExperimentalLongitudinalEnabled", "KonikMinutes", "MapBoxRequests", "ModelDrivesAndScores", "ModelVersions",
   "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches",
-  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "TiAbConfig", "TiAbProgress", "TiAbOn", "TiAbPin", "TiAbStatus", "TiPlanOn", "TiPlan", "TiPlanAck", "TiTestHold", "TiCruiseCheck", "TiCruiseCheckStatus", "TiCurveOn", "TiCurvePlan", "TiCurveStatus", "CommaLogsUrl"
+  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "TiAbConfig", "TiAbProgress", "TiAbOn", "TiAbPin", "TiAbStatus", "TiPlanOn", "TiPlan", "TiPlanAck", "TiTestHold", "TiCruiseCheck", "TiCruiseCheckStatus", "TiButtonTest", "TiButtonTestStatus", "TiCurveOn", "TiCurvePlan", "TiCurveStatus", "CommaLogsUrl"
 }
 
 TINYGRAD_FILES = [
@@ -499,6 +499,8 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TiTestHold", "", 3, ""),
   ("TiCruiseCheck", "", 3, ""),
   ("TiCruiseCheckStatus", "", 3, ""),
+  ("TiButtonTest", "", 3, ""),
+  ("TiButtonTestStatus", "", 3, ""),
   ("TiCurveOn", "0", 3, "0"),
   ("TiCurvePlan", "", 3, ""),
   ("TiCurveStatus", "", 3, ""),

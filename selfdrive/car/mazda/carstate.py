@@ -7,6 +7,15 @@ from openpilot.selfdrive.car.interfaces import CarStateBase
 from openpilot.selfdrive.car.mazda.values import DBC, LKAS_LIMITS, MazdaFlags, TI_STATE, CarControllerParams
 from openpilot.common.realtime import DT_CTRL
 
+def crz_btns_flags(btns):
+  """The driver's cruise buttons from the car's OWN 0x09D frame (CRZ_BTNS, read only by the bus-0 parser: the comma's own button
+  frames come back only as transmit echoes, src 128, and as copies on bus 1, where no parser reads 0x09D; pinned by
+  test_mazda_ti_curve_hold.py) -> (any button pressed, SET+ or SET- pressed, SET+ and not SET-)."""
+  driver = bool(btns["SET_P"] or btns["SET_M"] or btns["RES"] or btns["CAN_OFF"] or btns["DISTANCE_LESS"] or
+                btns["DISTANCE_MORE"] or btns["MODE_X"] or btns["MODE_Y"])
+  return driver, bool(btns["SET_P"] or btns["SET_M"]), bool(btns["SET_P"]) and not btns["SET_M"]
+
+
 class CarState(CarStateBase):
   def __init__(self, CP, FPCP):
     super().__init__(CP, FPCP)
@@ -158,12 +167,8 @@ class CarState(CarStateBase):
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
     # For the cruise set-speed check (ti_cruise_check.py), read only: whether the driver is pressing any cruise button on the car's
     # own button frame (the comma's own frames are not read back on this bus), and whether the stock cruise follows a lead.
-    btns = cp.vl["CRZ_BTNS"]
-    self.crz_btns_driver = bool(btns["SET_P"] or btns["SET_M"] or btns["RES"] or btns["CAN_OFF"] or btns["DISTANCE_LESS"] or
-                                btns["DISTANCE_MORE"] or btns["MODE_X"] or btns["MODE_Y"])
     # curve slowing (ti_curve.py): only SET+ / SET- choose a speed (RES, DISTANCE, MODE and CANCEL never do)
-    self.crz_btns_set = bool(btns["SET_P"] or btns["SET_M"])
-    self.crz_btns_set_plus = bool(btns["SET_P"]) and not btns["SET_M"]
+    self.crz_btns_driver, self.crz_btns_set, self.crz_btns_set_plus = crz_btns_flags(cp.vl["CRZ_BTNS"])
     if not (self.CP.flags & MazdaFlags.RADAR_INTERCEPTOR) and not (self.CP.flags & MazdaFlags.NO_MRCC):
       self.crz_lead = bool(cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"])
 

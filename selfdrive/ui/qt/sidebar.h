@@ -205,6 +205,13 @@ private:
   std::string cruiseOthers() const;
   void drawCruise(QPainter &p);
   void drawCruiseBusy(QPainter &p);
+  // The cruise button tests' own page (selfdrive/car/mazda/ti_button_tests.py; logic in ti_pages_logic.h buttonsLook)
+  void buttonsOpen();
+  void buttonsPoll();
+  void buttonsAct(int control);
+  void buttonsWrite(const char *cmd);
+  std::string buttonsOthers() const;
+  void drawButtons(QPainter &p);
   // Curve slowing's own page (selfdrive/car/mazda/ti_curve.py; logic in ti_pages_logic.h curveLook)
   void curveOpen();
   void curvePoll();
@@ -232,6 +239,8 @@ private:
   ti_pages::CruiseView cruise_view;   // what the car controller last published (TiCruiseCheckStatus, tmpfs)
   bool curve_page = false;       // curve slowing's page (from the progress page)
   ti_pages::CurveView curve_view;     // what the car controller last published (TiCurveStatus, tmpfs)
+  bool buttons_page = false;     // the cruise button tests' page (from the progress page)
+  ti_pages::ButtonsView buttons_view;   // what the car controller last published (TiButtonTestStatus, tmpfs)
   bool drive_base_set = false;   // what the counters were when START was last pressed (the "since START" line)
   double drive_base_win[ti_logic::N_WINDOWS] = {0, 0, 0, 0};
   double drive_base_a = 0;
