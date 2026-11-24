@@ -14,6 +14,58 @@ MAX_TAP_SPAN_S = 0.15           # hard cap, first to last pressed frame of a tap
 MIN_TAP_GAP_S = 0.25            # last pressed frame of one tap to the first of the next
 PHASE_WAIT_S = 0.2              # a tap waits at most this long for a new car button frame to start after (else it starts anyway)
 
+# ---- the held button (plan A7, owner approved 2026-11-24) ---------------------------------------------------------------------------
+# OFF: the recorded drives cannot show that the car reads OUR continuous stream as a hold. The car's own button module keeps sending
+# its unpressed frame (same counter as ours) 0.1 s after each of ours, and our recorded 2-frame taps step later than 1-frame taps
+# (0.068 s vs 0.040 s median, 186 / 106 taps), so the cruise unit does act on a frame repeating the last counter: it may see press /
+# release every 0.1 s rather than a hold. A short on-car check decides; until then curve slowing uses taps only (and plans with them).
+HOLD_ENABLED = False
+HOLD_MAX_S = 2.5                # hard cap, first to last pressed frame of a hold (frames AND real time): 0.55 s + 3 x 0.6 s + read
+HOLD_FRAME_MIN_S = 0.08         # never two held frames closer than this (one per car button frame, 10 Hz)
+HOLD_MAX_FRAMES = int(HOLD_MAX_S / 0.1) + 1   # 26: one per car frame over the cap
+
+
+class HoldGuard:
+  """The hard cap on a hold, independent of the logic that drives it (like PressGuard for taps): at most HOLD_MAX_FRAMES pressed
+  frames, at most HOLD_MAX_S from the first to the last, never two closer than HOLD_FRAME_MIN_S, all on frames AND real time; a new
+  hold only MIN_TAP_GAP_S after the last pressed frame of anything (`begin` is given the tap guard too)."""
+
+  def __init__(self):
+    self.first = None
+    self.first_mono = None
+    self.count = 0
+    self.last_frame = None
+    self.last_mono = None
+
+  def begin(self, frame, mono=None, other=None):
+    pairs = [(self.last_frame, self.last_mono)] + ([(other.last_frame, other.last_mono)] if other is not None else [])
+    for lf, lm in pairs:
+      if lf is not None and (frame - lf) * DT < MIN_TAP_GAP_S - 1e-9:
+        return False
+      if mono is not None and lm is not None and mono - lm < MIN_TAP_GAP_S - 1e-6:
+        return False
+    self.first, self.first_mono, self.count = frame, mono, 0
+    return True
+
+  def allow(self, frame, mono=None):
+    if self.first is None or self.count >= HOLD_MAX_FRAMES:
+      return False
+    if (frame - self.first) * DT > HOLD_MAX_S + 1e-9:
+      return False
+    if mono is not None and self.first_mono is not None and mono - self.first_mono > HOLD_MAX_S + 1e-6:
+      return False                    # real time too: a stalled control loop cannot stretch a hold
+    if self.count and (frame - self.last_frame) * DT < HOLD_FRAME_MIN_S - 1e-9:
+      return False
+    if self.count and mono is not None and self.last_mono is not None and mono - self.last_mono < HOLD_FRAME_MIN_S - 1e-6:
+      return False
+    self.count += 1
+    self.last_frame = frame
+    self.last_mono = mono
+    return True
+
+  def end(self):
+    self.first = None
+
 
 class PressGuard:
   """The hard cap on a tap, independent of the recipe: at most MAX_PRESSED_FRAMES pressed frames, at most MAX_TAP_SPAN_S from the
