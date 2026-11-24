@@ -58,6 +58,8 @@ CONFIRM_LEAD_S = 6.0
 CONFIRM_TICKS = 2
 FORK_CONFIRM_S = 3.0
 LATE_SHED_MPH = 5
+S1_MIN_PASSES = 3               # R15 (A15): stage 1 acts only on remembered points with at least this many passes (Memory.npass);
+#                                 a bend whose constraining points have fewer is left to stage 2 and the warning
 BLINKER_HOLD_S = 2.0            # assumption (not in the plan's table)
 S2_TAP_LAG_S = 0.5             # the warning's stage-2 prediction: plan read and first tap after confirmation (assumption)
 S2_MIN_MPH = 20.0               # never act below 19-20 mph (the cruise and the comma engage from ~19)
@@ -635,7 +637,8 @@ class Planner:
     u_ref = max(u, self.int_base or 0.0)
     sign = np.sign(self.kmed[idx])
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
-                             self.active, grade_of=None if grade is None else (lambda j: self._grade(grade, idx, dist, j)))
+                             self.active, grade_of=None if grade is None else (lambda j: self._grade(grade, idx, dist, j)),
+                             npass=self.mem.npass[idx])
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
     cap, need_true, cend, behind, stage = r["cap"], r["need"], r["end"], r["behind"], r["stage"]
@@ -689,11 +692,12 @@ class Planner:
       return GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
     return 0.0
 
-  def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None):
+  def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None):
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
-    aim_at, S1, buf, cap, side}."""
+    aim_at, S1, buf, cap, side}. npass: the passes behind each look-ahead point (memory; None: the map), R15: only points with at
+    least S1_MIN_PASSES constrain stage 1, and a bend with none such is not stage 1's."""
     cands = {}
     tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
     if not len(tight):
@@ -708,18 +712,24 @@ class Planner:
       key = key_of(run)
       if key is None or key in self.released:
         continue
-      if key not in active and u_ref - float(shed_to[run].min()) <= LATE_SHED_MPH:
+      if npass is not None:
+        ok = npass[run] >= S1_MIN_PASSES          # R15: only remembered points with the evidence constrain stage 1
+        if not ok.any():
+          continue
+      else:
+        ok = np.ones(len(run), bool)
+      if key not in active and u_ref - float(shed_to[run[ok]].min()) <= LATE_SHED_MPH:
         continue                                   # plan T6 / A6: a bend needing at most LATE_SHED_MPH off is stage 2's
-      lowest = run[int(np.argmin(need[run]))]
+      lowest = run[ok][int(np.argmin(need[run[ok]]))]
       # aimed at the corner's ENTRY (entry_point: the first point whose demand reaches ENTRY_LA at the corner's speed), not at the
       # run's first point (a gentle lead-in). GUARD: every tight point before the entry is a constraint of its own at its own speed
       # and distance, so the car is never planned to arrive at an earlier point faster than the capacity there allows. The lowest
       # point (the first of equals at or after the entry) is always a constraint.
       aim = entry_point(run, kab, int(shed_to[run].min()))
-      tied = run[(need[run] <= need[lowest]) & (run >= aim)]
+      tied = run[ok & (need[run] <= need[lowest]) & (run >= aim)]
       lowest = int(tied[0]) if len(tied) else int(lowest)
       pts = {int(aim), int(lowest)}
-      pts.update(int(j) for j in run[run < aim])
+      pts.update(int(j) for j in run[ok & (run < aim)])
       side = int(sign[lowest])
       for j in sorted(pts):
         T = int(shed_to[j])

@@ -488,13 +488,29 @@ def test_alert_when_behind_plan_and_not_when_reachable():
   assert not any(p.alert_mph for t, s, p, v in res)
 
 
-def test_single_pass_corner_is_slowed_for_like_any_other():
-  # owner, 2026-11-23: no single-pass trim; a corner from one pass gets its full need (within the floor), model or not
+def test_r15_stage1_needs_3_passes_at_the_constraining_points():
+  # R15 (A15) replaces test_single_pass_corner_is_slowed_for_like_any_other (owner 2026-11-23: no single-pass trim; it asserted a
+  # one-pass corner got its full stage-1 need, 39): stage 1 now acts only where the remembered points have S1_MIN_PASSES (3) passes;
+  # with fewer the bend is left to stage 2 (no preview here: nothing) and the warning, which still sounds
+  assert P.S1_MIN_PASSES == 3
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
-  mem = M.synthetic([tr])
-  mem.npass = np.ones(mem.n, np.int32)
-  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") == max(D.need_mph(CORNER_K)[0], 50 - 15)
+  want = max(D.need_mph(CORNER_K)[0], 50 - 15)
+  for n, slowed in ((1, False), (2, False), (3, True), (20, True)):
+    mem = _mem_n(tr, n)
+    res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
+    corner = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner" and p.stage in (1, 2)]
+    if slowed:
+      assert corner and min(corner) == want, n
+    else:
+      assert not corner, n
+      assert any(p.alert_mph == D.need_mph(CORNER_K)[0] for _, _, p in res), n        # the warning still sounds
+  # per point: a bend whose sharpest points have 2 passes but whose milder lead-in has 5 is constrained by the lead-in only
+  tr2 = road((1500, 0.0), (60, CORNER_K * 0.8), (90, CORNER_K), (800, 0.0))
+  mem = _mem_n(tr2, 5)
+  mem.npass[np.abs(mem.kap_med - CORNER_K) < 1e-9] = 2
+  res = drive(mem, tr2, 55, 120, planner=P.Planner(mem))
+  corner = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
+  assert corner and min(corner) == max(int(D.need_mph(CORNER_K * 0.8)[0]), 40)
 
 
 def test_hold_between_corners_only_when_the_next_slowdown_is_near():
