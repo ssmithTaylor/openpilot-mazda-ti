@@ -130,3 +130,67 @@ def test_car_side_floor_now_is_lead_aware():
                  counter=0, plan=None, plan_age=None, mono=0.0)
   assert c._floor_for(inp, None) == 25                               # min(55, 40) - 15
   assert c._floor_for(inp._replace(lead=False) if hasattr(inp, "_replace") else C.Inputs(**{**inp.__dict__, "lead": False}), None) == 40
+
+
+# ---- the map service's curvature list (synthetic coordinates near 0, 0: never a recorded position) ------------------------------
+import json  # noqa: E402
+import math  # noqa: E402
+
+
+def _map_json(n=40, step_m=20.0, k=0.004, north=True):
+  """a straight north-going (or south-going) line of nodes from 100 m south of (0, 0), curvature k at every node"""
+  deg = step_m / (D.EARTH_R * math.pi / 180.0)
+  lats = [(-100.0 / step_m + i) * deg for i in range(n)]
+  if not north:
+    lats = lats[::-1]
+  return json.dumps([{"latitude": a, "longitude": 0.0, "curvature": k} for a in lats])
+
+
+def test_map_profile_distances_along_the_road_from_the_car():
+  d, k = D.map_profile(_map_json(), 0.5, 0.0, 0.0, 0.0)
+  assert abs(d[0] + 20.0) < 0.5                         # the first kept node: 20 m behind (nodes from 30 m behind)
+  assert all(b > a for a, b in zip(d, d[1:]))
+  assert abs(d[-1] - (39 * 20.0 - 100.0)) < 1.0
+  assert all(abs(x - 0.004) < 1e-12 for x in k)
+
+
+def test_map_profile_no_opinion_when_stale_missing_unmatched_or_wrong_way():
+  good = _map_json()
+  assert D.map_profile(good, D.MAP_STALE_S + 0.1, 0.0, 0.0, 0.0) is None        # stale
+  assert D.map_profile(good, None, 0.0, 0.0, 0.0) is None                         # no file
+  assert D.map_profile(None, 0.5, 0.0, 0.0, 0.0) is None
+  assert D.map_profile("[]", 0.5, 0.0, 0.0, 0.0) is None                          # mapd's "no way" output
+  assert D.map_profile("{}", 0.5, 0.0, 0.0, 0.0) is None
+  assert D.map_profile("not json", 0.5, 0.0, 0.0, 0.0) is None
+  assert D.map_profile(good, 0.5, 0.0, 0.001, 0.0) is None                        # ~111 m to the side: not this road
+  assert D.map_profile(good, 0.5, 0.0, 0.0, 180.0) is None                        # the map's way runs the other way
+  assert D.map_profile(_map_json(north=False), 0.5, 0.0, 0.0, 180.0) is not None
+  bad = json.loads(good)
+  bad[3]["curvature"] = float("nan")
+  assert D.map_profile(json.dumps(bad), 0.5, 0.0, 0.0, 0.0) is None
+
+
+def test_map_age_absent_file_is_none(tmp_path):
+  assert D.map_age_s(str(tmp_path / "MapCurvatures")) is None
+  p = tmp_path / "MapCurvatures"
+  p.write_text("[]")
+  assert 0.0 <= D.map_age_s(str(p)) < 5.0
+
+
+def test_map_profile_never_returns_positions():
+  # synthetic origin away from (0, 0) so a leaked coordinate would be recognisable (never a recorded position)
+  lat0, lon0, step_m, n = 10.37, -71.73, 20.0, 40
+  deg = step_m / (D.EARTH_R * math.pi / 180.0)
+  pts = [{"latitude": lat0 + (-100.0 / step_m + i) * deg, "longitude": lon0, "curvature": 0.001 * (1 + i % 3)} for i in range(n)]
+  out = D.map_profile(json.dumps(pts), 0.5, lat0, lon0, 0.0)
+  assert out is not None
+  assert isinstance(out, tuple) and len(out) == 2                   # (distances, curvatures) and nothing else
+  d, k = out
+  assert len(d) == len(k) >= 2
+  coords = {p["latitude"] for p in pts} | {p["longitude"] for p in pts} | {lat0, lon0}
+  for x in list(d) + list(k):
+    assert isinstance(x, float) and math.isfinite(x)
+    assert all(abs(x - c) > 1e-3 for c in coords)                   # no latitude / longitude passes through
+  assert -30.0 <= d[0] and d[-1] <= n * step_m                      # metres along the road from the car
+  assert all(0.0 <= x <= 0.0031 for x in k)                          # |curvature| as given
+  assert "lat" not in repr(out).lower() and "lon" not in repr(out).lower()

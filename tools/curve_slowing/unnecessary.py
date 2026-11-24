@@ -70,6 +70,28 @@ def rule_of(planner, mem, k):
   return why
 
 
+def model_preview(R, n):
+  """The recorded driving-model preview on the drive cache's 20 Hz grid, read ALONGSIDE the cache (the cache keeps only model_la5):
+  each segment's seg20 extraction (B.SEG20, position-free) has pred_la = orientationRate.z * velocity.x at 33 preview times pred_t
+  (0..10 s). -> (pred_t, pred_la (n, 33) float32, nan where the segment has no seg20 copy or its length differs), or (None, None)."""
+  offs = list(R['seg_off']) + [n]
+  out, pt = None, None
+  for tag, a, b in zip(R['seg_tags'], offs[:-1], offs[1:]):
+    f = os.path.join(B.SEG20, str(tag) + '.npz')
+    if not os.path.exists(f):
+      f = os.path.join(DATA_DIR, 'cache', 'model', str(tag) + '.npz')     # model_cache.py: the same preview read from the rlog
+    if not os.path.exists(f):
+      continue
+    with np.load(f, allow_pickle=False) as z:
+      if 'pred_la' not in z.files or z['pred_la'].shape[0] != int(b - a):
+        continue
+      if out is None:
+        pt = z['pred_t'].astype(float)
+        out = np.full((n, len(pt)), np.nan, np.float32)
+      out[int(a):int(b)] = z['pred_la']
+  return pt, out
+
+
 def one(args):
   drive, mempath = args
   mem = _mem(mempath)

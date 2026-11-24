@@ -47,6 +47,65 @@ def model_curvature(m):
     return None
 
 
+MAP_PARAM = "MapCurvatures"     # written by the map service (pfeiferj mapd v1.12.0, ~1 Hz) to /dev/shm/params: a JSON list of
+MAP_FILE = "/dev/shm/params/d/" + MAP_PARAM   # {"latitude", "longitude", "curvature" (1/m, unsigned, 3-node average)} for the nodes of the
+MAP_STALE_S = 3.0               # current way from its first node in the direction of travel, then the ways it predicts next
+MAP_MATCH_M = 30.0              # the car must be within this of the map's polyline ...
+MAP_HDG_DEG = 45.0              # ... on a piece pointing within this of the car's heading, or the map has no opinion
+EARTH_R = 6371000.0
+
+
+def map_profile(raw, age_s, lat, lon, bearing_deg):
+  """The map service's curvature list as (metres along the road from the car, |curvature|), for the planner; None (no map opinion) when
+  missing, older than MAP_STALE_S, unreadable, or not matched to the car (no polyline piece within MAP_MATCH_M pointing its way).
+  Positions are used here only and never leave this function."""
+  try:
+    if raw is None or age_s is None or not (0.0 <= age_s <= MAP_STALE_S):
+      return None
+    pts = json.loads(raw)
+    if not isinstance(pts, list) or len(pts) < 2:
+      return None
+    la = [float(p["latitude"]) for p in pts]
+    lo = [float(p["longitude"]) for p in pts]
+    ks = [abs(float(p["curvature"])) for p in pts]
+    if not all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
+      return None
+    cl = math.cos(math.radians(lat))
+    xs = [math.radians(b - lon) * cl * EARTH_R for b in lo]
+    ys = [math.radians(a - lat) * EARTH_R for a in la]
+    hx, hy = math.sin(math.radians(bearing_deg)), math.cos(math.radians(bearing_deg))
+    cum = [0.0]
+    for i in range(len(xs) - 1):
+      cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+    best = None
+    for i in range(len(xs) - 1):
+      dx, dy = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
+      L = math.hypot(dx, dy)
+      if L < 0.1 or (dx * hx + dy * hy) / L < math.cos(math.radians(MAP_HDG_DEG)):
+        continue
+      tt = max(0.0, min(1.0, -(xs[i] * dx + ys[i] * dy) / (L * L)))
+      lat_m = math.hypot(xs[i] + tt * dx, ys[i] + tt * dy)
+      if lat_m <= MAP_MATCH_M and (best is None or lat_m < best[0]):
+        best = (lat_m, cum[i] + tt * L)
+    if best is None:
+      return None
+    d = [c - best[1] for c in cum]
+    keep = [j for j in range(len(d)) if d[j] >= -30.0 and (j == 0 or cum[j] > cum[j - 1])]
+    if len(keep) < 2:
+      return None
+    return [d[j] for j in keep], [ks[j] for j in keep]
+  except Exception:
+    return None
+
+
+def map_age_s(path=MAP_FILE, now=None):
+  """Seconds since the map service last wrote its list (file time on tmpfs); None when absent."""
+  try:
+    return (time.time() if now is None else now) - os.path.getmtime(path)
+  except OSError:
+    return None
+
+
 LIMIT_MAX_AGE_S = 2.0           # frogpilotPlan must have been received within this (it is published at 20 Hz)
 LIMIT_MAX_BELOW_MPH = 15.0      # a limit more than this below OR above the car's speed is implausible (a stale or wrong value)
 
