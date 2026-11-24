@@ -10,6 +10,13 @@ import math
 CAR_HALF_WIDTH = 0.92        # m
 DRIFT_CLEARANCE = 0.30       # m: car's side within this of a visible line (or over it) counts as drifting
 MIN_LINE_PROB = 0.5
+# Review I2 (2026-11-24): in a turn the evidence is taken on the OUTSIDE of the turn (the side the car runs wide toward), from the
+# outside lane line OR the outside road edge, and fails OPEN when neither is seen with confidence, whatever the inside line shows.
+# Turn direction: the sign of openpilot's desired curvature, RIGHT positive in this fork's convention (as the lane-line y: the
+# device frame, y to the right; ti_curve_plan.MODEL_K_SIGN): curvature > 0 is a right turn (outside = LEFT), < 0 a left turn
+# (outside = RIGHT). Below STRAIGHT_CURVATURE it is a straight: either line, as before.
+STRAIGHT_CURVATURE = 2e-4    # 1/m (a 5 km radius)
+MAX_EDGE_STD = 0.5           # m: a road edge is "seen with confidence" when the model's own std for it is at most this
 
 
 def side_clearances(model):
@@ -26,10 +33,37 @@ def side_clearances(model):
   return left, right
 
 
-def lane_drift_evidence(model):
-  """True if a visible lane line is close to or under the car's side. Fails OPEN (True) when no line is
-  visible, because then there is no evidence the car is holding its lane either."""
+def edge_clearances(model):
+  """(left, right) clearance in metres from the car's side to each road edge seen with confidence (std <= MAX_EDGE_STD); None
+  for an edge not seen. Negative means the car's side is past the edge."""
+  try:
+    edges, stds = model.roadEdges, model.roadEdgeStds
+    left_y, right_y = edges[0].y[0], edges[1].y[0]
+    left_s, right_s = stds[0], stds[1]
+  except (AttributeError, IndexError, TypeError):
+    return None, None
+  left = (-left_y - CAR_HALF_WIDTH) if (math.isfinite(left_y) and math.isfinite(left_s) and left_s <= MAX_EDGE_STD) else None
+  right = (right_y - CAR_HALF_WIDTH) if (math.isfinite(right_y) and math.isfinite(right_s) and right_s <= MAX_EDGE_STD) else None
+  return left, right
+
+
+def lane_drift_evidence(model, curvature=None):
+  """True if the car's side is close to or over a line it may be running wide toward. In a turn (|curvature| at least
+  STRAIGHT_CURVATURE, openpilot's desired curvature, RIGHT positive): the OUTSIDE lane line or the OUTSIDE road edge within
+  DRIFT_CLEARANCE; FAILS OPEN (True) when neither is seen with confidence, whatever the inside line shows (review I2). On a straight
+  (or curvature unknown): any visible line, failing open when none is visible (as before)."""
   left, right = side_clearances(model)
+  try:
+    k = float(curvature) if curvature is not None else None
+  except (TypeError, ValueError):
+    k = None
+  if k is not None and math.isfinite(k) and abs(k) >= STRAIGHT_CURVATURE:
+    e_left, e_right = edge_clearances(model)
+    out = (left, e_left) if k > 0 else (right, e_right)      # right turn: runs wide to the LEFT; left turn: to the RIGHT
+    seen = [c for c in out if c is not None]
+    if not seen:
+      return True
+    return min(seen) < DRIFT_CLEARANCE
   seen = [c for c in (left, right) if c is not None]
   if not seen:
     return True

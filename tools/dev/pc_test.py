@@ -52,6 +52,7 @@ CURVE_TESTS = (
 # --all: every suite the car-side work touches that runs on the PC.
 ALL_GLOBS = (
   "selfdrive/car/tests/test_mazda_ti*.py",
+  "selfdrive/car/tests/test_lane_drift_alerts.py",
   "tools/curve_slowing/test_*.py",
   "selfdrive/controls/lib/tests/test_*.py",
   "selfdrive/controls/tests/test_alerts.py",

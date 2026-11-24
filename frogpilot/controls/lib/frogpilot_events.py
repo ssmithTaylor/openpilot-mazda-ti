@@ -257,7 +257,7 @@ class FrogPilotEvents:
     runwide_now = (lat_active and ti_now and at_ceil
                    and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
                    and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT
-                   and lane_drift_evidence(sm["modelV2"]))   # at the limit alone is normal on held bends: needs a line close or crossed
+                   and lane_drift_evidence(sm["modelV2"], sm["controlsState"].desiredCurvature))   # at the limit alone is normal on held bends: needs a line close or crossed
     self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
     if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
         and getattr(frogpilot_toggles, "steer_authority_advisory", True)):

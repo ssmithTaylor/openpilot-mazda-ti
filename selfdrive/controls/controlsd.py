@@ -857,7 +857,7 @@ class Controls:
       # TAKE_CONTROL_HOLD_S = 0.7 s held here): on the 2026-11-23 drive the 14 clips at the TI limit lasted 0.13-6.1 s; 1.5 s chimes for the 4 longest
       # (2.0, 2.1, 2.8, 6.1 s), about 4.5 s before the end of the 6.1 s one, and never for the brief clips at corner entry
       # owner, 2026-11-23: at the limit on a bend the car holds is normal; the alert also needs a lane line close to or under the car's side
-      held = lac_log.saturated and undershooting and turning and lane_drift_evidence(model_v2)
+      held = lac_log.saturated and undershooting and turning and lane_drift_evidence(model_v2, model_v2.action.desiredCurvature)
       self.sat_alert_frames = self.sat_alert_frames + 1 if held else 0
       if held and self.sat_alert_frames * DT_CTRL >= TAKE_CONTROL_HOLD_S:
         if self.frogpilot_toggles.goat_scream_alert:
