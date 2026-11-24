@@ -58,8 +58,11 @@ CONFIRM_LEAD_S = 6.0
 CONFIRM_TICKS = 2
 FORK_CONFIRM_S = 3.0
 LATE_SHED_MPH = 5
-S1_MIN_PASSES = 3               # R15 (A15): stage 1 acts only on remembered points with at least this many passes (Memory.npass);
-#                                 a bend whose constraining points have fewer is left to stage 2 and the warning
+S1_MIN_PASSES = 1               # the owner's standing rule (RULES.md, 2026-11-23): "One pass is enough for full slowing; phantom
+#                                 protection comes from the pass-quality filters only". R15 (A15: at least 3 passes) contradicted it
+#                                 and is undone; the per-point mechanism stays so the alternative can be measured and switched here:
+#                                 above 1, stage 1 acts only on remembered points with at least this many passes (Memory.npass), and a
+#                                 bend whose constraining points have fewer is left to stage 2 and the warning
 BLINKER_HOLD_S = 2.0            # assumption (not in the plan's table)
 S2_TAP_LAG_S = 0.5             # the warning's stage-2 prediction: plan read and first tap after confirmation (assumption)
 S2_MIN_MPH = 20.0               # never act below 19-20 mph (the cruise and the comma engage from ~19)
@@ -84,11 +87,14 @@ CONFIRM_SHARE = 0.6
 # the cap to its end ("s1_unconfirmed"; the warning covers the rest). A bend started with no preview able to confirm it (none: the
 # model not running; or one shorter than CONFIRM_LEAD_S, which could never reach the entry at the decision) has nothing to wait for:
 # no cap, decided at CONFIRM_LEAD_S as before.
+# ONE switch (the owner is to be asked): None = no cap (stage 1 walks its full graded ramp from the start, as before R16).
 S1_UNCONFIRMED_MAX_MPH = 5
 
 
 def s1_unconfirmed_ceiling(u0_mph):
-  """R16: the lowest dash set speed stage 1 asks for before its bend is confirmed, for a start at u0_mph."""
+  """R16: the lowest dash set speed stage 1 asks for before its bend is confirmed, for a start at u0_mph; None with the cap off."""
+  if S1_UNCONFIRMED_MAX_MPH is None:
+    return None
   return int(math.ceil(float(u0_mph) - 1e-6)) - S1_UNCONFIRMED_MAX_MPH
 
 
@@ -712,8 +718,9 @@ class Planner:
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
-    aim_at, S1, buf, cap, side}. npass: the passes behind each look-ahead point (memory; None: the map), R15: only points with at
-    least S1_MIN_PASSES constrain stage 1, and a bend with none such is not stage 1's."""
+    aim_at, S1, buf, cap, side}. npass: the passes behind each look-ahead point (memory; None: the map); with S1_MIN_PASSES above 1
+    (R15, off by default: the owner's one-pass rule) only points with at least that many constrain stage 1, and a bend with none such
+    is not stage 1's."""
     cands = {}
     tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
     if not len(tight):
@@ -728,8 +735,8 @@ class Planner:
       key = key_of(run)
       if key is None or key in self.released:
         continue
-      if npass is not None:
-        ok = npass[run] >= S1_MIN_PASSES          # R15: only remembered points with the evidence constrain stage 1
+      if npass is not None and S1_MIN_PASSES > 1:
+        ok = npass[run] >= S1_MIN_PASSES          # R15 (off at 1): only remembered points with the evidence constrain stage 1
         if not ok.any():
           continue
       else:

@@ -112,3 +112,14 @@ def test_profile_stop_walks_back_up_and_tap_cycle():
   # unchanged by default
   c = E.Profile(45.0, 30, S1=24)
   assert c.t_arr == pytest.approx(E.Profile(45.0, 30, S1=24, cap=None, stop_t=None, tap_s=None).t_arr)
+
+
+def test_options_switch_min_passes_and_unconfirmed_cap():
+  # Job 1 measurement: the replay switches S1_MIN_PASSES and S1_UNCONFIRMED_MAX_MPH (None = no cap) in a stand-in module only
+  m = NS(S1_MIN_PASSES=1, S1_UNCONFIRMED_MAX_MPH=5, CONFIRM_SHARE=0.6, MIN_DROP_MPH=2)
+  U.apply_options(m)
+  assert (m.S1_MIN_PASSES, m.S1_UNCONFIRMED_MAX_MPH) == (1, 5)          # nothing given: unchanged
+  U.apply_options(m, min_passes=3, unconfirmed_cap=None)
+  assert (m.S1_MIN_PASSES, m.S1_UNCONFIRMED_MAX_MPH) == (3, None)
+  U.apply_options(m, unconfirmed_cap=5)
+  assert m.S1_UNCONFIRMED_MAX_MPH == 5

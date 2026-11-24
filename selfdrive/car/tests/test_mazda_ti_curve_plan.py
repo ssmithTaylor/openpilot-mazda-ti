@@ -488,11 +488,29 @@ def test_alert_when_behind_plan_and_not_when_reachable():
   assert not any(p.alert_mph for t, s, p, v in res)
 
 
-def test_r15_stage1_needs_3_passes_at_the_constraining_points():
-  # R15 (A15) replaces test_single_pass_corner_is_slowed_for_like_any_other (owner 2026-11-23: no single-pass trim; it asserted a
-  # one-pass corner got its full stage-1 need, 39): stage 1 now acts only where the remembered points have S1_MIN_PASSES (3) passes;
-  # with fewer the bend is left to stage 2 (no preview here: nothing) and the warning, which still sounds
-  assert P.S1_MIN_PASSES == 3
+def test_single_pass_corner_is_slowed_for_like_any_other():
+  # owner, 2026-11-23 (RULES.md): "One pass is enough for full slowing; phantom protection comes from the pass-quality filters only".
+  # A corner from one pass gets its full need (within the floor), model or not. (Restored: R15 had replaced this test; R15 is undone.)
+  assert P.S1_MIN_PASSES == 1
+  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
+  want = max(D.need_mph(CORNER_K)[0], 50 - 15)
+  for mf in (None, road_preview(tr, 50)):
+    mem = _mem_n(tr, 1)
+    res = drive(mem, tr, 50, 120, planner=P.Planner(mem), model_fn=mf)
+    corner = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner" and p.stage in (1, 2)]
+    assert corner and min(corner) == want, mf
+    # exactly as a 20-pass corner
+    mem20 = _mem_n(tr, 20)
+    res20 = drive(mem20, tr, 50, 120, planner=P.Planner(mem20), model_fn=mf)
+    assert [p.ceil for _, _, p in res] == [p.ceil for _, _, p in res20], mf
+
+
+@pytest.mark.parametrize("min_passes", [3])
+def test_r15_mechanism_min_passes_at_the_constraining_points(monkeypatch, min_passes):
+  # the R15 mechanism (OFF by default: S1_MIN_PASSES = 1, the owner's rule) still works when switched on: stage 1 acts only where the
+  # remembered points have S1_MIN_PASSES passes; with fewer the bend is left to stage 2 (no preview here: nothing) and the warning,
+  # which still sounds
+  monkeypatch.setattr(P, "S1_MIN_PASSES", min_passes)
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   want = max(D.need_mph(CORNER_K)[0], 50 - 15)
   for n, slowed in ((1, False), (2, False), (3, True), (20, True)):
@@ -929,6 +947,32 @@ def _preview_reach(tr, v_mph, reach_s):
     ts, k = f(t, s)
     return ts[ts <= reach_s + 1e-9], k[ts <= reach_s + 1e-9]
   return g
+
+
+def test_r16_switch_none_means_no_cap(monkeypatch):
+  # S1_UNCONFIRMED_MAX_MPH is ONE switch: None = no cap (stage 1's full graded ramp from the start, as before R16). Same road as the
+  # R16 test below: with the cap off a preview showing a STRAIGHT road (never confirmed, released at CONFIRM_LEAD_S) lets the dash go
+  # below start - 5 before the release; with the cap on it never does
+  monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", None)
+  assert P.s1_unconfirmed_ceiling(45.0) is None
+  k, T = k_needing(24), 30
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 45))
+  assert "s1_release" in [e["kind"] for e in pl.events]
+  assert all(a_.get("cap_c") is None for a_ in pl.active.values())
+  assert min(p.ceil for t, s, p, v in res if p.ceil is not None and p.kind == "corner") < 45 - 5   # uncapped: deeper before the release
+  # confirmed bend, cap off: the full ramp, on time, exactly one start and one confirmation
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(tr, 45))
+  assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.5
+  # with the cap on (the default) the same never-confirmed case keeps the dash at or above start - 5
+  monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", 5)
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 45))
+  assert min(p.ceil for t, s, p, v in res if p.ceil is not None and p.kind == "corner") >= 45 - 5
+  assert min(v for t, s, p, v in res if s <= 1650) >= 45 - P.S1_UNCONFIRMED_MAX_MPH - 0.5
 
 
 def test_r16_unconfirmed_sheds_at_most_5_confirmed_gets_the_full_ramp():

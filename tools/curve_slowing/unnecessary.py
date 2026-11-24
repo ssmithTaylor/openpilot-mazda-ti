@@ -21,7 +21,8 @@ Evidence rules: car-steered passes only; headline figures on standard builds (th
 alongside. Output is POSITION-FREE: route, segment, seconds, speeds, counts.
 
   python tools/curve_slowing/unnecessary.py [--mem FILE] [--drives D ...] [--workers 3] [--confirm-share 0.6] [--cap-scale 1.0]
-                                            [--min-drop 2] [--planner FILE] [--out JSON] [--list]
+                                            [--min-drop 2] [--min-passes 1] [--unconfirmed-cap 5|none] [--planner FILE]
+                                            [--out JSON] [--list]
 """
 import argparse
 import importlib.util
@@ -93,11 +94,18 @@ def planner_module(path=None):
   return mod
 
 
-def apply_options(Pm, confirm_share=None, cap_scale=1.0, min_drop=None):
+_UNSET = object()
+
+
+def apply_options(Pm, confirm_share=None, cap_scale=1.0, min_drop=None, min_passes=None, unconfirmed_cap=_UNSET):
   """The sweep's settings (in this worker process only): CONFIRM_SHARE (stage 1's release), a scale on capacity (every need and
-  release judgement), MIN_DROP_MPH."""
+  release judgement), MIN_DROP_MPH, S1_MIN_PASSES (R15's mechanism), S1_UNCONFIRMED_MAX_MPH (R16's switch; None = no cap)."""
   if confirm_share is not None and hasattr(Pm, 'CONFIRM_SHARE'):
     Pm.CONFIRM_SHARE = float(confirm_share)
+  if min_passes is not None and hasattr(Pm, 'S1_MIN_PASSES'):
+    Pm.S1_MIN_PASSES = int(min_passes)
+  if unconfirmed_cap is not _UNSET and hasattr(Pm, 'S1_UNCONFIRMED_MAX_MPH'):
+    Pm.S1_UNCONFIRMED_MAX_MPH = None if unconfirmed_cap is None else int(unconfirmed_cap)
   if min_drop is not None:
     Pm.MIN_DROP_MPH = int(min_drop)
   if cap_scale and abs(cap_scale - 1.0) > 1e-9 and Pm is P:
@@ -270,7 +278,8 @@ def account_row(x, Pm, s, v, kap, can_start, stop, s_end, opts):
 def replay_drive(args):
   drive, mempath, opts = args
   Pm = planner_module(opts.get('planner'))
-  apply_options(Pm, opts.get('confirm_share'), opts.get('cap_scale', 1.0), opts.get('min_drop'))
+  apply_options(Pm, opts.get('confirm_share'), opts.get('cap_scale', 1.0), opts.get('min_drop'), opts.get('min_passes'),
+                opts['unconfirmed_cap'] if 'unconfirmed_cap' in opts else _UNSET)
   mem = _mem(mempath)
   new = Pm is P
   sig = inspect.signature(Pm.Planner.step).parameters
@@ -591,11 +600,15 @@ def main():
   ap.add_argument('--planner', default='', help='an older ti_curve_plan saved as a file (A5: the build on the car)')
   ap.add_argument('--no-s3', action='store_true')
   ap.add_argument('--tap-s', type=float, default=None, help='the tap cycle the replay cruise model walks the dash with (R17; the planner is unchanged)')
+  ap.add_argument('--min-passes', type=int, default=None, help='S1_MIN_PASSES (default: the planner value, 1)')
+  ap.add_argument('--unconfirmed-cap', default=None, help='S1_UNCONFIRMED_MAX_MPH: a whole mph, or "none" for no cap (default: the planner value)')
   ap.add_argument('--out', default='')
   a = ap.parse_args()
   drives = a.drives or G.drives()
   opts = dict(confirm_share=a.confirm_share, cap_scale=a.cap_scale, min_drop=a.min_drop, planner=a.planner or None, no_s3=a.no_s3,
-              tap_s=a.tap_s)
+              tap_s=a.tap_s, min_passes=a.min_passes)
+  if a.unconfirmed_cap is not None:
+    opts['unconfirmed_cap'] = None if a.unconfirmed_cap.lower() == 'none' else int(a.unconfirmed_cap)
   R = run(drives, a.mem, opts, a.workers)
   rep = dict(options={k: v for k, v in opts.items()}, memory=os.path.basename(a.mem), drives=len(drives),
              standard=score(R, True), all_builds=score(R, False), must_catch=must_catch(R))
