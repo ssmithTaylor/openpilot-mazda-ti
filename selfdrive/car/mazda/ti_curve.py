@@ -179,6 +179,27 @@ class Inputs(NamedTuple):
   desired_la: Optional[float] = None   # the controller's desired lateral acceleration now (v^2 x desired curvature), None unknown
 
 
+_PLAN_NUM = ("ceil", "corner", "dist", "end", "need", "limit", "model_k", "alert", "conf", "model_la")
+_PLAN_FLAG = ("trusted", "known", "past", "capped", "behind")
+
+
+def plan_valid(plan):
+  """Review (minor): the planner's message as the car side may use it: a dict whose number fields are None or finite numbers (not
+  bool) and whose flags are None or bool / 0 / 1. Anything else (a string `ceil`, a NaN) is treated as no planner output."""
+  if not isinstance(plan, dict):
+    return False
+  for k in _PLAN_NUM:
+    v = plan.get(k)
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)):
+      return False
+  for k in _PLAN_FLAG:
+    v = plan.get(k)
+    if v is not None and not (isinstance(v, bool) or v in (0, 1)):
+      return False
+  kind = plan.get("kind")
+  return kind is None or isinstance(kind, str)
+
+
 class Curve:
   def __init__(self, hold=None):
     self.state = "off"
@@ -359,6 +380,11 @@ class Curve:
   # ---- one frame ----------------------------------------------------------------------------------------------------------------
   def step(self, frame, inp):
     """The button to send this frame: None, "SET_MINUS" or "SET_PLUS"."""
+    if inp.plan is not None and not plan_valid(inp.plan):
+      inp = inp._replace(plan=None, plan_age=None)   # malformed: as no planner output (the late / dead path, which restores)
+      if not getattr(self, "bad_plan_logged", False):
+        self.bad_plan_logged = True
+        self._ev("plan_invalid", frame)
     t = frame * DT
     btn = bool(inp.driver_button)
     set_changed = inp.set_mph != self.set_last

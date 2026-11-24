@@ -179,7 +179,7 @@ TI_FEEDBACK_ADDR, TI_FEEDBACK_BUS = 0x24A, 1
 CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
-             "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu")
+             "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms")
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
 
 
@@ -467,7 +467,11 @@ def main():
                     ti=list(ti_fb) if ti_fb is not None and t - ti_t < 0.5 else None, ln=lane_summary(sm["modelV2"]),
                     drv=(DRV_PRESSED * bool(cs.steeringPressed) | DRV_BRAKE * bool(cs.brakePressed) | DRV_GAS * bool(cs.gasPressed) |
                          DRV_BUTTON * bool(len(cs.buttonEvents)) | DRV_LBLINK * bool(cs.leftBlinker) | DRV_RBLINK * bool(cs.rightBlinker)),
-                    tq=int(round(float(cs.steeringTorque))), cpu=cpu_us)
+                    tq=int(round(float(cs.steeringTorque))), cpu=cpu_us,
+                    # review (minor): the CAN frame lacc / ti were last read from may be up to 0.5 s old (only the latest can message
+                    # of each update is read): their age in ms, so a tick never reports a stale value as current
+                    lacc_ms=int(round((t - lacc_t) * 1000)) if t - lacc_t < 0.5 else None,
+                    ti_ms=int(round((t - ti_t) * 1000)) if ti_fb is not None and t - ti_t < 0.5 else None)
       if mk != last_map:
         extras["map"] = mk or []
         last_map = mk

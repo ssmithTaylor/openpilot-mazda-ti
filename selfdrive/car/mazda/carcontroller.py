@@ -838,7 +838,7 @@ class CarController(CarControllerBase):
         return self._curve_exit_only(CC, CS)   # the exit, then the set-speed-left alert until the driver acts (review I4)
       return None
     mon = None
-    if getattr(self, "curve_mon_ok", True):
+    if getattr(self, "curve_mon_ok", True) and (self.curve_on or cv.state != "off"):   # OFF: no stage-3 work, no events (review)
       try:
         mon = self._curve_monitor(CC, CS, ti_apply_steer)
       except Exception:

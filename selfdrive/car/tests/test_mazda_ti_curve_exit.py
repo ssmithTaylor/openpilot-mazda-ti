@@ -324,3 +324,22 @@ def test_i4_no_alert_once_back_or_after_a_driver_button_or_a_brake_restore():
 def test_i4_closed_loop_exit_failure_leaves_the_alert_until_the_driver_acts():
   car, cv, ex, st, lo, hi, fl, _ = _drive("no_response", 6, keep_ignoring=True)
   assert ex.result == "failed" and C.set_left(cv, ex, car.set) == (car.set, 55)
+
+
+# ---- review minor items (2026-11-24) ------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("bad", [{"ceil": "40"}, {"ceil": float("nan")}, {"trusted": "yes"}, {"dist": [1]}, {"kind": 3}])
+def test_malformed_plan_never_raises_and_takes_the_dead_path_which_restores(bad):
+  car, cv = T.Car(55.0, 55), C.Curve()
+  T.run(cv, car, 2500, lambda f, c: T.plan(45, corner=45))
+  assert car.set == 45
+  T.run(cv, car, 9000, lambda f, c: dict(T.plan(45, corner=45), **bad), start=2500)    # malformed from now on
+  assert any(e["kind"] == "plan_invalid" for e in cv.events)
+  assert car.set == 55                                                               # restored past the corner (dead path)
+
+
+def test_monitor_does_no_work_and_logs_nothing_while_off(monkeypatch):
+  cc, mem, CC, CS, clock = _cc({}, monkeypatch)
+  calls = []
+  monkeypatch.setattr(type(cc), "_curve_monitor", lambda self, *a: calls.append(1))
+  _frames(cc, CC, CS, clock, 300, set_mph=[55])
+  assert not calls and cc.curve.state == "off"
