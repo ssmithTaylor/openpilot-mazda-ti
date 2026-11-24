@@ -256,3 +256,71 @@ def test_internal_error_mid_push_runs_the_exit_without_the_curve(monkeypatch):
   assert cc.curve is None and cc.curve_exit.active
   _frames(cc, CC, CS, clock, 1500, k0=1, set_mph=setv)
   assert setv[0] == 40 and cc.curve_exit.result == "done"
+
+
+# ---- review I4 (2026-11-24): the on-road alert when a stopped feature left the set speed below the driver's -------------------------
+class _Mem:
+  def __init__(self):
+    self.d = {}
+
+  def get(self, k):
+    return self.d.get(k)
+
+  def put(self, k, v):
+    self.d[k] = v.encode() if isinstance(v, str) else v
+
+
+def _alert_text(mem, now):
+  from types import SimpleNamespace as NS
+  from openpilot.selfdrive.controls.lib import events as ev
+  val, _ = C.read_curve_code(mem, now)
+  if val is None:
+    return None
+  return ev.steer_authority_advisory_alert(NS(), NS(), {"frogpilotPlan": NS(steerAdvisorySpeed=val)}, False, 100, NS()).alert_text_1
+
+
+def _stopped(why, set_mph=40, ref=55, after_brake=False):
+  cv = C.Curve()
+  cv.state, cv.ref, cv.after_brake = "stopped", ref, after_brake
+  cv.why = why
+  return cv
+
+
+@pytest.mark.parametrize("why", ["set speed did not respond", "set speed changed to 33 mph unexpectedly", "road not matched",
+                                 "cruise check started"])
+def test_i4_each_stopped_state_raises_the_alert(why):
+  import json
+  import time
+  ex = C.SafeExit()
+  assert C.set_left(_stopped(why), ex, 40) == (40, 55)
+  mem, now = _Mem(), time.monotonic()
+  mem.put(C.PARAM_LEFT, json.dumps({"m": now, "who": "curve slowing", "now": 40, "was": 55}))
+  assert _alert_text(mem, now) == "CRUISE SET TO 40, WAS 55"
+  assert _alert_text(mem, now + C.LEFT_FRESH_S + 0.1) is None          # stale: gone
+
+
+def test_i4_internal_error_switch_off_and_failed_exit_raise_it_but_not_while_the_exit_runs():
+  ex = C.SafeExit()
+  ex.ref, ex.floor = 55, 40
+  assert C.set_left(None, ex, 34) == (34, 55)                          # the Curve gone (internal error)
+  cv = C.Curve()
+  cv.state, cv.ref, cv.off_note = "off", 55, "Set speed 34 mph (was 55): set it yourself"
+  assert C.set_left(cv, ex, 34) == (34, 55)                            # switched off, left lowered
+  ex.active = True
+  assert C.set_left(cv, ex, 34) is None                                # the exit still raising it: not yet
+  ex.active, ex.result = False, "failed"
+  assert C.set_left(cv, ex, 34) == (34, 55)                            # the exit's tap not read back: the driver is told
+
+
+def test_i4_no_alert_once_back_or_after_a_driver_button_or_a_brake_restore():
+  ex = C.SafeExit()
+  assert C.set_left(_stopped("set speed did not respond"), ex, 55) is None
+  assert C.set_left(_stopped("brake pressed", after_brake=True), ex, 40) is None    # restored by itself after RES
+  cv = C.Curve()
+  cv.state, cv.ref = "paused", 55                                      # the driver pressed a cruise button: their value stands
+  assert C.set_left(cv, ex, 40) is None
+
+
+def test_i4_closed_loop_exit_failure_leaves_the_alert_until_the_driver_acts():
+  car, cv, ex, st, lo, hi, fl, _ = _drive("no_response", 6, keep_ignoring=True)
+  assert ex.result == "failed" and C.set_left(cv, ex, car.set) == (car.set, 55)

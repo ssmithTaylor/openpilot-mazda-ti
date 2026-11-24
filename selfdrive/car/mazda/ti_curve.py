@@ -56,6 +56,9 @@ from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, FRAME_SPACING, HOLD
 PARAM_ON = "TiCurveOn"           # tmpfs, the page: "1" on for this drive, "0" / absent off
 PARAM_PLAN = "TiCurvePlan"       # tmpfs, the planner (ti_curve_plannerd.py): its output, 5 Hz
 PARAM_STATUS = "TiCurveStatus"   # tmpfs, the car controller: what the page shows, on change (at most 10 Hz) and every second
+PARAM_LEFT = "TiSetSpeedLeft"    # tmpfs, generic (review I4): {"m", "who", "now", "was"} while a stopped feature / test left the
+                                 # cruise set speed below the driver's; the on-road alert "CRUISE SET TO now, WAS was" reads it
+LEFT_FRESH_S = 1.5               # the record is rewritten every 0.5 s while it holds: older than this, it is gone
 PARAM_DELIVER = "TiCurveDeliver"  # tmpfs, the car controller: stage 3's alert {"m", "need", "why"} at onset, clear, and every 0.2 s
 GENTLE_TAP_S = 1.0               # stage 3 (ti_curve_monitor): at most one SET- per this, about 1 mph/s (plan A2)
 STATUS_EVERY = 100
@@ -1414,7 +1417,7 @@ def deliver_code(why):
 
 def read_curve_code(params_memory, now):
   """(steerAdvisorySpeed value of a fixed-text curve alert, its monotonic time) or (None, 0): stage 3's dropout / assist off
-  (TiCurveDeliver, fresh). I4's set-speed-left alert is added in its own commit."""
+  (TiCurveDeliver, fresh), else the set speed left lower than the driver's (TiSetSpeedLeft, fresh: review I4)."""
   import json
   try:
     raw = params_memory.get(PARAM_DELIVER)
@@ -1426,7 +1429,36 @@ def read_curve_code(params_memory, now):
         return alert_code_value(code), m
   except Exception:
     pass
+  try:
+    raw = params_memory.get(PARAM_LEFT)
+    d = json.loads(raw) if raw else None
+    if isinstance(d, dict) and isinstance(d.get("now"), int) and isinstance(d.get("was"), int) and d["now"] < d["was"]:
+      m = float(d.get("m", 0.0))
+      if now - m <= LEFT_FRESH_S:
+        return alert_code_value(CODE_SET_LEFT, d["now"], d["was"]), m
+  except Exception:
+    pass
   return None, 0.0
+
+
+def set_left(cv, ex, set_mph):
+  """Review I4: (now, was) while curve slowing has STOPPED with the cruise set speed below the driver's own (`ref`), or None. Stopped:
+  the stopped state (a set speed that did not respond / changed unexpectedly, the road not matched, the cruise check, ...) other than
+  a pedal / cruise-off stop it restores by itself (after_brake), switched off with the set speed left lowered, or the Curve gone after
+  an internal error; never while the safe exit is still raising it. Ends when the driver presses a cruise button (the Curve leaves
+  stopped / the off note is answered) or the set speed is back."""
+  if ex is not None and ex.active:
+    return None
+  ref = cv.ref if cv is not None else (ex.ref if ex is not None else None)
+  if set_mph is None or ref is None or int(set_mph) >= int(ref):
+    return None
+  if cv is None:
+    return int(set_mph), int(ref)
+  if cv.state == "stopped" and not cv.after_brake:
+    return int(set_mph), int(ref)
+  if cv.state == "off" and cv.off_note:
+    return int(set_mph), int(ref)
+  return None
 
 
 def curve_alert_mph(params_memory, now):

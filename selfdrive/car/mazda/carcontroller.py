@@ -834,7 +834,9 @@ class CarController(CarControllerBase):
     cv = self.curve
     ex = getattr(self, "curve_exit", None)
     if cv is None:
-      return self._curve_exit_only(CC, CS) if ex is not None and ex.active else None
+      if ex is not None and (ex.active or getattr(self, "curve_left", None) is not None):
+        return self._curve_exit_only(CC, CS)   # the exit, then the set-speed-left alert until the driver acts (review I4)
+      return None
     mon = None
     if getattr(self, "curve_mon_ok", True):
       try:
@@ -944,6 +946,7 @@ class CarController(CarControllerBase):
     try:
       inp = self._curve_inputs(CC, CS, time.monotonic(), None, None)
       b = curve_mod.run_frame(None, ex, self.frame, inp)
+      self._curve_left(None, ex, inp.set_mph)
       for ev in ex.events:
         ti_curve_log(ev)
       ex.events.clear()
@@ -963,9 +966,21 @@ class CarController(CarControllerBase):
         self.curve_exit = None
       return None
 
+  def _curve_left(self, cv, ex, set_mph):
+    """Review I4: write / clear the generic TiSetSpeedLeft record (who, now, was) for the on-road alert; at most every 0.5 s."""
+    left = curve_mod.set_left(cv, ex, set_mph)
+    if left is not None and (self.frame % 50 == 5 or getattr(self, "curve_left", None) != left):
+      self.params_memory.put(curve_mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": "curve slowing",
+                                                               "now": left[0], "was": left[1]}))
+    elif left is None and getattr(self, "curve_left", None) is not None:
+      self.params_memory.put(curve_mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": "curve slowing",
+                                                               "now": None, "was": None}))
+    self.curve_left = left
+
   def _curve_publish(self, cv, force=False):
     ex = getattr(self, "curve_exit", None)
     inp = getattr(self, "curve_inp_last", None)
+    self._curve_left(cv, ex, getattr(inp, "set_mph", None))
     mk = None if ex is None else ex.marker(cv, getattr(inp, "set_mph", None))
     ex_lines = (ex.line1, ex.line2) if ex is not None and ex.active else None
     key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph, json.dumps(mk), ex_lines)
