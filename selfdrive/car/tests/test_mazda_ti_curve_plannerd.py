@@ -194,3 +194,25 @@ def test_map_profile_never_returns_positions():
   assert -30.0 <= d[0] and d[-1] <= n * step_m                      # metres along the road from the car
   assert all(0.0 <= x <= 0.0031 for x in k)                          # |curvature| as given
   assert "lat" not in repr(out).lower() and "lon" not in repr(out).lower()
+
+
+def test_map_input_passes_the_profile_only_when_fresh_and_positioned(tmp_path):
+  # plan T6: plannerd passes map_k = map_profile(...) of the map service's list; None without a valid position, when the list is
+  # absent, or stale (older than MAP_STALE_S)
+  f = tmp_path / "MapCurvatures"
+  f.write_text(_map_json())
+
+  class PM:
+    def __init__(self, raw):
+      self.raw = raw
+
+    def get(self, key):
+      assert key == D.MAP_PARAM
+      return self.raw
+  now = f.stat().st_mtime + 0.5
+  mk = D.map_input(PM(_map_json().encode()), True, 0.0, 0.0, 0.0, now=now, path=str(f))
+  assert mk is not None and mk == D.map_profile(_map_json(), 0.5, 0.0, 0.0, 0.0)
+  assert D.map_input(PM(_map_json().encode()), False, 0.0, 0.0, 0.0, now=now, path=str(f)) is None
+  assert D.map_input(PM(None), True, 0.0, 0.0, 0.0, now=now, path=str(f)) is None
+  assert D.map_input(PM(_map_json().encode()), True, 0.0, 0.0, 0.0, now=now + D.MAP_STALE_S, path=str(f)) is None
+  assert D.map_input(PM(_map_json().encode()), True, 0.0, 0.0, 0.0, now=now, path=str(tmp_path / "absent")) is None

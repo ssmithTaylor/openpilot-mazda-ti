@@ -5,7 +5,7 @@ ti_curve.PARAM_PLAN for the car controller (ti_curve.py). It always runs while o
 plans and logs what it would have done; the car controller sends nothing).
 
 Reads: liveLocationKalman (position, heading, validity), carState (speed, set speed), modelV2 (the driving model's predicted curvature
-over the next seconds), frogpilotPlan.slcMapSpeedLimit (the road's speed limit from the offline maps; 0 = unknown), the car's yaw
+over the next seconds), the map service's curvature list (MAP_PARAM, as map_k: plan T6), frogpilotPlan.slcMapSpeedLimit (the road's speed limit from the offline maps; 0 = unknown), the car's yaw
 sensor from CAN 0x075 (bytes 4-5, -0.00017243 rad/s per count, offset 3.1032, right positive; the newest frame in the latest CAN
 batch, else liveLocationKalman's calibrated yaw rate). The road memory: MEMORY_PATH, copied to the device by hand (it is private: where
 the owner has driven); without it the planner publishes "no road memory on the device" and nothing happens.
@@ -104,6 +104,20 @@ def map_age_s(path=MAP_FILE, now=None):
     return (time.time() if now is None else now) - os.path.getmtime(path)
   except OSError:
     return None
+
+
+def map_input(params_memory, ok, lat, lon, bearing_deg, now=None, path=MAP_FILE):
+  """The planner's map_k (plan T6): map_profile of the map service's list when the position is valid (ok), else None. Absent, stale
+  (older than MAP_STALE_S) or unmatched: None (no map stage). Positions stay here and in map_profile."""
+  if not ok:
+    return None
+  try:
+    raw = params_memory.get(MAP_PARAM)
+  except Exception:
+    return None
+  if isinstance(raw, bytes):
+    raw = raw.decode("utf-8", "replace")
+  return map_profile(raw, map_age_s(path, now), lat, lon, bearing_deg)
 
 
 LIMIT_MAX_AGE_S = 2.0           # frogpilotPlan must have been received within this (it is published at 20 Hz)
@@ -232,8 +246,12 @@ def main():
       except Exception:
         limit = None
       ref_mph, floor_mph, acting = car_side(params_memory, time.time(), tc)
+      map_k = None
+      if ok:
+        map_k = map_input(params_memory, ok, llk.positionGeodetic.value[0], llk.positionGeodetic.value[1],
+                          math.degrees(llk.calibratedOrientationNED.value[2]))     # plan T6: stage 1 where no memory is known
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit,
-                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting,
+                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k,
                           blinker=bool(cs.leftBlinker or cs.rightBlinker))     # stage 2 is off with a blinker (plan T5)
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")

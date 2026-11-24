@@ -1,4 +1,5 @@
 """Curve slowing planner (ti_curve_plan.py) on SYNTHETIC roads only (no recorded position is ever used in a test)."""
+import json
 import math
 
 import numpy as np
@@ -116,10 +117,25 @@ def test_a6_graded_10_percent_over_capacity_costs_about_2_mph():
   assert D.need_mph(kr)[0] == 42
   for kk in (k, kr):
     assert 2 <= 45 - D.need_mph(kk)[0] <= 3
+  # plan T6: a bend needing at most LATE_SHED_MPH off is stage 2's (late, forecast-confirmed), not the memory ramp's: with memory
+  # alone (no preview) nothing slows for it; with the preview showing it, stage 2 sets 42 (rewritten for T6: was the memory ramp)
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   res = drive(M.synthetic([tr]), tr, 45, 120)
+  assert not any(p.ceil is not None and p.kind == "corner" for _, _, p in res)
+  res = drive(M.synthetic([tr]), tr, 45, 120, model_fn=road_preview(tr, 45))
   ceils = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
-  assert ceils and min(ceils) == 42
+  assert ceils and min(ceils) == 42 and all(p.stage == 2 and p.src == "fc" for _, _, p in res if p.kind == "corner")
+
+
+def road_preview(tr, v_mph):
+  """model_fn for drive(): the model preview of the synthetic road ahead at v_mph, as the model publishes it (right positive,
+  under-read by FC_RATIO)."""
+  ahead = np.arange(0, 8.01, 0.25)
+
+  def f(t, s):
+    kk = np.array([tr["kap"][min(int(q // M.SPACING_M), len(tr["kap"]) - 1)] for q in s + ahead * v_mph * MPH])
+    return ahead, P.MODEL_K_SIGN * kk * np.interp(ahead, D.FC_LEAD_S, D.FC_RATIO)
+  return f
 
 
 def test_capacity_continuous_from_32():
@@ -133,15 +149,17 @@ def test_capacity_continuous_from_32():
 
 def test_need_from_median_not_sharpest():
   # plan T4: the planner plans from memory kap_med, never kap (the sharpest pass)
-  tr = road((1500, 0.0), (150, 0.006), (800, 0.0))
-  med = 0.004 * (tr["kap"] > 0)
+  # (values changed for plan T6, which leaves bends needing at most LATE_SHED_MPH off to stage 2: was kap 0.006 / kap_med 0.004,
+  # now a 60 -> 55 mph bend under R7; now kap 0.007 (41 mph, floor 45) / kap_med 0.0055 (47 mph, 13 off))
+  tr = road((1500, 0.0), (150, 0.007), (800, 0.0))
+  med = 0.0055 * (tr["kap"] > 0)
   mem = M.synthetic([tr], kap_med=[med])
   pl = P.Planner(mem)
   res = drive(mem, tr, 60, 120, planner=pl)
   ceils = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
-  assert ceils and min(ceils) == max(int(D.need_mph(0.004)[0]), 45)
-  assert int(D.need_mph(0.004)[0]) > int(D.need_mph(0.006)[0])
-  assert np.all(pl.need[tr["kap"] > 0] == D.need_mph(0.004)[0])
+  assert ceils and min(ceils) == max(int(D.need_mph(0.0055)[0]), 45) == 47
+  assert int(D.need_mph(0.0055)[0]) > max(int(D.need_mph(0.007)[0]), 45)
+  assert np.all(pl.need[tr["kap"] > 0] == D.need_mph(0.0055)[0])
 
 
 def test_no_kap_med_no_memory_stage():
@@ -476,9 +494,11 @@ def test_h1_floor_follows_the_drivers_current_set_speed_not_an_old_episode():
 
 
 def test_h3_an_ordinary_start_is_never_behind_and_never_warns():
+  # plan T6: at 45 mph this corner needs at most LATE_SHED_MPH off: stage 2's, which acts on the preview (now given to every run;
+  # without one nothing slows for it and the warning rightly sounds)
   for v in (45, 55, 65):
     tr, mem = single_corner()
-    res = drive(mem, tr, v, 200, closed=True)
+    res = drive(mem, tr, v, 200, closed=True, model_fn=road_preview(tr, v))
     assert not any(p.behind for t, s, p, vv in res), v
     assert not any(p.alert_mph for t, s, p, vv in res if not p.capped), v
 
@@ -800,3 +820,165 @@ def test_r8_behind_plan_predicts_with_the_push_and_raise_manoeuvre():
   res = drive(mem, tr, 55, 120, closed=True, planner=pl)
   assert any(p.kind == "corner" for t, s, p, v in res)
   assert calls and all(T is not None and T >= s1 for s1, T in calls)
+
+
+# ---- stage 1: early geometry, with release (plan T6, A3) ---------------------------------------------------------------------------
+def _reversals(xs):
+  """Direction changes of a sequence (ties ignored): [down, up, down] has 2."""
+  dirs = []
+  for a, b in zip(xs, xs[1:]):
+    d = (b > a) - (b < a)
+    if d and (not dirs or dirs[-1] != d):
+      dirs.append(d)
+  return max(0, len(dirs) - 1)
+
+
+def test_45_to_30_arrives_at_entry():
+  # plan T6 / section 4 risk 5: one ramp, the stage-1 part (no lower than T + 5) first, timed to arrive at the entry (the first
+  # point whose demand reaches ENTRY_LA at T): within T + 1.5 mph there, and no early dwell (<= 1 s) by the closed loop and by
+  # early_dwell.Profile
+  from openpilot.tools.curve_slowing import early_dwell as E
+  k = k_needing(25)
+  T = 30                                                       # the floor (45 - 15) binds
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  assert D.demand(T, k) >= P.ENTRY_LA                          # the entry is the bend's first point
+  res = drive(M.synthetic([tr]), tr, 45, 160, closed=True)
+  at_entry = next(v for t, s, p, v in res if s >= 1500)
+  assert at_entry <= T + 1.5, at_entry
+  i0 = next(i for i, (t, s, p, v) in enumerate(res) if p.kind == "corner")
+  assert res[i0][2].stage == 1 and res[i0][2].ceil == T + P.LATE_SHED_MPH
+  ss = np.array([s for t, s, p, v in res])
+  kap = np.array([tr["kap"][min(int(s // M.SPACING_M), len(tr["kap"]) - 1)] for s in ss])
+  # early_dwell's profile from this start, "arrived" at the planner's ARRIVED_MPH (plan A11), to where the bend first loads the car
+  prof = E.Profile(45, T, arrived=P.ARRIVED_MPH)
+  j = E.load_index(ss, kap, T, i0, 1650.0, DT)
+  dwell = prof.at(float(ss[j] - ss[i0]))[0] - prof.t_arr
+  assert dwell <= 1.0, dwell
+  # the stage-1 ceiling never goes below T + 5; after the hand-over (stage 2, same source) the ramp completes
+  stages = [(p.stage, p.ceil) for t, s, p, v in res if p.kind == "corner"]
+  assert all(c >= T + P.LATE_SHED_MPH for st, c in stages if st == 1)
+  assert any(st == 2 and c == T for st, c in stages) and all(p.src == "mem" for t, s, p, v in res if p.kind == "corner")
+
+
+def test_stage1_hands_over_to_stage2_without_a_step_or_reacceleration():
+  # plan T6: stage 1 (T + 5) hands over to stage 2 on the same ramp: one hand-over, the ceiling never rises before the push's
+  # model-timed raise, the speed never rises from the start to the corner's end, and the corner is made
+  k = k_needing(42)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  res = drive(M.synthetic([tr]), tr, 55, 160, closed=True, model_fn=road_preview(tr, 55))
+  T = int(D.need_mph(k)[0])
+  corner = [(t, s, p, v) for t, s, p, v in res if p.kind == "corner"]
+  st = [p.stage for t, s, p, v in corner]
+  assert st[0] == 1 and 2 in st and _reversals(st) == 0           # 1 ... 1 2 ... 2: one hand-over, never back
+  h = st.index(2)
+  ceils = [p.ceil for t, s, p, v in corner]
+  assert ceils[h] <= ceils[h - 1]                                 # no step up at the hand-over
+  lo = ceils.index(min(ceils))
+  assert all(b <= a for a, b in zip(ceils[:lo], ceils[1:lo + 1]))  # down only until the push's low point
+  vs = [v for t, s, p, v in res if corner[0][1] <= s <= 1650]
+  assert all(b <= a + 0.02 for a, b in zip(vs, vs[1:])), "sped up before the corner's end"
+  assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.0
+  assert not any(p.released for t, s, p, v in res)
+
+
+def test_release_at_6s_restores_and_no_reslow():
+  # plan T6 / section 4 risk 2: memory knows a bend the preview (reaching the entry) does not show: at the hand-over, CONFIRM_LEAD_S
+  # before the entry, it is released (Plan.released), the set speed is restored and the bend is not slowed for again; with a
+  # flickering forecast at most 1 down-up-down reversal per bend
+  k = k_needing(40)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  straight = road((3000, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(straight, 55))
+  ev = [e["kind"] for e in pl.events if e["kind"] in ("start", "s1_release", "s1_confirm")]   # (s1_handover may come first)
+  assert ev[:2] == ["start", "s1_release"] and "s1_confirm" not in ev, ev
+  rel = next((t, s, v) for t, s, p, v in res if p.released)
+  assert 0.0 <= 1500 - rel[1] <= P.CONFIRM_LEAD_S * rel[2] * MPH + 15.0, rel
+  assert all(p.ceil is None or p.kind == "hold" for t, s, p, v in res if rel[1] < s < 1650)
+  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, s, p, v in res]
+  assert _reversals(sets) <= 1                                   # down, up: never down again
+  assert max(v for t, s, p, v in res if 1500 <= s <= 1650) > 50     # restored by the (absent) bend
+  # flickering: the preview shows the remembered bend 0.6 s on, 0.6 s off
+  flick = road_preview(tr, 55)
+  flat = road_preview(straight, 55)
+  res = drive(mem, tr, 55, 160, closed=True, model_fn=lambda t, s: flick(t, s) if int(t / 0.6) % 2 else flat(t, s))
+  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, s, p, v in res if s <= 1650 + P.HOLD_AFTER_M]
+  assert _reversals(sets) <= 2                                   # at most one down-up-down
+
+
+def _map_profile(s, bend_at, bend_len, k):
+  d = np.arange(-30.0, 800.0, 10.0)
+  return d, np.where((s + d >= bend_at) & (s + d < bend_at + bend_len), abs(k), 0.0)
+
+
+def _drive_map(pl, mph, seconds, map_fn):
+  out = []
+  for i in range(int(seconds / DT)):
+    t = i * DT
+    s = mph * MPH * t
+    out.append((t, s, pl.step(t, P.Fix(False), mph * MPH, set_mph=mph, ref_mph=mph, map_k=map_fn(t, s))))
+  return out
+
+
+def test_map_absent_or_stale_no_map_stage():
+  # plan T6 / section 4 risk 3: the map acts (stage 1, src "map") where no memory is known; absent, or stale (plannerd's map_profile
+  # gives None), there is no map stage; with trusted memory the map is not used
+  from openpilot.selfdrive.car.mazda import ti_curve_plannerd as PD
+  k = 1 / 120.0
+  res = _drive_map(P.Planner(None), 45, 90, lambda t, s: _map_profile(s, 1500.0, 150.0, k))
+  m = [p for t, s, p in res if p.src == "map"]
+  assert m and all(p.trusted and p.stage in (1, 2) for p in m) and any(p.kind == "corner" for p in m)
+  assert min(p.ceil for p in m if p.kind == "corner") >= 30                  # the floor
+  res = _drive_map(P.Planner(None), 45, 90, lambda t, s: None)
+  assert all(p.ceil is None for t, s, p in res)
+  good = json.dumps([{"latitude": 0.0, "longitude": 0.0, "curvature": 0.0}, {"latitude": 0.001, "longitude": 0.0, "curvature": k}])
+  assert PD.map_profile(good, 0.5, 0.0, 0.0, 0.0) is not None and PD.map_profile(good, PD.MAP_STALE_S + 0.1, 0.0, 0.0, 0.0) is None
+  # the map going away mid-approach drops its ceiling
+  t_on = next(t for t, s, p in _drive_map(P.Planner(None), 45, 90, lambda t, s: _map_profile(s, 1500.0, 150.0, k))
+              if p.src == "map" and p.kind == "corner")
+  res = _drive_map(P.Planner(None), 45, 90, lambda t, s: _map_profile(s, 1500.0, 150.0, k) if t < t_on + 1.0 else None)
+  assert any(p.src == "map" for t, s, p in res) and all(p.ceil is None for t, s, p in res if t >= t_on + 1.0)
+  # trusted memory (a straight remembered road): the map's bend is ignored
+  tr = road((3000, 0.0))
+  pl = P.Planner(M.synthetic([tr]))
+  out = []
+  for i in range(int(45 / DT)):
+    t = i * DT
+    s = 45 * MPH * t
+    j = min(int(s // M.SPACING_M), len(tr["x"]) - 1)
+    out.append(pl.step(t, P.Fix(True, float(tr["x"][j]), float(tr["y"][j]), float(tr["hdg"][j])), 45 * MPH, set_mph=45, ref_mph=45,
+                       yaw_k=0.0, map_k=_map_profile(s, 1500.0, 150.0, k)))
+  assert any(p.trusted and p.known for p in out) and not any(p.src == "map" for p in out)
+
+
+def test_map_uses_lower_side_capacity():
+  # plan T6: map curvature is unsigned: the bend is judged on the LOWER side's capacity (side 0), whatever its real direction
+  k = 1 / 160.0
+  assert D.need_mph(-k)[0] < D.need_mph(k)[0]                  # right holds less here
+  T = max(int(D.need_mph(-k)[0]), 40)
+  res = _drive_map(P.Planner(None), 55, 75, lambda t, s: _map_profile(s, 1500.0, 150.0, k))
+  c = [p for t, s, p in res if p.src == "map" and p.kind == "corner"]
+  assert c and all(p.corner_mph == T for p in c)
+  assert c[0].cap == pytest.approx(D.capacity(T, D.UNKNOWN))
+
+
+def test_map_bend_must_persist_a3():
+  # plan A3: a map bend acts only once it has been shown 0 s (45 mph and below) rising linearly to 2.5 s (50 mph and above);
+  # a phantom shown less than that never acts
+  assert P.map_persist_s(45) == 0.0 and P.map_persist_s(40) == 0.0
+  assert P.map_persist_s(47.5) == pytest.approx(1.25) and P.map_persist_s(50) == 2.5 and P.map_persist_s(70) == 2.5
+  k = 1 / 100.0
+
+  def shown(t0, t1):
+    return lambda t, s: _map_profile(s, 1500.0, 150.0, k if t0 <= t < t1 else 0.0)
+  # at 60 mph the bend is first shown at 46 s, when its start is already due (about 270 m before it): acts 2.5 s later, not before
+  res = _drive_map(P.Planner(None), 60, 60, shown(46.0, 99.0))
+  first = next(t for t, s, p in res if p.src == "map")
+  assert first == pytest.approx(46.0 + 2.5, abs=DT + 1e-6), first
+  # a 2.1 s phantom at 60 mph never acts
+  res = _drive_map(P.Planner(None), 60, 60, shown(46.0, 48.1))
+  assert not any(p.src == "map" for t, s, p in res)
+  # at 45 mph the same 2.1 s showing acts at once (0 s persistence) when its start is due
+  res = _drive_map(P.Planner(None), 45, 80, shown(64.0, 66.1))
+  assert next(t for t, s, p in res if p.src == "map") == pytest.approx(64.0, abs=1e-6)

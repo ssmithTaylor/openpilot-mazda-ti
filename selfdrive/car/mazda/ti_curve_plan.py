@@ -57,9 +57,25 @@ CONFIRM_TICKS = 2
 FORK_CONFIRM_S = 3.0
 LATE_SHED_MPH = 5
 BLINKER_HOLD_S = 2.0            # assumption (not in the plan's table)
+S2_TAP_LAG_S = 0.5             # the warning's stage-2 prediction: plan read and first tap after confirmation (assumption)
 S2_MIN_MPH = 20.0               # never act below 19-20 mph (the cruise and the comma engage from ~19)
 FORK_NEAR_M = 30.0              # "memory straight" around the forecast's bend: no tight remembered point within this of its distance
 MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its sharpest curvature is at least this share of it
+# ---- stage 1: early geometry, with release (plan T6, A3, A6). Acts only on a bend needing MORE than LATE_SHED_MPH below the speed
+# (smaller ones are stage 2's). Its ceiling is T + LATE_SHED_MPH: the FIRST part of ONE ramp, timed (approach_m, the latest start) to
+# arrive at the entry; stage 1 hands over to stage 2 (Plan.stage 2, same source) as the dash comes within one tap of T + 5, so the
+# walk never pauses there (no early dwell, no step, no re-acceleration). Once per bend, CONFIRM_LEAD_S before its entry (distance /
+# speed), with a preview REACHING the entry, the bend is RELEASED when the calibrated forecast demand (peak over FC_LO_S ..
+# MODEL_LOOK_S, scaled to the target speed) is below CONFIRM_SHARE x its capacity (the bend is not there: a wrong map, a changed road):
+# the ceiling goes, the set speed is restored, and a released bend stays released until passed. Without such a preview it is never
+# released. Sources: trusted memory ("mem"); where no memory is known the map ("map": unsigned, so the LOWER side's capacity), a map
+# bend acting only once it has persisted map_persist_s (0 s up to MAP_PERSIST_LO_MPH, rising linearly to MAP_PERSIST_S at
+# MAP_PERSIST_HI_MPH and above: phantoms last <= 2.1 s); a missing or stale map (plannerd passes None) has no map stage.
+CONFIRM_SHARE = 0.6
+MAP_PERSIST_S = 2.5
+MAP_PERSIST_LO_MPH = 45.0
+MAP_PERSIST_HI_MPH = 50.0
+MAP_KEY_M = 40.0                # a map bend is the same bend from tick to tick while its end stays within this (odometer)
 HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if the next slowdown would start within this of now
 # The on-road warning (first drive, 2026-11-23: a corner needing ~35 mph was reached at 40 and the car crossed the lane line, with no
 # alert). Raised, once per corner, when the corner's own speed is below what the feature may (the floor) or can (behind plan) reach,
@@ -140,6 +156,11 @@ def approach_m(u, T, S1, dt=0.05, set0=None):
                          set0=float(key[3]))
   _APPROACH[key] = dist
   return dist
+
+
+def map_persist_s(mph):
+  """Plan A3: how long a map bend must have been shown before stage 1 acts on it."""
+  return MAP_PERSIST_S * min(1.0, max(0.0, (mph - MAP_PERSIST_LO_MPH) / (MAP_PERSIST_HI_MPH - MAP_PERSIST_LO_MPH)))
 
 
 def v_allow(D, T, S1, buf_s):
@@ -251,7 +272,7 @@ class Plan(NamedTuple):
   src: str = ""                   # "mem" / "map" / "fc" (forecast); "" with no ceiling
   ahead_la: Optional[float] = None  # signed (left +) peak calibrated forecast demand within AHEAD_S, m/s^2 (None: no preview)
   cap: Optional[float] = None     # the capacity (m/s^2) the limiting bend was judged against, at its target and side
-  released: bool = False          # stage 1 released by the forecast (plan T6; always False until then)
+  released: bool = False          # a bend ahead was released by the forecast (plan T6; kept until passed)
   diag: Optional[dict] = None     # small per-tick decision record for the tick log (plan T8); never a position
 
 
@@ -313,6 +334,8 @@ class Planner:
     self.s2 = None                      # stage 2 in force: T, need, u0 (the speed it began at), until (odometer), alert
     self.s2_run, self.s2_t0 = 0, 0.0    # consecutive ticks the forecast has shown a bend, and since when
     self.blink_t = -1e9
+    self.released = {}                  # plan T6: bend key -> its end (odometer); released by the forecast, kept until passed
+    self.map_active, self.map_bends, self.map_seq = {}, {}, 0   # the map stage's bends in progress / seen (A3 persistence)
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
   def _candidates(self, fix):
@@ -506,7 +529,8 @@ class Planner:
            map_k=None, blinker=False):
     """t: seconds (monotonic); fix: Fix; v: m/s; set_mph: the cruise set speed or None; yaw_k: live curvature (1/m, left +, from the
     car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview as it publishes it (RIGHT
-    positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (accepted; used from plan T6);
+    positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (ti_curve_plannerd.map_profile; None
+    when absent or stale), used by stage 1 only where no memory is known (plan T6);
     blinker: either turn signal on (suppresses stage 2). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
@@ -537,9 +561,11 @@ class Planner:
     mph = v / MPH
     if blinker:
       self.blink_t = t
+    self.released = {k: at for k, at in self.released.items() if self.odo <= at + HOLD_AFTER_M}
     if self.mem is None:
-      self._stage2(t, v, mph, set_mph, self._floor(floor_mph, ref_mph, set_mph, mph), None)
-      return self._out(None, 0.0, False, False, "no road memory on the device", None, None, model_la)
+      floor = self._floor(floor_mph, ref_mph, set_mph, mph)
+      self._stage2(t, v, mph, set_mph, floor, None)
+      return self._map_out(t, v, mph, set_mph, floor, ref_mph, map_k, model_la, 0.0, False, "no road memory on the device")
     self._localise(dt, fix, v)
     if self.locked and yaw_k is not None and self.odo >= self.distrust_until and self._check_change():
       self.distrust_until = self.odo + CHANGE_HOLDOFF_M
@@ -567,9 +593,13 @@ class Planner:
       self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
       self.alert = self._warn(list(self.latch.values()), mph, v, floor, acting, set_mph, lowering=False)
       self._stage2(t, v, mph, set_mph, floor, None)
-      return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
+      if untrusted[1]:
+        self.map_active, self.map_bends = {}, {}  # a remembered road is being matched here: no map (plan T6)
+        return self._out(None, untrusted[0], False, untrusted[1], untrusted[2], None, None, model_la)
+      return self._map_out(t, v, mph, set_mph, floor, ref_mph, map_k, model_la, untrusted[0], untrusted[1], untrusted[2])
 
     # ---- the corners ahead -------------------------------------------------------------------------------------------------------
+    self.map_active, self.map_bends = {}, {}     # trusted memory: the map is not used (plan T6: map only where no memory is known)
     u = max(mph, float(set_mph)) if set_mph else mph
     look = min(LOOKAHEAD_MAX_M, max(LOOKAHEAD_MIN_M, v * LOOKAHEAD_S))
     i0 = int(math.floor(self.pos))
@@ -588,120 +618,12 @@ class Planner:
     # tight against the speed now, the set speed, and (within a chain) the speed the chain started from, so a corner just after one
     # already slowed for still bounds the way back up (a "hold")
     u_ref = max(u, self.int_base or 0.0)
-    tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
-    # corners: runs of consecutive tight points; per run, its entry (entry_point), its lowest-speed point, and the guard points
-    cands = {}
-    if len(tight):
-      breaks = np.nonzero(np.diff(tight) > 1)[0]
-      starts = np.r_[0, breaks + 1]
-      ends = np.r_[breaks, len(tight) - 1]
-      kab = self.kabs[idx]
-      for s0, s1 in zip(starts, ends):
-        run = tight[s0:s1 + 1]
-        lowest = run[int(np.argmin(need[run]))]
-        # a corner is known by the END of its tight stretch: it stays the same while the car drives into the stretch (its first and
-        # lowest points ahead change as they are passed), so a corner is started once
-        key = int(idx[run[-1]])
-        # aimed at the corner's ENTRY (entry_point: the first point whose demand reaches ENTRY_LA at the corner's speed), not at the
-        # run's first point (a gentle lead-in). GUARD: every tight point before the entry is a constraint of its own at its own speed
-        # and distance, so the car is never planned to arrive at an earlier point faster than the capacity there allows. The lowest
-        # point (the first of equals at or after the entry) is always a constraint.
-        aim = entry_point(run, kab, int(shed_to[run].min()))
-        tied = run[(need[run] <= need[lowest]) & (run >= aim)]
-        lowest = int(tied[0]) if len(tied) else int(lowest)
-        pts = {int(aim), int(lowest)}
-        pts.update(int(j) for j in run[run < aim])
-        for j in sorted(pts):
-          T = int(shed_to[j])
-          D_ = float(dist[j]) - ENTRY_M
-          buf = BUFFER_S
-          if grade is not None and dist[j] > 0:
-            sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
-            g = float(np.degrees(np.nanmean(grade[sel]))) if len(sel) else 0.0
-            if math.isfinite(g) and g < -GRADE_STEEP_DEG:
-              buf += GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
-          S1 = max(floor, T - DRIVE_GAP_MPH)
-          va = v_allow(D_, T, S1, buf)
-          # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
-          # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
-          # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
-          due = bool(set_mph and set_mph > mph + SETTLE_MPH and
-                     approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D_ and
-                     approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D_)
-          c = cands.get(key)
-          if c is None or va < c["va"] or (due and not c["due"]):
-            side = D.LEFT if self.kmed[idx[j]] > 0 else D.RIGHT
-            cands[key] = {"T": T, "need": int(need[j]), "Tc": int(need[j]), "va": va, "D": D_, "due": due,
-                          "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]), "S1": S1, "buf": buf,
-                          "cap": D.capacity(T, side)}
-    # start: the car is at or above the highest speed from which it can still make it (or, below its set speed, the start is due)
-    for key, c in cands.items():
-      if key not in self.active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
-        self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
-                            "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"]}
-        self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
-                            "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
-    for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
-      self.events.append({"kind": "passed", "point": key, "T": self.active[key]["T"], "mph": round(mph, 1)})
-      del self.active[key]
-    ceil, cdist, cpt, kind, corner = None, None, -1, "", None
-    cap = None
-    need_true = None
-    cend = None
-    behind = False
-    for key, a_ in self.active.items():
-      c = cands.get(key)
-      va = c["va"] if c is not None else float(a_["T"])
-      mode = a_["mode"]
-      if c is not None and c["T"] < a_["T"]:
-        # A9-R2b: a lower constraint of this corner now binds: a corner "on target" for the higher one is pushed again
-        a_["T"] = c["T"]
-        if mode == "target":
-          mode = "push"
-      T = a_["T"]
-      S1 = max(floor, T - DRIVE_GAP_MPH)
-      late, on_plan = mph > va + BEHIND_MPH, mph <= va
-      if c is not None and set_mph and mode in ("push", "behind"):
-        # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
-        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting,
-        # with the SAME push-and-raise manoeuvre as the warning (R8, plan A12)
-        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True, T=T)
-        late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
-      if mode != "target":
-        if self._raise_due(mph, set_mph, T):
-          mode = "target"
-        elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
-          mode = "behind"
-        elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
-          mode = "coast"
-        elif mode == "behind" and on_plan:
-          mode = "push"
-        elif mode == "coast" and mph >= va - REPUSH_MPH:
-          mode = "push"
-      if mode != a_["mode"]:
-        self.events.append({"kind": "mode", "point": key, "mode": mode, "mph": round(mph, 1), "planned": round(va, 1), "T": T})
-        a_["mode"], a_["since"] = mode, t
-      cc = S1 if mode in ("push", "behind") else T
-      if mode == "behind":
-        behind = True
-      if ceil is None or cc < ceil:
-        ceil, cdist, cpt, kind, corner = cc, round(max(0.0, a_["entry"] - self.odo), 1), key, "corner", T
-        need_true = a_["Tc"]
-        cap = a_.get("cap")
-        cend = round(a_["at"] - self.odo, 1)
-    if not self.active:
-      # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
-      # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
-      hold = None
-      for key, c in cands.items():
-        need_m = approach_m(int(u_ref), c["T"], c["S1"]) + c["buf"] * u_ref * MPH
-        if (c["D"] - need_m) / max(v, 1.0) > HOLD_GAP_S:
-          continue
-        if hold is None or c["va"] < hold[0]:
-          hold = (c["va"], key, c)
-      if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
-        ceil, cdist, cpt, kind, corner = int(math.floor(hold[0])), round(hold[2]["D"], 1), hold[1], "hold", hold[2]["T"]
-        cap = hold[2]["cap"]
+    sign = np.sign(self.kmed[idx])
+    cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
+                             self.active, grade_of=None if grade is None else (lambda j: self._grade(grade, idx, dist, j)))
+    r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
+    ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
+    cap, need_true, cend, behind, stage = r["cap"], r["need"], r["end"], r["behind"], r["stage"]
     corners = self._corners(idx, dist, need, mph)
     # latch every corner within reach of the warning horizon (plus LATCH_EXTRA_S of driving) while the road is trusted, and keep it,
     # by the odometer, until the car is LATCH_PAST_M past its end: also through a wrong re-match (a trusted position that no longer
@@ -712,7 +634,7 @@ class Planner:
         self.latch[c["key"]] = c
     self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
     corners = corners + [c for k, c in self.latch.items() if k not in keys]
-    self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True)
+    self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True, u_ref=u_ref)
     self._stage2(t, v, mph, set_mph, floor, (need, dist, u_ref))
     # a warned corner whose need is below the floor is "capped" too, also on the tick before its slowdown starts
     warned_below_floor = self.alert is not None and self.alert < floor
@@ -727,7 +649,219 @@ class Planner:
     self.need_out = need_true
     self.cap_out = cap
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
-                     past=kind == "hold", stage=1, src="mem")
+                     past=kind == "hold", stage=stage, src="mem")
+
+  def _map_out(self, t, v, mph, set_mph, floor, ref_mph, map_k, model_la, conf, known, why):
+    """The output where no memory is known: the map stage's ramp (plan T6) if it has a ceiling, else none (stage 2 merges in _out)."""
+    r = self._map_stage(t, v, mph, set_mph, floor, ref_mph, map_k)
+    if r is None or r["ceil"] is None:
+      return self._out(None, conf, False, known, why, None, None, model_la)
+    self.end_m, self.behind, self.need_out, self.cap_out = r["end"], r["behind"], r["need"], r["cap"]
+    capped = bool(self.map_active) and min(a_["need"] for a_ in self.map_active.values()) < floor
+    why = "next bend (map): holding what it needs" if r["kind"] == "hold" else "bend ahead (map)"
+    # trusted: this ceiling's source (the map, persisted, matched by plannerd) is valid
+    return self._out(int(r["ceil"]), conf, True, known, why, r["dist"], r["corner"], model_la, capped=capped, point=-1,
+                     kind=r["kind"], past=r["kind"] == "hold", stage=r["stage"], src="map")
+
+  @staticmethod
+  def _grade(grade, idx, dist, j):
+    """Extra start-early buffer (s) for a remembered approach steeper downhill than GRADE_STEEP_DEG up to look-ahead point j."""
+    if dist[j] <= 0:
+      return 0.0
+    sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
+    g = float(np.degrees(np.nanmean(grade[sel]))) if len(sel) else 0.0
+    if math.isfinite(g) and g < -GRADE_STEEP_DEG:
+      return GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
+    return 0.0
+
+  def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None):
+    """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
+    target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
+    bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
+    aim_at, S1, buf, cap, side}."""
+    cands = {}
+    tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
+    if not len(tight):
+      return cands
+    breaks = np.nonzero(np.diff(tight) > 1)[0]
+    starts = np.r_[0, breaks + 1]
+    ends = np.r_[breaks, len(tight) - 1]
+    for s0, s1 in zip(starts, ends):
+      run = tight[s0:s1 + 1]
+      # a corner is known by the END of its tight stretch: it stays the same while the car drives into the stretch (its first and
+      # lowest points ahead change as they are passed), so a corner is started once
+      key = key_of(run)
+      if key is None or key in self.released:
+        continue
+      if key not in active and u_ref - float(shed_to[run].min()) <= LATE_SHED_MPH:
+        continue                                   # plan T6 / A6: a bend needing at most LATE_SHED_MPH off is stage 2's
+      lowest = run[int(np.argmin(need[run]))]
+      # aimed at the corner's ENTRY (entry_point: the first point whose demand reaches ENTRY_LA at the corner's speed), not at the
+      # run's first point (a gentle lead-in). GUARD: every tight point before the entry is a constraint of its own at its own speed
+      # and distance, so the car is never planned to arrive at an earlier point faster than the capacity there allows. The lowest
+      # point (the first of equals at or after the entry) is always a constraint.
+      aim = entry_point(run, kab, int(shed_to[run].min()))
+      tied = run[(need[run] <= need[lowest]) & (run >= aim)]
+      lowest = int(tied[0]) if len(tied) else int(lowest)
+      pts = {int(aim), int(lowest)}
+      pts.update(int(j) for j in run[run < aim])
+      side = int(sign[lowest])
+      for j in sorted(pts):
+        T = int(shed_to[j])
+        D_ = float(dist[j]) - ENTRY_M
+        buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0)
+        S1 = max(floor, T - DRIVE_GAP_MPH)
+        va = v_allow(D_, T, S1, buf)
+        # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
+        # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
+        # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
+        due = bool(set_mph and set_mph > mph + SETTLE_MPH and
+                   approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D_ and
+                   approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D_)
+        c = cands.get(key)
+        if c is None or va < c["va"] or (due and not c["due"]):
+          cands[key] = {"T": T, "need": int(need[j]), "Tc": int(need[j]), "va": va, "D": D_, "due": due,
+                        "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
+                        "aim_at": self.odo + float(dist[aim]), "S1": S1, "buf": buf, "cap": D.capacity(T, side), "side": side}
+    return cands
+
+  def _release_check(self, v, T, cap, lead_s):
+    """Plan T6: True when the preview, REACHING the bend's entry (lead_s ahead), shows it asking less than CONFIRM_SHARE x its
+    capacity: the calibrated peak demand over FC_LO_S .. MODEL_LOOK_S, scaled from the speed now to the target T. None: no preview,
+    or one that does not reach the entry (never released then)."""
+    if self.fc is None or float(np.max(self.fc[0])) < lead_s - 1e-6:
+      return None
+    _, _, la, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, MODEL_LOOK_S)
+    if la is None:
+      return None
+    la_T = abs(la) * (T * MPH) ** 2 / max(v, 1.0) ** 2
+    return bool(la_T < CONFIRM_SHARE * cap)
+
+  def _ramp(self, t, v, mph, set_mph, floor, cands, active, u_ref):
+    """The closed-loop ramp for the bends in `cands` (started, pushed, let off, behind, raised, handed over, released, passed);
+    `active` holds the bends in progress. -> dict(ceil, dist, point, kind, corner, need, cap, end, behind, stage)."""
+    # start: the car is at or above the highest speed from which it can still make it (or, below its set speed, the start is due)
+    for key, c in cands.items():
+      if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
+        active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
+                       "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
+                       "side": c["side"]}
+        self.events.append({"kind": "start", "point": key if isinstance(key, int) else -1, "T": c["T"], "need": c["need"],
+                            "floor": floor, "mph": round(mph, 1), "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
+    for key in [k for k, a_ in active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
+      self.events.append({"kind": "passed", "point": key if isinstance(key, int) else -1, "T": active[key]["T"], "mph": round(mph, 1)})
+      del active[key]
+    out = {"ceil": None, "dist": None, "point": -1, "kind": "", "corner": None, "need": None, "cap": None, "end": None,
+           "behind": False, "stage": 1}
+    for key, a_ in list(active.items()):
+      c = cands.get(key)
+      mode = a_["mode"]
+      if c is not None and c["T"] < a_["T"]:
+        # A9-R2b: a lower constraint of this corner now binds: a corner "on target" for the higher one is pushed again
+        a_["T"] = c["T"]
+        if mode == "target":
+          mode = "push"
+      T = a_["T"]
+      S1 = max(floor, T - DRIVE_GAP_MPH)
+      va = c["va"] if c is not None else float(T)
+      late, on_plan = mph > va + BEHIND_MPH, mph <= va
+      if c is not None and set_mph and mode in ("push", "behind"):
+        # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
+        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting,
+        # with the SAME push-and-raise manoeuvre as the warning (R8, plan A12)
+        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True, T=T)
+        late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
+      d_aim = a_["aim_at"] - self.odo
+      if not a_.get("decided") and d_aim <= CONFIRM_LEAD_S * max(v, 1.0):
+        # the release decision, once per bend, CONFIRM_LEAD_S before its entry (also when the hand-over came earlier)
+        a_["decided"] = True
+        rel = self._release_check(v, T, a_["cap"], d_aim / max(v, 1.0))
+        if rel:
+          self.released[key] = a_["at"]
+          self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+          del active[key]
+          continue
+        self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
+                            "preview": rel is not None})
+      if a_["phase"] == 1 and (a_.get("decided") or (set_mph is not None and set_mph <= T + LATE_SHED_MPH + 1.5)):
+        # stage 1 -> 2 hand-over: at the release decision, or as soon as the dash is within one tap of T + LATE_SHED_MPH (judged a
+        # planner tick early, so the walk never pauses there while the car side waits for the next plan): ONE ramp, no early dwell
+        a_["phase"] = 2
+        self.events.append({"kind": "s1_handover", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+      if mode != "target":
+        if self._raise_due(mph, set_mph, T):
+          mode = "target"
+        elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
+          mode = "behind"
+        elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
+          mode = "coast"
+        elif mode == "behind" and on_plan:
+          mode = "push"
+        elif mode == "coast" and mph >= va - REPUSH_MPH:
+          mode = "push"
+      if mode != a_["mode"]:
+        self.events.append({"kind": "mode", "point": key if isinstance(key, int) else -1, "mode": mode, "mph": round(mph, 1),
+                            "planned": round(va, 1), "T": T})
+        a_["mode"], a_["since"] = mode, t
+      cc = S1 if mode in ("push", "behind") else T
+      if a_["phase"] == 1:
+        cc = max(cc, T + LATE_SHED_MPH)           # stage 1's part of the ramp
+      if mode == "behind":
+        out["behind"] = True
+      if out["ceil"] is None or cc < out["ceil"]:
+        out.update(ceil=cc, dist=round(max(0.0, a_["entry"] - self.odo), 1), point=key if isinstance(key, int) else -1,
+                   kind="corner", corner=T, need=a_["Tc"], cap=a_.get("cap"), end=round(a_["at"] - self.odo, 1),
+                   stage=a_["phase"])
+    if not active:
+      # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
+      # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
+      hold = None
+      for key, c in cands.items():
+        need_m = approach_m(int(u_ref), c["T"], c["S1"]) + c["buf"] * u_ref * MPH
+        if (c["D"] - need_m) / max(v, 1.0) > HOLD_GAP_S:
+          continue
+        if hold is None or c["va"] < hold[0]:
+          hold = (c["va"], key, c)
+      if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
+        out.update(ceil=int(math.floor(hold[0])), dist=round(hold[2]["D"], 1), point=hold[1] if isinstance(hold[1], int) else -1,
+                   kind="hold", corner=hold[2]["T"], cap=hold[2]["cap"])
+    return out
+
+  def _map_stage(self, t, v, mph, set_mph, floor, ref_mph, map_k):
+    """Stage 1 from the map (plan T6, A3) where no memory is known: map_k = (metres ahead, |curvature|) from
+    ti_curve_plannerd.map_profile, or None (absent / stale: no map stage). Unsigned: judged on the LOWER side's capacity. A bend acts
+    only once it has persisted map_persist_s(mph). -> the _ramp dict, or None."""
+    ok = map_k is not None
+    if ok:
+      d, k = np.asarray(map_k[0], np.float64), np.abs(np.asarray(map_k[1], np.float64))
+      ok = len(d) >= 2 and len(d) == len(k) and bool(np.all(np.isfinite(d)) and np.all(np.isfinite(k)))
+    if not ok:
+      self.map_active, self.map_bends = {}, {}
+      return None
+    need = np.minimum(D.need_mph(k), D.need_mph(-k)).astype(np.float64)     # side unknown: the lower capacity
+    u = max(mph, float(set_mph)) if set_mph else mph
+    u_ref = max(u, float(ref_mph) if ref_mph else 0.0)
+    shed_to = np.maximum(need, floor)
+    seen = set()
+    hold_s = map_persist_s(mph)
+
+    def key_of(run):
+      end = self.odo + float(d[run[-1]])
+      key = None
+      for kk, b in self.map_bends.items():
+        if kk not in seen and abs(b["end"] - end) <= MAP_KEY_M:
+          key = kk
+          break
+      if key is None:
+        self.map_seq += 1
+        key = ("map", self.map_seq)
+        self.map_bends[key] = {"first": t}
+      self.map_bends[key]["end"] = end
+      seen.add(key)
+      return key if (key in self.map_active or t - self.map_bends[key]["first"] >= hold_s - 1e-6) else None
+    cands = self._bend_cands(key_of, d, need, k, np.zeros(len(k)), shed_to, u_ref, mph, set_mph, floor, self.map_active)
+    self.map_bends = {kk: b for kk, b in self.map_bends.items() if kk in seen or kk in self.map_active}
+    return self._ramp(t, v, mph, set_mph, floor, cands, self.map_active, u_ref)
 
   @staticmethod
   def _mem_tight(mem_ahead, lo_m, hi_m):
@@ -865,7 +999,7 @@ class Planner:
     (above s1): the planner's own manoeuvre, a push to s1 and the model-timed raise back to T (plan A11)."""
     return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T)
 
-  def _warn(self, corners, mph, v, floor, acting, set_mph, lowering):
+  def _warn(self, corners, mph, v, floor, acting, set_mph, lowering, u_ref=None):
     """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,
     while it is not trusted): predict the speed at the corner's tightest point from what curve slowing will actually do (`_arrive`;
     acting on trusted road: taps down to the push speed max(floor, need - DRIVE_GAP_MPH), never below the floor; otherwise the set
@@ -875,6 +1009,8 @@ class Planner:
     stopped, floored, behind or decided against. -> the lowest need warned for (whole mph) or None."""
     seen = set()
     out = None
+    if u_ref is None:
+      u_ref = max(mph, float(set_mph)) if set_mph else mph
     for c in corners:
       key, need = c["key"], c["need"]
       seen.add(key)
@@ -886,7 +1022,15 @@ class Planner:
         continue
       if not set_mph:
         arrive = mph                              # no cruise: nothing changes the speed
-      elif acting and lowering:
+      elif acting and lowering and u_ref - max(need, int(floor)) <= LATE_SHED_MPH and self.fc is not None:
+        # a bend stage 1 leaves to stage 2 (plan T6): nothing changes until the preview's window reaches it, then a straight walk
+        # to at most LATE_SHED_MPH below (stage 2 does not push)
+        # confirmed on the 2nd planner tick (5 Hz), then the car side reads the plan and sends the first tap (S2_TAP_LAG_S)
+        win = max(0.0, min(CONFIRM_LEAD_S, float(np.max(self.fc[0]))) - CONFIRM_TICKS / 5.0 - S2_TAP_LAG_S)
+        d1 = max(0.0, d_low - win * v)
+        T2 = float(max(need, int(round(u_ref)) - LATE_SHED_MPH, int(floor)))
+        arrive = self._arrive(v, d_low - d1, float(set_mph), min(float(set_mph), T2), True)
+      elif acting and lowering and u_ref - max(need, int(floor)) > LATE_SHED_MPH:
         T = max(need, int(floor))
         arrive = self._arrive(v, d_low, float(set_mph), float(max(floor, T - DRIVE_GAP_MPH)), True, T=T)
       else:
@@ -935,10 +1079,11 @@ class Planner:
       stage, src = 0, ""
     ahead = getattr(self, "ahead_la", None)
     diag = {"stage": stage, "ceil": ceil, "kind": kind, "need": need if isinstance(need, (int, np.integer)) else None,
-            "cap": cap, "ahead": ahead, "behind": behind, "alert": alert}
+            "cap": cap, "ahead": ahead, "behind": behind, "alert": alert, "src": src,
+            "rel": len(getattr(self, "released", {}) or {})}
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
                 self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
-                point, stage, src, ahead, cap, False, diag)
+                point, stage, src, ahead, cap, bool(getattr(self, "released", None)), diag)
 
 
 def plan_json(plan, t_mono, seq, mode):
