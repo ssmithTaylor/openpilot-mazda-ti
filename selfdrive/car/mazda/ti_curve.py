@@ -127,6 +127,16 @@ BEND_IN_LA = P.ENTRY_LA
 BEND_HYST_LA = 0.3
 BEND_OUT_S = 1.0
 
+# ---- a lowest ceiling remembered per slowdown (planner restart mid-bend, 2026-11-24) ----------------------------------------------
+# A planner that restarts inside a bend has lost its guard and may publish a higher trusted ceiling (or none). The car side remembers
+# the lowest corner speed it has acted on in this slowdown (`cap_lo`) and sends no SET+ above it merely because the published ceiling
+# rose or vanished. It is forgotten when (a) the road has been straight (lateral acceleration under BEND_IN_LA - BEND_HYST_LA) for
+# BEND_OUT_S AND the car is past where the planner last said that corner ends (no end known: straight alone); (b) the car is
+# TRUST_HOLD_M past that end whatever the lateral acceleration says; (c) CAP_STALE_S (= TRUST_HOLD_MAX_S, the existing bound for
+# a planner whose word cannot be trusted) passes with no plan that confirms the cap (a ceiling at or under it); or (d) the intervention
+# or the stop ends it.
+CAP_STALE_S = 30.0
+
 
 class HoldRun:
   """One hold in flight (or settling after its release)."""
@@ -270,6 +280,11 @@ class Curve:
     self.bend_low_f = None            # frame the lateral acceleration first fell under the exit level
     self.bend_lo = None               # the highest a SET+ may bring the dash while in this bend (None: no limit known)
     self.bend_held = False            # a SET+ was held back by the bend rule (logged once per bend)
+    self.cap_lo = None                # the lowest corner speed acted on in this slowdown: no SET+ above it (see CAP_STALE_S)
+    self.cap_end = None               # odometer where the planner last said that corner ends
+    self.cap_seen_f = None            # frame of the last plan at or under the cap
+    self.cap_straight_f = None        # frame the road last became straight
+    self.cap_held = False             # a SET+ was held back by the cap (logged once per cap)
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -298,6 +313,7 @@ class Curve:
 
   def _stop(self, frame, inp, why):
     self._cut_tap()
+    self._cap_clear()
     lowered = self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and self.intervening()
     self.stop_lowered = lowered
     if lowered:
@@ -345,6 +361,7 @@ class Curve:
     self.hold = None
 
   def _end_intervention(self, frame):
+    self._cap_clear()
     self._cut_hold(frame, "intervention ended")
     self.hold_off = False
     self.press_floor = None
@@ -396,6 +413,7 @@ class Curve:
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
     self._bend_track(frame, inp)
+    self._cap_track(frame, inp)
     if inp.gas:
       self.gas_off_at = None
     elif self.gas_hold and self.gas_off_at is None:
@@ -702,6 +720,8 @@ class Curve:
         self.press_floor = self.floor           # the push net acted: no push below the floor for the rest of this intervention
         self.target = max(self.target, min(self.floor, self.ref))
       self.shown = min(max(int(corner), self.floor), self.ref)
+      if not gentle:
+        self._cap_note(frame, self.shown)
       if self.in_bend:
         self.bend_lo = self.shown if self.bend_lo is None else min(self.bend_lo, self.shown)
       need_true = plan.get("need") if plan.get("need") is not None else corner
@@ -925,6 +945,42 @@ class Curve:
     else:
       self.bend_low_f = None
 
+  def _cap_clear(self):
+    self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
+    self.cap_held = False
+
+  def _cap_track(self, frame, inp):
+    """Forget the remembered lowest ceiling when its end conditions hold (see CAP_STALE_S)."""
+    if self.cap_lo is None:
+      return
+    vals = [abs(x) for x in (inp.la_now, inp.desired_la) if x is not None]
+    if vals and max(vals) < BEND_IN_LA - BEND_HYST_LA:
+      self.cap_straight_f = frame if self.cap_straight_f is None else self.cap_straight_f
+    else:
+      self.cap_straight_f = None
+    past_end = self.cap_end is None or self.odo >= self.cap_end
+    straight = self.cap_straight_f is not None and (frame - self.cap_straight_f) * DT >= BEND_OUT_S - 1e-9
+    if (straight and past_end) or (self.cap_end is not None and self.odo >= self.cap_end + TRUST_HOLD_M) or        (frame - self.cap_seen_f) * DT >= CAP_STALE_S:
+      self._cap_clear()
+
+  def _cap_note(self, frame, shown):
+    """A plan acted on (corner speed `shown`): the cap follows the lowest, and a plan at or under it confirms it."""
+    if self.cap_lo is None or shown <= self.cap_lo:
+      if self.cap_lo is None or shown < self.cap_lo:
+        self.cap_held = False
+      self.cap_lo, self.cap_seen_f = shown, frame
+      if self.corner_end_odo is not None:
+        self.cap_end = self.corner_end_odo
+
+  def _cap_blocks(self, frame, inp, button, exempt):
+    """True: a SET+ above the lowest ceiling acted on in this slowdown (the push net and the safe exit are exempt)."""
+    if button != "SET_PLUS" or exempt or self.cap_lo is None or inp.set_mph is None or inp.set_mph + 1 <= self.cap_lo:
+      return False
+    if not self.cap_held:
+      self.cap_held = True
+      self._ev("cap_hold", frame, set_mph=inp.set_mph, allowed=self.cap_lo, target=self.target, state=self.state)
+    return True
+
   def _bend_blocks(self, frame, inp, button, exempt):
     """True: a SET+ that would take the dash above what the bend allows (BEND_*); the push net and the safe exit are exempt."""
     if button != "SET_PLUS" or exempt or not self.in_bend or inp.set_mph is None:
@@ -946,7 +1002,7 @@ class Curve:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
-    if not correcting and self._bend_blocks(frame, inp, button, exempt):
+    if not correcting and (self._bend_blocks(frame, inp, button, exempt) or self._cap_blocks(frame, inp, button, exempt)):
       return None
     if self.in_bend and button == "SET_PLUS":
       allow_hold = False                  # in a bend a raise is tapped, one step at a time, each checked against the bend's limit
