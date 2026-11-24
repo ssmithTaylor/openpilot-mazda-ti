@@ -220,14 +220,104 @@ def test_short_gas_tolerated_long_gas_stops():
   assert car.history[-1][1] == 55
 
 
-def test_planner_dead_or_late_while_lowered_stops():
+def _silent_planner(c, end_at, silent_from, end_known=True):
+  """The planner's output: a corner wanting 45 whose tight stretch ends at odometer `end_at` m, fresh until frame `silent_from`, then
+  the LAST output stays (the car controller keeps it) and only grows old, as when the planner process stops writing."""
+  last = {}
+  odos = []
+
+  def pf(f, car):
+    odos.append((f, c.odo))
+    if f < silent_from or not last:
+      if end_known:
+        last["p"] = dict(plan(45, corner=45, dist=max(0.0, end_at - 100.0 - c.odo)), end=end_at - c.odo)
+      else:
+        last["p"] = dict(plan(45, corner=45, dist=None), end=None)     # the car side never learns where the corner ends
+    return last["p"]
+
+  def age(f, car):
+    return 0.1 if f < silent_from else 0.1 + (f - silent_from) * DT
+  return pf, age, odos
+
+
+def test_planner_dead_while_lowered_restores():
+  # lowered 55 -> 45 by the feature, then the planner goes silent: late (1-3 s) holds, dead (> 3 s) restores past the corner end + 30 m
   c, car = C.Curve(), Car(55, 55)
-  run(c, car, 1500, lambda f, car: plan(45), plan_age=lambda f, car: 0.1 if f < 800 else 5.0)
-  assert c.state == "stopped" and "planner" in c.why
-  assert not [k for k, b in car.sent if k > 800]
+  pf, age, odos = _silent_planner(c, end_at=500.0, silent_from=800)
+  run(c, car, 800, pf, plan_age=age)
+  assert car.set == 45 and c.state in ("slowing", "holding")
+  late_from, dead_from = 800 + 90, 800 + 291                    # age past 1 s, past 3 s
+  run(c, car, 6000, pf, start=800, plan_age=age)
+  assert not [k for k, b in car.sent if late_from + 1 <= k <= dead_from + 1], "a tap while the planner was merely late"
+  assert not any(e["kind"] == "stop" for e in c.events), [e for e in c.events if e["kind"] == "stop"]
+  past = next(f for f, o in odos if o >= 500.0 + C.TRUST_HOLD_M)
+  assert not [k for k, b in car.sent if b == "SET_PLUS" and k < past]
+  back = next(h[0] for h in car.history if h[0] > past and h[1] == 55)
+  assert (back - past) * DT <= 12.0, (back - past) * DT
+  assert car.history[-1][1] == 55 and c.state == "ready" and not c.stop_latched
+  assert any(e["kind"] == "state" and e["state"] == "restoring" and e["why"] == "planner stopped: restoring your set speed"
+             for e in c.events)
+  assert max(h[1] for h in car.history) <= 55
+  # no latch: the planner back, the next corner is slowed for as usual
+  run(c, car, 3000, lambda f, car: plan(45, corner=45), start=6800)
+  assert car.history[-1][1] == 45
+
+
+def test_planner_late_holds_mid_lowering():
+  # the planner late while still lowering: no tap starts (one already pressing may finish), nothing stops, nothing restored
   c, car = C.Curve(), Car(55, 55)
-  run(c, car, 1500, lambda f, car: plan(45), plan_age=lambda f, car: 0.1 if f < 800 else 1.5)
-  assert c.state == "stopped" and "late" in c.why
+  pf, age, _ = _silent_planner(c, end_at=2000.0, silent_from=150)
+  run(c, car, 150, pf, plan_age=age)
+  run(c, car, 140, pf, start=150, plan_age=age)
+  held = car.set
+  assert 45 < held < 55
+  run(c, car, 150, pf, start=290, plan_age=age)                 # late: age 1.4-2.99 s
+  late_taps = [t for t in taps(car) if t[0][0] > 241]
+  assert not late_taps, late_taps
+  assert car.set == held and c.state == "holding" and "late" in c.why
+  assert not any(e["kind"] == "stop" for e in c.events)
+
+
+def test_planner_dead_restore_respects_driver():
+  c, car = C.Curve(), Car(55, 55)
+  pf, age, _ = _silent_planner(c, end_at=300.0, silent_from=800)
+  run(c, car, 800, pf, plan_age=age)
+  assert car.set == 45
+  st = {"at": None}
+
+  def btn(f, car):
+    if st["at"] is None and car.set >= 48 and c.state == "restoring":
+      st["at"] = f + 30                                       # the driver's SET- shortly after the restore got going
+    if st["at"] is not None and f == st["at"] + 5:
+      car.set -= 1
+    return st["at"] is not None and st["at"] <= f < st["at"] + 10
+  run(c, car, 6000, pf, start=800, plan_age=age, driver_button=btn, driver_set=True)
+  assert st["at"] is not None
+  chosen = next(h[1] for h in car.history if h[0] == st["at"] + 6)
+  assert chosen < 55
+  assert not [k for k, b in car.sent if k > st["at"] + 1], "pressed after the driver's own SET-"
+  assert car.history[-1][1] == chosen and c.ref == chosen
+
+
+@pytest.mark.parametrize("end_known", [True, False])
+def test_planner_dead_no_restore_inside_corner(end_known):
+  c, car = C.Curve(), Car(55, 55)
+  pf, age, odos = _silent_planner(c, end_at=2500.0, silent_from=800, end_known=end_known)
+  run(c, car, 800, pf, plan_age=age)
+  assert car.set == 45
+  dead_at = 800 + 291
+  if end_known:
+    run(c, car, 6000, pf, start=800, plan_age=age)
+    past = next((f for f, o in odos if o >= 2500.0 + C.TRUST_HOLD_M), None)
+    assert past is None or past > 6800
+    assert not [k for k, b in car.sent if b == "SET_PLUS"]
+    assert c.state == "restoring" and c.why == "planner stopped: restoring your set speed" and car.set == 45
+  else:
+    assert c.corner_end_odo is None                           # never knew where the corner ends: wait 30 s from the planner's death
+    run(c, car, 6000, pf, start=800, plan_age=age)
+    ups = [k for k, b in car.sent if b == "SET_PLUS"]
+    assert ups and min(ups) - 1 >= dead_at + 3000 - 1, (min(ups) if ups else None)
+    assert car.history[-1][1] == 55 and not c.stop_latched
 
 
 def test_low_confidence_restores_gently_only_with_model():

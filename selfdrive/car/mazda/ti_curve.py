@@ -27,10 +27,13 @@ Every frame (the car controller calls `step`, 100 Hz; the planner's output is re
   paused     the driver pressed a cruise button: the intervention ends at once, nothing is restored, their new set speed becomes `ref`,
              and nothing is done for PAUSE_S.
   stopped    brake; gas held longer than GAS_MAX_S; openpilot disengaged; cruise off, cancelled or unavailable; a set-speed change
-             that was not the step asked for (no restore: the page says "set it yourself"); a tap not read back within ACCEPT_WAIT_S;
-             the planner stale or dead while the set speed is lowered. Nothing more is sent until the driver presses a cruise button or
-             re-engages the cruise (then `ref` is the set speed as it is); only a pedal / engagement stop that lowered nothing clears
-             by itself, once the cause has cleared for CLEAR_S.
+             that was not the step asked for (no restore: the page says "set it yourself"); a tap not read back within ACCEPT_WAIT_S.
+             Nothing more is sent until the driver presses a cruise button or re-engages the cruise (then `ref` is the set speed as it
+             is); only a pedal / engagement stop that lowered nothing clears by itself, once the cause has cleared for CLEAR_S.
+Planner output late (over PLAN_STALE_S) while lowered: hold the set speed, no tap either way (a tap not yet sent is dropped). Planner
+dead (over PLAN_DEAD_S) while lowered: `restoring` ("planner stopped: restoring your set speed"): SET_PLUS back to `ref` once past
+where the corner ends + TRUST_HOLD_M (the end last known; never known: PLAN_DEAD_WAIT_S after it died), under the restore guards that
+do not need the planner (speed, lead flag, settled, paced) and the tap pace; no latch: when the planner is back it works as usual.
 Low-confidence planner output while lowered: restore gently (same rules as restoring) if the model's preview is gentle, else hold.
 
 Never: a SET_PLUS above `ref`; a SET_MINUS below the floor; taps closer than the reviewed tap machinery allows (ti_cruise_taps.py:
@@ -63,6 +66,8 @@ PAUSE_S = 10.0                   # after the driver's own cruise button (owner, 
 CLEAR_S = 2.0
 PLAN_STALE_S = 1.0               # planner output older than this is not used (it publishes at 5 Hz)
 PLAN_DEAD_S = 3.0                # ... older than this: the planner is taken as dead
+PLAN_DEAD_WAIT_S = 30.0          # planner dead while lowered and the corner's end never known: restore this long after it died
+PLAN_DEAD_WHY = "planner stopped: restoring your set speed"
 SETTLED_MPH = 3.0                # restore only with the speed within this of the set speed
 RESTORE_MIN_MPH = 2              # a restore toward a "hold" ceiling only for 2 mph or more (no dithering)
 RESTORE_LEAD_MPH = 7             # while restoring, the set speed is at most this above the car's speed: enough gap for the cruise's
@@ -155,6 +160,7 @@ class Curve:
     self.after_brake = False          # a pedal / cruise-off stop left the set speed lowered: restore promptly once the cruise is back
     self.trust_past = False           # trust was lost during an approach and the car has since passed where the corner ended
     self.off_seen = False
+    self.dead_since = None            # frame the planner was first seen dead while the set speed was lowered (restoring after it)
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -223,6 +229,7 @@ class Curve:
       self.lowered_from = None
     self.taps_down = self.taps_up = 0
     self.trust_hold_since = self.restore_wait_since = None
+    self.dead_since = None
     if self.left_at is None:
       self.corner_end_odo = None
 
@@ -422,9 +429,21 @@ class Curve:
         return None
       self.line1, self.line2 = "ON: waiting", "the cruise check is running"
       return None
+    if plan_ok:
+      self.dead_since = None
+    late_hold = dead_restore = False
     if not plan_ok and self.intervening() and inp.set_mph < self.ref:
-      self._stop(frame, inp, "planner stopped" if dead else "planner output late")
-      return None
+      if dead:
+        # the planner dead while lowered: restore the driver's set speed once past the corner (never latched; when the planner
+        # comes back the feature works as usual)
+        if self.dead_since is None:
+          self.dead_since = frame
+          self._ev("planner_dead", frame, set_mph=inp.set_mph, ref=self.ref, corner_end_known=self.corner_end_odo is not None)
+        dead_restore = True
+      else:
+        late_hold = True                    # merely late: hold the set speed, no tap either way
+      if self.tap is not None and self.tap.first is None and not self.tap_correcting and          (late_hold or not self._dead_past(frame)):
+        self._cut_tap()                     # a tap not yet sent: not sent (one already pressing finishes and is read back)
 
     if self.tap is not None and self.tap.first is None and self.tap.button == "SET_MINUS" and not self.tap_correcting:
       p_ = inp.plan if plan_ok else None
@@ -448,6 +467,15 @@ class Curve:
         return None
       else:
         return None
+
+    if late_hold:
+      self.target = self.shown = inp.set_mph
+      self._to(frame, "holding", "planner output late: holding")
+      self.line1 = f"HOLDING: {inp.set_mph} mph"
+      self.line2 = "planner output late: holding"
+      return None
+    if dead_restore:
+      return self._dead_restore(frame, inp)
 
     plan = inp.plan if plan_ok else None
     ceil = plan.get("ceil") if plan else None
@@ -573,6 +601,31 @@ class Curve:
     a = plan.get("alert") if plan else None
     self.alert_mph = int(a) if a else None
 
+  def _dead_past(self, frame):
+    """Planner dead while lowered: past where the corner it was slowing for ends, plus TRUST_HOLD_M (the end the car side last knew);
+    never knew one: PLAN_DEAD_WAIT_S after the planner died."""
+    if self.corner_end_odo is not None:
+      return self.odo >= self.corner_end_odo + TRUST_HOLD_M
+    return self.dead_since is not None and (frame - self.dead_since) * DT >= PLAN_DEAD_WAIT_S - 1e-9
+
+  def _dead_restore(self, frame, inp):
+    """The planner dead with the set speed lowered: SET_PLUS taps back to `ref` once past the corner, under the normal restore's
+    guards that do not need the planner (speed, standstill, lead flag readable, settled, paced to the car) and the tap machinery's
+    pace; the driver's buttons, brake and gas are handled before this, as always."""
+    self.target = self.shown = self.ref
+    if not self._dead_past(frame):
+      ok, wait = False, "planner stopped: waiting until past the corner"
+    elif inp.mph < MIN_MPH or inp.standstill:
+      ok, wait = False, f"below {MIN_MPH:.0f} mph: no presses"
+    else:
+      ok, wait = self._restore_common(inp)
+    self._to(frame, "restoring", PLAN_DEAD_WHY)
+    self.line1 = f"RESTORING: {inp.set_mph} -> {self.ref} mph"
+    self.line2 = wait or PLAN_DEAD_WHY
+    if ok:
+      return self._start(frame, inp, "SET_PLUS")
+    return None
+
   def _restore_ok(self, inp, plan):
     if inp.mph < MIN_MPH or inp.standstill:
       return False, f"below {MIN_MPH:.0f} mph: no presses"
@@ -585,6 +638,10 @@ class Curve:
       return False, "no model preview"
     if not P.fits(float(plan["model_k"]), inp.set_mph + 1):
       return False, "the model sees a bend ahead"
+    return self._restore_common(inp)
+
+  def _restore_common(self, inp):
+    """The restore guards that do not need the planner: lead flag readable, speed settled, paced to the car."""
     if inp.lead is None:
       return False, "lead flag unreadable"
     gap = inp.mph - inp.set_mph
