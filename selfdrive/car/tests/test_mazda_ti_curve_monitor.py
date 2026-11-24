@@ -75,12 +75,13 @@ def test_no_profile_needs_the_whole_two_seconds():
 
 def test_dropout_alert():
   # the dropout path: speed >= 32 mph, the stock lane-keep path blocked with no effect, the interceptor saturated 0.5 s; fires even
-  # when the angle and the ask would not
-  kw = dict(lkas_blocked=True, lkas_effective=0.0, angle_rate_deg=5.0, desired_la=1.0, ahead_la=1.0)
+  # when the ask would not. R18 (A15): it also needs the stalled wheel (was: fired with the wheel still winding, angle rate 5.0 deg/s
+  # toward the turn; now 0.5 here, and 5.0 is in the no-alert list below)
+  kw = dict(lkas_blocked=True, lkas_effective=0.0, angle_rate_deg=0.5, desired_la=1.0, ahead_la=1.0)
   res = run(TM.DeliveryMonitor(), 1.0, lambda t: bend(**kw))
   first = next(t for t, o in res if o.phase == "alert")
   assert first == pytest.approx(TM.MON_HOLD_S - DT, abs=1.5 * DT) and res[-1][1].why == "dropout"
-  for bad in (dict(mph=31.0), dict(lkas_effective=12.0), dict(lkas_blocked=False), dict(ti_cmd=500.0)):
+  for bad in (dict(mph=31.0), dict(lkas_effective=12.0), dict(lkas_blocked=False), dict(ti_cmd=500.0), dict(angle_rate_deg=5.0)):
     res = run(TM.DeliveryMonitor(), 2.0, lambda t, bad=bad: bend(**dict(kw, **bad)))
     assert not any(o.phase == "alert" for _, o in res), bad
 

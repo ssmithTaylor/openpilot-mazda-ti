@@ -116,8 +116,11 @@ class DeliveryMonitor:
       if stall and ask >= floor_la:
         limit = True
         rem = remain_s(inp.ahead_prof, floor_la, turn)
+    # R18 (A15): the dropout path also needs the stalled wheel (the angle rate toward the turn under ANGLE_STALL; turn unknown: its
+    # magnitude): a wheel still winding into the bend is the steering delivering, not a dropout (5 of its 11 false alerts)
+    wheel_stall = (inp.angle_rate_deg * turn < ANGLE_STALL) if turn != 0.0 else (abs(inp.angle_rate_deg) < ANGLE_STALL)
     dropout = bool(sat and inp.mph >= DROPOUT_MIN_MPH and inp.lkas_blocked and inp.lkas_effective is not None
-                   and inp.lkas_effective == 0)
+                   and inp.lkas_effective == 0 and wheel_stall)
     ti_off = bool(inp.lat_active and inp.ti_state is not None and inp.ti_state != TI_RUN)
     return sat, limit, dropout, ti_off, rem
 
