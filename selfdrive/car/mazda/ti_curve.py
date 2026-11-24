@@ -452,7 +452,7 @@ class Curve:
         dead_restore = True
       else:
         late_hold = True                    # merely late: hold the set speed, no tap either way
-      if self.tap is not None and self.tap.first is None and not self.tap_correcting and          (late_hold or not self._dead_past(frame)):
+      if self.tap is not None and self.tap.first is None and not self.tap_correcting and (late_hold or not self._dead_past(frame)):
         self._cut_tap()                     # a tap not yet sent: not sent (one already pressing finishes and is read back)
 
     if self.tap is not None and self.tap.first is None and self.tap.button == "SET_MINUS" and not self.tap_correcting:
