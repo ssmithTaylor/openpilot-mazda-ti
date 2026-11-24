@@ -43,6 +43,7 @@ trap resume EXIT
 
 stage "1 preconditions"
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean"; exit 1; }
+bash tools/dev/install_preflight.sh "$BRANCH" || { echo "pre-flight failed: nothing pushed"; exit 1; }   # before anything is pushed
 run git fetch origin main
 git merge-base --is-ancestor origin/main "$BRANCH" || { echo "$BRANCH is not a fast-forward of origin/main"; exit 1; }
 NEW=$(git rev-parse "$BRANCH"); echo "installing $NEW"
