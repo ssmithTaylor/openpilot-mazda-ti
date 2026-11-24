@@ -103,6 +103,16 @@ HOLD_STEP_WAIT_S = 0.7
 HOLD_FALLBACK_S = 1.5
 HOLD_SETTLE_S = 0.3              # after a release: no press until the dash has been still this long (and this long after the release)
 
+# ---- the push net (owner, 2026-11-24: the SET speed may pass the 15 mph line, the car's speed may not) ------------------------------
+# While the dash is below this intervention's floor (a push below the 15 mph line), this side keeps its own model car (the ONE cruise
+# model, fed with the dash and synced to the speed every NET_DT_S) and raises the dash back to the floor BY ITSELF the moment the model
+# says the car, raised from now with the first tap NET_DELAY_S late, would bottom out within NET_MARGIN_MPH of the floor: whatever the
+# planner says, late or dead. Once it has acted, no push below the floor for the rest of the intervention ("push_net" event).
+NET_DT_S = 0.05
+NET_CHECK_S = 0.1
+NET_DELAY_S = 0.0                # the raise modelled from now, as the planner's raise_due (swept: 0.1 / 0.2 s fire before an on-time planner)
+NET_MARGIN_MPH = 0.0             # ... and acting when it would bottom out AT the floor: the planner's raise (T + 0.1) always comes first
+
 
 class HoldRun:
   """One hold in flight (or settling after its release)."""
@@ -215,6 +225,10 @@ class Curve:
     self.trust_past = False           # trust was lost during an approach and the car has since passed where the corner ended
     self.off_seen = False
     self.dead_since = None            # frame the planner was first seen dead while the set speed was lowered (restoring after it)
+    self.net_car = None               # the push net's model car (CM.Cruise), while intervening
+    self.net_f = -10 ** 9             # its last update / check
+    self.net_chk = -10 ** 9
+    self.net_up = False               # the push net acted: the dash back to the floor, no push below it for this intervention
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -299,6 +313,7 @@ class Curve:
     self.taps_down = self.taps_up = 0
     self.trust_hold_since = self.restore_wait_since = None
     self.dead_since = None
+    self.net_car, self.net_up = None, False
     if self.left_at is None:
       self.corner_end_odo = None
 
@@ -366,6 +381,7 @@ class Curve:
       return None
     self._update_alert(inp)
     self.floor_now = self._floor_for(inp, inp.plan if self._plan_ok(inp) else None)
+    self._net_track(frame, inp)
     if self.state == "off":
       if inp.cruise_on:
         self._adopt(inp.set_mph)
@@ -525,7 +541,8 @@ class Curve:
         dead_restore = True
       else:
         late_hold = True                    # merely late: hold the set speed, no tap either way
-      if self.tap is not None and self.tap.first is None and not self.tap_correcting and (late_hold or not self._dead_past(frame)):
+      if self.tap is not None and self.tap.first is None and not self.tap_correcting and not self.net_up and \
+         (late_hold or not self._dead_past(frame)):
         self._cut_tap()                     # a tap not yet sent: not sent (one already pressing finishes and is read back)
       if self.hold is not None and self.hold.released is None:
         self._release_hold(frame, "planner output late" if late_hold else "planner stopped")   # a hold never runs on
@@ -557,6 +574,10 @@ class Curve:
         return None
       else:
         return None
+
+    net = self._push_net(frame, inp)
+    if net is not None or self.tap is not None:
+      return net
 
     if late_hold:
       self.target = self.shown = inp.set_mph
@@ -630,6 +651,9 @@ class Curve:
       else:
         self.press_floor = self.floor
         self.target = min(max(int(ceil), self.floor), self.ref)
+      if self.net_up:
+        self.press_floor = self.floor           # the push net acted: no push below the floor for the rest of this intervention
+        self.target = max(self.target, min(self.floor, self.ref))
       self.shown = min(max(int(corner), self.floor), self.ref)
       need_true = plan.get("need") if plan.get("need") is not None else corner
       needs_more = int(need_true) < self.floor        # ONE meaning: the corner's TRUE need is below the floor (never "behind")
@@ -692,6 +716,38 @@ class Curve:
       return None
     self._to(frame, "ready")
     return self._idle_text(plan, dead=dead)
+
+  def _net_track(self, frame, inp):
+    """The push net's model car, fed every NET_DT_S of an intervention (every frame is seen, whatever else waits)."""
+    if not self.intervening() or self.floor is None or inp.set_mph is None or inp.mph is None:
+      self.net_car = None
+      return
+    if self.net_car is None:
+      self.net_car, self.net_f = CM.Cruise(inp.mph, inp.set_mph, NET_DT_S), frame
+    elif (frame - self.net_f) * DT >= NET_DT_S - 1e-9:
+      self.net_car.v = inp.mph                 # synced to the real speed; the gap history and the lag are the model's
+      self.net_car.step(inp.set_mph)
+      self.net_f = frame
+
+  def _push_net(self, frame, inp):
+    """The push net (see NET_*): SET_PLUS toward the floor once the model says so, or None. Runs only while intervening."""
+    if self.net_car is None or self.floor is None or inp.set_mph is None:
+      return None
+    fl = min(self.floor, self.ref) if self.ref is not None else self.floor
+    if inp.set_mph >= fl:
+      return None
+    if not self.net_up and (frame - self.net_chk) * DT >= NET_CHECK_S - 1e-9:
+      self.net_chk = frame
+      lo = CM.min_after_raise(self.net_car, inp.set_mph, fl, CM.TAP_S, False, NET_DELAY_S)
+      if lo <= fl + NET_MARGIN_MPH:
+        self.net_up = True
+        self._ev("push_net", frame, set_mph=inp.set_mph, floor=fl, mph=round(inp.mph, 1), model_low=round(lo, 2),
+                 plan_age=None if inp.plan_age is None else round(inp.plan_age, 2))
+    if not self.net_up:
+      return None
+    self.target = fl
+    self._to(frame, "slowing", "raising to the floor")
+    return self._start(frame, inp, "SET_PLUS")
 
   def _floor_for(self, inp, plan):
     """The floor a new intervention would take NOW: max(ABS_FLOOR_MPH, (ref, or min(ref, speed) when a lead holds the car under the

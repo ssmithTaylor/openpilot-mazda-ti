@@ -329,8 +329,13 @@ def test_planner_dies_mid_push_with_the_dash_10_below_target_restores(monkeypatc
   car = BusCar(55.0, 55, "hold")
   c = C.Curve(hold=True)
   # corner 40 (the floor: 55 - 15), push to 30: 10 below the target, below the floor, above the absolute floor
-  out = drive(c, car, 700, lambda f, car: plan(30, corner=40, dist=60.0))
-  assert car.set == 30 and min(s for _, _, s, _ in out) == 30 and c.floor == 40 and c.press_floor == 30
+  out = drive(c, car, 1200, lambda f, car: plan(30, corner=40, dist=60.0))
+  # owner rule 2026-11-24 (the car's speed may not pass the 15 mph line): the dash still goes to 30, but a planner that keeps asking
+  # for the push no longer holds it there; the push net raises it back to the floor before the car would pass 40
+  # (was: car.set == 30 and press_floor == 30 after 7 s; now after 12 s car.set == 40, press_floor 40, car speed >= 40, a push_net event)
+  assert min(s for _, _, s, _ in out) == 30 and c.floor == 40
+  assert car.set == 40 and c.press_floor == 40 and min(v for _, _, v in car.history) >= 40 - 1e-6
+  assert any(e["kind"] == "push_net" for e in c.events)
   # the planner dies: hold the set speed until past the corner's end, then restore to the driver's 55 (existing rule, T1)
   out = drive_more(c, car, 4000, lambda f, car: None, plan_age=None)
   assert car.set == 55 and not c.stop_latched

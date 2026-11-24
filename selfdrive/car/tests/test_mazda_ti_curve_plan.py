@@ -274,10 +274,14 @@ def test_push_opens_the_gap_then_raises_to_target():
   need = D.need_mph(CORNER_K)[0]                     # 36: floor 50 binds at 65 mph; use a faster start to see the push
   ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
   T = max(need, 50)
-  assert min(ceils) == max(T - P.DRIVE_GAP_MPH, 50) and ceils[-1] == T
+  # owner rule 2026-11-24 (RULES.md: the set speed may pass the 15 mph line, the car's speed may not): the PUSH may go below the
+  # floor 50 by the push depth (was: clamped at 50, min(ceils) == 50; now 50 - DRIVE_GAP_MPH = 44); the TARGET stays at the floor
+  # and the car's speed never goes below it
+  assert min(ceils) == max(T - P.DRIVE_GAP_MPH, CM.push_floor(50, P.DRIVE_GAP_MPH)) == 50 - P.DRIVE_GAP_MPH and ceils[-1] == T
+  assert min(v for t, s, p, v in res) >= 50 - 0.05
   res = drive(mem, tr, 50, 160, closed=True)
   ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
-  assert min(ceils) == max(need - P.DRIVE_GAP_MPH, 35) and ceils[-1] == need   # pushed 1 below, then raised to the target
+  assert min(ceils) == max(need - P.DRIVE_GAP_MPH, CM.push_floor(35, P.DRIVE_GAP_MPH)) and ceils[-1] == need   # pushed, then raised
 
 
 def test_downhill_slow_car_is_flagged_not_pushed_lower():
@@ -296,7 +300,10 @@ def test_corner_right_after_long_straight_is_seen_far_ahead():
   mem = M.synthetic([tr])
   res = drive(mem, tr, 70, 120)
   on = [s for t, s, p in res if p.ceil is not None and p.kind == "corner"]
-  assert on and 2500 - on[0] >= P.approach_m(70, 55, 55) - 10
+  # owner rule 2026-11-24: the push may go below the floor 55 (to CM.push_floor(55, DRIVE_GAP_MPH) = 49), so the approach it plans
+  # is the shorter push-to-49 one (was approach_m(70, 55, 55) = 373 m, seen 378 m ahead; now approach_m(70, 55, 49) = 295 m, 303 m)
+  assert on and 2500 - on[0] >= P.approach_m(70, 55, CM.push_floor(55, P.DRIVE_GAP_MPH)) - 10
+  assert min(p.ceil for t, s, p in res if p.ceil is not None and p.kind == "corner") == CM.push_floor(55, P.DRIVE_GAP_MPH)
 
 
 def test_s_bends_both_on_target():
@@ -908,8 +915,16 @@ def test_release_at_6s_restores_and_no_reslow():
   flick = road_preview(tr, 55)
   flat = road_preview(straight, 55)
   res = drive(mem, tr, 55, 160, closed=True, model_fn=lambda t, s: flick(t, s) if int(t / 0.6) % 2 else flat(t, s))
-  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, s, p, v in res if s <= 1650 + P.HOLD_AFTER_M]
-  assert _reversals(sets) <= 2                                   # at most one down-up-down
+  win = [(t, p) for t, s, p, v in res if s <= 1650 + P.HOLD_AFTER_M]
+  sets = [p.ceil if p.ceil is not None and p.kind == "corner" else 55 for t, p in win]
+  # owner rule 2026-11-24 (push below the floor): the deeper push shortens the approach, so stage 1 now starts later and its
+  # release (CONFIRM_LEAD_S before the entry) can come one or two planner cycles BEFORE stage 2's forecast takes the bend over: the
+  # ceiling shows one down-up-down and then the restore up (was <= 2 reversals, seen 1: [55, 45, 40, 41, 55]; now <= 3, seen 3:
+  # [55, 45, 34, 55, 46, 55]). Never more than that, and the "up" of that hand-over lasts at most 2 planner cycles (0.4 s).
+  assert _reversals(sets) <= 3                                   # at most one down-up-down, then the restore
+  firsts = [i for i, (t, p) in enumerate(win) if p.ceil is not None and p.kind == "corner"]
+  gaps = [i for i in range(firsts[0], firsts[-1] + 1) if not (win[i][1].ceil is not None and win[i][1].kind == "corner")]
+  assert len(gaps) <= 2, [round(win[i][0], 1) for i in gaps]
 
 
 def _map_profile(s, bend_at, bend_len, k):

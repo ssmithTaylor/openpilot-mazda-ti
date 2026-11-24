@@ -46,12 +46,12 @@ HOLD_MIN_MPH = 5                # a hold only with at least this far to go
 HOLD_READ_S = 0.15              # a landing is read back (and the press released) within this; the press must fit TT.HOLD_MAX_S
 HOLD = TT.HOLD_ENABLED          # the walk the planner plans with: held where allowed, else taps
 
-# floors of a push (plan A10, default taken by the coordinating session, awaiting the owner's confirmation): the 15 mph maximum drop
-# applies to the TARGET; a transient push may take the dash below it by the push depth, never below these. Built and tested (True in
-# test_mazda_ti_curve_hold.py) but OFF here: True changes three existing planner tests that pin the push clamped at the floor
-# (test_push_opens_the_gap_then_raises_to_target, test_corner_right_after_long_straight_is_seen_far_ahead,
-# test_release_at_6s_restores_and_no_reslow); they are to be re-judged with the owner's yes, not loosened here.
-PUSH_BELOW_MAX_DROP = False
+# floors of a push (plan A10; owner, 2026-11-24: "I'm okay with setting cruise lower than the 15-mile-per-hour limit. I'm less okay
+# with actually making the car go 15 miles per hour less than the limit."): the 15 mph maximum drop applies to the TARGET (what the
+# car is slowed to); a transient push may take the DASH below it by the push depth, never below these. The car's actual speed keeps
+# the floor as a hard cap: the planner raises in time (raise_due), and the car side raises a dash left below the floor by itself
+# (ti_curve "push net") whatever the planner does (test_mazda_ti_curve_push.py, both braking tables).
+PUSH_BELOW_MAX_DROP = True
 PUSH_ABS_FLOOR_MPH = 25         # = ti_curve.ABS_FLOOR_MPH (pinned by a test)
 PUSH_CAR_MIN_MPH = 19           # the car's own lowest set speed
 
@@ -213,17 +213,17 @@ class Cruise:
     return self.v
 
 
-def min_after_raise(car, set_now, T, tap_s=TAP_S, hold=False):
+def min_after_raise(car, set_now, T, tap_s=TAP_S, hold=False, delay_s=0.0):
   """The lowest speed (mph) the car `car` (a Cruise, not changed) reaches if our presses walk the dash from `set_now` up to T from
-  now (one tap per tap_s, the first at once; with `hold`, held where `hold_landing` allows)."""
+  now (one tap per tap_s, the first at once, or `delay_s` from now; with `hold`, held where `hold_landing` allows)."""
   c = car.clone()
-  lo, t, horizon = c.v, 0.0, DELAY_S + 6.0 * TAU_S + max(0.0, T - set_now) * tap_s
+  lo, t, horizon = c.v, 0.0, DELAY_S + 6.0 * TAU_S + max(0.0, T - set_now) * tap_s + delay_s
   while t < horizon:
     v0 = c.v
-    c.step(dash_after(set_now, T, t, tap_s, hold))
+    c.step(dash_after(set_now, T, t - delay_s, tap_s, hold))
     lo = min(lo, c.v)
     t += c.dt
-    if c.v > v0 and t > DELAY_S:
+    if c.v > v0 and t > DELAY_S + delay_s:
       break                             # turned back up: the minimum is behind
   return lo
 
