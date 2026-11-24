@@ -13,6 +13,7 @@ files predate v6 and are not used). Output is POSITION-FREE: segment+seconds, sp
   python tools/curve_slowing/unnecessary.py [--mem FILE] [--drives D ...] [--worst 20]
 """
 import argparse
+import json
 import glob
 import math
 import os
@@ -129,9 +130,17 @@ def one(args):
         tag = str(R['seg_tags'][sg])
         sec = (i - int(R['seg_off'][sg])) * DT
         dur = float(len(ww) * DT)
+        # did this pass actually go THROUGH the remembered corner? nearest approach of the car's own later positions to the limiting
+        # memory point (metres); large = the matcher was on a different road (a ramp beside a highway, a parallel road)
+        j1 = min(n, ww[-1] + int(10.0 / DT))
+        okj = np.nonzero(R['pos_ok'][i:j1])[0] + i
+        miss = float('nan')
+        if len(okj):
+          px, py = mem.to_local(R['lat'][okj].astype(float), R['lon'][okj].astype(float))
+          miss = float(np.hypot(np.asarray(px) - mem.x[kk], np.asarray(py) - mem.y[kk]).min())
         out.append(dict(drive=drive, seg=tag, sec=round(sec, 1), mph=e['mph'], T=T, act=round(act, 1), cls=cls, tr='+'.join(tr),
                         waste=max(0.0, act - T) * dur if cls == 'UNNECESSARY' else 0.0, npass=int(mem.npass[kk]),
-                        vmed=float(mem.v[kk] / MPH), vpro=float(mem.v_proven[kk] / MPH), rule=rule_of(planner, mem, kk)))
+                        miss=round(miss, 1), eng=round(float((R['lat_act'][ww] > .5).mean()), 2), vmed=float(mem.v[kk] / MPH), vpro=float(mem.v_proven[kk] / MPH), rule=rule_of(planner, mem, kk)))
       planner.events.clear()
   return drive, eng_s, out
 
@@ -161,6 +170,12 @@ def main():
                  ('envelope (no trouble cap)', lambda r: r.startswith('envelope'))):
     k = sum(1 for x in un if f(x['rule']))
     print(f"  unnecessary by rule: {lab}: {k} ({100.0 * k / max(len(un), 1):.0f} %)")
+  ms = np.array([x['miss'] for x in un], float)
+  for lim in (8, 15, 25):
+    print(f"  unnecessary where the pass came no nearer than {lim} m to the remembered corner (other road): {int((ms > lim).sum())} ({100.0 * (ms > lim).sum() / max(len(un), 1):.0f} %)")
+  ne = sum(1 for x in un if x['eng'] < 0.9)
+  print(f"  unnecessary where this pass was NOT steered by the car through the bend (a hand-driven pass proves nothing): {ne} ({100.0 * ne / max(len(un), 1):.0f} %)")
+  json.dump(allr, open(os.environ.get('UNNEC_OUT', os.devnull), 'w'))
   print("worst unnecessary (segment+s | start mph -> target | actual clean min mph | memory passes, median, best clean | rule):")
   for x in sorted([x for x in allr if x['cls'] == 'UNNECESSARY'], key=lambda x: -(x['act'] - x['T']))[:a.worst]:
     print(f"  {x['seg']}+{x['sec']:.0f}s | {x['mph']:.0f}->{x['T']} | {x['act']:.0f} | n={x['npass']} med {x['vmed']:.0f} best {x['vpro']:.0f} | {x['rule']}")

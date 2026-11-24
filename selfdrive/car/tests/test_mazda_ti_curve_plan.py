@@ -514,3 +514,23 @@ def test_alert_re_arms_when_the_car_speeds_up_again_before_the_corner():
   pl.alerting.clear()
   res = drive(mem, tr, 60, 200, planner=pl, closed=True, start=first[-1][1])
   assert any(p.alert_mph for t, s, p, v in res)
+
+
+# ---- a fork: a ramp leaving a highway (owner, 2026-11-23: "an on-ramp shouldn't look the same as the highway itself") ------------
+def _fork():
+  ramp = road((400, 0.0), (70, -0.001), (400, 0.0), (150, CORNER_K), (200, 0.0))    # leaves at about 4 degrees, then a tight bend
+  hwy = road((3000, 0.0))
+  return ramp, hwy, M.synthetic([ramp, hwy])                                        # the ramp first: an equal match locks on it
+
+
+def test_staying_on_the_highway_is_never_slowed_for_the_ramps_bend():
+  ramp, hwy, mem = _fork()
+  res = drive(mem, hwy, 60, 90)
+  assert any(p.trusted for _, _, p in res)
+  assert all(p.ceil is None for _, _, p in res)
+
+
+def test_taking_the_ramp_is_still_slowed_for_its_bend():
+  ramp, hwy, mem = _fork()
+  res = drive(mem, ramp, 55, 60)
+  assert any(p.ceil is not None for _, _, p in res)

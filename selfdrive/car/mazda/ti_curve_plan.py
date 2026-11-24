@@ -183,6 +183,16 @@ LOOKAHEAD_MAX_M = 2000.0
 # ---- localisation ----------------------------------------------------------------------------------------------------------------
 MATCH_RADIUS_M = 25.0
 MATCH_HEADING_DEG = 30.0
+# WHICH road, by geometry (owner, 2026-11-23: "an on-ramp shouldn't look the same as the highway itself"). Remembered roads overlap where
+# they share tarmac (a ramp's record starts on the highway it leaves). Two rules: (1) while another remembered road lies as near the
+# car sideways as the locked one (within AMBIG_M: a lane, the position error), the car may be on either, and a corner counts only if
+# EVERY such road has one about there (within AMBIG_SHIFT_M along the road); (2) once another road is nearer by SWITCH_MARGIN_M for
+# SWITCH_S the lock is on the wrong one and is dropped (the nearer road is then matched in the ordinary way).
+AMBIG_M = 4.0
+AMBIG_SHIFT_M = 50.0
+AMBIG_MAX = 3
+SWITCH_MARGIN_M = 3.0
+SWITCH_S = 1.0
 TRACK_WINDOW_M = 40.0           # while locked, a fix must land within this of the predicted along-road position
 FIX_GAIN = 0.3                  # how far a fix pulls the dead-reckoned position
 STABLE_S = 3.0                  # a new match must stay consistent this long before it is trusted
@@ -347,6 +357,7 @@ class Planner:
     self.stable_s = 0.0
     self.cand = None                    # (trace, along metres, odometer) of the tentative match
     self.miss_s = 0.0
+    self.alts, self.off_s = [], 0.0     # other remembered roads as near as the locked one; seconds one has been nearer
     self.fix_age = 1e9
     self.odo = 0.0
     self.live_k = 0.0
@@ -391,6 +402,7 @@ class Planner:
       self.events.append({"kind": "lock_lost", "why": why, "trace": self.trace})
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
     self.trace = -1
+    self.alts, self.off_s = [], 0.0
     self.cmp = []
     self.active = {}
 
@@ -429,6 +441,21 @@ class Planner:
           self.miss_s = 0.0
           if best[1] == self.trace:
             self.pos += FIX_GAIN * best[3]
+          # the other remembered roads here (not this trace nor its continuation): as near sideways, or nearer
+          alts, seen = [], set()
+          for lat, tr, p in cands:
+            if tr in seen or self._gap(tr, p) is not None:
+              continue
+            seen.add(tr)
+            if lat <= best[0] + AMBIG_M and len(alts) < AMBIG_MAX:
+              alts.append((lat, tr, p))
+          self.alts = [(tr, p) for _, tr, p in alts]
+          if alts and alts[0][0] + SWITCH_MARGIN_M < best[0]:
+            self.off_s += dt
+            if self.off_s >= SWITCH_S:
+              self._lose("a nearer remembered road")
+          else:
+            self.off_s = 0.0
         else:
           self.miss_s += dt
           if self.miss_s >= MISS_S:
@@ -451,10 +478,32 @@ class Planner:
             self.events.append({"kind": "lock", "trace": tr, "point": int(p)})
     else:
       self.fix_age += dt
+      self.alts = []
       if self.cand is not None and not self.locked:
         self.cand, self.stable_s = None, 0.0
       if self.locked and self.fix_age >= FIX_LOST_S:
         self._lose("no position fix")
+
+  def _either_road(self, need, dist, look, mph):
+    """While the car may as well be on another remembered road (self.alts), a point's allowed speed is at least the lowest the other
+    road allows within AMBIG_SHIFT_M of the same distance ahead: a corner only one of them has is not slowed for."""
+    tight = np.nonzero(need < mph)[0]
+    if not len(tight):
+      return need
+    for tr, p in self.alts:
+      i0 = int(math.floor(p))
+      idx2, d2 = self.mem.ahead(tr, i0, look + AMBIG_SHIFT_M)
+      if not len(idx2):
+        continue
+      d2 = d2 - (p - i0) * self.mem.spacing
+      eff = np.maximum(self.need[idx2], self.proven[idx2])
+      for j in tight:
+        if dist[j] > d2[-1]:
+          continue                                   # the other road's record ends before here: nothing known against the corner
+        w = np.abs(d2 - dist[j]) <= AMBIG_SHIFT_M
+        if w.any():
+          need[j] = max(need[j], float(eff[w].min()))
+    return need
 
   def _gap(self, tr, p):
     """Points from the current position to candidate (tr, p) along the trace or its continuation; None if unrelated."""
@@ -572,7 +621,7 @@ class Planner:
     i0 = int(math.floor(self.pos))
     idx, dist = self.mem.ahead(self.trace, i0, look)
     dist = dist - (self.pos - i0) * self.mem.spacing
-    need = self.need[idx]
+    need = self._either_road(self.need[idx].astype(np.float64), dist, look, mph)
     if model_need is not None:
       # the model's own preview, where it shows a sharper bend than memory around the same distance
       near = np.abs(dist - model_dist) <= 30.0
