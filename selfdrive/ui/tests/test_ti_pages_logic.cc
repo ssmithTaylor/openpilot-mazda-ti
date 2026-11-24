@@ -977,6 +977,17 @@ static void buttonsRules() {
   }
   ButtonsView none;
   CHECK(buttonsLook(none, "").word == "noreport" && !buttonsLook(none, "").run_enabled && !buttonsBusy(none));
+  // the large line in the warning colour whenever the driver is to set or check the set speed (review 2026-11-24)
+  for (const char *r : {"SET IT YOURSELF: NOW 40 MPH, WAS 45", "CRUISE OFF: CHECK SET SPEED (WAS 45)", "YOUR SET SPEED STANDS",
+                        "SET SPEED PUT BACK: 45 MPH"}) {
+    ButtonsView w;
+    w.have = w.fresh = true;
+    w.state = "aborted";
+    w.result = r;
+    const ButtonsLook k = buttonsLook(w, "");
+    CHECK(k.result_warn == (std::string(r).rfind("SET IT", 0) == 0 || std::string(r).rfind("CRUISE OFF", 0) == 0));
+    CHECK((int)k.result.size() <= MAX_BUTTONS_RESULT_CHARS && k.result == r);
+  }
 }
 
 int main() {

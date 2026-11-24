@@ -1669,7 +1669,7 @@ struct ButtonsLook {
   std::string word;                 // the controller's state, "unavailable" or "noreport"
   std::string primary, second, result, detail1, detail2, detail3;
   Tone tone = Tone::Stopped;
-  bool result_warn = false;         // the large line asks the driver to set the speed (warning colour)
+  bool result_warn = false;         // the large line asks the driver to set or check the speed (warning colour)
   bool run_enabled = false;         // HOLD TEST and TAP TEST
   std::string hold_sub, taps_sub;
   bool stop_enabled = false;
@@ -1696,7 +1696,7 @@ inline ButtonsLook buttonsLook(const ButtonsView &v, const std::string &others) 
     k.detail1 = curveCut(v.d1, MAX_BUTTONS_DETAIL_CHARS);
     k.detail2 = curveCut(v.d2, MAX_BUTTONS_DETAIL_CHARS);
     k.detail3 = curveCut(v.d3, MAX_BUTTONS_DETAIL_CHARS);
-    k.result_warn = v.result.rfind("SET IT YOURSELF", 0) == 0;
+    k.result_warn = v.result.rfind("SET IT YOURSELF", 0) == 0 || v.result.rfind("CRUISE OFF", 0) == 0;
   }
   if (!v.have || !v.fresh) {
     k.word = "noreport";
