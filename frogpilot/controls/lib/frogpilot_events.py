@@ -4,6 +4,7 @@ import random
 from openpilot.common.conversions import Conversions as CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import TurnDirection
+from openpilot.selfdrive.controls.lib.lane_drift import lane_drift_evidence
 from openpilot.selfdrive.controls.lib.events import ET, EVENT_NAME, FROGPILOT_EVENT_NAME, EventName, FrogPilotEventName, Events
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
@@ -255,7 +256,8 @@ class FrogPilotEvents:
     at_ceil = abs(sm["carControl"].actuators.steer) >= steer_authority.RUNWIDE_CEIL
     runwide_now = (lat_active and ti_now and at_ceil
                    and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
-                   and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT)
+                   and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT
+                   and lane_drift_evidence(sm["modelV2"]))   # at the limit alone is normal on held bends: needs a line close or crossed
     self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
     if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
         and getattr(frogpilot_toggles, "steer_authority_advisory", True)):
