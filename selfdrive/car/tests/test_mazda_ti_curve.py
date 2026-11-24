@@ -220,6 +220,63 @@ def test_short_gas_tolerated_long_gas_stops():
   assert car.history[-1][1] == 55
 
 
+def test_short_gas_pauses_taps():
+  # 0.6 s of gas during a slowdown: no tap starts while it is pressed or within GAS_RESUME_S after; no stop; the target still reached
+  assert C.GAS_RESUME_S == 0.5
+  c, car = C.Curve(), Car(55, 55)
+  g0, g1 = 100, 160                                             # frames with the gas pressed (car frame k = f + 1)
+  run(c, car, 3000, lambda f, car: plan(40, corner=40), gas=lambda f, car: g0 <= f < g1)
+  tt = taps(car)
+  before = [t for t in tt if t[0][0] < g0 + 1]
+  assert before, "no tap before the gas"
+  assert not [t for t in tt if g0 + 1 <= t[0][0] < g1 + 1 + 50], [t[0] for t in tt]
+  assert not [k for k, b in car.sent if g0 + 1 <= k < g1 + 1 + 50 and not any((k, b) in t for t in before)]
+  resumed = [t for t in tt if t[0][0] >= g1 + 1 + 50]
+  assert resumed and resumed[0][0][0] <= g1 + 1 + 50 + 25, resumed[0][0]   # resumes promptly (aligned to the next car frame)
+  assert not any(e["kind"] == "stop" for e in c.events), [e for e in c.events if e["kind"] == "stop"]
+  assert min(h[1] for h in car.history) == 40 and c.state != "stopped"
+
+
+class SlowCar(Car):
+  """A press reads back 9 frames after it starts (not 4): the tap's second pressed frame goes out before the step is read."""
+  def press(self, button):
+    n = len(self.pending)
+    super().press(button)
+    self.pending[n:] = [(k + 5, v) for k, v in self.pending[n:]]
+
+
+@pytest.mark.parametrize("slow", [False, True])
+def test_gas_during_tap_in_flight_no_false_stop(slow):
+  # the gas pressed on the frame after a tap's first pressed frame: that tap completes and is read back (never a false
+  # "set speed did not respond"); no new tap until GAS_RESUME_S after the gas is released
+  def first_frame(car):
+    c, f, n0 = C.Curve(), 0, 0
+    while True:
+      run(c, car, 1, lambda f_, car: plan(45, corner=45), start=f)
+      f += 1
+      if len(car.sent) > n0 and len(taps(car)[-1]) == 1:
+        return c, f
+      n0 = len(car.sent)
+      assert f < 1000
+
+  mk = SlowCar if slow else Car
+  ref_car = mk(55, 55)
+  ref_c, f_ref = first_frame(ref_car)
+  run(ref_c, ref_car, 30, lambda f_, car: plan(45, corner=45), start=f_ref)          # the same tap without the gas
+  car = mk(55, 55)
+  c, f = first_frame(car)
+  first_k = car.sent[-1][0]
+  run(c, car, 30, lambda f_, car: plan(45, corner=45), start=f, gas=True)
+  last = taps(car)[-1]
+  assert last[0][0] == first_k and last == taps(ref_car)[len(taps(car)) - 1]       # the tap in flight goes out exactly as without gas
+  assert len(last) == (C.PRESSED_FRAMES if slow else 1)                           # (the quick car reads the step before frame 2)
+  assert car.set == 55 - len(taps(car)) and c.tap_to is None                       # and is read back
+  assert not [t for t in taps(car) if t[0][0] > first_k]                          # nothing new while the gas is pressed
+  run(c, car, 3000, lambda f_, car: plan(45, corner=45), start=f + 30)
+  assert not any(e["kind"] == "stop" for e in c.events), [e for e in c.events if e["kind"] == "stop"]
+  assert car.history[-1][1] == 45 and c.state != "stopped"
+
+
 def _silent_planner(c, end_at, silent_from, end_known=True):
   """The planner's output: a corner wanting 45 whose tight stretch ends at odometer `end_at` m, fresh until frame `silent_from`, then
   the LAST output stays (the car controller keeps it) and only grows old, as when the planner process stops writing."""

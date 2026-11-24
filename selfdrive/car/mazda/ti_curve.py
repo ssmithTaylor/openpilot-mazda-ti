@@ -34,6 +34,8 @@ Planner output late (over PLAN_STALE_S) while lowered: hold the set speed, no ta
 dead (over PLAN_DEAD_S) while lowered: `restoring` ("planner stopped: restoring your set speed"): SET_PLUS back to `ref` once past
 where the corner ends + TRUST_HOLD_M (the end last known; never known: PLAN_DEAD_WAIT_S after it died), under the restore guards that
 do not need the planner (speed, lead flag, settled, paced) and the tap pace; no latch: when the planner is back it works as usual.
+Gas pressed (any length): no tap starts, a tap not yet sent is dropped (one already pressing finishes and is read back); tapping
+resumes GAS_RESUME_S after the gas is released. Gas held over GAS_MAX_S still stops the intervention, as above.
 Low-confidence planner output while lowered: restore gently (same rules as restoring) if the model's preview is gentle, else hold.
 
 Never: a SET_PLUS above `ref`; a SET_MINUS below the floor; taps closer than the reviewed tap machinery allows (ti_cruise_taps.py:
@@ -61,6 +63,7 @@ MAX_SHED_MPH = 15                # never more than this below the known speed li
 MIN_MPH = 20.0                   # no press of either kind below this speed, at standstill or with the cruise in its standstill hold
 MPH = 0.44704
 GAS_MAX_S = 1.0                  # gas held longer than this stops the intervention
+GAS_RESUME_S = 0.5               # shorter gas: no tap starts while pressed nor until this long after it is released
 OTHER_BUTTON_PAUSE_S = 2.0       # after RES / distance / mode / cancel
 PAUSE_S = 10.0                   # after the driver's own cruise button (owner, first drive: 30 s was too long, "like 10 seconds")
 CLEAR_S = 2.0
@@ -127,6 +130,8 @@ class Curve:
     self.taps_down = 0
     self.taps_up = 0
     self.gas_since = None
+    self.gas_off_at = None            # frame the gas was last released
+    self.gas_hold = False             # the gas pressed or released under GAS_RESUME_S ago: no tap may start
     self.pause_until = None
     self.stop_lowered = False
     self.stop_latched = False
@@ -265,6 +270,11 @@ class Curve:
     btn_rose = btn and not self.btn_was
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
+    if inp.gas:
+      self.gas_off_at = None
+    elif self.gas_hold and self.gas_off_at is None:
+      self.gas_off_at = frame
+    self.gas_hold = bool(inp.gas) or (self.gas_off_at is not None and (frame - self.gas_off_at) * DT < GAS_RESUME_S - 1e-9)
     if inp.driver_button and inp.driver_set:
       self.last_set_press = frame
     if cruise_rose and (frame - self.last_set_press) * DT <= 1.5:
@@ -688,7 +698,7 @@ class Curve:
     """Request one tap. Like the reviewed cruise check (ti_cruise_check._start_tap / _send): the tap waits for a new car button frame
     (a counter change, at most PHASE_WAIT_S), so both pressed frames fall between two of the car's own idle frames and register as
     ONE press; then PRESSED_FRAMES frames FRAME_SPACING apart, each re-checked, under PressGuard."""
-    if self.tap is not None or self.tap_to is not None or not self._can_press(inp):
+    if self.tap is not None or self.tap_to is not None or not self._can_press(inp) or self.gas_hold:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
@@ -708,6 +718,9 @@ class Curve:
     """The next pressed frame of the tap in flight, or None (the cruise check's _send, frame for frame)."""
     tap = self.tap
     if tap is None:
+      return None
+    if tap.first is None and self.gas_hold:
+      self._cut_tap()                 # the gas: a tap not yet sent is not sent (one already pressing finishes and is read back)
       return None
     out = None
     ok = self._correct_ok(self.tap_from) if self.tap_correcting else self._direction_ok(tap.button, self.tap_from)
