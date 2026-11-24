@@ -11,11 +11,10 @@ process and the tests feed it one tick at a time.
    the car measures over the last CHANGE_WINDOW_M stops matching the remembered curvature (the road may have changed: no trust for the
    next CHANGE_HOLDOFF_M).
 2. Look ahead along the trace (following its continuation links) LOOKAHEAD_S of driving, at least LOOKAHEAD_MIN_M, at most
-   LOOKAHEAD_MAX_M. For every remembered point the speed the steering can hold (`corner_mph`): the highest whole mph at which the
-   remembered curvature needs at most MARGIN of the measured steering envelope (ENVELOPE, conservative end of the two measurements),
-   checked over +-0.75 mph; where a remembered pass reached the steering limit or had a firm takeover, at least FLAGGED_DROP_MPH below
-   the speed that pass was driven at. The driving model's own preview (when it shows a sharper bend than memory in the next few
-   seconds) gives a second figure; the lower wins.
+   LOOKAHEAD_MAX_M. For every remembered point the speed the steering can hold (ti_curve_demand.need_mph): the highest whole mph at
+   which the MEDIAN pass's curvature (memory kap_med; never the sharpest-pass kap; a file without kap_med has no memory stage) asks no
+   more than the measured capacity of its direction (CAP_RAW: no bank term until the memory's bank is corrected), checked over
+   +-0.75 mph. Graded (plan A6): the target is where demand equals capacity, so the drop follows the excess.
 3. Slowing for a corner starts at the LATEST moment that still arrives at its speed ENTRY_M before it, given the measured response
    (see the constants below); closed loop every tick against the planned approach (push / let off / behind plan); held through the
    corner and released HOLD_AFTER_M past it. Between corners the output is a "hold" ceiling: the highest set speed a restore may reach
@@ -32,18 +31,16 @@ from typing import NamedTuple, Optional
 import numpy as np
 
 from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
+from openpilot.selfdrive.car.mazda import ti_curve_demand as D
 from openpilot.selfdrive.car.mazda import ti_curve_memory as M
 
 MPH = 0.44704
+fits = D.fits                   # re-exported: the car side's restore check (ti_curve.py)
 
-# ---- what the steering can hold (lateral-sensors-20261122 and the codex corner design; the LOWER of the two per band) -------------
-# (lowest mph of the band, m/s^2 achieved at the steering limit). Measured: 1.41 / 2.20 / 2.42 / 2.13 at 19-27 / 28-41 / 42-56 / 57+;
-# design study episode medians: 1.14 / 1.14 (28-31, the stock-steering handover) / 2.12 (32-41) / 2.42 / 2.24.
-ENVELOPE = ((19.0, 1.41), (28.0, 1.41), (32.0, 2.20), (42.0, 2.42), (57.0, 2.13))
-MARGIN = 0.90                   # 90 % of the MEASURED limit (first drive, 2026-11-23: too aggressive at the conservative end, 0.85 of the
-                                # lower design medians). The 28-31 mph handover keeps the weaker 19-27 mph figure. With the proven-speed
-                                # rule below, a corner is slowed for only above a speed earlier passes have not proven
-PROVEN_MIN_PASSES = 1           # a speed taken by any pass without the steering limit or a takeover is "proven" (memory v_proven)
+MODEL_K_SIGN = -1.0             # the model preview (ti_curve_plannerd.model_curvature: orientationRate.z / velocity.x) is openpilot's
+                                # curvature, RIGHT positive (latcontrol_angle / _pid steer from -desired_curvature); the planner's yaw_k
+                                # and the memory are LEFT positive: preview curvature times this is left positive
+AHEAD_S = 3.0                   # Plan.ahead_la: the signed peak calibrated forecast demand within this lead
 MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its sharpest curvature is at least this share of it
 HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if the next slowdown would start within this of now
 # The on-road warning (first drive, 2026-11-23: a corner needing ~35 mph was reached at 40 and the car crossed the lane line, with no
@@ -63,13 +60,9 @@ RAISE_SLACK_MPH = 0.5           # a warning starts only above need + ALERT_MARGI
 SETTLE_MPH = 0.3                # within this of its set speed the cruise is taken to be at it
 SIM_DT_S = 0.2                  # the arrival prediction's time step
 ACCEL_MPH_S = CM.ACCEL_MPH_S    # the stock cruise speeding up toward its set speed (measured: 5 mph in 7-9 s)
-SPEED_WINDOW_MPH = 0.75         # a speed fits only if every speed within this of it fits (band edges, speed error)
-FLAGGED_DROP_MPH = 10           # where a pass hit the limit or had a takeover: at least this far below the speed it was driven at
-FLAG_MIN_LA = 1.3               # ... only where the remembered bend needed at least this lateral acceleration (m/s^2) at that speed
-                                # (1.0 until 2026-11-24: with flags spread 60-80 m ahead of the event, gentle lead-ins were capped too)
-AIM_MIN_LA = 1.3                # aim the approach at the first point of a corner where the remembered bend needs at least this lateral
-                                # acceleration (m/s^2) at the corner's own target speed (owner, 2026-11-24: arrive just in time; it aimed
-                                # at the first flagged point, 5-9 s early on 00000342). None reaches it: the corner's sharpest point
+SPEED_WINDOW_MPH = D.SPEED_WINDOW_MPH   # a speed fits only if every speed within this of it fits (band edges, speed error)
+ENTRY_LA = 1.3                  # a corner's entry (where the approach aims) is its first point whose demand reaches this (m/s^2) at the
+                                # corner's own target speed (owner, 2026-11-24: arrive just in time). None reaches it: its sharpest point
 CAR_MIN_MPH = 19                # the car's own lowest set speed
 MAX_MPH = 90
 
@@ -201,87 +194,11 @@ LIVE_K_TAU_S = 0.5              # smoothing of the live curvature (the memory is
 # ---- the model's own preview -----------------------------------------------------------------------------------------------------
 MODEL_LOOK_S = 8.0
 
-_RUNGS = np.arange(MAX_MPH, CAR_MIN_MPH - 1, -1, dtype=np.float64)   # highest first
-
-
-def envelope(mph):
-  a = ENVELOPE[0][1]
-  for lo, acc in ENVELOPE:
-    if mph >= lo:
-      a = acc
-  return a
-
-
-def _limit_table():
-  """For every rung: the lowest envelope within +-SPEED_WINDOW_MPH, times MARGIN, over (rung + window) squared in m/s:
-  the largest curvature that fits at that rung."""
-  out = []
-  for r in _RUNGS:
-    lo, hi = max(CAR_MIN_MPH, r - SPEED_WINDOW_MPH), r + SPEED_WINDOW_MPH
-    env = min(envelope(s) for s in (lo, r, hi))
-    out.append(MARGIN * env / ((hi * MPH) ** 2))
-  return np.array(out)
-
-
-_KMAX = _limit_table()
-
-
-def fits(k, mph):
-  """True when |k| fits at `mph` (same rule as corner_mph)."""
-  lo, hi = max(CAR_MIN_MPH, mph - SPEED_WINDOW_MPH), mph + SPEED_WINDOW_MPH
-  env = min(envelope(s) for s in (lo, mph, hi))
-  return abs(k) * (hi * MPH) ** 2 <= MARGIN * env + 1e-12
-
-
-def corner_mph(k):
-  """Highest whole mph (CAR_MIN_MPH .. MAX_MPH) at which |k| fits; CAR_MIN_MPH when none does. Vectorised over k."""
-  k = np.abs(np.atleast_1d(np.asarray(k, np.float64)))
-  ok = k[:, None] <= _KMAX[None, :] + 1e-12
-  first = np.where(ok.any(axis=1), ok.argmax(axis=1), len(_RUNGS) - 1)
-  return _RUNGS[first]
-
-
-LIMIT_OUTWEIGH_MPH = 5          # HISTORY BEATS CALCULATION (owner, 2026-11-23 second drive): a steering-limit flag is outweighed by a clean
-LANE_OUTWEIGH_MPH = 0           # engaged pass this much faster than the failing speed; a takeover / lane-line flag alone by one at or above it
-
-
-def real_trouble(kap, flags, v_flag, v_proven=None):
-  """Points where the record shows trouble that the clean passes do not outweigh: a flag (steering limit, firm takeover, lane line) on
-  a real bend at the failing speed, and no clean ENGAGED pass (memory v_proven: lateral control active, no event near, not stopping)
-  faster than the failing speed by LIMIT_OUTWEIGH_MPH (a limit flag) or LANE_OUTWEIGH_MPH (a takeover or lane-line flag alone).
-  Hand-driven passes never prove a speed: the lateral acceleration a driver reaches says nothing of what the steering can hold."""
-  fl = np.asarray(flags)
-  flagged = (fl & (M.FLAG_LIMIT | M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
-  vf = np.asarray(v_flag, np.float64)
-  # trouble counts only where it was a CORNER at the failing speed (a lane-line touch or a takeover on a straight is not a corner)
-  corner_there = np.abs(np.asarray(kap, np.float64)) * np.where(np.isfinite(vf), vf, 0.0) ** 2 >= FLAG_MIN_LA
-  out = flagged & np.isfinite(vf) & corner_there
-  # the steering command at its limit is NOT trouble by itself on this car (owner, 2026-11-23: the "running wide" alert fires on bends
-  # it holds fine; the interceptor command saturates at 600 there): a limit flag counts only with a takeover or lane-line flag there too
-  out &= (fl & (M.FLAG_TAKEOVER | getattr(M, "FLAG_LANE", 8))) != 0
-  if v_proven is not None:
-    vp = np.asarray(v_proven, np.float64)
-    over = np.where((fl & M.FLAG_LIMIT) != 0, LIMIT_OUTWEIGH_MPH, LANE_OUTWEIGH_MPH)
-    outweighed = np.isfinite(vp) & np.isfinite(vf) & (np.floor(vp / MPH) >= np.floor(vf / MPH) + over)
-    out &= ~outweighed
-  return out
-
-
-def needed_mph(kap, flags, v_flag, v_proven=None):
-  """The speed each remembered point allows: corner_mph, and at least FLAGGED_DROP_MPH below a flagged pass's speed where that
-  trouble is real (real_trouble: not outweighed by a faster clean pass; without v_proven every flag on a real bend counts)."""
-  need = corner_mph(kap)
-  vf = np.asarray(v_flag, np.float64)
-  real = real_trouble(kap, flags, v_flag, v_proven)
-  cap = np.where(real, np.floor(np.where(np.isfinite(vf), vf, 0.0) / MPH) - FLAGGED_DROP_MPH, np.inf)
-  return np.minimum(need, np.maximum(cap, CAR_MIN_MPH))
-
-
-def aim_point(run, kabs, T):
-  """The point of a tight run (array of look-ahead indices) to aim the approach at: the first whose remembered |curvature| needs at
-  least AIM_MIN_LA at the corner's target T (mph); none does: the run's sharpest point (the first of equals)."""
+def entry_point(run, kabs, T):
+  """The point of a tight run (array of look-ahead indices) to aim the approach at: the first whose demand (remembered median |k|, no
+  bank term) reaches ENTRY_LA at the corner's target T (mph); none does: the run's sharpest point (the first of equals)."""
   la = kabs[run] * (T * MPH) ** 2
-  hit = np.nonzero(la >= AIM_MIN_LA)[0]
+  hit = np.nonzero(la >= ENTRY_LA)[0]
   return int(run[hit[0]]) if len(hit) else int(run[int(np.argmax(kabs[run]))])
 
 
@@ -309,9 +226,15 @@ class Plan(NamedTuple):
   end_m: Optional[float] = None   # a corner in progress: metres to the END of its tight stretch (dist_m is to its start)
   behind: bool = False            # the car is slowing less than planned (not the same as capped)
   alert_mph: Optional[int] = None # warn the driver: the corner ahead needs this speed and the feature will not get there
-  need_mph: Optional[int] = None  # the corner's TRUE need (envelope, proven speed), NOT clamped to the floor (corner_mph is)
+  need_mph: Optional[int] = None  # the corner's TRUE need (demand against capacity), NOT clamped to the floor (corner_mph is)
   trace: int = -1
   point: int = -1
+  stage: int = 0                  # what set the ceiling: 0 none, 1 memory ramp (early geometry), 2 late forecast-confirmed
+  src: str = ""                   # "mem" / "map" / "fc" (forecast); "" with no ceiling
+  ahead_la: Optional[float] = None  # signed (left +) peak calibrated forecast demand within AHEAD_S, m/s^2 (None: no preview)
+  cap: Optional[float] = None     # the capacity (m/s^2) the limiting bend was judged against, at its target and side
+  released: bool = False          # stage 1 released by the forecast (plan T6; always False until then)
+  diag: Optional[dict] = None     # small per-tick decision record for the tick log (plan T8); never a position
 
 
 def bearing_to_hdg(bearing_deg):
@@ -325,22 +248,15 @@ class Planner:
 
   def __init__(self, memory):
     self.mem = memory
-    vp = np.asarray(getattr(memory, "v_proven", np.full(memory.n, np.nan)), np.float64) if memory is not None else None
-    self.need = needed_mph(memory.kap, memory.flags, memory.v_flag, vp) if memory is not None else None
+    self.need = None
+    self.mem_stage = False
     if memory is not None:
-      self.proven = np.where(np.isfinite(vp), np.floor(vp / MPH), 0.0)
-      # HISTORY BEATS CALCULATION: the highest clean engaged speed on record is never slowed below, whatever the curvature says. Only
-      # where the trouble on record is REAL (real_trouble: not outweighed by a faster clean pass) does the trouble win: no proven speed
-      # there, and the target stays FLAGGED_DROP_MPH below the speed that failed (needed_mph). (Before 2026-11-23 any flag on any
-      # pass zeroed the proven speed: the cause of 10-15 mph slowdowns on bends driven cleanly many times.)
-      trouble = real_trouble(memory.kap, memory.flags, memory.v_flag, vp)
-      self.proven = np.where(trouble, 0.0, self.proven)
-      self.single = np.asarray(memory.npass) <= 1
-      self.kabs = np.abs(memory.kap)
-      self.env_need = corner_mph(memory.kap)          # what the steering envelope alone allows (no trouble cap): the aim guard
-      # the road-change check compares shape with the MEDIAN pass (memory kap_med), never with the conservative figure
+      # plan from the MEDIAN pass only (plan T4: never the sharpest-pass kap); the same figure serves the road-change check
       self.kmed = np.asarray(getattr(memory, "kap_med", memory.kap), np.float64)
-    self.skipped = set()
+      self.mem_stage = bool(getattr(memory, "has_kap_med", True))
+      # bank = 0 and CAP_RAW until the memory carries the corrected bank (Memory.bank_v >= 2; plan section 5, default 4)
+      self.need = D.need_mph(self.kmed).astype(np.float64) if self.mem_stage else np.full(memory.n, float(MAX_MPH))
+      self.kabs = np.abs(self.kmed)
     self.limit = None
     self.reset()
 
@@ -490,7 +406,7 @@ class Planner:
       if not len(idx2):
         continue
       d2 = d2 - (p - i0) * self.mem.spacing
-      eff = np.maximum(self.need[idx2], self.proven[idx2])
+      eff = self.need[idx2]
       for j in tight:
         if dist[j] > d2[-1]:
           continue                                   # the other road's record ends before here: nothing known against the corner
@@ -563,9 +479,11 @@ class Planner:
     return self.change_strikes >= CHANGE_STRIKES
 
   # ---- one tick ------------------------------------------------------------------------------------------------------------------
-  def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None, ref_mph=None, floor_mph=None, acting=True):
+  def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None, ref_mph=None, floor_mph=None, acting=True,
+           map_k=None):
     """t: seconds (monotonic); fix: Fix; v: m/s; set_mph: the cruise set speed or None; yaw_k: live curvature (1/m, left +, from the
-    car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview, or None. -> Plan."""
+    car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview as it publishes it (RIGHT
+    positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (accepted; used from plan T6). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
@@ -575,18 +493,22 @@ class Planner:
     if yaw_k is not None and math.isfinite(yaw_k):
       a = 1.0 if dt <= 0 else min(1.0, dt / LIVE_K_TAU_S)
       self.live_k += a * (yaw_k - self.live_k)
-    model_la, model_need, model_dist = None, None, None
+    model_la = None
     self.model_k = None
+    self.fc = None                      # (lead times, LEFT-positive curvature) of the model preview this tick
+    self.ahead_la = None
     if model_k is not None:
       ts, ks = model_k
       ts, ks = np.asarray(ts, np.float64), np.asarray(ks, np.float64)
       sel = ts <= MODEL_LOOK_S
-      if sel.any() and np.all(np.isfinite(ks[sel])):
+      if len(ts) == len(ks) and sel.any() and np.all(np.isfinite(ks[sel])):
         kk = np.abs(ks[sel])
         j = int(np.argmax(kk))
         model_la = float(kk[j] * max(v, 1.0) ** 2)
         self.model_k = float(kk[j])
-        model_need, model_dist = float(corner_mph(kk[j])[0]), float(ts[sel][j] * v)
+        self.fc = (ts, MODEL_K_SIGN * ks)
+        _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S)
+        self.ahead_la = None if la3 is None else round(la3, 2)
     if self.mem is None:
       return self._out(None, 0.0, False, False, "no road memory on the device", None, None, model_la)
     self._localise(dt, fix, v)
@@ -624,13 +546,6 @@ class Planner:
     idx, dist = self.mem.ahead(self.trace, i0, look)
     dist = dist - (self.pos - i0) * self.mem.spacing
     need = self._either_road(self.need[idx].astype(np.float64), dist, look, mph)
-    if model_need is not None:
-      # the model's own preview, where it shows a sharper bend than memory around the same distance
-      near = np.abs(dist - model_dist) <= 30.0
-      if near.any() and model_need < float(need[near].min()):
-        idx = np.r_[idx, -1]
-        dist = np.r_[dist, model_dist]
-        need = np.r_[need, model_need]
     # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
     # (kept from the first corner of a chain until the car is back near the speed it started from, as the car side does)
     # ONE source with the car side (2026-11-23 drive: a floor kept here from an earlier 55 mph episode clamped every corner for 11 min
@@ -639,58 +554,36 @@ class Planner:
     self.int_floor = floor
     self.int_base = float(ref_mph) if ref_mph else None
     shed_to = np.maximum(need, floor)
-    mem_pt = idx >= 0
-    u_ref0 = max(u, self.int_base or 0.0)
-    # 1. never a target below a speed earlier passes have PROVEN (taken without the steering limit or a takeover); a corner at or above
-    #    the car's speed by that measure is not slowed for at all
-    proven = np.where(mem_pt, self.proven[np.clip(idx, 0, None)], 0.0)
-    shed_env = shed_to.copy()
-    shed_to = np.maximum(shed_to, proven)
-    # 2. a corner remembered from ONE pass is slowed for like any other (owner, 2026-11-23: "I don't think I want that actually" to the
-    #    5 mph single-pass trim; "Surely once is enough for at least a first attempt"). Phantom protection comes from the pass-quality
-    #    filters in the memory builder only.
-    # what it chose NOT to slow for (logged once per corner, for review against outcomes)
-    skip = np.nonzero(((u_ref0 - shed_env) >= MIN_DROP_MPH) & ((u_ref0 - shed_to) < MIN_DROP_MPH) & mem_pt)[0]
-    for j in skip[:1]:
-      k_ = int(idx[j])
-      if k_ not in self.skipped and len(self.skipped) < 5000:
-        self.skipped.add(k_)
-        self.events.append({"kind": "not_slowing", "point": k_, "why": "proven speed", "env_mph": int(shed_env[j]),
-                            "proven_mph": int(proven[j]), "mph": round(mph, 1), "dist": round(float(dist[j]), 1)})
     grade = getattr(self.mem, "grade", None)
     # tight against the speed now, the set speed, and (within a chain) the speed the chain started from, so a corner just after one
     # already slowed for still bounds the way back up (a "hold")
     u_ref = max(u, self.int_base or 0.0)
     tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
-    # corners: runs of consecutive tight points; per run, its aim point (aim_point), its lowest-speed point, and the guard points
+    # corners: runs of consecutive tight points; per run, its entry (entry_point), its lowest-speed point, and the guard points
     cands = {}
     if len(tight):
       breaks = np.nonzero(np.diff(tight) > 1)[0]
       starts = np.r_[0, breaks + 1]
       ends = np.r_[breaks, len(tight) - 1]
-      # the |curvature| of every look-ahead point (the driving model's own point: its preview) and what the envelope alone allows there
-      kab = np.where(mem_pt, self.kabs[np.clip(idx, 0, None)], self.model_k or 0.0)
-      phys = np.maximum(shed_to, np.where(mem_pt, np.maximum(np.maximum(self.env_need[np.clip(idx, 0, None)], floor), proven), shed_to))
+      kab = self.kabs[idx]
       for s0, s1 in zip(starts, ends):
         run = tight[s0:s1 + 1]
         lowest = run[int(np.argmin(need[run]))]
         # a corner is known by the END of its tight stretch: it stays the same while the car drives into the stretch (its first and
         # lowest points ahead change as they are passed), so a corner is started once
         key = int(idx[run[-1]])
-        # aimed where the bend really loads the car at the corner's speed (aim_point), not at the run's first point (often a trouble
-        # flag spread ahead of the event). GUARD: every point before the aim whose ENVELOPE speed (phys: no trouble cap, never below
-        # the floor or the proven speed) is itself tight is a constraint of its own at that speed and distance, so the car is never
-        # planned to arrive at an earlier point faster than the physics there allows. The lowest point is always a constraint.
-        aim = aim_point(run, kab, int(shed_to[run].min()))
-        # the lowest speed of the run: among equals (a trouble cap spread over the lead-in) the first at or after the aim point; a
-        # strictly lower point before the aim is still a constraint where it is
+        # aimed at the corner's ENTRY (entry_point: the first point whose demand reaches ENTRY_LA at the corner's speed), not at the
+        # run's first point (a gentle lead-in). GUARD: every tight point before the entry is a constraint of its own at its own speed
+        # and distance, so the car is never planned to arrive at an earlier point faster than the capacity there allows. The lowest
+        # point (the first of equals at or after the entry) is always a constraint.
+        aim = entry_point(run, kab, int(shed_to[run].min()))
         tied = run[(need[run] <= need[lowest]) & (run >= aim)]
         lowest = int(tied[0]) if len(tied) else int(lowest)
         pts = {int(aim), int(lowest)}
-        pts.update(int(j) for j in run[run < aim] if (u_ref - phys[j]) >= MIN_DROP_MPH)
+        pts.update(int(j) for j in run[run < aim])
         for j in sorted(pts):
-          T = int(shed_to[j]) if j in (aim, int(lowest)) else int(phys[j])
-          D = float(dist[j]) - ENTRY_M
+          T = int(shed_to[j])
+          D_ = float(dist[j]) - ENTRY_M
           buf = BUFFER_S
           if grade is not None and dist[j] > 0:
             sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
@@ -698,28 +591,31 @@ class Planner:
             if math.isfinite(g) and g < -GRADE_STEEP_DEG:
               buf += GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
           S1 = max(floor, T - DRIVE_GAP_MPH)
-          va = v_allow(D, T, S1, buf)
+          va = v_allow(D_, T, S1, buf)
           # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
           # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
           # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
           due = bool(set_mph and set_mph > mph + SETTLE_MPH and
-                     approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D and
-                     approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D)
+                     approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D_ and
+                     approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D_)
           c = cands.get(key)
           if c is None or va < c["va"] or (due and not c["due"]):
-            cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "va": va, "D": D, "due": due,
-                          "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]), "S1": S1, "buf": buf}
+            side = D.LEFT if self.kmed[idx[j]] > 0 else D.RIGHT
+            cands[key] = {"T": T, "need": int(need[j]), "Tc": int(need[j]), "va": va, "D": D_, "due": due,
+                          "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]), "S1": S1, "buf": buf,
+                          "cap": D.capacity(T, side)}
     # start: the car is at or above the highest speed from which it can still make it (or, below its set speed, the start is due)
     for key, c in cands.items():
       if key not in self.active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
-                            "since": t, "start_t": t, "start_over": mph - c["va"]}
+                            "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"]}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
                             "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in self.active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
       self.events.append({"kind": "passed", "point": key, "T": self.active[key]["T"], "mph": round(mph, 1)})
       del self.active[key]
     ceil, cdist, cpt, kind, corner = None, None, -1, "", None
+    cap = None
     need_true = None
     cend = None
     behind = False
@@ -760,6 +656,7 @@ class Planner:
       if ceil is None or cc < ceil:
         ceil, cdist, cpt, kind, corner = cc, round(max(0.0, a_["entry"] - self.odo), 1), key, "corner", T
         need_true = a_["Tc"]
+        cap = a_.get("cap")
         cend = round(a_["at"] - self.odo, 1)
     if not self.active:
       # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
@@ -773,7 +670,8 @@ class Planner:
           hold = (c["va"], key, c)
       if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
         ceil, cdist, cpt, kind, corner = int(math.floor(hold[0])), round(hold[2]["D"], 1), hold[1], "hold", hold[2]["T"]
-    corners = self._corners(idx, dist, np.maximum(need, proven), mph)
+        cap = hold[2]["cap"]
+    corners = self._corners(idx, dist, need, mph)
     # latch every corner within reach of the warning horizon (plus LATCH_EXTRA_S of driving) while the road is trusted, and keep it,
     # by the odometer, until the car is LATCH_PAST_M past its end: also through a wrong re-match (a trusted position that no longer
     # shows it). A corner seen now replaces its latched copy.
@@ -795,8 +693,9 @@ class Planner:
     self.end_m = cend
     self.behind = behind
     self.need_out = need_true
+    self.cap_out = cap
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
-                     past=kind == "hold")
+                     past=kind == "hold", stage=1, src="mem")
 
   @staticmethod
   def _raise_due(mph, set_mph, T):
@@ -821,7 +720,7 @@ class Planner:
     return v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
 
   def _corners(self, idx, dist, need_true, mph):
-    """The corners ahead the car is too fast for now: runs of points (at most 2 spacings apart) whose TRUE need (envelope, proven
+    """The corners ahead the car is too fast for now: runs of points (at most 2 spacings apart) whose TRUE need (demand against capacity;
     speed; never the floor) is below mph - ALERT_MARGIN_MPH, up to HOLD_AFTER_M behind. Each: key (its last point, or the model's
     point), need (whole mph, the run's lowest), entry / low / end on the odometer."""
     pts = np.nonzero((need_true < mph - ALERT_MARGIN_MPH) & (dist >= -HOLD_AFTER_M))[0]
@@ -873,12 +772,13 @@ class Planner:
     self.resp = min(RESP_FACTOR, max(0.2, obs / exp))
     self.resp_t = t
 
-  def _arrive(self, v, d, set0, s1, lowering):
+  def _arrive(self, v, d, set0, s1, lowering, T=None):
     """The speed (mph) at `d` metres from what curve slowing will actually do: the set speed tapped down from `set0` one mph per TAP_S
     to `s1` when `lowering` (else it stays), the car answering as ti_cruise_model says (the same model the approach is planned with),
     its slowing scaled by the share of it the car is observed to give now if less (`_observe`; kept under plan amendment A1 because
-    it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5)."""
-    return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp)
+    it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5). With T
+    (above s1): the planner's own manoeuvre, a push to s1 and the model-timed raise back to T (plan A11)."""
+    return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T)
 
   def _warn(self, corners, mph, v, floor, acting, set_mph, lowering):
     """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,
@@ -902,7 +802,8 @@ class Planner:
       if not set_mph:
         arrive = mph                              # no cruise: nothing changes the speed
       elif acting and lowering:
-        arrive = self._arrive(v, d_low, float(set_mph), float(max(floor, need - DRIVE_GAP_MPH)), True)
+        T = max(need, int(floor))
+        arrive = self._arrive(v, d_low, float(set_mph), float(max(floor, T - DRIVE_GAP_MPH)), True, T=T)
       else:
         arrive = self._arrive(v, d_low, float(set_mph), float(set_mph), False)
       if key in self.alerting:
@@ -925,14 +826,20 @@ class Planner:
       self.alerted.add(key)
     return out
 
-  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind=""):
+  def _out(self, ceil, conf, trusted, known, why, dist, cmph, model_la, past=False, capped=False, point=-1, kind="", stage=0, src=""):
     end, self.end_m = self.end_m, None
     behind, self.behind = self.behind, False
     alert, self.alert = self.alert, None
     need, self.need_out = getattr(self, "need_out", None), None
+    cap, self.cap_out = getattr(self, "cap_out", None), None
+    if ceil is None:
+      stage, src = 0, ""
+    ahead = getattr(self, "ahead_la", None)
+    diag = {"stage": stage, "ceil": ceil, "kind": kind, "need": need if isinstance(need, (int, np.integer)) else None,
+            "cap": cap, "ahead": ahead, "behind": behind, "alert": alert}
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
                 self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
-                point)
+                point, stage, src, ahead, cap, False, diag)
 
 
 def plan_json(plan, t_mono, seq, mode):
@@ -942,4 +849,5 @@ def plan_json(plan, t_mono, seq, mode):
           "model_la": None if plan.model_la is None else round(plan.model_la, 2), "capped": plan.capped,
           "limit": plan.limit_mph, "model_k": None if plan.model_k is None else round(plan.model_k, 5), "kind": plan.kind,
           "corner": plan.corner_mph, "end": plan.end_m, "behind": plan.behind, "alert": plan.alert_mph,
-          "need": None if plan.need_mph is None else int(plan.need_mph)}
+          "need": None if plan.need_mph is None else int(plan.need_mph), "stage": plan.stage, "src": plan.src,
+          "ahead": plan.ahead_la, "cap": plan.cap, "rel": plan.released}

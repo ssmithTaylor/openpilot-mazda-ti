@@ -270,7 +270,8 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
         paused_or_stopped_before=any(x[4] in ('paused', 'stopped') for x in before),
         grade_deg=round(float(np.degrees(np.mean([x[10] for x in before[-60:]]))) if before else 0.0, 2),
         grade_min_deg=round(float(np.degrees(np.min([x[10] for x in before[-60:]]))) if before else 0.0, 2),
-        fits_raw=bool(kc * (v_c * MPH) ** 2 <= P.envelope(v_c)), fits_raw_rec=bool(kc * (float(R['c_v_mph'][j]) * MPH) ** 2 <= P.envelope(float(R['c_v_mph'][j]))),
+        fits_raw=bool(kc * (v_c * MPH) ** 2 <= P.D.capacity(v_c, P.D.UNKNOWN)),
+        fits_raw_rec=bool(kc * (float(R['c_v_mph'][j]) * MPH) ** 2 <= P.D.capacity(float(R['c_v_mph'][j]), P.D.UNKNOWN)),
         fits_margin=bool(P.fits(kc, v_c)), shed=round(max(0.0, float(R['c_v_mph'][j]) - v_c), 1),
         restored_s_after=None if restored is None else round(restored[1] - tc, 1)))
   return dict(drive=drive, runs=runs, corners=out_corners, plan_ms=[float(np.mean(plan_times) * 1e3) if plan_times else None,

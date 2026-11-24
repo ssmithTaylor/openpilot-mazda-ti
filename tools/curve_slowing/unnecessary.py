@@ -49,24 +49,15 @@ def _mem(path):
 
 def rule_of(planner, mem, k):
   """which rule set the target at memory point k"""
+  # plan T4: the target is the median pass's demand against the capacity of its direction (no trouble cap, no proven speed);
+  # this tool is rewritten in T9
   fl = int(mem.flags[k])
-  env = int(P.corner_mph(mem.kap[k])[0])
   need = int(planner.need[k])
-  pv = mem.v_proven[k] / MPH if np.isfinite(mem.v_proven[k]) else float('nan')
-  vf = mem.v_flag[k] / MPH if np.isfinite(mem.v_flag[k]) else float('nan')
+  side = 'left' if mem.kap_med[k] > 0 else 'right'
   names = [n for b, n in ((M.FLAG_LIMIT, 'limit'), (M.FLAG_TAKEOVER, 'takeover'), (M.FLAG_LANE, 'lane')) if fl & b]
-  if need < env:
-    why = f"trouble cap ({'+'.join(names)} at {vf:.0f}) -> {need}"
-  else:
-    sharp = abs(mem.kap[k]) > 1.3 * abs(mem.kap_med[k]) + 1e-9
-    why = f"envelope {env}" + (" (conservative curvature, median pass allows %d)" % int(P.corner_mph(mem.kap_med[k])[0]) if sharp else "")
+  why = f"capacity ({side}) {need}" + (f", flags {'+'.join(names)} (not used)" if names else "")
   if int(mem.npass[k]) <= 1:
     why += ", single pass"
-  pr = int(planner.proven[k])
-  if names and np.isfinite(pv):
-    why += f", proven {pv:.0f} ZEROED by flag"
-  elif pr < need + 2:
-    why += f", proven {pr if pr else 'none'}"
   return why
 
 

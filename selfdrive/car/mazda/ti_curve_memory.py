@@ -22,8 +22,10 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
   bank         float16 m/s^2 (nan where unknown); informational only
   grade        OPTIONAL float16 radians, road grade, positive = uphill in the direction of travel (median over passes of the
                liveLocationKalman calibrated pitch, low-passed ~3 s); nan where unknown; read as zeros when the file has none
-  kap_med      OPTIONAL float16 1/m, left positive: the plain MEDIAN curvature of the same usable passes as kap (for the road-change
-               check); read as a copy of kap when the file has none
+  kap_med      OPTIONAL float16 1/m, left positive: the plain MEDIAN curvature of the same usable passes as kap: what the planner plans
+               from (plan T4) and the road-change check compares with. A file without it has NO memory stage (Memory.has_kap_med
+               False); the road-change check then reads a copy of kap
+  meta bank_v  the bank term's version (default 1); the planner uses the bank only from 2 (corrected tilt sign)
   v_proven     OPTIONAL float16 m/s: the highest speed of a pass through the point with lateral control active and no steering-limit
                event or firm takeover from 80 m before to 80 m after it; nan where none, and read as nan when the file has none
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
@@ -58,7 +60,11 @@ class Memory:
     self.y = np.asarray(arrays["y"], np.float64)
     self.hdg = np.asarray(arrays["hdg"], np.float64)
     self.kap = np.asarray(arrays["kap"], np.float64)
-    self.kap_med = np.asarray(arrays["kap_med"], np.float64) if "kap_med" in arrays else self.kap.copy()
+    # the planner plans from the MEDIAN pass only (plan T4): a file without kap_med has no memory stage (it used to fall back silently
+    # to the sharpest-pass kap); the copy below serves only the road-change check
+    self.has_kap_med = "kap_med" in arrays
+    self.kap_med = np.asarray(arrays["kap_med"], np.float64) if self.has_kap_med else self.kap.copy()
+    self.bank_v = int(meta.get("bank_v", 1))     # the bank term is used only from version 2 (corrected tilt sign); bank = 0 until then
     self.v = np.asarray(arrays["v"], np.float64)
     self.flags = np.asarray(arrays["flags"], np.uint8)
     self.v_flag = np.asarray(arrays["v_flag"], np.float64)
@@ -213,8 +219,9 @@ def synthetic_trace(segments, x0=0.0, y0=0.0, h0=0.0, spacing=SPACING_M):
   return {"x": np.array(xs), "y": np.array(ys), "hdg": np.array([wrap(a) for a in hs]), "kap": np.array(ks)}
 
 
-def synthetic(traces, v=25.0, nexts=None, flags=None, v_flag=None):
-  """A Memory from synthetic traces (each a dict from synthetic_trace). flags / v_flag: optional per-trace arrays."""
+def synthetic(traces, v=25.0, nexts=None, flags=None, v_flag=None, kap_med=True):
+  """A Memory from synthetic traces (each a dict from synthetic_trace). flags / v_flag: optional per-trace arrays. kap_med: True (the
+  median curvature is the traces' own), False (a file without one), or per-trace arrays."""
   cat = lambda k: np.concatenate([t[k] for t in traces])
   n = sum(len(t["x"]) for t in traces)
   starts = np.r_[0, np.cumsum([len(t["x"]) for t in traces])]
@@ -223,4 +230,8 @@ def synthetic(traces, v=25.0, nexts=None, flags=None, v_flag=None):
   arrays = {"x": cat("x"), "y": cat("y"), "hdg": cat("hdg"), "kap": cat("kap"), "v": np.full(n, v), "flags": fl, "v_flag": vf,
             "npass": np.full(n, 3), "bank": np.full(n, np.nan), "trace_start": starts,
             "trace_next": np.array(nexts if nexts is not None else [-1] * len(traces))}
+  if kap_med is True:
+    arrays["kap_med"] = cat("kap").copy()
+  elif kap_med is not False:
+    arrays["kap_med"] = np.concatenate(kap_med)
   return Memory(arrays, {"version": VERSION, "spacing_m": SPACING_M, "lat0": 0.0, "lon0": 0.0, "kx": 111320.0, "ky": 110574.0})

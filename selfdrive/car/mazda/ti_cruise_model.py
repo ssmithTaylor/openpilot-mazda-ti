@@ -159,14 +159,28 @@ def manoeuvre(v0, T, S1=None, raise_at=None, arrived=ARRIVED_MPH, dt=0.05, varia
   return t, x
 
 
-def speed_at(v_mph, d_m, set0, goal, lowering, dt=0.2, variant=TIMING, scale=1.0, tmax=120.0):
+def speed_at(v_mph, d_m, set0, goal, lowering, dt=0.2, variant=TIMING, scale=1.0, tmax=120.0, T=None, tap_s=TAP_S):
   """The speed (mph) after `d_m` metres: the cruise settled on its current gap (dash `set0`), our taps walking the dash to `goal`
-  from now when `lowering` (else it stays at `set0`); `scale` as in Cruise."""
+  from now when `lowering` (else it stays at `set0`); `scale` as in Cruise. With T (> goal, lowering): the planner's own manoeuvre
+  (plan A11): the push toward `goal` and the walk back up to T when `raise_due` says, judged as in `manoeuvre`."""
   car = Cruise(v_mph, set0, dt, variant, scale)
   x, t = 0.0, 0.0
+  if T is None or not lowering or goal >= T:
+    while x < d_m and t < tmax:
+      s = dash_after(set0, goal, t) if lowering else set0
+      car.step(s)
+      x += car.v * MPH * dt
+      t += dt
+    return car.v
+  setn, tap_t, raised, chk = int(round(set0)), 0.0, False, 0.0
   while x < d_m and t < tmax:
-    s = dash_after(set0, goal, t) if lowering else set0
-    car.step(s)
+    if not raised and t >= tap_t - 1e-9 and t >= chk - 1e-9 and car.v <= T + RAISE_CHECK_MPH:
+      raised, chk = raise_due(car, setn, T, tap_s), t + RAISE_CHECK_S
+    g = T if raised else goal
+    if t >= tap_t - 1e-9 and setn != g:
+      setn += 1 if g > setn else -1
+      tap_t = t + tap_s
+    car.step(setn)
     x += car.v * MPH * dt
     t += dt
   return car.v

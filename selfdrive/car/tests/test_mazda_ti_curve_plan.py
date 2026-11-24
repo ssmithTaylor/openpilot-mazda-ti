@@ -7,6 +7,7 @@ import pytest
 from openpilot.selfdrive.car.mazda import ti_curve_memory as M
 from openpilot.selfdrive.car.mazda import ti_curve_plan as P
 from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
+from openpilot.selfdrive.car.mazda import ti_curve_demand as D
 
 MPH = P.MPH
 DT = 0.2
@@ -64,42 +65,89 @@ def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph
 
 
 # ---- the speed law -------------------------------------------------------------------------------------------------------------
-def test_corner_mph_monotonic_and_fits():
+def test_need_mph_monotonic_and_fits():
+  # rewritten for plan T4 (was test_corner_mph_monotonic_and_fits): need_mph per direction, demand within capacity over the window
   ks = np.linspace(0.0, 0.05, 400)
-  sp = P.corner_mph(ks)
-  assert np.all(np.diff(sp) <= 0)                      # sharper never allows more speed
-  for k, s in zip(ks, sp):
-    if s > P.CAR_MIN_MPH:
-      assert P.fits(k, s)
-      assert not any(P.fits(k, r) for r in range(int(s) + 1, P.MAX_MPH + 1))
+  for sign in (1.0, -1.0):
+    sp = D.need_mph(sign * ks)
+    assert np.all(np.diff(sp) <= 0)                    # sharper never allows more speed
+    for k, s_ in zip(ks, sp):
+      if s_ > P.CAR_MIN_MPH:
+        side = D.LEFT if sign > 0 else D.RIGHT
+        for v in (s_ - 0.75, s_, s_ + 0.75):
+          assert D.demand(v, sign * k) <= D.capacity(v, side) + 1e-9
+  for k in (0.004, 0.008, 0.012):
+    lo = int(min(D.need_mph(k)[0], D.need_mph(-k)[0]))
+    assert P.fits(k, lo) and not P.fits(k, lo + 1)       # P.fits: direction unknown, the lower side
 
 
-def test_corner_mph_examples():
-  # a 200 m radius bend: 2.42*0.85 = 2.06 m/s^2 -> about 45 mph
-  s = P.corner_mph(1 / 200.0)[0]
-  assert 40 <= s <= 46
-  assert P.corner_mph(0.0)[0] == P.MAX_MPH
-  assert P.corner_mph(1.0)[0] == P.CAR_MIN_MPH
+def test_need_mph_examples():
+  # rewritten for plan T4 (was test_corner_mph_examples: 40-46 mph for a 200 m bend at 0.9 x the old envelope). CAP_RAW, no margin:
+  # left 49 mph (2.56 m/s^2 at 45-54), right 46 (2.19)
+  assert D.need_mph(1 / 200.0)[0] == 49 and D.need_mph(-1 / 200.0)[0] == 46
+  assert D.need_mph(0.0)[0] == P.MAX_MPH
+  assert D.need_mph(1.0)[0] == P.CAR_MIN_MPH
 
 
-def test_envelope_conservative_end():
-  # the lower of the two measurements per band
-  # the measured limits (lateral-sensors-20261122); the 28-31 mph handover keeps the 19-27 figure; 90 % of them
-  assert P.envelope(25) == 1.41 and P.envelope(30) == 1.41 and P.envelope(35) == 2.20
-  assert P.envelope(50) == 2.42 and P.envelope(65) == 2.13
-  assert P.MARGIN <= 0.90
+def test_capacity_right_below_left_from_35():
+  # plan T4 / section 3: measured per direction; the car holds less to the right from 35 mph
+  assert D.capacity(45, D.RIGHT, banked=True) == 1.91 and D.capacity(45, D.LEFT, banked=True) == 2.47
+  for mph in (35, 40, 45, 50, 55, 65):
+    for banked in (True, False):
+      assert D.capacity(mph, D.RIGHT, banked) < D.capacity(mph, D.LEFT, banked), (mph, banked)
+      assert D.capacity(mph, D.UNKNOWN, banked) == D.capacity(mph, D.RIGHT, banked)
+  assert D.capacity(25, D.LEFT) == D.capacity(25, D.RIGHT) == 1.41
+  # a right bend is slowed for more than the same left bend
+  assert D.need_mph(-1 / 200.0)[0] < D.need_mph(1 / 200.0)[0]
 
 
-def test_flagged_point_at_least_10_below():
-  kap = np.array([1 / 300.0, 1 / 200.0, 0.0])               # real bends at the failing speeds (> 1 m/s^2), and a straight
-  flags = np.array([M.FLAG_LIMIT | M.FLAG_LANE, M.FLAG_TAKEOVER, M.FLAG_LANE], np.uint8)
-  vf = np.array([50 * MPH, 40 * MPH, 50 * MPH])
-  need = P.needed_mph(kap, flags, vf)
-  assert need[0] <= 40 and need[1] <= 30
-  assert need[2] == P.MAX_MPH                                # a lane-line touch on a straight is not a corner
-  # the steering command at its limit with the lane held (no lane-line or takeover flag) is not trouble (owner, 2026-11-23)
-  alone = P.needed_mph(kap[:1], np.array([M.FLAG_LIMIT], np.uint8), vf[:1])
-  assert alone[0] == P.corner_mph(kap[:1])[0]
+def test_a6_graded_10_percent_over_capacity_costs_about_2_mph():
+  # plan A6 (owner, 2026-11-24): the target is where demand equals capacity; nothing forces the old 10 mph minimum drop. A left bend
+  # whose demand at 45 mph is 10 % over the capacity there (2.56 m/s^2, CAP_RAW): demand equals capacity at 42.9 mph; the whole-mph
+  # target over the +-0.75 mph window (and the 35-44 band's 2.49) is 41: 4 mph lower. Right: 44 (the 35-44 band holds more to the
+  # right than 45-54 does): 1 mph lower. Never 35.
+  k = 1.1 * D.capacity(45, D.LEFT) / (45 * MPH) ** 2
+  assert D.demand(45, k) == pytest.approx(1.1 * 2.56)
+  assert D.need_mph(k)[0] == 41
+  kr = -1.1 * D.capacity(45, D.RIGHT) / (45 * MPH) ** 2
+  assert D.need_mph(kr)[0] == 44
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  res = drive(M.synthetic([tr]), tr, 45, 120)
+  ceils = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
+  assert ceils and min(ceils) == 41
+
+
+def test_need_from_median_not_sharpest():
+  # plan T4: the planner plans from memory kap_med, never kap (the sharpest pass)
+  tr = road((1500, 0.0), (150, 0.006), (800, 0.0))
+  med = 0.004 * (tr["kap"] > 0)
+  mem = M.synthetic([tr], kap_med=[med])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 60, 120, planner=pl)
+  ceils = [p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner"]
+  assert ceils and min(ceils) == max(int(D.need_mph(0.004)[0]), 45)
+  assert int(D.need_mph(0.004)[0]) > int(D.need_mph(0.006)[0])
+  assert np.all(pl.need[tr["kap"] > 0] == D.need_mph(0.004)[0])
+
+
+def test_no_kap_med_no_memory_stage():
+  # plan T4: a memory file without kap_med has no memory stage (it used to fall back silently to the sharpest-pass kap)
+  tr = road((1500, 0.0), (150, 1 / 60.0), (800, 0.0))
+  mem = M.synthetic([tr], kap_med=False)
+  assert not mem.has_kap_med
+  res = drive(mem, tr, 55, 80)
+  assert any(p.trusted for _, _, p in res)              # localisation still works
+  assert all(p.ceil is None and p.alert_mph is None and p.stage == 0 for _, _, p in res)
+  assert M.synthetic([tr]).has_kap_med and M.synthetic([tr]).bank_v == 1
+
+
+def test_approach_times_at_45():
+  # plan T4 + A8-R4 + A9 / A11: the planner's own manoeuvre at 45 mph (push to T - DRIVE_GAP_MPH, model-timed raise), timing variant,
+  # to within the planner's ARRIVED_MPH (0.5): 5 / 10 / 15 mph off take about 4.99 / 7.86 / 10.44 s (A11, block two), pinned here
+  for drop, want in ((5, 4.99), (10, 7.86), (15, 10.44)):
+    T = 45 - drop
+    t, _ = CM.manoeuvre(45.0, T, max(P.CAR_MIN_MPH, T - P.DRIVE_GAP_MPH), arrived=P.ARRIVED_MPH, tap_s=P.TAP_S)
+    assert t == pytest.approx(want, abs=0.05), (drop, t)
 
 
 def test_slow_distance_grows_with_drop():
@@ -127,7 +175,7 @@ def test_v_allow_inverts_approach():
 def test_no_ceiling_for_corner_holdable_at_current_speed():
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
-  need = P.corner_mph(CORNER_K)[0]
+  need = D.need_mph(CORNER_K)[0]
   res = drive(mem, tr, need, 80, set_mph=need)
   assert all(p.ceil is None for _, _, p in res)
 
@@ -168,7 +216,7 @@ def test_trust_needs_stable_match():
 def test_single_corner_arrives_on_target_just_in_time_and_releases():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 160, closed=True)
-  need = max(P.corner_mph(CORNER_K)[0], 55 - 15)       # never more than 15 mph below the speed (no known limit)
+  need = max(D.need_mph(CORNER_K)[0], 55 - 15)       # never more than 15 mph below the speed (no known limit)
   at_entry = [v for t, s, p, v in res if s >= 1500 - P.ENTRY_M][0]
   assert at_entry <= need + 1.0, at_entry
   t_entry = [t for t, s, p, v in res if s >= 1500][0]
@@ -187,7 +235,7 @@ def test_push_opens_the_gap_then_raises_to_target():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 160, closed=True)
   res = drive(mem, tr, 65, 160, closed=True, set_mph=65)
-  need = P.corner_mph(CORNER_K)[0]                     # 36: floor 50 binds at 65 mph; use a faster start to see the push
+  need = D.need_mph(CORNER_K)[0]                     # 36: floor 50 binds at 65 mph; use a faster start to see the push
   ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
   T = max(need, 50)
   assert min(ceils) == max(T - P.DRIVE_GAP_MPH, 50) and ceils[-1] == T
@@ -199,7 +247,7 @@ def test_push_opens_the_gap_then_raises_to_target():
 def test_downhill_slow_car_is_flagged_not_pushed_lower():
   tr, mem = single_corner()
   res = drive(mem, tr, 50, 160, closed=True, rate=0.5)  # 50 mph: floor 35, below the corner's own speed (the floor does not bind)
-  need = P.corner_mph(CORNER_K)[0]
+  need = D.need_mph(CORNER_K)[0]
   assert need > 35
   corner = [p for t, s, p, v in res if p.kind == "corner"]
   assert any(p.behind for p in corner) and not any(p.capped for p in corner)   # behind plan is NOT "needs more"
@@ -219,7 +267,7 @@ def test_s_bends_both_on_target():
   tr = road((1500, 0.0), (100, 1 / 200.0), (60, 0.0), (100, -1 / 120.0), (800, 0.0))
   mem = M.synthetic([tr])
   res = drive(mem, tr, 60, 200, closed=True)
-  n1, n2 = P.corner_mph(1 / 200.0)[0], P.corner_mph(1 / 120.0)[0]
+  n1, n2 = D.need_mph(1 / 200.0)[0], D.need_mph(1 / 120.0)[0]
   v1 = [v for t, s, p, v in res if s >= 1500 - P.ENTRY_M][0]
   v2 = [v for t, s, p, v in res if s >= 1660 - P.ENTRY_M][0]
   assert v1 <= max(n1, 45) + 1.0 and v2 <= max(n2, 45) + 1.0
@@ -299,19 +347,6 @@ def test_follows_trace_link():
   assert not any(p.ceil is not None for t, s, p in res2 if s < 990)
 
 
-def test_model_preview_sharper_wins():
-  tr, mem = single_corner()
-  # memory corner needs ~39 mph; the model shows a 1/80 bend 4 s ahead while in the corner region -> lower ceiling
-  def model(t, s):
-    if 900 <= s <= 1150:
-      return (np.array([0.0, 2.0, 4.0, 6.0]), np.array([0.0, 0.002, 1 / 80.0, 0.002]))
-    return (np.array([0.0, 2.0, 4.0]), np.zeros(3))
-  res = drive(mem, tr, 50, 80, model_fn=model)
-  ceils = [p.corner_mph for t, s, p in res if p.ceil is not None and p.kind == "corner"]
-  assert min(ceils) < P.corner_mph(CORNER_K)[0]
-  assert any(p.model_la is not None for t, s, p in res)
-
-
 def test_no_memory():
   pl = P.Planner(None)
   p = pl.step(0.0, P.Fix(True, 0, 0, 0), 20.0)
@@ -322,7 +357,8 @@ def test_plan_json_has_no_position():
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 30)
   d = P.plan_json(res[-1][2], 12.0, 7, "shadow")
-  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit", "model_k", "kind", "corner", "end", "behind", "alert", "need"}
+  assert set(d) == {"m", "seq", "mode", "ceil", "conf", "trusted", "known", "why", "dist", "past", "model_la", "capped", "limit",
+                    "model_k", "kind", "corner", "end", "behind", "alert", "need", "stage", "src", "ahead", "cap", "rel"}   # plan T4
 
 
 def test_memory_roundtrip(tmp_path):
@@ -374,71 +410,13 @@ def test_alert_when_behind_plan_and_not_when_reachable():
   assert not any(p.alert_mph for t, s, p, v in res)
 
 
-def test_proven_speed_means_no_slowing_and_trouble_wins():
-  tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
-  n = len(tr["x"])
-  need = P.corner_mph(CORNER_K)[0]
-  mem = M.synthetic([tr])
-  mem.v_proven = np.full(n, 55 * MPH)                   # earlier passes took it at 55 without trouble
-  res = drive(mem, tr, 52, 120, planner=P.Planner(mem))
-  assert all(p.ceil is None for _, _, p in res)        # at or below the proven speed: no slowing
-  res = drive(mem, tr, 62, 120, planner=P.Planner(mem))
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") >= 55   # never below proven
-  # the same corner with a trouble flag at or above every clean speed on record: proven ignored, 10 below the failing speed
-  mem2 = M.synthetic([tr], flags=[np.full(n, M.FLAG_TAKEOVER, np.uint8)], v_flag=[np.full(n, 56 * MPH)])
-  mem2.v_proven = np.full(n, 55 * MPH)
-  res = drive(mem2, tr, 58, 120, planner=P.Planner(mem2))
-  assert any(p.ceil is not None and p.corner_mph <= 46 for _, _, p in res)
-
-
-def _flagged_corner(flag, v_flag_mph, v_proven_mph, k=CORNER_K):
-  tr = road((1500, 0.0), (150, k), (800, 0.0))
-  n = len(tr["x"])
-  mem = M.synthetic([tr], flags=[np.full(n, flag, np.uint8)], v_flag=[np.full(n, v_flag_mph * MPH)])
-  mem.v_proven = np.full(n, v_proven_mph * MPH) if v_proven_mph else np.full(n, np.nan)
-  return tr, mem
-
-
-@pytest.mark.parametrize("flag, vf, vp, at", [
-  (M.FLAG_LIMIT | M.FLAG_LANE, 40, 46, 45),   # first drive: limit+lane flag at 40 on one pass, best clean engaged pass 46: 45 -> 29 before
-  (M.FLAG_LANE, 45, 50, 45),                  # first drive: lane-line touch at 45, best clean 50: 45 -> 35 before
-  (M.FLAG_TAKEOVER, 48, 55, 52),              # first drive: one takeover at 48 on a bend taken at 55 clean: 55 -> 41 before
-  (M.FLAG_TAKEOVER | M.FLAG_LANE, 45, 45, 45),  # 22 of 23 passes clean at 45, the one other had trouble at 45
-])
-def test_history_beats_calculation_no_slowdown_where_driven_cleanly(flag, vf, vp, at):
-  # owner, 2026-11-23 second drive: "no way there is a history of speed problems on that curve": at or below the best clean speed
-  # on record no slowing, whatever the curvature formula says (the bend here needs well under the speed by the envelope)
-  tr, mem = _flagged_corner(flag, vf, vp, k=1 / 150.0)
-  assert P.corner_mph(1 / 150.0)[0] < at - 5
-  res = drive(mem, tr, at, 120, planner=P.Planner(mem))
-  assert all(p.ceil is None for _, _, p in res)
-
-
-def test_real_trouble_corner_still_slowed_and_warned():
-  # steering at its limit at 45 and no clean pass well above it (best clean 47 < 45 + LIMIT_OUTWEIGH_MPH): slowed to 10 below, and
-  # warned when the feature cannot get there
-  tr, mem = _flagged_corner(M.FLAG_LIMIT | M.FLAG_LANE, 45, 47, k=1 / 150.0)
-  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") <= 35
-  res = drive(mem, tr, 50, 160, closed=True, rate=0.4)
-  assert any(p.alert_mph for t, s, p, v in res)
-  # the same with the steering at its limit but the lane held (no lane-line / takeover flag): a clean pass, no slowing at 47
-  tr, mem = _flagged_corner(M.FLAG_LIMIT, 45, 47, k=1 / 150.0)
-  res = drive(mem, tr, 47, 120, planner=P.Planner(mem))
-  assert all(p.ceil is None for _, _, p in res)
-  # no clean engaged pass at all (only the failing one): trouble wins too
-  tr, mem = _flagged_corner(M.FLAG_TAKEOVER, 45, None, k=1 / 150.0)
-  res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
-  assert any(p.ceil is not None and p.corner_mph <= 35 for _, _, p in res)
-
-
 def test_single_pass_corner_is_slowed_for_like_any_other():
   # owner, 2026-11-23: no single-pass trim; a corner from one pass gets its full need (within the floor), model or not
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
   mem.npass = np.ones(mem.n, np.int32)
   res = drive(mem, tr, 50, 120, planner=P.Planner(mem))
-  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") == max(P.corner_mph(CORNER_K)[0], 50 - 15)
+  assert min(p.corner_mph for _, _, p in res if p.ceil is not None and p.kind == "corner") == max(D.need_mph(CORNER_K)[0], 50 - 15)
 
 
 def test_hold_between_corners_only_when_the_next_slowdown_is_near():
@@ -471,7 +449,7 @@ def test_h1_floor_follows_the_drivers_current_set_speed_not_an_old_episode():
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
   first = drive(mem, tr, 55, 200, planner=pl, closed=True)
-  need = P.corner_mph(k)[0]
+  need = D.need_mph(k)[0]
   assert need < 40
   later = [p for t, s, p, v in first if 3000 <= s <= 3150 and p.kind == "corner"]
   pl2 = P.Planner(mem)
@@ -551,59 +529,42 @@ def _first_corner_s(mem, tr, v_mph, planner=None):
   return next(s for t, s, p in res if p.ceil is not None and p.kind == "corner")
 
 
-def _spread_flags(segments, flagged, vf_mph):
-  """A road from `segments` with FLAG_TAKEOVER | FLAG_LANE at `vf_mph` on the pieces whose index is in `flagged`."""
-  tr = road(*segments)
-  fl, vf = [], []
-  for i, (length, _) in enumerate(segments):
-    n = int(round(length / M.SPACING_M))
-    fl.append(np.full(n, (M.FLAG_TAKEOVER | M.FLAG_LANE) if i in flagged else 0, np.uint8))
-    vf.append(np.full(n, vf_mph * MPH if i in flagged else np.nan))
-  return tr, M.synthetic([tr], flags=[np.concatenate(fl)], v_flag=[np.concatenate(vf)])
-
-
 def test_arrival_constants_are_the_approved_ones():
-  assert P.AIM_MIN_LA == 1.3 and P.FLAG_MIN_LA == 1.3
+  assert P.ENTRY_LA == 1.3               # plan T4 (was AIM_MIN_LA == FLAG_MIN_LA == 1.3; the flag cap is gone)
   assert P.BUFFER_S == 0.3 and P.ENTRY_M == 0.0
   assert P.ARRIVED_MPH == 0.5            # plan A8-R1 (was 1.5; 1.0 ruled, 0.5 the largest <= 1.0 that passes the lead-held e2e cases)
   # plan amendment A1: the reaction is the measured model's dead time (0.5 s, then a 0.5 s lag), the tap walk 0.30 s
   assert P.REACTION_S == CM.DELAY_S == 0.5 and P.TAP_S == CM.TAP_S == 0.30 and P.RESP_FACTOR == 1.0
 
 
-def test_aim_is_where_the_bend_loads_the_car_not_where_the_flags_begin():
-  # the memory builder spreads a takeover's flags 60-80 m ahead of the real event: here 80 m of gentle approach (1.43 m/s^2 at the
-  # failing 50 mph, so a real-trouble cap; 0.91 at the 40 mph target) before the bend itself (1.45 at 40). The slowdown must start
-  # where it would for the bend alone, not 80 m earlier.
-  segs = [(1500, 0.0), (80, 1 / 350.0), (150, 1 / 220.0), (800, 0.0)]
-  tr, spread = _spread_flags(segs, {1, 2}, 50)
-  _, bend_only = _spread_flags(segs, {2}, 50)
-  s_spread, s_bend = _first_corner_s(spread, tr, 55), _first_corner_s(bend_only, tr, 55)
-  assert abs(s_spread - s_bend) <= 2 * M.SPACING_M + 1.0, (s_spread, s_bend)
+def test_entry_is_where_the_bend_loads_the_car_not_where_the_lead_in_begins():
+  # rewritten for plan T4 (was test_aim_is_where_the_bend_loads_the_car_not_where_the_flags_begin: the flags are gone). A right-hand
+  # gentle lead-in tight at 50 mph (needs 47) but under ENTRY_LA at the corner's target (35: 1.18 m/s^2), then the bend (needs 25,
+  # floor 35): the slowdown starts where it would for the bend alone, not at the lead-in
+  segs = [(1500, 0.0), (80, -0.0048), (150, -1 / 95.0), (800, 0.0)]
+  tr = road(*segs)
+  tr_b = road((1500, 0.0), (80, 0.0), (150, -1 / 95.0), (800, 0.0))
+  assert D.need_mph(-0.0048)[0] <= 48 and D.demand(35, -0.0048) < P.ENTRY_LA
+  s_lead, s_bend = _first_corner_s(M.synthetic([tr]), tr, 50), _first_corner_s(M.synthetic([tr_b]), tr_b, 50)
+  assert abs(s_lead - s_bend) <= 2 * M.SPACING_M + 1.0, (s_lead, s_bend)
 
 
-def test_aim_falls_back_to_the_runs_sharpest_point():
-  # no point of the run reaches AIM_MIN_LA at the target (the cap, 40 mph: 1.23 m/s^2 at the bend): aim at its sharpest point
-  segs = [(1500, 0.0), (80, 1 / 350.0), (150, 1 / 260.0), (800, 0.0)]
-  tr, spread = _spread_flags(segs, {1, 2}, 50)
-  _, bend_only = _spread_flags(segs, {2}, 50)
-  assert abs(_first_corner_s(spread, tr, 55) - _first_corner_s(bend_only, tr, 55)) <= 2 * M.SPACING_M + 1.0
-
-
-def test_flag_cap_only_where_the_bend_needs_1_3():
-  kap = np.array([1.15 / (50 * MPH) ** 2, 1.35 / (50 * MPH) ** 2])
-  flags = np.array([M.FLAG_TAKEOVER | M.FLAG_LANE] * 2, np.uint8)
-  need = P.needed_mph(kap, flags, np.array([50 * MPH] * 2))
-  assert need[0] == P.corner_mph(kap[:1])[0]                  # 1.15 m/s^2 at the failing speed: not a corner for the cap any more
-  assert need[1] == 40
+def test_entry_falls_back_to_the_runs_sharpest_point():
+  # rewritten for plan T4 (was test_aim_falls_back_to_the_runs_sharpest_point, through flags): no point reaches ENTRY_LA at T
+  kabs = np.array([0.001, 0.002, 0.003, 0.0025])
+  run = np.arange(4)
+  assert P.entry_point(run, kabs, 30) == 2                 # 0.003 * 13.4^2 = 0.54 m/s^2 < 1.3: the sharpest
+  assert P.entry_point(run, kabs, 60) == 1                 # 0.002 * 26.8^2 = 1.44: the first reaching ENTRY_LA
 
 
 def test_a_lower_physics_speed_before_the_aim_point_is_still_honoured(monkeypatch):
-  # A (60 m, 1/150: the envelope allows ~38 mph) then B (1/120), both flagged at 45 (cap 35). With the aim raised so that it lands on B,
-  # the car must still be down to A's own envelope speed when it reaches A: no later start than for A alone (A is not flagged there,
-  # B is straight), whose envelope speed binds earlier than B's 35 mph 60 m further on.
-  monkeypatch.setattr(P, "AIM_MIN_LA", 1.7)
+  # A (60 m, 1/150: capacity allows 42 mph) then B (1/120: 37). With the entry raised so that it lands on B (ENTRY_LA 1.9: A asks
+  # 1.82 at 37 mph, B 2.28), the car must still be down to A's own speed when it reaches A: no later start than for A alone.
+  # (Plan T4: was AIM_MIN_LA 1.7 with both flagged at 45, a 35 mph cap on B; the flags are gone.)
+  monkeypatch.setattr(P, "ENTRY_LA", 1.9)
   segs = [(1500, 0.0), (60, 1 / 150.0), (150, 1 / 120.0), (800, 0.0)]
-  tr, mem = _spread_flags(segs, {1, 2}, 45)
+  tr = road(*segs)
+  mem = M.synthetic([tr])
   tr_a = road((1500, 0.0), (60, 1 / 150.0), (950, 0.0))
   s_aim, s_a = _first_corner_s(mem, tr, 50), _first_corner_s(M.synthetic([tr_a]), tr_a, 50)
   assert s_aim <= s_a + 1.0, (s_aim, s_a)
@@ -611,21 +572,22 @@ def test_a_lower_physics_speed_before_the_aim_point_is_still_honoured(monkeypatc
 
 @pytest.mark.parametrize("v0", [45, 50, 55, 60])
 def test_closed_loop_never_faster_than_the_envelope_before_the_aim_point(monkeypatch, v0):
-  # the aim's SAFETY GUARANTEE, closed loop (the start-distance test above only compares where slowing begins): with the aim pushed
-  # past a 120 m A onto B, the car that answers as the planner expects is, at every point of A, at or below A's own envelope speed
-  # (never below the floor; within the arrival tolerance the aim point itself has), and at every point of B at or below B's target.
-  # Without the guard the car is 44.6 mph at A from 50 (A's envelope: 37).
-  monkeypatch.setattr(P, "AIM_MIN_LA", 1.7)
+  # the entry's SAFETY GUARANTEE, closed loop (the start-distance test above only compares where slowing begins): with the entry
+  # pushed past a 120 m A onto B, the car that answers as the planner expects is, at every point of A, at or below A's own speed
+  # (never below the floor; within the arrival tolerance the entry itself has), and at every point of B at or below B's target.
+  # Plan T4: ENTRY_LA 1.9 (was AIM_MIN_LA 1.7 with flags at 45 capping B at 35); B's target is its own capacity speed (37).
+  monkeypatch.setattr(P, "ENTRY_LA", 1.9)
   segs = [(1500, 0.0), (120, 1 / 150.0), (150, 1 / 120.0), (800, 0.0)]
-  tr, mem = _spread_flags(segs, {1, 2}, 45)
-  env_a = P.corner_mph(np.array([1 / 150.0]))[0]
+  tr = road(*segs)
+  mem = M.synthetic([tr])
+  env_a = D.need_mph(np.array([1 / 150.0]))[0]
   floor = v0 - 15
   res = drive(mem, tr, v0, 200, closed=True)
   in_a = [v for t, s, p, v in res if 1500 <= s < 1620]
   in_b = [v for t, s, p, v in res if 1620 <= s < 1770]
   assert in_a and in_b
   assert max(in_a) <= max(env_a, floor) + P.ARRIVED_MPH + 0.05, (max(in_a), env_a)
-  t_b = max(min(35, P.corner_mph(np.array([1 / 120.0]))[0]), floor)
+  t_b = max(D.need_mph(np.array([1 / 120.0]))[0], floor)
   assert max(in_b) <= t_b + P.ARRIVED_MPH + 0.05, (max(in_b), t_b)
 
 
@@ -668,7 +630,7 @@ def test_single_corner_arrives_just_in_time():
   # reaches it no more than ~BUFFER_S plus a planner tick or two before
   tr, mem = single_corner()
   res = drive(mem, tr, 55, 160, closed=True)
-  need = max(P.corner_mph(CORNER_K)[0], 55 - 15)
+  need = max(D.need_mph(CORNER_K)[0], 55 - 15)
   at_entry = [v for t, s, p, v in res if s >= 1500][0]
   assert at_entry <= need + P.ARRIVED_MPH + 0.05, at_entry
   reached = [t for t, s, p, v in res if v <= need + P.ARRIVED_MPH + 0.05][0]
@@ -681,8 +643,8 @@ def test_a9_r2a_push_then_settle_at_target_no_dip_no_reacceleration(v0, need):
   # plan A9-R2a: after a push below the target the dash is raised at the moment the model says the car will bottom out at T, so the
   # speed never dips more than 0.5 mph below T and the car never speeds up before the corner's end
   ks = np.linspace(0.0005, 0.03, 6000)
-  k = float(ks[np.argmin(np.abs(P.corner_mph(ks) - need))])
-  T = int(max(P.corner_mph(k)[0], v0 - 15))
+  k = float(ks[np.argmin(np.abs(D.need_mph(ks) - need))])
+  T = int(max(D.need_mph(k)[0], v0 - 15))
   assert T - P.DRIVE_GAP_MPH < T and max(v0 - 15, T - P.DRIVE_GAP_MPH) < T      # a push below T happens
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   res = drive(M.synthetic([tr]), tr, v0, 160, closed=True, set_mph=v0)

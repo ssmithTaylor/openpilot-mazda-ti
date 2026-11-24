@@ -23,7 +23,7 @@ T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)
 DT = 0.01
 _KS = np.linspace(0.0005, 0.06, 12000)
-_SP = P.corner_mph(_KS)
+_SP = P.D.need_mph(_KS)   # plan T4: ti_curve_demand (left bends, CAP_RAW)
 R = [(2500, None), (150, 33), (1200, None)]      # the reference road: 2.5 km straight, a corner needing 33 mph, straight
 
 
