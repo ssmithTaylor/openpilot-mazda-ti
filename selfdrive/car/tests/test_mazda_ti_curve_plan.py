@@ -601,6 +601,26 @@ def test_a_lower_physics_speed_before_the_aim_point_is_still_honoured(monkeypatc
   assert s_aim <= s_a + 1.0, (s_aim, s_a)
 
 
+@pytest.mark.parametrize("v0", [45, 50, 55, 60])
+def test_closed_loop_never_faster_than_the_envelope_before_the_aim_point(monkeypatch, v0):
+  # the aim's SAFETY GUARANTEE, closed loop (the start-distance test above only compares where slowing begins): with the aim pushed
+  # past a 120 m A onto B, the car that answers as the planner expects is, at every point of A, at or below A's own envelope speed
+  # (never below the floor; within the arrival tolerance the aim point itself has), and at every point of B at or below B's target.
+  # Without the guard the car is 44.6 mph at A from 50 (A's envelope: 37).
+  monkeypatch.setattr(P, "AIM_MIN_LA", 1.7)
+  segs = [(1500, 0.0), (120, 1 / 150.0), (150, 1 / 120.0), (800, 0.0)]
+  tr, mem = _spread_flags(segs, {1, 2}, 45)
+  env_a = P.corner_mph(np.array([1 / 150.0]))[0]
+  floor = v0 - 15
+  res = drive(mem, tr, v0, 200, closed=True)
+  in_a = [v for t, s, p, v in res if 1500 <= s < 1620]
+  in_b = [v for t, s, p, v in res if 1620 <= s < 1770]
+  assert in_a and in_b
+  assert max(in_a) <= max(env_a, floor) + P.ARRIVED_MPH + 0.05, (max(in_a), env_a)
+  t_b = max(min(35, P.corner_mph(np.array([1 / 120.0]))[0]), floor)
+  assert max(in_b) <= t_b + P.ARRIVED_MPH + 0.05, (max(in_b), t_b)
+
+
 def test_approach_ends_at_target_plus_1_5_after_the_measured_reaction():
   # the planner's approach: reaction 1.3 s at the start speed, then the full measured deceleration, done at T + 1.5 mph
   def ref(u, T, S1, dt=0.05):
