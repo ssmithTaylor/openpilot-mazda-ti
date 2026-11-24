@@ -44,6 +44,12 @@ try:
   from openpilot.selfdrive.car.mazda import ti_curve_monitor as curve_mon_mod, ti_curve_demand as curve_demand_mod   # stage 3
 except Exception:
   curve_mod = curve_mon_mod = curve_demand_mod = None
+try:
+  # Cruise button tests (ti_button_tests.py): the hold test and the tap-rate test, started only by their own controls on the Tests
+  # pages. Optional: without the module nothing here changes (self.button_tests is None).
+  from openpilot.selfdrive.car.mazda import ti_button_tests as button_tests_mod
+except Exception:
+  button_tests_mod = None
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -128,6 +134,20 @@ def ti_cruise_log(event):
     pass
 
 
+def ti_button_log(event):
+  """The cruise button tests' steps (armed, waiting, start, held / tapped frames with their counters, the dash's steps, each
+  direction's and each cycle's result, aborted, restore, result) into the log."""
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("ti_button", **event)
+  except Exception:
+    pass
+
+
+# The button tests' states in which the car controller calls them every frame (else only on the 10 Hz trigger read)
+BUTTON_ACTIVE = button_tests_mod.ACTIVE_STATES if button_tests_mod is not None else ()
+
+
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -207,6 +227,11 @@ class CarController(CarControllerBase):
     self.cruise_started_wall = time.time()
     self.cruise_trigger = None
     self.cruise_published = None
+    # Cruise button tests: gen1 with the interceptor only, like the cruise check. Off after every start of this process (the trigger and
+    # the last status are cleared below; a trigger stamped before this moment is ignored).
+    self.button_tests = (button_tests_mod.ButtonTests()
+                         if button_tests_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CP.flags & MazdaFlags.GEN1 else None)
+    self.button_published = None
     # Curve slowing: gen1 with the interceptor only. OFF after every start of this process: the switch and the status are cleared here.
     self.curve = (curve_mod.Curve()
                   if curve_mod is not None and CP.flags & MazdaFlags.TORQUE_INTERCEPTOR and CP.flags & MazdaFlags.GEN1 else None)
@@ -242,6 +267,12 @@ class CarController(CarControllerBase):
           pass
     if self.cruise_check is not None:
       for key in (cruise_check_mod.PARAM_TRIGGER, cruise_check_mod.PARAM_STATUS):
+        try:
+          self.params_memory.remove(key)
+        except Exception:
+          pass
+    if self.button_tests is not None:
+      for key in (button_tests_mod.PARAM_TRIGGER, button_tests_mod.PARAM_STATUS):
         try:
           self.params_memory.remove(key)
         except Exception:
@@ -725,7 +756,106 @@ class CarController(CarControllerBase):
       return "the dither test is on"
     if getattr(self, "curve_on", False):
       return "curve slowing is on"
+    bt = getattr(self, "button_tests", None)
+    if bt is not None and bt.state in BUTTON_ACTIVE:
+      return "a button test is running"
     return ""
+
+  def button_others_on(self):
+    """Why another mode excludes the button tests ("" when none is on): the cruise check's list, and the cruise check itself."""
+    if self.ti_plan_on:
+      return "the drive plan is on"
+    if self.ti_ab_switch:
+      return "the A/B switch is on"
+    if self.ti_ident_all or self.ti_ident_on:
+      return "a test is on"
+    if self.ti_dither_enabled:
+      return "the dither test is on"
+    if getattr(self, "curve_on", False):
+      return "curve slowing is on"
+    chk = getattr(self, "cruise_check", None)
+    if chk is not None and chk.active:
+      return "the cruise check is running"
+    return ""
+
+  def button_tests_step(self, CC, CS, ti_apply_steer):
+    """One frame of the cruise button tests: the button frame to send, or None. Reads the trigger at 10 Hz (and consumes it),
+    publishes the status on change (at most 10 Hz) and every second, logs every step. Never raises: after an error the tests are off
+    for the rest of this process and say so. The caller calls it only on the 10 Hz read while no test is in progress."""
+    bt = self.button_tests
+    if bt is None:
+      return None
+    try:
+      mod = button_tests_mod
+      wall = time.time()
+      trigger = None
+      if self.frame % 10 == 0:
+        raw = self.params_memory.get(mod.PARAM_TRIGGER)
+        if raw:
+          self.params_memory.remove(mod.PARAM_TRIGGER)        # one press arms one run: the trigger is consumed
+          trigger = mod.parse_trigger(raw)
+          if trigger is not None and trigger.t and trigger.t < self.cruise_started_wall:
+            ti_button_log({"kind": "trigger_before_start", "frame": self.frame, "id": trigger.id})
+            trigger = None                                     # written before this process started: never acted on
+      out = CS.out
+      cruise = out.cruiseState
+      speed = float(cruise.speed or 0.0)
+      counter = getattr(CS, "crz_btns_counter", None)
+      inp = mod.Inputs(
+        engaged=bool(CC.enabled), lat_active=bool(CC.latActive), cruise_on=bool(cruise.enabled),
+        cruise_available=bool(cruise.available), mph=float(out.vEgo) * CV.MS_TO_MPH,
+        set_mph=int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None, brake=bool(out.brakePressed), gas=bool(out.gasPressed),
+        lead=getattr(CS, "crz_lead", None), steer_share=abs(ti_apply_steer) / max(1.0, float(self.ccp.TI_STEER_MAX)),
+        driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
+        cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume), others_on=self.button_others_on(),
+        wall=wall, mono=time.monotonic())
+      button = bt.step(self.frame, inp, trigger)
+      if bt.events:
+        for ev in bt.events:
+          ti_button_log(ev)
+        bt.events.clear()
+      if self.frame % 10 == 0:
+        key = (bt.state, bt.why, bt.sub, bt.test, bt.set_now, len(bt.cycles), len(bt.dirs), bt.restore.get("note"), bt.run_id)
+        if key != self.button_published or self.frame % mod.STATUS_EVERY == 0:
+          self.params_memory.put(mod.PARAM_STATUS, json.dumps(bt.status(wall)))
+          self.button_published = key
+      self._button_left(bt, inp.set_mph)
+      if button is None or inp.cancel_req or inp.resume_req:
+        return None
+      return mazdacan.create_button_cmd(self.packer, self.CP, inp.counter, Buttons.SET_MINUS if button == "SET_MINUS" else Buttons.SET_PLUS)
+    except Exception:
+      self.button_tests = None
+      try:
+        self.params_memory.put(button_tests_mod.PARAM_STATUS, json.dumps({"t": round(time.time(), 1), "v": 1, "state": "aborted",
+                                                                           "test": "", "line1": "BUTTON TESTS OFF",
+                                                                           "line2": "Internal error: off until controls restart",
+                                                                           "result": "CHECK THE SET SPEED", "d1": "", "d2": "", "d3": ""}))
+      except Exception:
+        pass
+      try:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.exception("ti_button disabled")
+      except Exception:
+        pass
+      return None
+
+  def _button_left(self, bt, set_mph):
+    """The button tests' TiSetSpeedLeft record (who "button test"): a failed restore left the set speed lower than the driver's, so
+    the on-road alert says "CRUISE SET TO now, WAS was" until the driver presses a cruise button (the button branch's review). Written
+    on change and every 0.5 s while it holds, cleared once; curve slowing's own record (written by _curve_left) wins while it holds."""
+    mod = button_tests_mod
+    left = mod.set_left(bt, set_mph)
+    curve_holds = getattr(self, "curve_left", None) is not None
+    prev = getattr(self, "button_left", None)
+    curve_released = getattr(self, "button_left_curve", False) and not curve_holds
+    self.button_left_curve = curve_holds
+    if left is not None and not curve_holds and (self.frame % mod.LEFT_EVERY == 0 or prev != left or curve_released):
+      self.params_memory.put(mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": mod.LEFT_WHO,
+                                                         "now": left[0], "was": left[1]}))
+    elif left is None and prev is not None and not curve_holds:
+      self.params_memory.put(mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": mod.LEFT_WHO,
+                                                         "now": None, "was": None}))
+    self.button_left = left
 
   def cruise_check_step(self, CC, CS, ti_apply_steer):
     """One frame of the cruise set-speed check: the button frame to send, or None. Reads the trigger at 10 Hz (and consumes it),
@@ -926,13 +1056,17 @@ class CarController(CarControllerBase):
     speed = float(cruise.speed or 0.0)
     counter = getattr(CS, "crz_btns_counter", None)
     chk = self.cruise_check
+    # check_active: the cruise check OR a cruise button test in progress: the Curve stands aside and the safe exit waits (merge
+    # 2026-11-24; the button tests' source pin reads the line pair below as written)
     return mod.Inputs(
       on=self.curve_on, engaged=bool(CC.enabled), cruise_on=bool(cruise.enabled), cruise_available=bool(cruise.available),
       mph=float(out.vEgo) * CV.MS_TO_MPH, set_mph=int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None,
       brake=bool(out.brakePressed), gas=bool(out.gasPressed), lead=getattr(CS, "crz_lead", None),
       driver_button=getattr(CS, "crz_btns_driver", None), counter=None if counter is None else int(counter),
       cancel_req=bool(CC.cruiseControl.cancel), resume_req=bool(CC.cruiseControl.resume),
-      check_active=bool(chk is not None and chk.active), plan=self.curve_plan, plan_age=age, mono=now,
+      check_active=bool((chk is not None and chk.active) or
+                        (getattr(self, "button_tests", None) is not None and self.button_tests.state in BUTTON_ACTIVE)),
+        plan=self.curve_plan, plan_age=age, mono=now,
       standstill=bool(out.standstill or getattr(cruise, "standstill", False)), driver_set=bool(getattr(CS, "crz_btns_set", False)),
       driver_set_plus=bool(getattr(CS, "crz_btns_set_plus", False)),
       deliver=bool(mon is not None and mon.phase == "alert"), deliver_need=None if mon is None else mon.need_mph,
@@ -972,7 +1106,8 @@ class CarController(CarControllerBase):
     if left is not None and (self.frame % 50 == 5 or getattr(self, "curve_left", None) != left):
       self.params_memory.put(curve_mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": "curve slowing",
                                                                "now": left[0], "was": left[1]}))
-    elif left is None and getattr(self, "curve_left", None) is not None:
+    elif left is None and getattr(self, "curve_left", None) is not None and getattr(self, "button_left", None) is None:
+      # (a button test's own record, if one holds, is not cleared here: it is rewritten on its next 0.5 s)
       self.params_memory.put(curve_mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": "curve slowing",
                                                                "now": None, "was": None}))
     self.curve_left = left
@@ -1159,9 +1294,19 @@ class CarController(CarControllerBase):
         cruise_msg = self.cruise_check_step(CC, CS, ti_apply_steer)
         if cruise_msg is not None:
           can_sends.append(cruise_msg)
-        # Curve slowing: SET_M / SET_P only, never on a frame the cruise check sends (one button frame per control frame at most)
+        # Cruise button tests: SET_M / SET_P only, the same sender, never on a frame the cruise check sends. Called every frame only
+        # while a test is in progress, else on the 10 Hz trigger read (no call on the other frames: cost)
+        button_msg = None
+        bt = self.button_tests
+        if bt is not None and (bt.state in BUTTON_ACTIVE or self.frame % 10 == 0):
+          button_msg = self.button_tests_step(CC, CS, ti_apply_steer)
+          if button_msg is not None and cruise_msg is None:
+            can_sends.append(button_msg)
+          else:
+            button_msg = None
+        # Curve slowing: SET_M / SET_P only, never on a frame the cruise check or a button test sends (one button frame per frame)
         curve_msg = self.curve_step(CC, CS, ti_apply_steer)
-        if curve_msg is not None and cruise_msg is None:
+        if curve_msg is not None and cruise_msg is None and button_msg is None:
           can_sends.append(curve_msg)
 
       # send HUD alerts

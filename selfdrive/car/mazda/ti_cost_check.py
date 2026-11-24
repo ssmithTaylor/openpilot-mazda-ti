@@ -11,7 +11,8 @@ the device's params, no CAN is sent, no message queue is opened):
   tests mode, idle   the plan in its tests mode, the car in a test window, the road too curved for any test: the scheduler runs, no signal
   tests mode, run    the plan in its tests mode on a straight road in a window: a test signal runs
 Then curve slowing (ti_curve.py, plan off) in three modes: off, on with no corner, on and tapping (exit 1 over budget, 2 when no tap
-was sent in the working mode). Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
+was sent in the working mode). Then the cruise button tests (ti_button_tests.py, plan off): idle, the hold test running and the tap
+test running (exit 2 when either sent no frame). Then the controls side (controlsd's TiAbRunner.step, the A/B alternation and the plan) in three modes: plan off, plan on in its A/B mode
 with a block running, plan on in its tests mode. Then controlsd's lateral controller (plan off) with its scalar helpers in plain
 Python and, for comparison, with the numpy calls they replaced; the two must give bit-identical outputs (exit 1 otherwise). Prints mean and p99 microseconds per cycle and the cost each mode adds to the plan off. Exits 1 when a tests mode adds more than the
 budget on average (default 300 us per cycle), 2 when the measurement is not valid (the running mode never ran a test).
@@ -215,6 +216,62 @@ def run_monitor(name, cycles, warm=300):
           "max_us": round(times[-1], 1), "alert_share": round(alerts / (cycles + warm), 3), "written": tc.PARAM_DELIVER in mem.d}
 
 
+def run_buttons(name, cmd, cycles, warm=300):
+  """The cruise button tests (ti_button_tests.py) in the car controller, plan off: cmd None (idle: the 10 Hz trigger read only), "hold"
+  or "taps" (armed after the warm-up on a steady 45 mph cruise whose set speed takes every pressed frame that follows one of the
+  switch's frames as 1 mph, 40 ms later: the tests run their whole sequence). -> mean / p99 / max us per cycle and the frames sent."""
+  from openpilot.selfdrive.car.mazda import ti_button_tests as tb
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  clock = {"k": 0}
+  ccm.time = NS(monotonic=lambda: clock["k"] * 0.01, time=lambda: 1_800_000_000.0 + clock["k"] * 0.01, perf_counter=time.perf_counter)
+  try:
+    return _run_buttons(name, cmd, cycles, warm, clock, tb)
+  finally:
+    ccm.time = time                                     # the real clock back, whatever happened
+
+
+def _run_buttons(name, cmd, cycles, warm, clock, tb):
+  cc, mem = make_controller()
+  sent = []
+
+  class Packer:                                         # no CAN is built or sent; the button frames are counted
+    def make_can_msg(self, name_, bus, values):
+      if name_ == "CRZ_BTNS":
+        sent.append((clock["k"], 1 if values.get("SET_P") else (-1 if values.get("SET_M") else 0)))
+      return (0, 0, b"\0" * 8, 0)
+  cc.packer = Packer()
+  toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
+  CC, CS = inputs(45.0, 0.0003)
+  cs = CS.out.cruiseState
+  set_mph, pending, last_ours = 45, [], None
+  times = []
+  for k in range(cycles + warm):
+    clock["k"] = k
+    if k % 10 == 3:
+      CS.crz_btns_counter = (CS.crz_btns_counter + 1) % 16
+    if cmd is not None and k == warm - 100:
+      mem.put(tb.PARAM_TRIGGER, json.dumps({"cmd": cmd, "id": "cost", "t": 1_800_000_000.0 + k * 0.01}))
+    for p in [p for p in pending if p[0] <= k]:
+      pending.remove(p)
+      set_mph += p[1]
+    cs.speed = set_mph * 0.44704
+    CS.out.vEgo = 45.0 * 0.44704
+    n0 = len(sent)
+    t0 = time.perf_counter_ns()
+    cc.update(CC, CS, k * 10_000_000, toggles)
+    dt = time.perf_counter_ns() - t0
+    for kk, d in sent[n0:]:
+      if d and (last_ours is None or (last_ours - 3) // 10 != (kk - 3) // 10):
+        pending.append((kk + 4, d))
+      last_ours = kk
+    if k >= warm:
+      times.append(dt / 1000.0)
+  times.sort()
+  bt_ = cc.button_tests
+  return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),
+          "max_us": round(times[-1], 1), "frames": len(sent), "state": bt_.state if bt_ is not None else "absent"}
+
+
 def _counting(fn):
   """(result, python calls, C calls) of fn() under sys.setprofile: the operation count, deterministic for one Python version."""
   n = [0, 0]
@@ -403,6 +460,18 @@ def main():
   if mon["alert_share"] <= 0.0 or not mon["written"]:
     print("NOT VALID: the monitor never alerted")
     return 2
+  # the cruise button tests (ti_button_tests.py, plan off): idle (the 10 Hz trigger read), the hold test and the tap test running
+  but = [run_buttons("buttons: idle", None, a.cycles), run_buttons("buttons: hold test", "hold", max(a.cycles, 1500)),
+         run_buttons("buttons: tap test", "taps", max(a.cycles, 3000))]
+  for r in but:
+    r["added_mean_us"] = round(r["mean_us"] - base, 1)
+    print(f"{r['mode']:22s} mean {r['mean_us']:8.1f} us  p99 {r['p99_us']:8.1f} us  max {r['max_us']:8.1f} us  added {r['added_mean_us']:7.1f} us"
+          f"  frames {r['frames']}  state {r['state']}")
+    if r["added_mean_us"] > a.budget_us:
+      bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
+  if but[1]["frames"] < 5 or but[2]["frames"] < 10:
+    print("NOT VALID: a button test sent no frames in its running mode")
+    return 2
   ctl = [run_controls("controls: plan off", False, 45.0, a.cycles),
          run_controls("controls: plan on, ab", True, 45.0, a.cycles),
          run_controls("controls: plan on, tests", True, 70.0, a.cycles)]
@@ -425,7 +494,7 @@ def main():
       bad.append("the lateral controller's outputs differ between the numpy and the plain-Python helpers")
   except Exception as e:                                     # the car-side numbers stand without it
     print(f"lateral controller not timed: {type(e).__name__}: {e}")
-  print(json.dumps({"results": res, "curve": cur, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
+  print(json.dumps({"results": res, "curve": cur, "buttons": but, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
   if res[3]["test_running_share"] < 0.2:
     print("NOT VALID: no test signal ran in the running mode")
     return 2

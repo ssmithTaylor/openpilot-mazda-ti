@@ -1426,6 +1426,7 @@ CODE_ASSIST_OFF = 1               # stage 3, the interceptor OFF in a bend
 CODE_ASSIST_STUCK = 2             # ... with its stuck-request code (0x11)
 CODE_DROPOUT = 3                  # stage 3, the steering command saturated with no effect (lane-keep path blocked)
 CODE_SET_LEFT = 4                 # I4: curve slowing (or a test) stopped and the cruise set speed is lower than the driver set it
+CODE_SET_LEFT_TEST = 5            # the same, left by a cruise button test (TiSetSpeedLeft who "button test"; merge 2026-11-24)
 
 
 def alert_code_value(code, a=0, b=0):
@@ -1461,7 +1462,8 @@ def read_curve_code(params_memory, now):
     if isinstance(d, dict) and isinstance(d.get("now"), int) and isinstance(d.get("was"), int) and d["now"] < d["was"]:
       m = float(d.get("m", 0.0))
       if now - m <= LEFT_FRESH_S:
-        return alert_code_value(CODE_SET_LEFT, d["now"], d["was"]), m
+        code = CODE_SET_LEFT_TEST if d.get("who") == "button test" else CODE_SET_LEFT
+        return alert_code_value(code, d["now"], d["was"]), m
   except Exception:
     pass
   return None, 0.0

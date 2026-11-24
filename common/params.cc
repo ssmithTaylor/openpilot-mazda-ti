@@ -609,6 +609,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiPlanAck", CLEAR_ON_MANAGER_START},   // tmpfs: the car controller's acknowledgement that the tests are quiet
     {"TiCruiseCheck", CLEAR_ON_MANAGER_START},        // tmpfs: the cruise set-speed check's trigger (the Tests pages; one press = one run)
     {"TiCruiseCheckStatus", CLEAR_ON_MANAGER_START},  // tmpfs: what the check is doing and its result (car controller, on change and 1 Hz)
+    {"TiButtonTest", CLEAR_ON_MANAGER_START},         // tmpfs: the cruise button tests' trigger (the Tests pages; one press = one run)
+    {"TiButtonTestStatus", CLEAR_ON_MANAGER_START},   // tmpfs: what the button test is doing and its result (car controller, on change and 1 Hz)
     {"TiCurveOn", CLEAR_ON_MANAGER_START},            // tmpfs: curve slowing switch for this drive (the Tests pages); the car controller clears it at start
     {"TiCurvePlan", CLEAR_ON_MANAGER_START},          // tmpfs: the curve planner's output, 5 Hz (ti_curve_plannerd): ceiling, confidence, no position
     {"TiCurveStatus", CLEAR_ON_MANAGER_START},        // tmpfs: what curve slowing is doing (car controller, on change and 1 Hz)

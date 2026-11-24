@@ -1191,6 +1191,7 @@ void TestsWindow::refresh() {
   tests.poll(frogpilotUIState()->frogpilot_toggles);
   abPoll();                  // the plan line is on both pages
   cruisePoll();              // the cruise check: its page, and whether START and the switches wait for it
+  buttonsPoll();             // the cruise button tests: their page, and whether START and the switches wait for them
   curvePoll();               // curve slowing: what the car controller reports (its page shows only that)
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
     // the tests are held for a reason of the plan or the alternation: say it, not "another test is on"
@@ -1235,6 +1236,9 @@ int TestsWindow::rowHeight() const {
 }
 
 ti_pages::Page TestsWindow::pageNow() const {
+  if (buttons_page) {
+    return ti_pages::Page::Buttons;
+  }
   if (curve_page) {
     return ti_pages::Page::Curve;
   }
@@ -1339,6 +1343,7 @@ void TestsWindow::mousePressEvent(QMouseEvent *event) {
 void TestsWindow::goHome() {
   abOpen();                // the set-up page's unconfirmed draft is dropped: the first page shows, and START runs, what is saved
   cruise_page = false;
+  buttons_page = false;
   curve_page = false;
   home_page = true;
   setup_page = false;
@@ -1447,14 +1452,23 @@ void TestsWindow::mouseReleaseEvent(QMouseEvent *event) {
     refresh();
     return;
   }
-  // While the car reports the cruise check running, nothing else starts: START, the A/B switch and the test switches wait (the
-  // car side also aborts the check if one comes on). STOP and the off controls still act, and STOP stops the check too.
-  if (cruiseBusy(cruise_view) && (control == CTL_START || control == CTL_AB_SWITCH || (control >= 10 && control < 20))) {
+  if (control == CTL_NAV_BUTTONS || control == CTL_BUTTONS_HOLD || control == CTL_BUTTONS_TAPS || control == CTL_BUTTONS_STOP) {
+    buttonsAct(control);
+    refresh();
+    return;
+  }
+  // While the car reports the cruise check or a button test running, nothing else starts: START, the A/B switch and the test switches
+  // wait (the car side also aborts them if one comes on). STOP and the off controls still act, and STOP stops the check / test too.
+  const bool busy = cruiseBusy(cruise_view) || buttonsBusy(buttons_view);
+  if (busy && (control == CTL_START || control == CTL_AB_SWITCH || (control >= 10 && control < 20))) {
     refresh();
     return;
   }
   if (control == CTL_STOP && cruiseBusy(cruise_view)) {
     cruiseWrite("stop");
+  }
+  if (control == CTL_STOP && buttonsBusy(buttons_view)) {
+    buttonsWrite("stop");
   }
   if (control == CTL_START || control == CTL_STOP || control == CTL_NAV_SETUP || control == CTL_NAV_PROGRESS || control == CTL_NAV_INDIV) {
     homeAct(control);
@@ -2272,6 +2286,7 @@ void TestsWindow::cruiseOpen() {
   ab_page = false;
   cruise_page = true;
   curve_page = false;
+  buttons_page = false;
 }
 
 void TestsWindow::cruisePoll() {
@@ -2310,6 +2325,9 @@ std::string TestsWindow::cruiseOthers() const {
   }
   if (tests.all_view.requested || tests.singleTestOn()) {
     return "a test is on";
+  }
+  if (ti_pages::buttonsBusy(buttons_view)) {
+    return "a button test is running";
   }
   return "";
 }
@@ -2388,6 +2406,7 @@ void TestsWindow::curveOpen() {
   ab_page = false;
   cruise_page = false;
   curve_page = true;
+  buttons_page = false;
 }
 
 void TestsWindow::curvePoll() {
@@ -2447,10 +2466,133 @@ void TestsWindow::drawCurve(QPainter &p) {
   drawEngagedBadge(p, qr(HOME_BADGE));
 }
 
+// ---- the cruise button tests' page --------------------------------------------------------------------------------------------
+// HOLD TEST / TAP TEST write one trigger (TiButtonTest, tmpfs) that the car controller consumes; STOP TEST writes a stop. Everything
+// shown comes from the car controller's report (TiButtonTestStatus); nothing here decides that a test runs.
+void TestsWindow::buttonsOpen() {
+  home_page = false;
+  setup_page = false;
+  progress_page = false;
+  ab_page = false;
+  cruise_page = false;
+  curve_page = false;
+  buttons_page = true;
+}
+
+void TestsWindow::buttonsPoll() {
+  ti_pages::ButtonsView v;
+  const QJsonObject st = QJsonDocument::fromJson(QByteArray::fromStdString(ab_memory.get(ti_pages::TI_BUTTON_STATUS_KEY))).object();
+  v.have = st.value("state").isString();
+  if (v.have) {
+    const double age = QDateTime::currentMSecsSinceEpoch() / 1000.0 - st.value("t").toDouble(-1e9);
+    v.fresh = age > -ti_pages::BUTTONS_STALE_S && age < ti_pages::BUTTONS_STALE_S;
+    v.state = st.value("state").toString().toStdString();
+    v.test = st.value("test").toString().toStdString();
+    v.line1 = st.value("line1").toString().toStdString();
+    v.line2 = st.value("line2").toString().toStdString();
+    v.result = st.value("result").toString().toStdString();
+    v.d1 = st.value("d1").toString().toStdString();
+    v.d2 = st.value("d2").toString().toStdString();
+    v.d3 = st.value("d3").toString().toStdString();
+  }
+  buttons_view = v;
+}
+
+// Why another mode keeps the button tests from starting, as the screen knows it ("" when nothing else is on); the car side checks again
+std::string TestsWindow::buttonsOthers() const {
+  if (ab_plan_on) {
+    return "the drive plan is on";
+  }
+  if (ab_on) {
+    return "the A/B switch is on";
+  }
+  if (tests.all_view.requested || tests.singleTestOn()) {
+    return "a test is on";
+  }
+  if (ti_pages::cruiseBusy(cruise_view)) {
+    return "the cruise check is running";
+  }
+  if (curve_view.have && curve_view.fresh && curve_view.state != "off") {
+    return "curve slowing is on";
+  }
+  return "";
+}
+
+void TestsWindow::buttonsWrite(const char *cmd) {
+  using namespace ti_pages;
+  QJsonObject t;
+  const qint64 ms = QDateTime::currentMSecsSinceEpoch();
+  t["cmd"] = QString(cmd);
+  t["id"] = QString("%1-%2").arg(cmd).arg(ms);
+  t["t"] = ms / 1000.0;
+  ab_memory.put(TI_BUTTON_TRIGGER_KEY, QJsonDocument(t).toJson(QJsonDocument::Compact).toStdString());
+}
+
+void TestsWindow::buttonsAct(int control) {
+  using namespace ti_pages;
+  if (control == CTL_NAV_BUTTONS) {
+    buttonsOpen();
+    return;
+  }
+  buttonsPoll();
+  const ButtonsLook look = buttonsLook(buttons_view, buttonsOthers());
+  if (control == CTL_BUTTONS_HOLD && look.run_enabled) {
+    buttonsWrite("hold");          // one press, one run: the car controller consumes the trigger
+  } else if (control == CTL_BUTTONS_TAPS && look.run_enabled) {
+    buttonsWrite("taps");
+  } else if (control == CTL_BUTTONS_STOP && look.stop_enabled) {
+    buttonsWrite("stop");
+  }
+}
+
+void TestsWindow::drawButtons(QPainter &p) {
+  using namespace ti_pages;
+  const QColor white(0xff, 0xff, 0xff);
+  const QColor grey(0x33, 0x33, 0x33);
+  const QColor dim(0xc9, 0xc9, 0xc9);
+  const QColor off_fill(0x1a, 0x1a, 0x1a);
+  const QColor off_ink(0x77, 0x77, 0x77);
+  const ButtonsLook look = buttonsLook(buttons_view, buttonsOthers());
+  drawBox(p, ctlRect(CTL_BACK), grey, white, QString("< START\nPAGE"), NAV_PX);
+  drawTitle(p, qr(BUTTONS_TITLE), QString("CRUISE BUTTON\nTESTS"), 64);
+  drawBox2(p, ctlRect(CTL_BUTTONS_HOLD), look.run_enabled ? toneQColor(Tone::Done) : off_fill, look.run_enabled ? white : off_ink,
+           QString("HOLD TEST"), START_PX, QString::fromStdString(look.hold_sub), START_SUB_PX);
+  drawBox2(p, ctlRect(CTL_BUTTONS_TAPS), look.run_enabled ? toneQColor(Tone::Done) : off_fill, look.run_enabled ? white : off_ink,
+           QString("TAP TEST"), START_PX, QString::fromStdString(look.taps_sub), START_SUB_PX);
+  drawBox2(p, ctlRect(CTL_BUTTONS_STOP), look.stop_enabled ? QColor(201, 34, 49) : QColor(0x6b, 0x1d, 0x25),
+           look.stop_enabled ? white : dim, QString("STOP TEST"), START_PX, QString::fromStdString(look.stop_sub), START_SUB_PX);
+
+  // the status band: its colour is the state, its words say the same
+  const ToneColor tc = toneColor(look.tone);
+  const QColor ink = tc.light ? QColor(0, 0, 0) : white;
+  p.setPen(Qt::NoPen);
+  p.setBrush(toneQColor(look.tone));
+  p.drawRoundedRect(qr(BUTTONS_BAND), 24, 24);
+  p.setPen(ink);
+  p.setFont(InterFont(BUTTONS_PRIMARY_PX, QFont::Bold));
+  p.drawText(qr(BUTTONS_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.primary));
+  p.setFont(InterFont(BUTTONS_SECOND_PX, QFont::DemiBold));
+  p.drawText(qr(BUTTONS_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.second));
+
+  // the answer, large and plain
+  if (!look.result.empty()) {
+    p.setPen(look.result_warn ? QColor(0xff, 0x6b, 0x6b) : QColor(0x33, 0xcc, 0x66));
+    p.setFont(InterFont(BUTTONS_RESULT_PX, QFont::Bold));
+    p.drawText(qr(BUTTONS_RESULT).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.result));
+  }
+  p.setPen(dim);
+  p.setFont(InterFont(DETAIL_PX));
+  p.drawText(qr(BUTTONS_DETAIL1), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail1));
+  p.drawText(qr(BUTTONS_DETAIL2), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail2));
+  p.drawText(qr(BUTTONS_DETAIL3), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(look.detail3));
+  drawEngagedBadge(p, qr(HOME_BADGE));
+}
+
 // The first page while the check runs: START is covered by what it waits for (the car's report decides, never this page)
 void TestsWindow::drawCruiseBusy(QPainter &p) {
   using namespace ti_pages;
-  if (!cruiseBusy(cruise_view)) {
+  const bool check = cruiseBusy(cruise_view);
+  if (!check && !buttonsBusy(buttons_view)) {
     return;
   }
   const QColor white(0xff, 0xff, 0xff);
@@ -2461,12 +2603,13 @@ void TestsWindow::drawCruiseBusy(QPainter &p) {
   p.drawRoundedRect(band, 24, 24);
   p.setPen(white);
   p.setFont(InterFont(PRIMARY_PX, QFont::Bold));
-  p.drawText(qr(HOME_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString("CRUISE CHECK RUNNING"));
+  p.drawText(qr(HOME_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, check ? QString("CRUISE CHECK RUNNING") : QString("BUTTON TEST RUNNING"));
   p.setFont(InterFont(SECOND_PX, QFont::DemiBold));
   p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString("Plan and tests wait for it"));
   drawBox2(p, ctlRect(CTL_START), QColor(0x6b, 0x5e, 0x10), white, QString("START WAITS"), START_PX,
-           QString("until the cruise check ends"), START_SUB_PX);
-  drawBox2(p, ctlRect(CTL_STOP), QColor(201, 34, 49), white, QString("STOP"), STOP_PX, QString("stops the cruise check"), START_SUB_PX);
+           check ? QString("until the cruise check ends") : QString("until the button test ends"), START_SUB_PX);
+  drawBox2(p, ctlRect(CTL_STOP), QColor(201, 34, 49), white, QString("STOP"), STOP_PX,
+           check ? QString("stops the cruise check") : QString("stops the button test"), START_SUB_PX);
 }
 
 void TestsWindow::paintEvent(QPaintEvent *event) {
@@ -2495,6 +2638,11 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     }
   };
 
+  if (buttons_page) {
+    drawButtons(p);
+    lockBorder();
+    return;
+  }
   if (curve_page) {
     drawCurve(p);
     lockBorder();
@@ -2520,6 +2668,7 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
     drawProgress(p);
     drawBox(p, ctlRect(CTL_NAV_CRUISE), grey, white, QString("CRUISE\nCHECK >"), NAV_PX);   // the cruise check's own page
     drawBox(p, ctlRect(CTL_NAV_CURVE), grey, white, QString("CURVE\nSLOWING >"), NAV_PX);   // curve slowing's own page
+    drawBox(p, ctlRect(CTL_NAV_BUTTONS), grey, white, QString("BUTTON\nTESTS >"), NAV_PX); // the cruise button tests' own page
     lockBorder();
     return;
   }
@@ -2584,6 +2733,9 @@ void TestsWindow::paintEvent(QPaintEvent *event) {
   }
   if (cruiseBusy(cruise_view)) {
     banner = QString("Cruise check running: the switches wait for it");
+    banner_color = amber;
+  } else if (buttonsBusy(buttons_view)) {
+    banner = QString("Button test running: the switches wait for it");
     banner_color = amber;
   }
   if (!banner.isEmpty()) {

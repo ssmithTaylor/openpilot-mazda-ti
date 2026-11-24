@@ -260,8 +260,9 @@ CURVE_CODE_UNIT = 1_000_000
 
 def curve_code_alert(v: int) -> Alert:
   code, a, b = v // CURVE_CODE_UNIT, (v // 1000) % 1000, v % 1000
-  if code == 4:
-    return Alert(f"CRUISE SET TO {a}, WAS {b}", "Curve slowing stopped: set it yourself",
+  if code in (4, 5):   # 5: left by a cruise button test (merge 2026-11-24)
+    return Alert(f"CRUISE SET TO {a}, WAS {b}", "Curve slowing stopped: set it yourself" if code == 4 else
+                 "Button test stopped: set it yourself",
                  AlertStatus.userPrompt, AlertSize.mid, Priority.MID, VisualAlert.none, AudibleAlert.prompt, 0.4)
   second = {2: "Interceptor stuck: take the wheel", 3: "Steering has no effect: take the wheel"}.get(code, "Interceptor off: take the wheel")
   return Alert("STEERING ASSIST OFF: slow down", second,
