@@ -31,6 +31,7 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
+from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
 from openpilot.selfdrive.car.mazda import ti_curve_memory as M
 
 MPH = 0.44704
@@ -55,11 +56,13 @@ LATCH_EXTRA_S = 10.0            # a corner on trusted road this many seconds of 
 LATCH_PAST_M = 30.0             # ... and kept until the car is this far past its end, whatever the trust (fourth review, MUST 1)
 OBS_WINDOW_S = 2.0              # the cruise's OBSERVED deceleration over this, against what it was measured to give for the same gap
 OBS_MIN_EXPECT = 0.5            # ... judged only while it should be slowing at least this much (mph/s)
+OBS_PRE_S = 1.5                 # ... the model is run from this long before the window (dead time + lag: 0.5 + 2 x 0.5 s)
+OBS_SIM_DT_S = 0.05             # ... in steps of this
 OBS_KEEP_S = 10.0               # ... and the last judgement kept this long (to the corner) once the gap closes
 RAISE_SLACK_MPH = 0.5           # a warning starts only above need + ALERT_MARGIN_MPH + this (speed noise at the margin); ends at the margin
 SETTLE_MPH = 0.3                # within this of its set speed the cruise is taken to be at it
 SIM_DT_S = 0.2                  # the arrival prediction's time step
-ACCEL_MPH_S = 0.7               # the stock cruise speeding up toward its set speed (measured: 5 mph in 7-9 s)
+ACCEL_MPH_S = CM.ACCEL_MPH_S    # the stock cruise speeding up toward its set speed (measured: 5 mph in 7-9 s)
 SPEED_WINDOW_MPH = 0.75         # a speed fits only if every speed within this of it fits (band edges, speed error)
 FLAGGED_DROP_MPH = 10           # where a pass hit the limit or had a takeover: at least this far below the speed it was driven at
 FLAG_MIN_LA = 1.3               # ... only where the remembered bend needed at least this lateral acceleration (m/s^2) at that speed
@@ -72,19 +75,21 @@ MAX_MPH = 90
 
 # ---- when to start: as LATE as still reaches the corner speed (owner, 2026-11-23: "we should ensure that we're not slowing down
 # further ahead than we need to ... We only want to do what we need to, speed change wise, and speed of speed change wise.")
-# The stock cruise's measured response to a lower set speed (cruise-slowing-20261122): reaction ~0.5 s, then a deceleration that
-# depends on the gap between speed and set speed: ~0.34 m/s^2 (0.76 mph/s) for a gap up to 3 mph, rising to ~0.9-1.0 m/s^2 (cap ~2 mph/s)
-# at 6 mph and more. So the approach is: PUSH (set DRIVE_GAP_MPH below the corner speed, never below the floor) so the car slows at the
-# rate it can, then set the corner speed itself once within RAISE_AT_MPH of it (no undershoot). The start is the latest moment that
-# still arrives by ENTRY_M before the corner with RESP_FACTOR of the measured deceleration and BUFFER_S of margin. CLOSED LOOP every
-# tick: the car's speed is compared with the highest speed from which it can still make it (`v_allow`); a car slowing less than planned
-# (downhill or anything else) is pushed to the floor; one slowing more (uphill) is let off to the corner speed (with hysteresis).
-REACTION_S = 1.3               # measured on 00000342 / 00000343 (2026-11-24): first tap to the car slowing 0.9-3.4 s, median 1.5 s
-TAP_S = 0.3                     # one set-speed tap per this (2 pressed frames + the reviewed 0.25 s gap)
-DRIVE_GAP_MPH = 6                # a gap of 6 mph or more gives the most deceleration the cruise has; more does nothing
+# How the car answers our taps is ti_cruise_model (the ONE measured cruise model, plan amendment A1, 2026-11-24): the dash walks 1 mph
+# per tap, one tap per 0.30 s; the cruise acts on the gap (speed minus set speed) 0.5 s late through a 0.5 s first-order lag, with the
+# measured, grade-corrected deceleration for that gap (0.21 m/s^2 at 1-2 mph rising to 0.90 at 10-14 mph, capped there). The same
+# model is used by the warning's arrival prediction, the replay tools and every test car. The approach is: PUSH (set DRIVE_GAP_MPH
+# below the corner speed, never below the floor), then set the corner speed itself once within RAISE_AT_MPH of it (no undershoot).
+# The start is the latest moment that still arrives at T + ARRIVED_MPH by ENTRY_M before the corner, with BUFFER_S of margin. CLOSED
+# LOOP every tick: the car's speed is compared with the highest speed from which it can still make it (`v_allow`); a car slowing less
+# than planned (downhill or anything else) is pushed to the floor; one slowing more (uphill) is let off to the corner speed.
+REACTION_S = CM.DELAY_S         # the model's dead time on the gap (0.5 s); the measured ~1.4 s from the first tap to the car slowing
+                                # 0.5 mph is not a separate constant: it comes out of the model (dead time, lag, weak small-gap decel)
+TAP_S = CM.TAP_S                # one set-speed tap per this (measured walk: 0.30 s per tap, 0 of 293 taps missed)
+DRIVE_GAP_MPH = 6                # push this far below the corner speed
 RAISE_AT_MPH = 1.5
-ARRIVED_MPH = 1.5               # the approach counts as done at the corner speed + this (was 0.5: ~0.7 s more early dwell; 2026-11-24)
-RESP_FACTOR = 1.0               # plan with the measured deceleration (was 0.9; measured for drops of 8+ mph: 1.36 mph/s, 2026-11-24)
+ARRIVED_MPH = CM.ARRIVED_MPH    # the approach counts as done at the corner speed + this (the measured whole-manoeuvre definition)
+RESP_FACTOR = 1.0               # plan with the measured deceleration
 BUFFER_S = 0.3                  # extra seconds of start-early margin (was 1.0; 2026-11-24, arrive just in time)
 ENTRY_M = 0.0                   # be at the corner speed this far before the aim point (was 10 m; 2026-11-24)
 COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
@@ -100,20 +105,9 @@ MIN_DROP_MPH = 2                # a point needing less than this below the speed
 HOLD_AFTER_M = 30.0             # keep the ceiling this far past the last tight point
 
 
-SAT_MPH_S = 1.6                 # the saturated rate at a 6+ mph gap: ~0.7 m/s^2 mean (peaks 0.9-1.0)
-
-
 def decel_mph_s(gap):
-  """The stock cruise's measured deceleration (mph/s) for a gap (mph) between speed and set speed."""
-  if gap <= 0.0:
-    return 0.0
-  if gap < 1.0:
-    return 0.76 * gap
-  if gap <= 3.0:
-    return 0.76
-  if gap >= 6.0:
-    return SAT_MPH_S
-  return 0.76 + (SAT_MPH_S - 0.76) * (gap - 3.0) / 3.0
+  """The stock cruise's measured settled deceleration (mph/s) for a gap (mph): ti_cruise_model, timing variant."""
+  return CM.decel_mph_s(gap)
 
 
 _APPROACH = {}
@@ -121,32 +115,12 @@ _APPROACH = {}
 
 def approach_m(u, T, S1, dt=0.05):
   """Metres from the first press until the speed is within ARRIVED_MPH of T, starting at u mph with the set speed at u, tapping down to S1
-  (one tap per TAP_S), raising to T once within RAISE_AT_MPH of it; the cruise acts REACTION_S after the set speed changes, with
-  RESP_FACTOR of the measured deceleration. Cached by whole mph."""
+  (one tap per TAP_S), raising to T once within RAISE_AT_MPH of it; the car answers as ti_cruise_model says. Cached by whole mph."""
   key = (int(u), int(T), int(S1))
   r = _APPROACH.get(key)
   if r is not None:
     return r
-  v = float(key[0])
-  T, S1 = key[1], key[2]
-  hist = []                       # set speed by step, for the reaction delay
-  setn = v
-  t = dist = 0.0
-  tap_t = 0.0
-  raised = False
-  lag = int(round(REACTION_S / dt))
-  while v > T + ARRIVED_MPH and t < 90.0:
-    if not raised and v <= T + RAISE_AT_MPH:
-      raised = True
-    goal = T if raised else S1
-    if t >= tap_t and setn != goal:
-      setn += 1 if goal > setn else -1
-      tap_t = t + TAP_S
-    hist.append(setn)
-    eff = hist[-1 - lag] if len(hist) > lag else float(key[0])
-    v = max(0.0, v - RESP_FACTOR * decel_mph_s(v - eff) * dt)
-    dist += v * MPH * dt
-    t += dt
+  _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=RAISE_AT_MPH, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S)
   _APPROACH[key] = dist
   return dist
 
@@ -747,14 +721,20 @@ class Planner:
       T = a_["T"]
       S1 = max(floor, T - DRIVE_GAP_MPH)
       mode = a_["mode"]
+      late, on_plan = mph > va + BEHIND_MPH, mph <= va
+      if c is not None and set_mph and mode in ("push", "behind"):
+        # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
+        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting
+        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True)
+        late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
       if mode != "target":
         if mph <= T + RAISE_AT_MPH:
           mode = "target"
-        elif mph > va + BEHIND_MPH and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
+        elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
           mode = "behind"
         elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
           mode = "coast"
-        elif mode == "behind" and mph <= va:
+        elif mode == "behind" and on_plan:
           mode = "push"
         elif mode == "coast" and mph >= va - REPUSH_MPH:
           mode = "push"
@@ -791,11 +771,13 @@ class Planner:
     self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
     corners = corners + [c for k, c in self.latch.items() if k not in keys]
     self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True)
+    # a warned corner whose need is below the floor is "capped" too, also on the tick before its slowdown starts
+    warned_below_floor = self.alert is not None and self.alert < floor
     if ceil is None:
-      return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True)
+      return self._out(None, conf, True, True, "no known corner ahead", None, None, model_la, past=True, capped=warned_below_floor)
     # "capped" means ONE thing: a corner's target is below the floor (more than the feature may shed); a car slowing less than planned
     # is "behind", reported separately and never as capped
-    capped = bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor
+    capped = (bool(self.active) and min(a_["need"] for a_ in self.active.values()) < floor) or warned_below_floor
     why = ("next corner: holding what it needs" if kind == "hold" else "corner ahead" if (cdist or 0) > 0 else "in the corner")
     self.end_m = cend
     self.behind = behind
@@ -844,10 +826,11 @@ class Planner:
 
   def _observe(self, t, mph, set_mph):
     """How much of its measured deceleration the cruise is ACTUALLY giving (a weaker cruise than measured, a downhill, a heavy load):
-    observed speed drop over OBS_WINDOW_S against decel_mph_s(gap to the set speed REACTION_S earlier), while it should be slowing.
-    The prediction (`_arrive`) uses min(RESP_FACTOR, that share); fourth review, item 3."""
+    observed speed drop over OBS_WINDOW_S against the drop ti_cruise_model predicts for the same recorded set speeds (the model run
+    from the oldest kept sample, OBS_PRE_S before the window, settled there), while it should be slowing. The prediction (`_arrive`)
+    uses min(RESP_FACTOR, that share); fourth review, item 3."""
     self.hist.append((t, mph, set_mph))
-    while self.hist and t - self.hist[0][0] > OBS_WINDOW_S + REACTION_S + 1e-6:
+    while self.hist and t - self.hist[0][0] > OBS_WINDOW_S + OBS_PRE_S + 1e-6:
       self.hist.pop(0)
     if t - self.resp_t > OBS_KEEP_S:
       self.resp = RESP_FACTOR
@@ -855,15 +838,14 @@ class Planner:
     if not old or set_mph is None or any(h[2] is None for h in self.hist):
       return
     t0, m0, _ = old[-1]
-    exp, n = 0.0, 0
-    for tt, m, _ in self.hist:
-      if tt < t0:
-        continue
-      lag = [h for h in self.hist if h[0] <= tt - REACTION_S + 1e-6]
-      sl = lag[-1][2] if lag else self.hist[0][2]
-      exp += decel_mph_s(m - sl)
-      n += 1
-    exp /= max(n, 1)
+    car = CM.Cruise(self.hist[0][1], self.hist[0][2], OBS_SIM_DT_S)
+    v_t0 = car.v
+    for (ta, _, sa), (tb, _, _) in zip(self.hist, self.hist[1:]):
+      for _ in range(max(1, int(round((tb - ta) / OBS_SIM_DT_S)))):
+        car.step(sa)
+      if tb <= t0 + 1e-6:
+        v_t0 = car.v
+    exp = (v_t0 - car.v) / max(t - t0, 1e-3)
     if exp < OBS_MIN_EXPECT:
       return
     obs = (m0 - mph) / max(t - t0, 1e-3)
@@ -872,22 +854,10 @@ class Planner:
 
   def _arrive(self, v, d, set0, s1, lowering):
     """The speed (mph) at `d` metres from what curve slowing will actually do: the set speed tapped down from `set0` one mph per TAP_S
-    to `s1` when `lowering` (else it stays), the cruise following it REACTION_S late at its MEASURED deceleration for the gap
-    (decel_mph_s: weak at a small gap; fourth review, item 3) times RESP_FACTOR, or the share it is observed to give now if less
-    (`_observe`), and speeding up toward a set speed above it at ACCEL_MPH_S."""
-    vv, x, t = v / MPH, 0.0, 0.0
-    while x < d and t < 120.0:
-      tl = t - REACTION_S
-      s_lag = max(s1, set0 - tl / TAP_S) if (lowering and tl > 0) else set0
-      if vv > s_lag:
-        vv = max(s_lag, vv - self.resp * decel_mph_s(vv - s_lag) * SIM_DT_S)
-        if vv - s_lag < SETTLE_MPH:
-          vv = s_lag                              # the cruise settles on its set speed (it shows whole mph)
-      elif vv < s_lag:
-        vv = min(s_lag, vv + ACCEL_MPH_S * SIM_DT_S)
-      x += vv * MPH * SIM_DT_S
-      t += SIM_DT_S
-    return vv
+    to `s1` when `lowering` (else it stays), the car answering as ti_cruise_model says (the same model the approach is planned with),
+    its slowing scaled by the share of it the car is observed to give now if less (`_observe`; kept under plan amendment A1 because
+    it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5)."""
+    return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp)
 
   def _warn(self, corners, mph, v, floor, acting, set_mph, lowering):
     """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,

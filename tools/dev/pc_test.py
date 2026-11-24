@@ -41,6 +41,8 @@ CURVE_TESTS = (
   "selfdrive/car/tests/test_mazda_ti_curve_e2e.py",
   "selfdrive/car/tests/test_mazda_ti_curve_screen.py",
   "selfdrive/car/tests/test_mazda_ti_curve_scenarios.py",
+  "selfdrive/car/tests/test_mazda_ti_cruise_model.py",
+  "tools/curve_slowing/test_early_dwell.py",
   "tools/curve_slowing/test_build_memory.py",
 )
 # --all: every suite the car-side work touches that runs on the PC.

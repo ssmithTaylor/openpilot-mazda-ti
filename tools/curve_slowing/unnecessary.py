@@ -208,7 +208,7 @@ def main():
   if a.dwell:
     sm = ED.summary([x['dwell'] for x in allr])
     nl = sum(1 for x in allr if x['dwell'] is None)
-    print(f"predicted early dwell (measured response {ED.DELAY_S} s, {ED.RATE_MPH_S} mph/s; arrived at T + {ED.ARRIVED_MPH} mph): "
+    print(f"predicted early dwell (ti_cruise_model, the one measured cruise model; arrived at T + {ED.ARRIVED_MPH} mph): "
           f"n {sm.get('n', 0)} (+{nl} where the pass never loads {ED.LOAD_LA} m/s^2 at T); median {sm.get('median')} s, "
           f"p10 {sm.get('p10')} s, p90 {sm.get('p90')} s; late {sm.get('late')}, worst {sm.get('worst_over_mph')} mph over T")
   json.dump(allr, open(os.environ.get('UNNEC_OUT', os.devnull), 'w'))

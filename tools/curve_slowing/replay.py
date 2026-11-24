@@ -41,7 +41,8 @@ READ_S = 0.08
 GRADE_CAP_MS2 = 1.25     # ASSUMPTION: the most deceleration the cruise can produce on the flat (engine and any brake use together); with
                          # gravity along the slope taken from it, the measured 0.7 m/s^2 is unaffected within +-3 degrees (as measured)
                          # and falls short beyond about 3 degrees downhill; nothing is known beyond +-3 degrees
-REACT_S = 0.5
+REACT_S = P.CM.DELAY_S          # the ONE measured cruise model (ti_cruise_model): 0.5 s dead time ...
+LAG_ALPHA = 1.0 - math.exp(-DT / P.CM.TAU_S)   # ... then a 0.5 s first-order lag on the deceleration
 ACCEL_MPH_S = 0.7
 DRIVER_ACCEL_MPH_S = 3.0   # the recorded driver on the gas or with the cruise off (they were not reacting to this feature)
 
@@ -57,6 +58,7 @@ def low_priority():
 class SimCruise:
   def __init__(self, max_rate):
     self.max_rate = max_rate
+    self.dec_f = 0.0         # the deceleration actually given (m/s^2), lagging the demand by ti_cruise_model.TAU_S
     self.counter = 0
     self.set = None          # the car's set speed (mph) as read
     self.eff = None          # the set speed the speed controller acts on (REACT_S after a change)
@@ -212,11 +214,13 @@ def replay_drive(drive, max_rate=2.0, feature_on=True):
       if v_sim > target:
         if cap is not None and target == cap:
           gap = (v_sim - target) / MPH
-          dec = min(max_rate, P.decel_mph_s(gap)) * MPH                                 # measured: weak under 3 mph, flat from 6 mph
+          dec = min(max_rate, P.decel_mph_s(gap)) * MPH                                 # ti_cruise_model's measured table (timing)
+          cru.dec_f += (dec - cru.dec_f) * LAG_ALPHA
           g = float(grade[p]) if np.isfinite(grade[p]) else 0.0
           avail = GRADE_CAP_MS2 + 9.81 * math.sin(g)                                   # downhill takes from what the cruise can do
-          v_sim = max(target, v_sim - max(0.0, min(dec, avail)) * DT)
+          v_sim = max(target, v_sim - max(0.0, min(cru.dec_f, avail)) * DT)
         else:
+          cru.dec_f = 0.0
           v_sim = target                                                               # the recording is slower (lead, brake): follow
       elif target - v_sim > 0.3 * MPH:
         # catching up: the cruise at its measured rate; the driver (gas, or driving with the cruise off) at DRIVER_ACCEL_MPH_S

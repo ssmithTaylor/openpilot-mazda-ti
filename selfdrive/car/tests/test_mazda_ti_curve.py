@@ -4,6 +4,7 @@ import random
 import pytest
 
 from openpilot.selfdrive.car.mazda import ti_curve as C
+from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
 from openpilot.selfdrive.car.mazda.ti_cruise_taps import DT, MAX_PRESSED_FRAMES, MAX_TAP_SPAN_S, MIN_TAP_GAP_S
 
 
@@ -12,7 +13,8 @@ class Car:
   10 Hz (k % 10 == 3, counter + 1). A press registers on a pressed frame that follows an idle one, so two pressed frames with an idle
   frame between them register as TWO presses. A press is read 4 frames after its first frame; an unbroken press lasting 0.52 s reads
   as a hold (jump to a multiple of 5). Modes: accept, ignore, hold_misread (every press reads as a hold), double (a SET_PLUS press
-  registers +2). The speed follows the set speed at ~1.2 mph/s down and 0.7 up."""
+  registers +2). The speed follows the set speed as the ONE measured cruise model says (ti_cruise_model: 0.5 s dead time, 0.5 s lag,
+  the measured deceleration by gap; 0.7 mph/s up)."""
 
   def __init__(self, mph=55.0, set_mph=55, mode="accept"):
     self.k = 0
@@ -26,6 +28,7 @@ class Car:
     self.sent = []                # (k, button)
     self.registered = 0           # presses the car registered
     self.history = []
+    self.cruise = CM.Cruise(mph, set_mph, DT)
 
   def tick(self):
     self.k += 1
@@ -35,11 +38,8 @@ class Car:
     for p in [p for p in self.pending if p[0] <= self.k]:
       self.pending.remove(p)
       self.set = p[1]
-    target = self.set
-    if self.mph > target:
-      self.mph = max(target, self.mph - 1.2 * DT)
-    elif self.mph < target:
-      self.mph = min(target, self.mph + 0.7 * DT)
+    self.cruise.v = self.mph          # a test may move the speed itself (brake, gas, a lead)
+    self.mph = self.cruise.step(self.set)
 
   def press(self, button):
     self.sent.append((self.k, button))

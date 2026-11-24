@@ -1,8 +1,8 @@
 """Predicted early dwell of a curve slowdown (off the car; owner, 2026-11-24: "curve slowing must arrive just in time").
 
 For one slowdown the planner STARTED (car at `u` mph, corner target `T` mph): the speed it would follow with the cruise as MEASURED on
-the drives 00000342 / 00000343 (arrival-20261124), not the planner's own assumptions: no change for DELAY_S after the first tap, then
-RATE_MPH_S, done at T + ARRIVED_MPH (the car then holds that speed in this figure). Against it, the moment the recorded pass first
+this car: the ONE measured cruise model (ti_cruise_model, plan amendment A1), the same the planner plans with, done at T +
+ARRIVED_MPH (the car then holds that speed in this figure). Against it, the moment the recorded pass first
 LOADS the car: the first sample from the start on where the pass's own curvature, at the target speed, needs LOAD_LA for at least
 SUSTAIN_S. The dwell is the time from arrival to that moment along the predicted speed: positive is early (time spent slow before the
 bend needs it), negative is LATE (the car would still be above T + ARRIVED_MPH when the bend loads; `over_mph` is how far above T).
@@ -10,37 +10,51 @@ bend needs it), negative is LATE (the car would still be above T + ARRIVED_MPH w
 Pure functions; unnecessary.py --dwell applies them to every slowdown it replays. Position-free.
 """
 import math
+import os
+import sys
 
 import numpy as np
 
+try:
+  from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
+except ImportError:
+  sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+  from selfdrive.car.mazda import ti_cruise_model as CM   # type: ignore
+
 MPH = 0.44704
-DELAY_S = 1.5             # measured: first tap to the car starting to slow, median 1.5 s (0.9-3.4)
-RATE_MPH_S = 1.36         # measured: mean deceleration for drops of 8 mph or more
 ARRIVED_MPH = 1.5         # arrived: at or below the target + this
 LOAD_LA = 1.3             # the bend loads the car: |curvature| * (target speed)^2 at least this (m/s^2) ...
 SUSTAIN_S = 0.5           # ... for at least this long
 
 
 class Profile:
-  """The measured-response speed after a start at u mph toward target T mph."""
+  """The speed after a start at u mph toward target T mph, as the ONE measured cruise model says (ti_cruise_model: our taps walk the
+  dash straight to T, 0.5 s dead time, 0.5 s lag, the measured deceleration by gap), done at T + ARRIVED_MPH (then held)."""
 
-  def __init__(self, u, T, delay_s=DELAY_S, rate=RATE_MPH_S, arrived=ARRIVED_MPH):
-    self.u, self.goal, self.delay, self.rate = float(u), float(T) + arrived, delay_s, rate
-    self.d_react = self.u * MPH * delay_s
-    drop = max(0.0, self.u - self.goal)
-    self.t_arr = (delay_s + drop / rate) if drop > 0 else 0.0
-    self.d_arr = (self.d_react + MPH * (self.u ** 2 - self.goal ** 2) / (2.0 * rate)) if drop > 0 else 0.0
+  def __init__(self, u, T, arrived=ARRIVED_MPH, dt=0.05):
+    self.u, self.goal = float(u), float(T) + arrived
+    car = CM.Cruise(self.u, self.u, dt)
+    ts, xs, vs = [0.0], [0.0], [self.u]
+    t, x = 0.0, 0.0
+    while car.v > self.goal and t < 90.0:
+      car.step(CM.dash_after(self.u, float(T), t))
+      t += dt
+      x += car.v * MPH * dt
+      ts.append(t)
+      xs.append(x)
+      vs.append(car.v)
+    self.ts, self.xs, self.vs = np.array(ts), np.array(xs), np.array(vs)
+    self.t_arr = t if self.u > self.goal else 0.0
+    self.d_arr = x if self.u > self.goal else 0.0
+    self.v_arr = car.v
 
   def at(self, d):
     """(seconds, mph) when the car has driven d metres from the start."""
     if self.t_arr == 0.0:
       return d / max(self.u * MPH, 0.1), self.u
-    if d <= self.d_react:
-      return d / (self.u * MPH), self.u
     if d <= self.d_arr:
-      v = math.sqrt(max(self.goal ** 2, self.u ** 2 - 2.0 * self.rate * (d - self.d_react) / MPH))
-      return self.delay + (self.u - v) / self.rate, v
-    return self.t_arr + (d - self.d_arr) / (self.goal * MPH), self.goal
+      return float(np.interp(d, self.xs, self.ts)), float(np.interp(d, self.xs, self.vs))
+    return self.t_arr + (d - self.d_arr) / (self.v_arr * MPH), self.v_arr
 
 
 def load_index(s, kap, T, i0, s_max, dt):

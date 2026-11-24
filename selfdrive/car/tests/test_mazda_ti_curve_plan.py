@@ -6,6 +6,7 @@ import pytest
 
 from openpilot.selfdrive.car.mazda import ti_curve_memory as M
 from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
 
 MPH = P.MPH
 DT = 0.2
@@ -18,19 +19,20 @@ def road(*segments, **kw):
 def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph=None, planner=None, model_fn=None, closed=False,
           rate=1.0):
   """Drive along `trace` (a synthetic_trace dict); returns [(t, along m, Plan, mph)]. Open loop: constant speed. closed=True: the set
-  speed follows the plan's ceiling at once (a corner ceiling lowers it, a hold ceiling caps the way back up to the driver's v_mph), the
-  speed answers it REACTION_S later with `rate` times the measured deceleration and speeds back up at 0.7 mph/s."""
+  speed walks toward the plan's ceiling one tap per TAP_S (a corner ceiling lowers it, a hold ceiling caps the way back up to the
+  driver's v_mph), the speed answers it as the ONE measured cruise model says (ti_cruise_model), with `rate` times its slowing."""
   pl = planner or P.Planner(mem)
   v = float(v_mph)
   ref = set_mph if set_mph is not None else v_mph
   xs, ys, hs, ks = trace["x"], trace["y"], trace["hdg"], trace["kap"]
   s_road = np.arange(len(xs)) * M.SPACING_M
   out = []
-  hist = []
   s = float(start)
   setv = ref
   n = int(seconds / DT)
-  lag = int(round(P.REACTION_S / DT))
+  sub = 4
+  car = CM.Cruise(v, ref, DT / sub)
+  tap_t = 0.0
   for k in range(n):
     t = k * DT
     if s > s_road[-1]:
@@ -46,13 +48,17 @@ def drive(mem, trace, v_mph, seconds, start=0, fix_fn=None, yaw_fn=None, set_mph
     p = pl.step(t, fix, v * MPH, set_mph=setv, yaw_k=yk, model_k=mk, ref_mph=ref)    # the car side's reference, as the daemon passes it
     out.append((t, s, p, v))
     if closed:
-      setv = ref if p.ceil is None else min(ref, p.ceil)
-      hist.append(setv)
-      eff = hist[-1 - lag] if len(hist) > lag else ref
-      if v > eff:
-        v = max(eff - 0.0, v - rate * P.decel_mph_s(v - eff) * DT)
-      else:
-        v = min(eff, v + 0.7 * DT)
+      goal = ref if p.ceil is None else min(ref, p.ceil)
+      for j in range(sub):
+        tj = t + j * DT / sub
+        if setv != goal and tj >= tap_t - 1e-9:
+          setv += 1 if goal > setv else -1
+          tap_t = tj + P.TAP_S
+        b = car.v
+        car.step(setv)
+        if car.v < b:
+          car.v = b - rate * (b - car.v)
+      v = car.v
     s += v * MPH * DT
   return [(t, s_, p) for t, s_, p, _ in out] if not closed else out
 
@@ -101,10 +107,11 @@ def test_slow_distance_grows_with_drop():
   assert all(b > a for a, b in zip(d, d[1:]))
 
 
-def test_response_model_saturates_at_6_mph():
-  assert P.decel_mph_s(0) == 0 and P.decel_mph_s(2) == P.decel_mph_s(3) == 0.76
-  assert P.decel_mph_s(6) == P.decel_mph_s(12) == P.SAT_MPH_S
-  assert P.SAT_MPH_S * MPH <= 0.75                     # ~0.7 m/s^2 mean: never assumes more
+def test_response_model_is_the_measured_one():
+  # rewritten for plan amendment A1 (was test_response_model_saturates_at_6_mph, pinning the unmeasured 0.76 / 1.6 mph/s law)
+  for g in (0, 1, 2, 3, 6, 12, 20):
+    assert P.decel_mph_s(g) == CM.decel_mph_s(g)
+  assert P.decel_mph_s(20) * MPH == pytest.approx(0.90)  # capped at the 10-14 mph band: never assumes more
   assert P.DRIVE_GAP_MPH >= 6
 
 
@@ -559,7 +566,8 @@ def test_arrival_constants_are_the_approved_ones():
   assert P.AIM_MIN_LA == 1.3 and P.FLAG_MIN_LA == 1.3
   assert P.BUFFER_S == 0.3 and P.ENTRY_M == 0.0
   assert P.ARRIVED_MPH == 1.5
-  assert P.REACTION_S == 1.3 and P.RESP_FACTOR == 1.0
+  # plan amendment A1: the reaction is the measured model's dead time (0.5 s, then a 0.5 s lag), the tap walk 0.30 s
+  assert P.REACTION_S == CM.DELAY_S == 0.5 and P.TAP_S == CM.TAP_S == 0.30 and P.RESP_FACTOR == 1.0
 
 
 def test_aim_is_where_the_bend_loads_the_car_not_where_the_flags_begin():
@@ -621,33 +629,34 @@ def test_closed_loop_never_faster_than_the_envelope_before_the_aim_point(monkeyp
   assert max(in_b) <= t_b + P.ARRIVED_MPH + 0.05, (max(in_b), t_b)
 
 
-def test_approach_ends_at_target_plus_1_5_after_the_measured_reaction():
-  # the planner's approach: reaction 1.3 s at the start speed, then the full measured deceleration, done at T + 1.5 mph
+def test_approach_ends_at_target_plus_1_5_with_the_measured_model():
+  # rewritten for plan amendment A1: the planner's approach is ti_cruise_model's manoeuvre, stepped by hand here
   def ref(u, T, S1, dt=0.05):
-    v, setn, t, d, tap_t, raised, hist = float(u), u, 0.0, 0.0, 0.0, False, []
-    lag = int(round(1.3 / dt))
-    while v > T + 1.5 and t < 90.0:
-      raised = raised or v <= T + P.RAISE_AT_MPH
+    car = CM.Cruise(float(u), float(u), dt)
+    setn, t, d, tap_t, raised = u, 0.0, 0.0, 0.0, False
+    while car.v > T + 1.5 and t < 90.0:
+      raised = raised or car.v <= T + P.RAISE_AT_MPH
       goal = T if raised else S1
-      if t >= tap_t and setn != goal:
+      if t >= tap_t - 1e-9 and setn != goal:
         setn += 1 if goal > setn else -1
-        tap_t = t + P.TAP_S
-      hist.append(setn)
-      eff = hist[-1 - lag] if len(hist) > lag else float(u)
-      v = max(0.0, v - P.decel_mph_s(v - eff) * dt)
-      d += v * MPH * dt
+        tap_t = t + 0.30
+      car.step(setn)
+      d += car.v * MPH * dt
       t += dt
     return d
   for u, T in ((55, 40), (50, 38), (65, 50), (45, 41)):
     assert abs(P.approach_m(u, T, max(T - 6, 19)) - ref(u, T, max(T - 6, 19))) < 1e-6, (u, T)
 
 
-def test_reaction_1_3_s_is_in_the_start_distance(monkeypatch):
-  d13 = P.approach_m(55, 40, 34)
-  monkeypatch.setattr(P, "REACTION_S", 0.0)
+def test_dead_time_is_in_the_start_distance(monkeypatch):
+  # rewritten for plan amendment A1 (was test_reaction_1_3_s_is_in_the_start_distance): the model's 0.5 s dead time is driven at
+  # the start speed before anything happens, so it lengthens the approach (not by a plain 0.5 s at 55 mph: the gap the cruise acts
+  # on is itself delayed, so the walk has opened a larger gap by the time it acts)
+  d05 = P.approach_m(55, 40, 34)
+  monkeypatch.setattr(CM, "DELAY_S", 0.0)
   monkeypatch.setattr(P, "_APPROACH", {})
   d0 = P.approach_m(55, 40, 34)
-  assert abs((d13 - d0) - 1.3 * 55 * MPH) < 0.05 * 55 * MPH + 1e-6
+  assert d05 > d0 + 2.0
   assert P.slow_distance_m(55, 40) == pytest.approx(P.approach_m(55, 40, 34) + 0.3 * 55 * MPH)
 
 
