@@ -38,10 +38,17 @@ else
 fi
 
 stage "5/5 smoke import of changed processes"
-MODS=$(git diff --name-only "${BASE:-HEAD~1}" HEAD -- '*.py' | grep -vE '(^|/)test_|/tests/|^tools/' | sed 's/\.py$//; s#/#.#g' || true)
-for m in $MODS; do
+CHANGED_PY=$(git diff --name-only "${BASE:-HEAD~1}" HEAD -- '*.py' || true)
+MODS=$(echo "$CHANGED_PY" | grep -vE '(^|/)test_|/tests/|^tools/' | sed 's/\.py$//; s#/#.#g' || true)
+# the real process entry points too, whenever anything under them changed (a module can import fine alone and still break them)
+if echo "$CHANGED_PY" | grep -qE '^(selfdrive/car/|selfdrive/controls/|frogpilot/)'; then
+  MODS="$MODS selfdrive.car.card selfdrive.controls.controlsd frogpilot.frogpilot_process"
+fi
+# each import as the process manager does it: openpilot.system.sentry first (system/manager/process.py imports it before any
+# process module), else frogpilot_variables / card report a circular import that never happens on the car
+for m in $(echo $MODS | tr ' ' '\n' | awk '!seen[$0]++'); do
   [ -f "${m//.//}.py" ] || continue
-  python3 -c "import importlib; importlib.import_module('openpilot.$m')" && echo "ok   $m" || { echo "FAIL $m"; exit 1; }
+  python3 -c "import importlib; import openpilot.system.sentry; importlib.import_module('openpilot.$m')" && echo "ok   $m" || { echo "FAIL $m"; exit 1; }
 done
 
 stage "all comma checks passed"
