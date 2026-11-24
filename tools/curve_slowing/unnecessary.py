@@ -243,7 +243,7 @@ def account_row(x, Pm, s, v, kap, can_start, stop, s_end, opts):
   S1 = max(int(floor), T - Pm.DRIVE_GAP_MPH) if x['stage'] == 1 else None
   cap = None
   s1_cap = getattr(Pm, 'S1_UNCONFIRMED_MAX_MPH', None) if x['stage'] == 1 else None
-  if s1_cap is not None:
+  if s1_cap is not None and x.get('capped'):
     # R16: before the decision (confirmed) the dash goes no lower than the planner's start speed - S1_UNCONFIRMED_MAX_MPH
     t_c = (x['i_dec'] - j) * DT if (x.get('i_dec') is not None and not x.get('rel')) else 1e9
     cap = (Pm.s1_unconfirmed_ceiling(x['u_plan']), t_c)
@@ -343,7 +343,7 @@ def replay_drive(args):
             end = s[i] + (aa['at'] - planner.odo)
             aim = s[i] + (aa.get('aim_at', aa['entry']) - planner.odo)
             res['slow'].append(dict(stage=1, run=ri, i=i, u=round(mph, 1), T=int(e['T']), floor=e.get('floor'), ent=ent, end=end, aim=aim,
-                                    key=str(key)))
+                                    key=str(key), capped=aa.get('cap_c') is not None))
           elif k == 's2_start':
             lead = float(e.get('lead') or 0.0)
             at = s[i] + lead * v[i]

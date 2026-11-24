@@ -76,6 +76,22 @@ MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its 
 # bend acting only once it has persisted map_persist_s (0 s up to MAP_PERSIST_LO_MPH, rising linearly to MAP_PERSIST_S at
 # MAP_PERSIST_HI_MPH and above: phantoms last <= 2.1 s); a missing or stale map (plannerd passes None) has no map stage.
 CONFIRM_SHARE = 0.6
+# R16 (A15): before the forecast confirms a stage-1 bend, stage 1 sheds at most S1_UNCONFIRMED_MAX_MPH (the dash no lower than the
+# speed at the start minus this); the rest only after confirmation. ONE decision per bend, ONE definition: the bend is CONFIRMED at
+# the first tick a preview REACHING its entry (and no further than MODEL_LOOK_S) shows it asking at least CONFIRM_SHARE x its
+# capacity at T (the release check's own test, passed); it is RELEASED at the first tick within CONFIRM_LEAD_S of the entry at which
+# such a preview does not show it (as before); a bend whose preview never reaches the entry by CONFIRM_LEAD_S is UNCONFIRMED and keeps
+# the cap to its end ("s1_unconfirmed"; the warning covers the rest). A bend started with no preview able to confirm it (none: the
+# model not running; or one shorter than CONFIRM_LEAD_S, which could never reach the entry at the decision) has nothing to wait for:
+# no cap, decided at CONFIRM_LEAD_S as before.
+S1_UNCONFIRMED_MAX_MPH = 5
+
+
+def s1_unconfirmed_ceiling(u0_mph):
+  """R16: the lowest dash set speed stage 1 asks for before its bend is confirmed, for a start at u0_mph."""
+  return int(math.ceil(float(u0_mph) - 1e-6)) - S1_UNCONFIRMED_MAX_MPH
+
+
 MAP_PERSIST_S = 2.5
 MAP_PERSIST_LO_MPH = 45.0
 MAP_PERSIST_HI_MPH = 50.0
@@ -770,7 +786,9 @@ class Planner:
       if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
-                       "side": c["side"], "hi": self.hi}
+                       "side": c["side"], "hi": self.hi,
+                       "cap_c": s1_unconfirmed_ceiling(mph) if (self.fc is not None and
+                                                                 float(np.max(self.fc[0])) >= CONFIRM_LEAD_S - 1e-6) else None}  # R16
         self.events.append({"kind": "start", "point": key if isinstance(key, int) else -1, "T": c["T"], "need": c["need"],
                             "floor": floor, "mph": round(mph, 1), "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
@@ -797,17 +815,30 @@ class Planner:
         pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True, T=T)
         late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
       d_aim = a_["aim_at"] - self.odo
+      early = (not a_.get("decided") and a_.get("cap_c") is not None and self.fc is not None and
+               CONFIRM_LEAD_S * max(v, 1.0) < d_aim <= MODEL_LOOK_S * max(v, 1.0))
+      if early and self._release_check(v, T, a_["cap"], d_aim / max(v, 1.0)) is False:
+        # R16: confirmed early: a preview reaching the entry already shows the bend (the one decision, taken now)
+        a_["decided"], a_["cap_c"] = True, None
+        self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
+                            "preview": True})
       if not a_.get("decided") and d_aim <= CONFIRM_LEAD_S * max(v, 1.0):
         # the release decision, once per bend, CONFIRM_LEAD_S before its entry (also when the hand-over came earlier)
         a_["decided"] = True
         rel = self._release_check(v, T, a_["cap"], d_aim / max(v, 1.0))
-        if rel:
+        if rel is None and a_.get("cap_c") is not None:
+          # R16: no preview reaching the entry: never confirmed; the cap stays to the bend's end
+          self.events.append({"kind": "s1_unconfirmed", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+          rel = "unconfirmed"
+        if rel is True:
           self.released[key] = a_["at"]
           self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
           del active[key]
           continue
-        self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
-                            "preview": rel is not None})
+        if rel != "unconfirmed":
+          a_["cap_c"] = None
+          self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
+                              "preview": rel is not None})
       if a_["phase"] == 1 and (a_.get("decided") or (set_mph is not None and set_mph <= T + LATE_SHED_MPH + 1.5)):
         # stage 1 -> 2 hand-over: at the release decision, or as soon as the dash is within one tap of T + LATE_SHED_MPH (judged a
         # planner tick early, so the walk never pauses there while the car side waits for the next plan): ONE ramp, no early dwell
@@ -831,6 +862,8 @@ class Planner:
       cc = S1 if mode in ("push", "behind") else T
       if a_["phase"] == 1:
         cc = max(cc, T + LATE_SHED_MPH)           # stage 1's part of the ramp
+      if a_.get("cap_c") is not None:
+        cc = max(cc, a_["cap_c"])                 # R16: not yet confirmed: at most S1_UNCONFIRMED_MAX_MPH off the start speed
       if mode == "behind":
         out["behind"] = True
       if out["ceil"] is None or cc < out["ceil"]:

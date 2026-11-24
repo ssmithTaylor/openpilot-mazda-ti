@@ -922,6 +922,60 @@ def test_45_to_30_arrives_at_entry():
   assert any(st == 2 and c == T for st, c in stages) and all(p.src == "mem" for t, s, p, v in res if p.kind == "corner")
 
 
+def _preview_reach(tr, v_mph, reach_s):
+  f = road_preview(tr, v_mph)
+
+  def g(t, s):
+    ts, k = f(t, s)
+    return ts[ts <= reach_s + 1e-9], k[ts <= reach_s + 1e-9]
+  return g
+
+
+def test_r16_unconfirmed_sheds_at_most_5_confirmed_gets_the_full_ramp():
+  # R16 (A15): before the forecast confirms, stage 1 sheds at most S1_UNCONFIRMED_MAX_MPH (5); the rest after. The one decision:
+  # confirmed at the first tick a preview reaching the entry shows the bend (here the model's 8 s preview, ~8 s out), released at the
+  # CONFIRM_LEAD_S point if it does not show it, unconfirmed (cap kept) if no preview reaches the entry by then
+  assert P.S1_UNCONFIRMED_MAX_MPH == 5 and P.s1_unconfirmed_ceiling(45.0) == 40 and P.s1_unconfirmed_ceiling(45.3) == 41
+  k, T = k_needing(24), 30                                     # 45 -> 30 (the floor binds)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(tr, 45))
+  ev = [e for e in pl.events if e["kind"] in ("start", "s1_confirm", "s1_release", "s1_unconfirmed")]
+  assert [e["kind"] for e in ev] == ["start", "s1_confirm"] and ev[1]["preview"]
+  t_conf = next(t for t, s, p, v in res if p.ceil is not None and p.ceil < 40)
+  assert all(p.ceil >= 40 for t, s, p, v in res if p.ceil is not None and t < t_conf)
+  at_entry = next(v for t, s, p, v in res if s >= 1500)
+  assert at_entry <= T + 1.5, at_entry                          # one continuous ramp, still on time
+  t_arr = next(t for t, s, p, v in res if v <= T + P.ARRIVED_MPH)
+  t_bend = next(t for t, s, p, v in res if s >= 1500)
+  assert t_bend - t_arr <= 1.0                                 # no early dwell
+  # never confirmed (the preview reaches the entry and shows a straight road): at most 5 mph lost, then restored by the bend
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 45))
+  assert "s1_release" in [e["kind"] for e in pl.events]
+  assert min(v for t, s, p, v in res if s <= 1650) >= 45 - P.S1_UNCONFIRMED_MAX_MPH - 0.5
+  assert max(v for t, s, p, v in res if 1500 <= s <= 1650) > 43
+  # the preview there at the start, then gone before it reaches the entry: unconfirmed at CONFIRM_LEAD_S, stage 1 keeps the cap
+  pl = P.Planner(mem)
+  f8 = road_preview(tr, 45)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 220 else None)
+  assert "s1_unconfirmed" in [e["kind"] for e in pl.events] and "s1_confirm" not in [e["kind"] for e in pl.events]
+  assert all(p.ceil >= 40 for t, s, p, v in res if p.ceil is not None and p.src == "mem")
+  # PHYSICAL LIMIT (reported, not met): a preview that confirms only at CONFIRM_LEAD_S (6 s) cannot deliver the 10 mph left after the
+  # cap in time with the measured cruise (from 40 settled: 7.95 s / 128 m to 30.5 vs 6 s / 107 m): it arrives about 1.3 mph late
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=_preview_reach(tr, 45, 6.0))
+  assert "s1_confirm" in [e["kind"] for e in pl.events]
+  assert T + 1.5 < next(v for t, s, p, v in res if s >= 1500) <= T + 3.5
+  # with no preview able to confirm (none: the model not running; or one shorter than CONFIRM_LEAD_S) there is nothing to wait for:
+  # no cap, as before R16
+  for mf in (None, _preview_reach(tr, 45, 4.0)):
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=mf)
+    assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.5
+
+
 def test_stage1_hands_over_to_stage2_without_a_step_or_reacceleration():
   # plan T6: stage 1 (T + 5) hands over to stage 2 on the same ramp: one hand-over, the ceiling never rises before the push's
   # model-timed raise, the speed never rises from the start to the corner's end, and the corner is made
