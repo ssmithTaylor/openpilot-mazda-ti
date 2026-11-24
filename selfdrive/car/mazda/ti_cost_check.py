@@ -191,6 +191,13 @@ def run_buttons(name, cmd, cycles, warm=300):
   from openpilot.selfdrive.car.mazda import carcontroller as ccm
   clock = {"k": 0}
   ccm.time = NS(monotonic=lambda: clock["k"] * 0.01, time=lambda: 1_800_000_000.0 + clock["k"] * 0.01, perf_counter=time.perf_counter)
+  try:
+    return _run_buttons(name, cmd, cycles, warm, clock, tb)
+  finally:
+    ccm.time = time                                     # the real clock back, whatever happened
+
+
+def _run_buttons(name, cmd, cycles, warm, clock, tb):
   cc, mem = make_controller()
   sent = []
 
@@ -226,7 +233,6 @@ def run_buttons(name, cmd, cycles, warm=300):
       last_ours = kk
     if k >= warm:
       times.append(dt / 1000.0)
-  ccm.time = time
   times.sort()
   bt_ = cc.button_tests
   return {"mode": name, "mean_us": round(statistics.fmean(times), 1), "p99_us": round(times[int(0.99 * (len(times) - 1))], 1),

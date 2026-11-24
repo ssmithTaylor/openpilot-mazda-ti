@@ -10,8 +10,9 @@ COMMA, to choose between a held button and faster taps for curve slowing (owner,
              where it started. 0.3 / 0.2 s: the recorded recipe (up to 2 pressed frames 50 ms apart, the second only while no step
              has been read back since the first); 0.1 s: ONE pressed frame per press (two would leave only the switch's own unpressed
              frame between presses 0.1 s apart: a nearly unbroken pressed stream, i.e. a hold, not taps). Per cycle: presses sent,
-             steps seen, steps per press, median time from press to step, missed / double steps, any jump of 2 mph or more (a
-             5-mph jump = the car took it for a hold). The page names the fastest cycle that stepped 1 mph on every press.
+             steps seen, steps per press, median time from press to step, missed / double steps. The page names the fastest cycle
+             that stepped 1 mph on every press. A step of 2 mph or more (the car took the presses for a hold) ends the cycle at
+             once ("JUMP: the car read it as a hold"): no further press, the faster cycles are skipped, and the set speed is put back.
 
 The held stream and the 0.1 s presses are the same frames on the bus (one pressed frame of ours after each of the switch's frames,
 its unpressed frame with our counter about 0.097 s later): only the car can say whether it reads them as a hold or as taps, and that
@@ -24,8 +25,11 @@ written before it started); refused while the drive plan, the A/B switch, a test
 Conditions before the first press (and before each tap cycle): openpilot engaged with lateral control active, stock cruise on and
 available, no brake, no gas, no cruise button, openpilot not asking for cancel / resume, no lead being followed (CRZ_CTRL bit 23, as
 the cruise check), 30-70 mph and STEADY: within STEADY_TOL_MPH of the dash set speed for STEADY_S, set speed at least SET_MIN_MPH (the
-car's 19 mph minimum + 15, so a 6 mph excursion is harmless), steering command under STEER_LIMIT_SHARE of its limit; the hold test also
-needs a set speed that is a multiple of 5 (else a hold back up would land past it: 47 -> 46 -> 45 down, 45 -> 46 -> 50 up).
+car's 19 mph minimum + 15, so a 6 mph excursion is harmless), steering command under STEER_LIMIT_SHARE of its limit; and a set speed
+that is a multiple of 5, for both tests (else a hold, or fast taps the car reads as one, would land past it on the way back up:
+42 -> 37 down, 37 -> 38 -> 40 -> 41 -> 45 up). Every press of either test is sent only if neither a 1 mph step nor a jump to the
+next multiple of 5 could take the set speed above the original (or below the test's lower bound). A driver's cruise button while
+the test waits disarms it.
 
 Aborts at once (and puts the set speed back, see below) on: brake, gas, a cruise button of the driver's (then NOTHING is put back: the
 driver's value stands), cancel / resume from openpilot, disengagement, cruise off / unavailable, lateral control inactive, the car's
@@ -39,10 +43,15 @@ hold is HOLD_TEST_S = 0.7 s (one 5-mph jump: 45 -> 44 -> 40, back 40 -> 41 -> 45
 excursion.py has the arithmetic.
 
 Putting the set speed back (after the run or an abort, never after a driver's cruise button): once the dash has been still SETTLE_S,
-ordinary taps (the reviewed 0.3 s recipe) toward the original, at most RESTORE_TAPS and only from at most RESTORE_MAX_MPH away; each
-must give exactly the 1 mph step toward it within ACCEPT_WAIT_S, else nothing more is sent. While the brake, gas, cancel or a disengaged
-cruise blocks a press, it waits up to RESTORE_WAIT_S. Then it checks: the dash must read the original for VERIFY_S. Otherwise the page
-says "Set speed is now X mph (was Y): set it yourself".
+ordinary taps (the reviewed 0.3 s recipe) toward the original, never past it, at most RESTORE_TAPS and only from at most
+RESTORE_MAX_MPH away (what the test itself could have caused); each must give exactly the 1 mph step toward it within ACCEPT_WAIT_S,
+else nothing more is sent. While the brake, gas, cancel / resume, a disengaged or inactive steering, a disengaged cruise or another
+mode blocks a press, it waits up to RESTORE_WAIT_S. If that attempt ends short, ONE more attempt follows when the conditions allow
+again within RESTORE_RETRY_S. Then it checks: the dash must read the original for VERIFY_S. Otherwise the page's large line says
+"SET IT YOURSELF: NOW X MPH, WAS Y" until the driver presses a cruise button, and the log has its own `set_speed_not_restored`
+event. A set speed that cannot be read (cruise cancelled / standby) is never put back and never reported as unchanged: "CRUISE OFF:
+CHECK SET SPEED (WAS Y)". There is no on-road alert for this: the fork's only car-side alert path (curve slowing's, through
+frogpilot_planner's steerAdvisorySpeed) carries one corner speed with fixed corner texts.
 
 Never CANCEL or RESUME; every frame goes through mazdacan.create_button_cmd from carcontroller.py (the same sender and place as the
 cruise check's taps). Pure (no clock, no params): the car controller does the I/O (`button_tests_step`), the tests drive it frame by
@@ -91,9 +100,10 @@ STEP_LATE_S = 0.02                        # a step is counted for a press from t
 INFLIGHT_S = 0.12                         # a press with no step read back yet may still land within this
 
 # ---- the restore ---------------------------------------------------------------------------------------------------------------
-RESTORE_TAPS = 10
-RESTORE_MAX_MPH = 8
+RESTORE_TAPS = 14                         # the test's own reach: 5 + 5 mph of a cycle, or a jump past it, with room to spare
+RESTORE_MAX_MPH = 12
 RESTORE_WAIT_S = 10.0
+RESTORE_RETRY_S = 30.0                    # one more attempt when a first one ends short and the conditions allow again within this
 ACCEPT_WAIT_S = 1.0
 VERIFY_S = 1.0
 
@@ -198,8 +208,8 @@ def precondition(inp, test, steady_s=None, need_steady=True):
     return "set speed unreadable"
   if inp.set_mph < SET_MIN_MPH:
     return f"set speed below {SET_MIN_MPH} mph"
-  if test == "hold" and inp.set_mph % 5 != 0:
-    return "hold test needs a set speed ending in 0 or 5"
+  if inp.set_mph % 5 != 0:
+    return "needs a set speed ending in 0 or 5"
   if inp.lead is None:
     return "lead flag unreadable"
   if inp.lead:
@@ -311,6 +321,8 @@ class ButtonTests:
     self.top_mph = None
     self.last_wait_ev = -10 ** 9
     self.no_restore = False
+    self.jump_at = None               # the tap test: the frame a step of 2 mph or more was read (the car took it for a hold)
+    self.answered = False             # a set speed left short: the driver has since pressed a cruise button
     # the hold test
     self.hold = None                  # the hold in flight: {"button","d","s0","first","frames","last_counter","changes","released"}
     self.dirs = {}                    # "down" / "up": {"word","text","s0","changes","frames"}
@@ -321,9 +333,11 @@ class ButtonTests:
     self.tap = None
     self.tap_set_first = None
     # the restore
-    self.restore = {"taps": 0, "ok": None, "note": "", "verified": False}
+    self.restore = {"taps": 0, "ok": None, "note": "", "verified": False, "attempts": 1}
     self.restore_t0 = None
     self.restore_from = None
+    self.retry_t0 = None
+    self.retry_why = ""
 
   def _ev(self, kind, frame, **kw):
     self.events.append({"kind": kind, "frame": int(frame), "id": self.run_id, "test": self.test, **kw})
@@ -351,6 +365,12 @@ class ButtonTests:
       self.lowest_mph = inp.mph if self.lowest_mph is None else min(self.lowest_mph, inp.mph)
       if changed and prev is not None and inp.set_mph is not None:
         self._record_change(frame, prev, inp.set_mph)
+        if (self.state == "running" and self.test == "taps" and self.block is not None and abs(inp.set_mph - prev) >= 2
+                and self.jump_at is None):
+          self.jump_at = frame        # acted on below, before any send decision of this frame
+    if self.state in ("finished", "aborted") and self.not_back() and not self.answered and inp.driver_button:
+      self.answered = True
+      self._ev("driver_set_after", frame, set_mph=inp.set_mph, orig=self.orig)
     steady_s = None if self.steady_since is None else (frame - self.steady_since) * DT
     if self.state == "waiting":
       return self._waiting(frame, inp, steady_s)
@@ -385,6 +405,12 @@ class ButtonTests:
     self._ev("armed", frame, set_mph=inp.set_mph, mph=round(inp.mph, 1))
 
   def _waiting(self, frame, inp, steady_s):
+    if inp.driver_button:
+      self.final, self.abort_why = "aborted", "you pressed a cruise button"   # their press wins: disarmed, nothing was pressed
+      self.state, self.why = "aborted", self.abort_why
+      self._ev("aborted", frame, why=self.abort_why, set_mph=inp.set_mph, mph=round(inp.mph, 1), waiting=True)
+      self._ev("result", frame, **self.summary())
+      return None
     why = precondition(inp, self.test, steady_s)
     if why != self.why and (frame - self.last_wait_ev) * DT >= WAIT_LOG_MIN_S:
       self.last_wait_ev = frame
@@ -420,9 +446,10 @@ class ButtonTests:
     b = self.block
     if b is not None:
       n = max(1, len(b["presses"]))
+      # a step per press (one more in flight), or the car's hold-like jump to the next multiple of 5 (then the cycle ends: JUMP)
       if b["d"] < 0:
-        return max(o - PRESSES - 2, b["s0"] - 2 * n), b["s0"]
-      return b["s0"], min(o, b["s0"] + 2 * n)
+        return max(o - PRESSES - 2, min(b["s0"] - 2 * n, next_mult(b["s0"], -1))), b["s0"]
+      return b["s0"], min(o, max(b["s0"] + 2 * n, next_mult(b["s0"], 1)))
     return o, o
 
   def _record_change(self, frame, prev, v):
@@ -446,6 +473,11 @@ class ButtonTests:
     if why:
       self._abort(frame, inp, why)
       return self._restoring(frame, inp) if self.state == "restoring" else None
+    if self.test == "taps" and self.jump_at is not None and not self.unexpected:
+      self._taps_jumped(frame, inp)       # a jump outside the bounds is left to the unexpected-set-speed abort (nothing sent meanwhile)
+      return self._restoring(frame, inp) if self.state == "restoring" else None
+    if self.unexpected:
+      return None                     # a set speed outside what is expected: no pressed frame while it is checked again
     return self._hold_running(frame, inp) if self.test == "hold" else self._taps_running(frame, inp, steady_s)
 
   def _settled(self, frame):
@@ -633,16 +665,42 @@ class ButtonTests:
 
   def _press_ok(self, frame, inp):
     """A press of the tap test only while it cannot take the dash past its bound, a step of the previous press still in flight
-    included: SET+ never past the original; SET- never below the original - PRESSES - 1."""
+    included, whether the car reads it as a tap (1 mph) or as a hold (a jump to the next multiple of 5, as the hold test allows for):
+    SET+ never past the original; SET- never below the original - PRESSES - 1."""
     b = self.block
     inflight = 0
     if b["presses"]:
       last = b["presses"][-1]
       if (frame - last) * DT < INFLIGHT_S and not any(f >= last for f, _ in b["changes"]):
         inflight = 1
-    if b["d"] > 0:
-      return inp.set_mph + inflight + 1 <= self.orig
-    return inp.set_mph - inflight - 1 >= self.orig - PRESSES - 1
+    v, d = inp.set_mph, b["d"]
+    if d > 0:
+      return max(v + inflight + 1, next_mult(v + inflight, 1)) <= self.orig      # the jump comes after the first step of a hold
+    return min(v - inflight - 1, next_mult(v - inflight, -1)) >= self.orig - PRESSES - 1
+
+  def _taps_jumped(self, frame, inp):
+    """A step of 2 mph or more in a tap cycle: the car read the presses as a hold. The cycle ends here (no further press), the
+    faster cycles are skipped (a faster rate can only be more hold-like) and the set speed is put back."""
+    if self.tap is not None:
+      self.guard.end()
+      self.tap = None
+    b, cyc = self.block, self.cycles[-1]
+    key = "down" if b["d"] < 0 else "up"
+    st = press_stats(b["presses"], b["changes"], b["d"], frame)
+    st["frames"] = b["frames"]
+    st["cycle_ms"] = None
+    cyc[key] = st
+    cyc["jump_stop"] = True
+    cyc["path"] = [b["s0"]] + [int(b["s0"] + sum(dd for _, dd in b["changes"][:i + 1])) for i in range(len(b["changes"]))]
+    cyc["lowest_mph"] = round(self.lowest_mph, 1) if self.lowest_mph is not None else None
+    self._ev("cycle_jump", frame, cycle=cyc["cycle"], dir=key, s0=b["s0"], set_mph=inp.set_mph, path=cyc["path"],
+             **{k: v for k, v in st.items() if k != "frames"}, frames=[list(f) for f in b["frames"]])
+    skipped = [c for c in CYCLES if c < cyc["cycle"]]
+    if skipped:
+      self._ev("cycles_stopped", frame, why="a jump: the car read the presses as a hold", skipped=skipped)
+    self.block = None
+    self.final = "finished"
+    self._to_restore(frame, inp)
 
   # ---- abort and restore -------------------------------------------------------------------------------------------------------
   def _abort(self, frame, inp, why):
@@ -686,10 +744,14 @@ class ButtonTests:
     self._ev("restore_start", frame, set_mph=inp.set_mph, orig=self.orig, driver=self.no_restore)
 
   def _restore_blocked(self, inp):
+    if inp.others_on:
+      return inp.others_on
     if inp.cancel_req or inp.resume_req:
       return "openpilot is using the cruise buttons"
     if not inp.engaged:
       return "openpilot not engaged"
+    if not inp.lat_active:
+      return "steering not active"
     if not (inp.cruise_on and inp.cruise_available):
       return "stock cruise not active"
     if inp.brake or inp.gas:
@@ -705,6 +767,16 @@ class ButtonTests:
       return None
     v = inp.set_mph
     blocked = self._restore_blocked(inp)
+    if self.sub == "retry":
+      if (frame - self.retry_t0) * DT >= RESTORE_RETRY_S:
+        self._end_restore(frame, inp, False, self.retry_why, final=True)
+        return None
+      if blocked or not self._settled(frame):
+        return None
+      self.restore["attempts"] += 1
+      self._ev("restore_retry", frame, set_mph=v, orig=self.orig, taps=self.restore["taps"])
+      self.restore_t0 = frame
+      self.sub, self.sub_t0 = "settle", frame
     if self.sub == "settle":
       if not self._settled(frame):
         return None
@@ -778,21 +850,34 @@ class ButtonTests:
       self.sub, self.sub_t0 = "wait", frame
     return out
 
-  def _end_restore(self, frame, inp, ok, why):
+  def _end_restore(self, frame, inp, ok, why, final=False):
     if self.tap is not None:
       self.guard.end()
       self.tap = None
     v = inp.set_mph
+    if (ok is False and not final and self.retry_t0 is None and why != "stopped on the screen" and v and self.orig is not None
+            and v != self.orig and abs(v - self.orig) <= RESTORE_MAX_MPH and self.restore["taps"] < RESTORE_TAPS):
+      self.retry_t0, self.retry_why = frame, why          # ONE more attempt when the conditions allow again
+      self.sub, self.sub_t0 = "retry", frame
+      self._ev("restore_retry_wait", frame, why=why, set_mph=v, orig=self.orig, taps=self.restore["taps"])
+      return
+    unknown = not v
     if ok is None:
       note = "Your set speed stands (you pressed a cruise button)"
+    elif unknown:
+      ok = False
+      note = f"Cruise went off: check your set speed (was {self.orig})"
     elif ok:
       note = f"Set speed back at {self.orig} mph and checked"
     elif v == self.orig:
       note = f"Set speed {self.orig} mph, not checked: {why}"
     else:
       note = self.not_restored_text(v)
-    self.restore.update(ok=ok, note=note)
-    self._ev("restore_end", frame, ok=ok, why=why, note=note, taps=self.restore["taps"], set_mph=v)
+    self.restore.update(ok=ok, note=note, left_at=v if v else None, unknown=unknown)
+    self._ev("restore_end", frame, ok=ok, why=why, note=note, taps=self.restore["taps"], set_mph=v if v else None, unknown=unknown,
+             attempts=self.restore["attempts"])
+    if ok is False and not unknown and self.orig is not None and v != self.orig:
+      self._ev("set_speed_not_restored", frame, set_mph=v, orig=self.orig, why=why, taps=self.restore["taps"])
     self.state = self.final or "finished"
     self.why = self.abort_why if self.state == "aborted" else ""
     self.sub = ""
@@ -815,10 +900,21 @@ class ButtonTests:
       out["fastest_clean"] = self.fastest_clean()
     return out
 
+  def not_back(self):
+    """The run ended with the set speed readable and not at the original (the driver is to set it)."""
+    v = self.restore.get("left_at")
+    return (self.state in ("finished", "aborted") and self.restore.get("ok") is False and bool(v) and self.orig is not None
+            and v != self.orig)
+
   def cycle_row(self, c):
     """"0.2 s: 10 sent, 10 steps, 1.00 per press, 60 ms, lost 1.7 mph: every press 1 mph" """
     if c is None:
       return ""
+    if c.get("jump_stop"):
+      parts = [x for x in (c.get("down"), c.get("up")) if x]
+      path = c.get("path") or []
+      steps = " -> ".join(str(x) for x in (path if len(path) <= 4 else path[:1] + ["..."] + path[-2:]))
+      return cut(f"{c['cycle']:.1f} s: JUMP: the car read it as a hold ({sum(x['sent'] for x in parts)} sent, {steps})", MAX_DETAIL)
     parts = [x for x in (c.get("down"), c.get("up")) if x]
     sent = sum(x["sent"] for x in parts)
     steps = sum(x["steps"] for x in parts)
@@ -861,15 +957,14 @@ class ButtonTests:
     if st == "idle":
       return ("READY: PICK A TEST", "Hold: 0.7 s each way. Taps: 5 down, 5 up, 3 rates",
               "", "Needs: engaged, cruise on, steady 30-70 mph, set 34 mph+, no car ahead",
-              "Hold test also needs a set speed ending in 0 or 5",
+              "Both also need a set speed ending in 0 or 5",
               "Brake, gas or a cruise button stops it; set speed is put back")
     if st == "refused":
       return cut("REFUSED: " + name, MAX_LINE1), cut(upper_first(self.why), MAX_LINE2), "", "", "", ""
     if st == "waiting":
       return (cut("WAITING: " + name, MAX_LINE1), cut(upper_first(self.why) or "Checking the conditions", MAX_LINE2), "",
               "Needs: engaged, cruise on, steady 30-70 mph, set 34 mph+, no car ahead",
-              "Hold test also needs a set speed ending in 0 or 5" if self.test == "hold" else "Gives up after 60 s of waiting",
-              "Gives up after 60 s of waiting" if self.test == "hold" else "")
+              "Also needs a set speed ending in 0 or 5", "Gives up after 60 s of waiting")
     if st == "running":
       if self.test == "hold":
         l1 = "HOLD TEST: SET- HELD" if self.sub.startswith("down") else "HOLD TEST: SET+ HELD"
@@ -879,6 +974,8 @@ class ButtonTests:
       l2 = ("Waiting: " + self.why) if (self.sub == "pre" and self.why) else "Hands off the cruise buttons. Brake stops it."
       return cut(l1, MAX_LINE1), cut(l2, MAX_LINE2), "", d[0], d[1], d[2]
     if st == "restoring":
+      if self.sub == "retry":
+        return ("PUTTING SET SPEED BACK", cut(f"Will try once more: {self.retry_why}", MAX_LINE2), "", d[0], d[1], d[2])
       return ("PUTTING SET SPEED BACK", cut(f"To {self.orig} mph with single taps, then checked", MAX_LINE2), "", d[0], d[1], d[2])
     # finished / aborted
     v = self.set_now
@@ -889,8 +986,14 @@ class ButtonTests:
     else:
       f = self.fastest_clean()
       result = f"FASTEST CLEAN RATE: {f:.1f} S" if f is not None else "NO RATE STEPPED 1 MPH EVERY PRESS"
-    not_back = restored is False and v is not None and self.orig is not None and v != self.orig
-    if not_back:
+    not_back = self.not_back()
+    v = self.restore.get("left_at", v)                                     # where the run left it
+    unknown = bool(self.restore.get("unknown")) and self.orig is not None    # cruise off / standby: never "unchanged"
+    if unknown:
+      result = cut(f"CRUISE OFF: CHECK SET SPEED (WAS {self.orig})", MAX_RESULT)
+    elif not_back and self.answered:
+      result = "YOUR SET SPEED STANDS"
+    elif not_back:
       result = cut(f"SET IT YOURSELF: NOW {v} MPH, WAS {self.orig}", MAX_RESULT)
     if st == "aborted":
       # the stop's reason on the second line; the large line says where the set speed is (the results so far are below)
@@ -898,7 +1001,7 @@ class ButtonTests:
         result = ""                   # never started: nothing was pressed
       elif restored is None:
         result = "YOUR SET SPEED STANDS"
-      elif not not_back:
+      elif not not_back and not unknown:
         result = cut(f"SET SPEED {'PUT BACK' if self.restore.get('taps') else 'UNCHANGED'}: {self.orig} MPH", MAX_RESULT)
       if self.orig is None and self.abort_why.startswith("not started: "):
         return (cut(name + " NOT RUN", MAX_LINE1), cut("Gave up: " + self.abort_why[len("not started: "):], MAX_LINE2),

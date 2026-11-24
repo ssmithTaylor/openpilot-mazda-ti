@@ -60,6 +60,7 @@ class Car:
     self.brake = self.gas = self.cancel = self.resume = False
     self.lead, self.driver, self.others, self.steer = False, False, "", 0.0
     self.mph_override = None
+    self.set_readable = True          # False: the dash shows no set speed (cruise cancelled / standby)
 
   def tick(self):
     self.k += 1
@@ -89,7 +90,7 @@ class Car:
 
   def inputs(self):
     return bt.Inputs(engaged=self.engaged, lat_active=self.lat, cruise_on=self.cruise_on, cruise_available=self.available,
-                     mph=self.mph, set_mph=self.set, brake=self.brake, gas=self.gas, lead=self.lead, steer_share=self.steer,
+                     mph=self.mph, set_mph=self.set if self.set_readable else None, brake=self.brake, gas=self.gas, lead=self.lead, steer_share=self.steer,
                      driver_button=self.driver, counter=self.counter, cancel_req=self.cancel, resume_req=self.resume,
                      others_on=self.others, wall=1000.0 + self.k * DT, mono=self.k * DT)
 
@@ -228,11 +229,13 @@ def test_classification_of_raw_traces():
   assert w == "TAPS" and "..." in t and len("SET-: " + t) <= bt.MAX_DETAIL
 
 
-def test_the_hold_needs_a_set_speed_ending_in_0_or_5_and_waits_with_the_reason():
-  car = Car("hold", 47)
-  chk, ev, st = run(car, "hold", frames=300)
-  assert chk.state == "waiting" and chk.why == "hold test needs a set speed ending in 0 or 5" and not car.sent
-  assert st[-1]["line2"] == "Hold test needs a set speed ending in 0 or 5"
+@pytest.mark.parametrize("test", ["hold", "taps"])
+@pytest.mark.parametrize("orig", [41, 42, 43, 44, 47])
+def test_both_tests_need_a_set_speed_ending_in_0_or_5_and_wait_with_the_reason(test, orig):
+  car = Car("fast_hold", orig)
+  chk, ev, st = run(car, test, frames=300)
+  assert chk.state == "waiting" and chk.why == "needs a set speed ending in 0 or 5" and not car.sent
+  assert st[-1]["line2"] == "Needs a set speed ending in 0 or 5"
 
 
 def test_hold_frames_are_one_per_car_frame_with_its_counter_plus_one_within_the_caps():
@@ -368,6 +371,8 @@ def test_never_starts_without_every_condition(field, value, why):
   assert not car.sent
   if field == "others":
     assert chk.state == "refused" and chk.why == value and st[-1]["line1"] == "REFUSED: HOLD TEST"
+  elif field == "driver":                                   # the driver's press while it waits disarms it (their press wins)
+    assert chk.state == "aborted" and chk.abort_why == "you pressed a cruise button"
   else:
     assert chk.state == "waiting" and chk.why == why
 
@@ -399,10 +404,11 @@ ACTS = {
   "unavailable": (_set("available", False), _set("available", True)),
   "lateral": (_set("lat", False), _set("lat", True)),
   "others": (_set("others", "the A/B switch is on"), _set("others", "")),
-  "speed": (lambda car: setattr(car, "mph_override", car.mph - 3.5), _set("mph_override", None)),
-  "jump": (lambda car: car.pending.append((car.k + 1, 30)), lambda car: None),
+  "speed": (lambda car: (setattr(car, "mph_override", car.mph - 3.5), setattr(car, "mph", car.mph - 3.5)), _set("mph_override", None)),
+  "jump": (_set("set", 30), lambda car: None),
   "driver": (_set("driver", True), _set("driver", False)),
 }
+BLOCKING = {"brake", "gas", "cancel", "resume", "disengage", "cruise_off", "unavailable", "lateral", "others"}
 WHY = {"brake": "brake pressed", "gas": "gas pressed", "cancel": "openpilot is using the cruise buttons",
        "resume": "openpilot is using the cruise buttons", "disengage": "openpilot not engaged", "cruise_off": "stock cruise not active",
        "unavailable": "stock cruise not active", "lateral": "steering not active", "others": "the A/B switch is on",
@@ -418,8 +424,12 @@ def test_every_abort_stops_at_once_says_why_and_puts_the_set_speed_back(test, na
   assert "f" in on
   f0 = on["f"]
   assert chk.state == "aborted" and chk.abort_why.startswith(WHY[name]), (chk.abort_why, WHY[name])
-  after = [(k, b) for k, b, _, _ in car.sent if k > f0 + 1]
+  after = [(k, b) for k, b, _, _ in car.sent if k > f0]          # car.k = loop frame + 1: every frame from the abort frame on
   restore_taps = [e for e in ev if e["kind"] == "restore_tap"]
+  restore_ks = {f[0] + 1 for e in restore_taps for f in e["frames"]}
+  assert all(k in restore_ks for k, _ in after), (after, restore_ks)    # nothing but restore taps from the abort frame on
+  if name in BLOCKING:
+    assert all(k > f0 + 60 for k, _ in after)                     # and none while the condition that stopped it holds
   if name == "driver":
     assert not after and not restore_taps                   # the driver's press wins: nothing more, ever
     assert chk.restore["ok"] is None and st[-1]["result"] == "YOUR SET SPEED STANDS"
@@ -440,7 +450,7 @@ def test_a_pedal_held_through_the_restore_wait_leaves_it_to_the_driver():
   hook, on = _abort_hook("brake")                           # never released
   chk, ev, st = run(car, "hold", frames=8000, hook=hook)
   assert chk.state == "aborted" and chk.restore["ok"] is False
-  assert not [k for k, _, _, _ in car.sent if k > on["f"] + 1]
+  assert not [k for k, _, _, _ in car.sent if k > on["f"]]
   if car.set != 45:
     assert st[-1]["result"].startswith("SET IT YOURSELF")
 
@@ -505,7 +515,7 @@ def test_every_line_fits_in_every_state():
   for seed in range(16):
     mode = rnd.choice(["hold", "taps", "once", "nothing", "slow", "fast_hold"])
     test = rnd.choice(["hold", "taps"])
-    car = Car(mode, rnd.choice([40, 45, 70]) if test == "hold" else rnd.choice([34, 47, 69]))
+    car = Car(mode, rnd.choice([40, 45, 70]) if test == "hold" else rnd.choice([35, 47, 70]))
     act = rnd.choice(sorted(ACTS) + [None, None])
     hook = _abort_hook(act, at_frame_of_press=rnd.randrange(1, 12), release_after=rnd.choice([None, 80]))[0] if act else None
     chk, ev, st = run(car, test, frames=12000, hook=hook)
@@ -562,18 +572,63 @@ def bus_frames(hold_frames, driver_at=None):
   return out
 
 
+class _RecordingParser:
+  """Stands in for opendbc's CANParser with its contract: a parser reads only the messages it was built with, and only from its own
+  bus (a transmit echo arrives as src 128, a copy on bus 1 as src 1). Built by carstate's own get_*_can_parser, so the message lists
+  and the buses are the real configuration; CRZ_BTNS is decoded with the DBC's bit positions."""
+  made = []
+
+  def __init__(self, dbc, messages, bus):
+    self.bus, self.names = bus, [m[0] for m in messages]
+    self.vl = {n: {} for n in self.names}
+    if "CRZ_BTNS" in self.names:
+      self.vl["CRZ_BTNS"] = dict(decode(IDLE), CTR=0)
+    _RecordingParser.made.append(self)
+
+  def feed(self, addr, src, dat):
+    if addr == 0x09D and src == self.bus and "CRZ_BTNS" in self.names:
+      self.vl["CRZ_BTNS"] = dict(decode(dat), CTR=dat[3] >> 4 if len(dat) > 3 else 0)
+
+
+def _real_parsers(monkeypatch):
+  from openpilot.selfdrive.car.mazda.values import CAR
+  _RecordingParser.made = []
+  monkeypatch.setattr(CSm, "CANParser", _RecordingParser)
+
+  class CP:
+    carFingerprint = CAR.MAZDA_CX5
+    flags = MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR
+  main = CSm.CarState.get_can_parser(CP, None)
+  CSm.CarState.get_cam_can_parser(CP, None)
+  CSm.CarState.get_body_can_parser(CP)
+  return main, list(_RecordingParser.made)
+
+
+SET_P = bytes([0x10]) + SET_M[1:]
+
+
 @pytest.mark.parametrize("driver_at", [None, 153])
-def test_held_frames_never_classify_as_a_driver_press(driver_at):
-  last = IDLE
+def test_our_frames_as_echoes_and_bus_1_copies_never_change_the_driver_flags(monkeypatch, driver_at):
+  main, parsers = _real_parsers(monkeypatch)
+  assert {p.bus for p in parsers if "CRZ_BTNS" in p.names} == {0} and main.bus == 0
   seen = []
-  for k, src, dat in bus_frames(25, driver_at):
-    if src == 0:
-      last = dat
-    seen.append((k, CSm.crz_btns_flags(decode(last))))
+  for k in range(300):
+    if k % 10 == 3:                                      # the switch's own frame, on bus 0 and copied to bus 1
+      d = SET_M if driver_at is not None and k >= driver_at else IDLE
+      for p in parsers:
+        p.feed(0x09D, 0, d)
+        p.feed(0x09D, 1, d)
+    if k % 10 == 4 and k < 250:                          # ours: SET- then SET+, as the transmit echo (src 128) and the bus-1 copy
+      ours = SET_M if k < 120 else SET_P
+      for p in parsers:
+        p.feed(0x09D, 128, ours)
+        p.feed(0x09D, 1, ours)
+    seen.append((k, CSm.crz_btns_flags(main.vl["CRZ_BTNS"])))     # what carstate.update computes, from the bus-0 parser
   if driver_at is None:
-    assert not any(f[0] for _, f in seen)
+    assert all(f == (False, False, False) for _, f in seen)
   else:
-    assert not any(f[0] for k, f in seen if k < driver_at) and all(f[0] and f[1] for k, f in seen if k >= driver_at)
+    assert all(f == (False, False, False) for k, f in seen if k < driver_at)
+    assert all(f == (True, True, False) for k, f in seen if k >= driver_at)
 
 
 def test_no_parser_but_bus_0_reads_the_button_frame(monkeypatch):
@@ -611,27 +666,33 @@ def _cost_mod():
   return mod
 
 
-def _closed_loop(mode, cmd, frames, set_mph=45, hook=None):
+def _closed_loop(mode, cmd, frames, set_mph=45, hook=None, stock_ok=False, read=4):
   """The real CarController.update with a simulated car behind it: the car's counter, set speed and speed into CarState, every
-  CRZ_BTNS frame the controller packs back into the car. -> (controller, car, frames packed, store)."""
+  CRZ_BTNS frame the controller packs back into the car. -> (controller, car, frames packed (k, bus, values, monotonic), store).
+  The controller's events are in cc._test_events; cc._test_clock["off"] shifts its monotonic clock (a stalled loop). stock_ok: the
+  stock CANCEL / RESUME frames openpilot sends while it asks for them are allowed (they are not ours and never reach the car)."""
   mod = _cost_mod()
   from openpilot.selfdrive.car.mazda import carcontroller as ccm
-  clock = {"k": 0}
-  saved = ccm.time
-  ccm.time = NS(monotonic=lambda: clock["k"] * DT, time=lambda: 1_800_000_000.0 + clock["k"] * DT, perf_counter=_time.perf_counter)
+  clock = {"k": 0, "off": 0.0}
+  saved, saved_log = ccm.time, ccm.ti_button_log
+  ccm.time = NS(monotonic=lambda: clock["k"] * DT + clock["off"], time=lambda: 1_800_000_000.0 + clock["k"] * DT + clock["off"],
+                perf_counter=_time.perf_counter)
+  events = []
+  ccm.ti_button_log = events.append
   try:
     cc, mem = mod.make_controller()
+    cc._test_events, cc._test_clock, cc._test_mem = events, clock, mem
     packed = []
 
     class Packer:
       def make_can_msg(self, name, bus, values):
         if name == "CRZ_BTNS":
-          packed.append((clock["k"], bus, dict(values)))
+          packed.append((clock["k"], bus, dict(values), clock["k"] * DT + clock["off"]))
         return (0, 0, b"\0" * 8, bus)
     cc.packer = Packer()
     toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
     CC, CS = mod.inputs(float(set_mph), 0.0003)
-    car = Car(mode, set_mph)
+    car = Car(mode, set_mph, read=read)
     for k in range(frames):
       clock["k"] = k
       car.tick()
@@ -645,8 +706,11 @@ def _closed_loop(mode, cmd, frames, set_mph=45, hook=None):
       CS.out.vEgo = car.mph * 0.44704
       n0 = len(packed)
       cc.update(CC, CS, k * 10_000_000, toggles)
-      for kk, bus, v in packed[n0:]:
+      for kk, bus, v, _ in packed[n0:]:
         assert bus == 0
+        if stock_ok and (v["CAN_OFF"] or v["RES"]) and not (v["SET_M"] or v["SET_P"]):
+          assert (CC.cruiseControl.cancel and v["CAN_OFF"]) or (CC.cruiseControl.resume and v["RES"])   # openpilot's own, as asked
+          continue
         assert v["CAN_OFF"] == 0 and v["RES"] == 0                 # never CANCEL or RESUME
         assert v["SET_M"] + v["SET_P"] == 1 and v["SET_M_INV"] == 1 - v["SET_M"] and v["SET_P_INV"] == 1 - v["SET_P"]
         assert v["CTR"] == (car.counter + 1) % 16
@@ -654,7 +718,7 @@ def _closed_loop(mode, cmd, frames, set_mph=45, hook=None):
       assert len(packed) - n0 <= 1                                   # one button frame per control frame at most
     return cc, car, packed, mem
   finally:
-    ccm.time = saved
+    ccm.time, ccm.ti_button_log = saved, saved_log
 
 
 @pytest.mark.parametrize("cmd,mode", [("hold", "hold"), ("hold", "taps"), ("taps", "taps")])
@@ -680,7 +744,7 @@ def test_closed_loop_a_driver_press_wins_at_once():
       on["k"] = k
       car.driver = True
   cc, car, packed, mem = _closed_loop("taps", "taps", 3000, hook=hook)
-  assert not [p for p in packed if p[0] > on["k"]]
+  assert not [p for p in packed if p[0] >= on["k"]]
   assert cc.button_tests.state == "aborted" and cc.button_tests.restore["ok"] is None
 
 
@@ -782,3 +846,370 @@ def test_report_and_events_carry_no_position():
         (ROOT / "selfdrive/car/mazda/ti_button_tests_report.py").read_text(encoding="utf-8")
   for word in ("latitude", "longitude", "gps", "liveLocation", "position"):
     assert word not in src.replace("Nothing about where the car\nwas", "")
+
+
+# ---- never above the driver's set speed; a jump ends the tap test (review 2026-11-24, Important 1) --------------------------------
+MODES = ["fast_hold", "hold", "taps", "once", "nothing", "slow"]
+
+
+@pytest.mark.parametrize("test", ["hold", "taps"])
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("orig", [40, 45, 50, 55])
+def test_the_set_speed_never_goes_above_the_drivers_in_any_car_behaviour(test, mode, orig):
+  car = Car(mode, orig)
+  chk, ev, st = run(car, test, frames=14000)
+  assert chk.state == "finished", (chk.why, chk.abort_why)
+  assert max(s for _, s, _ in car.hist) <= orig                      # at every frame
+  low = orig - bt.HOLD_DROP_MPH if test == "hold" else orig - bt.PRESSES - 1
+  assert min(s for _, s, _ in car.hist) >= low
+  assert car.set == orig and chk.restore["ok"] is True and chk.restore["verified"]
+  if test == "hold":
+    assert_frames(car)
+
+
+class FastJumpCar(Car):
+  """Faster than modelled: the jump at 0.35 s, then 5 mph more every 0.15 s while the stream lasts (the reviewer's probe)."""
+
+  def tick(self):
+    self.k += 1
+    if self.k % 10 == self.phase:
+      self.counter = (self.counter + 1) % 16
+    for p in [p for p in self.pending if p[0] <= self.k]:
+      self.pending.remove(p)
+      self.set = p[1] if not callable(p[1]) else p[1](self.set)
+    s = self.stream
+    if s is not None and self.k - s[2] > 12:
+      self.stream = None
+    elif s is not None:
+      d = -1 if s[1] == "SET_MINUS" else 1
+      el = self.k - s[0]
+      if el == 35:
+        self.set = bt.next_mult(self.set, d)
+      elif el > 35 and (el - 35) % 15 == 0:
+        self.set += 5 * d
+    self.gaps.append(self.set - self.mph)
+    g = self.gaps[-50] if len(self.gaps) >= 50 else 0.0
+    self.a += (accel(g) - self.a) * DT / 0.5
+    self.mph += self.a * DT
+    self.hist.append((self.k, self.set, self.mph))
+
+
+@pytest.mark.parametrize("cls", [Car, FastJumpCar])
+@pytest.mark.parametrize("orig", [40, 45, 50, 55])
+def test_a_jump_ends_the_tap_cycle_at_once_skips_the_faster_ones_and_restores(cls, orig):
+  car = cls("fast_hold", orig)
+  chk, ev, st = run(car, "taps", frames=14000)
+  jumps = [e for e in ev if e["kind"] == "cycle_jump"]
+  assert len(jumps) == 1 and jumps[0]["cycle"] == 0.1, jumps
+  fj = jumps[0]["frame"]
+  restore_ks = {f[0] + 1 for e in ev if e["kind"] == "restore_tap" for f in e["frames"]}
+  assert all(k in restore_ks for k, _, _, _ in car.sent if k > fj)       # no press of the cycle after the jump is read
+  assert chk.state == "finished" and car.set == orig and chk.restore["ok"] is True
+  assert max(s for _, s, _ in car.hist) <= orig and min(s for _, s, _ in car.hist) >= orig - bt.PRESSES - 1
+  assert st[-1]["d3"].startswith("0.1 s: JUMP: the car read it as a hold")
+  assert len(st[-1]["d3"]) <= bt.MAX_DETAIL
+
+
+def test_a_jump_in_an_early_cycle_skips_every_faster_one():
+  car = Car("fast_hold", 45)
+
+  def hook(f, c, chk):                                  # the car jumps on the 0.3 s cycle's second press
+    if chk.cycles and chk.block is not None and len(chk.block["presses"]) == 2 and not hasattr(hook, "done"):
+      hook.done = True
+      c.set = bt.next_mult(c.set, -1)
+  chk, ev, st = run(car, "taps", frames=14000, hook=hook)
+  assert [c["cycle"] for c in chk.cycles] == [0.3] and chk.cycles[0].get("jump_stop")
+  assert st[-1]["d2"] == "0.2 s: not run" and st[-1]["d3"] == "0.1 s: not run"
+  assert chk.state == "finished" and car.set == 45 and chk.restore["ok"] is True
+
+
+def _press_ok(orig, d, v):
+  chk = bt.ButtonTests()
+  chk.orig, chk.test = orig, "taps"
+  chk.block = {"button": "SET_PLUS" if d > 0 else "SET_MINUS", "d": d, "s0": v, "presses": [], "changes": [], "frames": []}
+  return chk._press_ok(100, bt.Inputs(set_mph=v))
+
+
+def test_press_ok_allows_for_a_jump_to_the_next_multiple_of_5_both_ways():
+  assert _press_ok(45, 1, 44) and _press_ok(45, 1, 40) and not _press_ok(45, 1, 45)
+  assert _press_ok(42, 1, 37) and not _press_ok(42, 1, 40)          # 40 -> 41 -> 45 would pass 42
+  assert _press_ok(45, -1, 41) and not _press_ok(45, -1, 40)        # 40 -> 39 -> 35 would pass 45 - PRESSES - 1
+  assert _press_ok(50, -1, 50) and not _press_ok(52, -1, 45)
+
+
+# ---- the restore: budget, one more attempt, and a failed one is plain (review 2026-11-24, Important 2) ----------------------------
+def test_the_restore_covers_ten_mph_with_up_to_fourteen_taps(monkeypatch):
+  assert bt.RESTORE_MAX_MPH == 12 and bt.RESTORE_TAPS == 14 and bt.RESTORE_RETRY_S == 30.0
+  car = Car("taps", 45)
+  monkeypatch.setitem(ACTS, "jump", (_set("set", 35), lambda c: None))
+  hook, on = _abort_hook("jump")
+  chk, ev, st = run(car, "taps", frames=12000, hook=hook)
+  assert chk.state == "aborted" and "not expected" in chk.abort_why
+  assert car.set == 45 and chk.restore["ok"] is True and chk.restore["taps"] in (10, 11)   # 11: a SET- step was still in flight
+  assert max(s for _, s, _ in car.hist) <= 45
+
+
+def test_a_restore_held_up_past_its_wait_gets_one_more_attempt():
+  car = Car("taps", 45)
+  hook, on = _abort_hook("brake", at_frame_of_press=5, release_after=int(14 / DT))   # held 14 s: past the 10 s wait
+  chk, ev, st = run(car, "taps", frames=20000, hook=hook)
+  kinds = [e["kind"] for e in ev]
+  assert "restore_retry_wait" in kinds and "restore_retry" in kinds
+  assert not [k for k, _, _, _ in car.sent if on["f"] < k <= on["f"] + int(14 / DT)]
+  assert car.set == 45 and chk.restore["ok"] is True and chk.restore["attempts"] == 2
+  assert max(s for _, s, _ in car.hist) <= 45
+
+
+def test_a_restore_that_cannot_finish_says_so_until_the_driver_presses_a_button():
+  car = Car("taps", 45)
+  hook, on = _abort_hook("brake", at_frame_of_press=5)                 # never released
+  state = {}
+  chk = bt.ButtonTests()
+  statuses, events = [], []
+  for f in range(int(60 / DT)):
+    car.tick()
+    hook(f, car, chk)
+    if chk.state == "aborted" and "end" not in state:
+      state["end"] = f
+    if "end" in state and f == state["end"] + 300:
+      car.driver = True
+    inp = car.inputs()
+    out = chk.step(f, inp, bt.Trigger("taps", "t1", inp.wall) if f == 5 else None)
+    if out is not None:
+      car.press(out, (car.counter + 1) % 16)
+    events.extend(chk.events)
+    chk.events.clear()
+    if f % 10 == 0:
+      statuses.append((f, chk.status(inp.wall)))
+  assert "end" in state and car.set != 45 and chk.restore["ok"] is False
+  ends = [e for e in events if e["kind"] == "set_speed_not_restored"]
+  assert len(ends) == 1 and ends[0]["set_mph"] == car.set and ends[0]["orig"] == 45
+  warn = f"SET IT YOURSELF: NOW {car.set} MPH, WAS 45"
+  shown = [s["result"] for f, s in statuses if state["end"] < f < state["end"] + 300]
+  assert len(shown) > 20 and all(r == warn for r in shown)               # stays up, not a flash
+  assert statuses[-1][1]["result"] == "YOUR SET SPEED STANDS"            # the driver's press answers it
+  assert len(warn) <= bt.MAX_RESULT
+
+
+# ---- cruise off: never "unchanged" (review 2026-11-24, Important 3) -------------------------------------------------------------------
+@pytest.mark.parametrize("test", ["hold", "taps"])
+def test_cruise_going_off_is_never_reported_as_unchanged_and_nothing_is_restored(test):
+  car = Car("taps", 45)
+  on = {}
+
+  def hook(f, c, chk):
+    if "f" not in on and len(c.sent) >= 3:
+      on["f"] = f
+      c.cruise_on, c.set_readable = False, False
+  chk, ev, st = run(car, test, frames=8000, hook=hook)
+  assert not [k for k, _, _, _ in car.sent if k > on["f"]]
+  assert chk.state == "aborted" and chk.restore["ok"] is False
+  assert st[-1]["result"] == "CRUISE OFF: CHECK SET SPEED (WAS 45)" and len(st[-1]["result"]) <= bt.MAX_RESULT
+  end = [e for e in ev if e["kind"] == "restore_end"][-1]
+  assert end["set_mph"] is None and end["unknown"] is True
+  assert "UNCHANGED" not in st[-1]["result"] and "PUT BACK" not in st[-1]["result"]
+
+
+def test_the_unreadable_set_speed_line_after_a_finished_run():
+  chk = bt.ButtonTests()
+  chk.state, chk.test, chk.orig, chk.final = "finished", "taps", 45, "finished"
+  chk.set_now = None
+  chk.restore = {"taps": 0, "ok": False, "note": "", "verified": False, "left_at": None, "unknown": True}
+  assert chk.lines()[2] == "CRUISE OFF: CHECK SET SPEED (WAS 45)"
+  chk.state = "aborted"
+  assert chk.lines()[2] == "CRUISE OFF: CHECK SET SPEED (WAS 45)"
+
+
+# ---- minor (review 2026-11-24) ---------------------------------------------------------------------------------------------------------
+def test_restore_waits_while_steering_is_inactive_or_another_mode_is_on():
+  base = bt.Inputs(engaged=True, lat_active=True, cruise_on=True, cruise_available=True, set_mph=40, driver_button=False, counter=1)
+  chk = bt.ButtonTests()
+  assert chk._restore_blocked(base) == ""
+  assert chk._restore_blocked(base._replace(lat_active=False)) == "steering not active"
+  assert chk._restore_blocked(base._replace(others_on="the A/B switch is on")) == "the A/B switch is on"
+
+
+def test_a_driver_press_while_waiting_disarms_the_test():
+  car = Car("hold", 45, mph=40.0)
+  car.mph_override = 40.0                                   # never steady: it waits
+
+  def hook(f, c, chk):
+    if f == 200:
+      c.driver = True
+  chk, ev, st = run(car, "taps", frames=600, hook=hook)
+  assert chk.state == "aborted" and chk.abort_why == "you pressed a cruise button" and not car.sent
+  assert st[-1]["line2"] == "Stopped: you pressed a cruise button" and st[-1]["result"] == ""
+
+
+def test_cost_check_puts_the_clock_back_on_error(monkeypatch):
+  mod = _cost_mod()
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  saved = ccm.time
+
+  def boom():
+    raise RuntimeError("boom")
+  monkeypatch.setattr(mod, "make_controller", boom)
+  with pytest.raises(RuntimeError):
+    mod.run_buttons("x", None, 10)
+  assert ccm.time is saved
+
+
+# ---- every abort through the real CarController.update (review 2026-11-24, test gaps) ------------------------------------------------
+REL = 80                                                    # the condition clears this many frames later
+
+
+def _ours(v):
+  return bool(v["SET_M"] or v["SET_P"])
+
+
+def _cause(cause, on, k, car, cc, CC, CS, mem):
+  out = CS.out
+  if cause == "brake":
+    out.brakePressed = on
+  elif cause == "gas":
+    out.gasPressed = on
+  elif cause == "cancel":
+    CC.cruiseControl.cancel = on
+  elif cause == "resume":
+    CC.cruiseControl.resume = on
+  elif cause == "disengage":
+    CC.enabled = not on
+  elif cause == "cruise_off":
+    out.cruiseState.enabled = not on
+  elif cause == "unavailable":
+    out.cruiseState.available = not on
+  elif cause == "lateral":
+    CC.latActive = not on
+  elif cause == "speed" and on:
+    car.mph_override = car.mph = car.mph - 3.5
+  elif cause == "speed":
+    car.mph_override = None
+  elif cause == "unexpected" and on:
+    car.set = 35
+  elif cause == "others" and on:
+    cc.button_others_on = lambda: "the A/B switch is on"
+  elif cause == "others":
+    del cc.button_others_on
+  elif cause == "stop" and on:
+    mem.put(bt.PARAM_TRIGGER, json.dumps({"cmd": "stop", "id": "s1", "t": 1_800_000_000.0 + k * DT}))
+  elif cause == "driver":
+    car.driver = on
+
+
+CC_CAUSES = ["brake", "gas", "cancel", "resume", "disengage", "cruise_off", "unavailable", "lateral", "speed", "unexpected", "others",
+             "stop", "time", "driver"]
+CC_BLOCKING = {"brake", "gas", "cancel", "resume", "disengage", "cruise_off", "unavailable", "lateral", "others"}
+
+
+@pytest.mark.parametrize("test", ["hold", "taps"])
+@pytest.mark.parametrize("cause", CC_CAUSES)
+def test_closed_loop_no_button_frame_from_the_abort_until_the_restore(test, cause, monkeypatch):
+  if cause == "time":
+    monkeypatch.setitem(bt.RUN_LIMIT_S, test, 0.3 if test == "hold" else 2.5)
+  on = {}
+
+  def hook(k, car, cc, CC, CS):
+    mem = cc._test_mem
+    if cause != "time" and "k" not in on and len(car.sent) >= 3:
+      on["k"] = k
+      _cause(cause, True, k, car, cc, CC, CS, mem)
+    if "k" in on and k == on["k"] + REL:
+      _cause(cause, False, k, car, cc, CC, CS, mem)
+  cc, car, packed, mem = _closed_loop("taps", test, 9000, hook=hook, stock_ok=cause in ("cancel", "resume"))
+  ev = cc._test_events
+  ab = [e for e in ev if e["kind"] == "aborted"]
+  assert len(ab) == 1, [e["kind"] for e in ev]
+  fa = ab[0]["frame"]
+  if cause == "time":
+    f0 = fa
+  else:
+    f0 = on["k"]
+    latency = {"stop": 9, "unexpected": bt.UNEXPECTED_FRAMES}.get(cause, 0)   # STOP is read at 10 Hz; a set speed needs 4 readings
+    assert f0 <= fa <= f0 + latency, (f0, fa)
+  restore_ks = {f[0] for e in ev if e["kind"] == "restore_tap" for f in e["frames"]}
+  after = [k for k, bus, v, _ in packed if _ours(v) and k >= f0]
+  assert all(k in restore_ks for k in after), (after, restore_ks)
+  if cause == "driver":
+    assert not after                                         # the driver's press wins: nothing more, ever
+    assert cc.button_tests.restore["ok"] is None
+    return
+  if cause in CC_BLOCKING:
+    assert all(k >= f0 + REL for k in after)
+  else:
+    assert all(k >= fa + int(bt.SETTLE_S / DT) for k in after)
+  assert car.set == 45 and max(s for _, s, _ in car.hist) <= 45
+
+
+@pytest.mark.parametrize("test", ["hold", "taps"])
+def test_closed_loop_a_stalled_loop_sends_no_pressed_frame_past_the_real_time_cap(test):
+  done = {}
+
+  def hook(k, car, cc, CC, CS):
+    b = cc.button_tests
+    if "k" in done or b is None:
+      return
+    if test == "hold" and b.hold is not None and len(b.hold["frames"]) == 3:
+      done["k"] = k
+      cc._test_clock["off"] += 0.5                           # the control loop pauses 0.5 s mid-hold (0.2 s in: 0.8 s at the next)
+    if test == "taps" and b.tap is not None and b.tap.first is not None and len(b.tap.frames) == 1 and b.tap.n == 2:
+      done["k"] = k
+      cc._test_clock["off"] += 0.5                           # ... mid-tap (a 2-frame tap of the 0.3 s cycle)
+  cc, car, packed, mem = _closed_loop("taps", test, 9000 if test == "hold" else 14000, hook=hook, read=7)
+  assert "k" in done
+  ours = [(k, mono) for k, bus, v, mono in packed if _ours(v)]
+  groups = []
+  for k, mono in ours:
+    if groups and k - groups[-1][-1][0] <= (12 if test == "hold" else 6):
+      groups[-1].append((k, mono))
+    else:
+      groups.append([(k, mono)])
+  cap = bt.HOLD_TEST_S if test == "hold" else TT.MAX_TAP_SPAN_S
+  for g in groups:
+    assert g[-1][1] - g[0][1] <= cap + 1e-6, g
+  stalled = next(g for g in groups if g[0][0] <= done["k"] <= g[-1][0] + 1)
+  assert all(k < done["k"] for k, _ in stalled)              # nothing of that press after the pause
+  assert max(s for _, s, _ in car.hist) <= 45
+
+
+@pytest.mark.parametrize("cls,mode", [(Car, "fast_hold"), (FastJumpCar, "fast_hold"), (FastJumpCar, "taps")])
+@pytest.mark.parametrize("orig", [41, 42, 43, 44, 46, 47])
+def test_the_press_checks_alone_keep_a_hold_like_car_at_or_below_the_drivers(cls, mode, orig, monkeypatch):
+  """Even with the 0-or-5 start rule taken away, no press of the tap test can take the set speed above the driver's (the reviewer's
+  scenario: 42, read as a hold: 42 -> 37, then 37 -> 38 -> 40 -> 41 -> 45)."""
+  real = bt.precondition
+
+  def no_0_or_5(inp, test, steady_s=None, need_steady=True):
+    return real(inp._replace(set_mph=inp.set_mph - inp.set_mph % 5) if inp.set_mph else inp, test, steady_s, need_steady)
+  monkeypatch.setattr(bt, "precondition", no_0_or_5)
+  car = cls(mode, orig)                                 # FastJumpCar "taps": every press steps 1 mph AND the stream jumps at 0.35 s
+  chk, ev, st = run(car, "taps", frames=14000)
+  assert chk.orig == orig, chk.abort_why                                  # it ran
+  assert max(s for _, s, _ in car.hist) <= orig and min(s for _, s, _ in car.hist) >= orig - bt.PRESSES - 1
+
+
+def test_every_new_line_fits():
+  """The page lines of the review's new cases (a jump, a second restore attempt, a set speed left short and the driver's answer,
+  cruise going off, a disarm while waiting) at the widest set speeds."""
+  rows = []
+  for orig in (35, 70):
+    for cls in (Car, FastJumpCar):
+      rows += run(cls("fast_hold", orig), "taps", frames=14000)[2]
+    for test in ("hold", "taps"):
+      hook, _ = _abort_hook("brake", at_frame_of_press=5, release_after=int(14 / DT))
+      rows += run(Car("taps", orig), test, frames=20000, hook=hook)[2]
+      hook, _ = _abort_hook("brake", at_frame_of_press=5)
+      rows += run(Car("taps", orig), test, frames=20000, hook=hook)[2]
+      on = {}
+
+      def off(f, c, chk, on=on):
+        if "f" not in on and len(c.sent) >= 3:
+          on["f"] = f
+          c.cruise_on, c.set_readable = False, False
+      rows += run(Car("taps", orig), test, frames=8000, hook=off)[2]
+  results = {r["result"] for r in rows}
+  assert any(r.startswith("SET IT YOURSELF") for r in results) and any(r.startswith("CRUISE OFF") for r in results)
+  assert any("Will try once more" in r["line2"] for r in rows)
+  assert any("JUMP: the car read it as a hold" in r["d3"] for r in rows)
+  for r in rows:
+    assert len(r["line1"]) <= bt.MAX_LINE1 and len(r["line2"]) <= bt.MAX_LINE2, r
+    assert len(r["result"]) <= bt.MAX_RESULT and all(len(r[k]) <= bt.MAX_DETAIL for k in ("d1", "d2", "d3")), r
