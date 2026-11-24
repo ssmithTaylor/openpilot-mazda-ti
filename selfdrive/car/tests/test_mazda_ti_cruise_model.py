@@ -58,12 +58,14 @@ def test_whole_manoeuvre_at_45(drop, t_lo, t_hi, x_lo, x_hi):
 
 
 def test_planner_warning_and_test_cars_share_the_model():
-  # the planner's settled-deceleration law IS the model's; its approach IS the model's manoeuvre (push to S1, raise at RAISE_AT_MPH)
+  # the planner's settled-deceleration law IS the model's; its approach IS the model's manoeuvre (push to S1, raise by CM.raise_due)
   for g in (0.0, 1.0, 2.5, 5.0, 8.0, 13.0):
     assert P.decel_mph_s(g) == CM.decel_mph_s(g)
-  t, x = CM.manoeuvre(55, 40, 34, raise_at=P.RAISE_AT_MPH, arrived=P.ARRIVED_MPH)
+  t, x = CM.manoeuvre(55, 40, 34, arrived=P.ARRIVED_MPH)            # A9-R2a: raised when the model says (raise_at=None)
   assert P.approach_m(55, 40, 34) == pytest.approx(x)
-  assert P.REACTION_S == CM.DELAY_S and P.ARRIVED_MPH == CM.ARRIVED_MPH
+  assert P.REACTION_S == CM.DELAY_S
+  # plan A8-R1: the planner aims at T + 0.5 (on target at entry; 1.0 ruled, see ti_curve_plan.ARRIVED_MPH); CM.ARRIVED_MPH stays the MEASURED manoeuvre definition (1.5)
+  assert P.ARRIVED_MPH == 0.5 and CM.ARRIVED_MPH == 1.5
 
 
 def test_speed_at_follows_the_walk():
@@ -76,3 +78,11 @@ def test_speed_at_follows_the_walk():
     t += 0.05
   assert v == pytest.approx(car.v)
   assert CM.speed_at(45.0, 300.0, 45.0, 35.0, False) == 45.0                   # not lowering: nothing changes
+
+
+def test_r3_manoeuvre_walks_the_dash_from_the_real_set_speed():
+  # plan A8-R3: a car held below its set speed (a lead) needs (set - target) taps, not (speed - target)
+  t0, x0 = CM.manoeuvre(40, 30)
+  t1, x1 = CM.manoeuvre(40, 30, set0=55)
+  assert t1 >= t0 + 15 * CM.TAP_S - 0.5 and x1 > x0
+  assert CM.manoeuvre(40, 30, set0=40) == (t0, x0)

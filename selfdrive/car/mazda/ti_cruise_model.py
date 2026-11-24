@@ -25,6 +25,8 @@ TAP_S_SLOW = 0.40                # ... sometimes this
 ACCEL_MPH_S = 0.7                # speeding up toward a set speed above the speed
 SETTLE_MPH = 0.3                 # within this of its set speed the cruise is taken to be on it (the dash shows whole mph)
 ARRIVED_MPH = 1.5                # a manoeuvre is "done" within this of its target (the measured whole-manoeuvre definition)
+RAISE_SLACK_MPH = 0.1            # after a push below the target: raise the dash back to it once the speed, raised NOW, would bottom
+                                 # out within this of the target (plan A9-R2a: the car keeps slowing for the dead time plus the lag)
 
 # gap nodes (mph): 0, 0.5, then the centres of the measured bands 1-2, 2-3, 3-4, 4-6, 6-8, 8-10, 10-14 (capped there)
 GAP_MPH = (0.0, 0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 9.0, 12.0)
@@ -88,6 +90,12 @@ class Cruise:
       return ACCEL_MPH_S
     return 0.0
 
+  def clone(self):
+    c = Cruise.__new__(Cruise)
+    c.__dict__.update(self.__dict__)
+    c.gaps = deque(self.gaps, maxlen=self.gaps.maxlen)
+    return c
+
   def step(self, set_mph):
     s = float(set_mph)
     self.gaps.append(self.v - s)
@@ -102,14 +110,39 @@ class Cruise:
     return self.v
 
 
-def manoeuvre(v0, T, S1=None, raise_at=1.5, arrived=ARRIVED_MPH, dt=0.05, variant=TIMING, tap_s=TAP_S, tmax=90.0):
-  """From the first tap, with the dash at `v0` and the car settled at `v0`: our taps walk the dash toward S1 (default: straight to T),
-  switching the goal to T once the speed is within `raise_at` of it. -> (seconds, metres) until the speed is within `arrived` of T."""
+def min_after_raise(car, set_now, T, tap_s=TAP_S):
+  """The lowest speed (mph) the car `car` (a Cruise, not changed) reaches if our taps walk the dash from `set_now` up to T from now
+  (one tap per tap_s, the first at once)."""
+  c = car.clone()
+  lo, t, horizon = c.v, 0.0, DELAY_S + 6.0 * TAU_S + max(0.0, T - set_now) * tap_s
+  while t < horizon:
+    v0 = c.v
+    c.step(dash_after(set_now, T, t, tap_s))
+    lo = min(lo, c.v)
+    t += c.dt
+    if c.v > v0 and t > DELAY_S:
+      break                             # turned back up: the minimum is behind
+  return lo
+
+
+def raise_due(car, set_now, T, tap_s=TAP_S):
+  """True when the dash, pushed below T (set_now < T), should be raised back to T now: the car would bottom out within
+  RAISE_SLACK_MPH of T (plan A9-R2a: the moment comes from the model, not a fixed distance above T)."""
+  return set_now < T and min_after_raise(car, set_now, T, tap_s) <= T + RAISE_SLACK_MPH
+
+
+def manoeuvre(v0, T, S1=None, raise_at=None, arrived=ARRIVED_MPH, dt=0.05, variant=TIMING, tap_s=TAP_S, tmax=90.0, set0=None):
+  """From the first tap, with the car settled at `v0` and the dash at `set0` (default `v0`; above v0: a car held below its set speed,
+  e.g. by a lead, which needs set0 - T taps, not v0 - T, plan A8-R3): our taps walk the dash toward S1 (default: straight to T),
+  switching the goal to T when `raise_due` says (or, given `raise_at`, once the speed is within it of T: the old fixed rule).
+  -> (seconds, metres) until the speed is within `arrived` of T."""
   goal1 = T if S1 is None else S1
-  car = Cruise(v0, v0, dt, variant)
-  setn, tap_t, raised, t, x = int(round(v0)), 0.0, False, 0.0, 0.0
+  s0 = v0 if set0 is None else set0
+  car = Cruise(v0, s0, dt, variant)
+  setn, tap_t, raised, t, x = int(round(s0)), 0.0, False, 0.0, 0.0
   while car.v > T + arrived and t < tmax:
-    raised = raised or car.v <= T + raise_at
+    if not raised:
+      raised = car.v <= T + raise_at if raise_at is not None else raise_due(car, setn, T, tap_s)
     goal = T if raised else goal1
     if t >= tap_t - 1e-9 and setn != goal:
       setn += 1 if goal > setn else -1

@@ -79,7 +79,9 @@ MAX_MPH = 90
 # per tap, one tap per 0.30 s; the cruise acts on the gap (speed minus set speed) 0.5 s late through a 0.5 s first-order lag, with the
 # measured, grade-corrected deceleration for that gap (0.21 m/s^2 at 1-2 mph rising to 0.90 at 10-14 mph, capped there). The same
 # model is used by the warning's arrival prediction, the replay tools and every test car. The approach is: PUSH (set DRIVE_GAP_MPH
-# below the corner speed, never below the floor), then set the corner speed itself once within RAISE_AT_MPH of it (no undershoot).
+# below the corner speed, never below the floor), then set the corner speed itself at the moment the same model says the car will
+# bottom out at it (CM.raise_due; plan A9-R2a: no dip below the corner speed and re-acceleration). With several constraints ahead the
+# lowest allowed speed decides: a lower one appearing after the push ended starts a new push (A9-R2b).
 # The start is the latest moment that still arrives at T + ARRIVED_MPH by ENTRY_M before the corner, with BUFFER_S of margin. CLOSED
 # LOOP every tick: the car's speed is compared with the highest speed from which it can still make it (`v_allow`); a car slowing less
 # than planned (downhill or anything else) is pushed to the floor; one slowing more (uphill) is let off to the corner speed.
@@ -87,8 +89,10 @@ REACTION_S = CM.DELAY_S         # the model's dead time on the gap (0.5 s); the 
                                 # 0.5 mph is not a separate constant: it comes out of the model (dead time, lag, weak small-gap decel)
 TAP_S = CM.TAP_S                # one set-speed tap per this (measured walk: 0.30 s per tap, 0 of 293 taps missed)
 DRIVE_GAP_MPH = 6                # push this far below the corner speed
-RAISE_AT_MPH = 1.5
-ARRIVED_MPH = CM.ARRIVED_MPH    # the approach counts as done at the corner speed + this (the measured whole-manoeuvre definition)
+RAISE_AT_MPH = 1.5              # only when the dash is NOT below the corner speed (no push under way): "on target" within this
+RAISE_SIM_DT_S = 0.1            # the planner's raise prediction steps (CM.raise_due)
+ARRIVED_MPH = 0.5               # plan A8-R1: at the corner speed + this (was 1.5, the measured manoeuvre definition CM.ARRIVED_MPH;
+                                # 1.0 ruled; the largest value <= 1.0 passing every suite on a 0.1 grid is 0.5: the lead-held e2e cases)
 RESP_FACTOR = 1.0               # plan with the measured deceleration
 BUFFER_S = 0.3                  # extra seconds of start-early margin (was 1.0; 2026-11-24, arrive just in time)
 ENTRY_M = 0.0                   # be at the corner speed this far before the aim point (was 10 m; 2026-11-24)
@@ -113,14 +117,16 @@ def decel_mph_s(gap):
 _APPROACH = {}
 
 
-def approach_m(u, T, S1, dt=0.05):
-  """Metres from the first press until the speed is within ARRIVED_MPH of T, starting at u mph with the set speed at u, tapping down to S1
-  (one tap per TAP_S), raising to T once within RAISE_AT_MPH of it; the car answers as ti_cruise_model says. Cached by whole mph."""
-  key = (int(u), int(T), int(S1))
+def approach_m(u, T, S1, dt=0.05, set0=None):
+  """Metres from the first press until the speed is within ARRIVED_MPH of T, starting at u mph with the set speed at `set0` (default u;
+  A8-R3: above u when a lead holds the car below it), tapping down to S1 (one tap per TAP_S), raising to T when the model says (A9-R2);
+  the car answers as ti_cruise_model says. Cached by whole mph."""
+  key = (int(u), int(T), int(S1), int(u) if set0 is None else max(int(u), int(round(set0))))
   r = _APPROACH.get(key)
   if r is not None:
     return r
-  _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=RAISE_AT_MPH, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S)
+  _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=None, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S,
+                         set0=float(key[3]))
   _APPROACH[key] = dist
   return dist
 
@@ -686,22 +692,24 @@ class Planner:
           T = int(shed_to[j]) if j in (aim, int(lowest)) else int(phys[j])
           D = float(dist[j]) - ENTRY_M
           buf = BUFFER_S
-          if set_mph and set_mph > mph:
-            buf += (set_mph - mph) * TAP_S                  # the taps from a set speed above the car's speed come first
           if grade is not None and dist[j] > 0:
             sel = idx[(dist >= 0) & (dist <= dist[j]) & (idx >= 0)]
             g = float(np.degrees(np.nanmean(grade[sel]))) if len(sel) else 0.0
             if math.isfinite(g) and g < -GRADE_STEEP_DEG:
               buf += GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
-          va = v_allow(D, T, max(floor, T - DRIVE_GAP_MPH), buf)
+          S1 = max(floor, T - DRIVE_GAP_MPH)
+          va = v_allow(D, T, S1, buf)
+          # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
+          # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
+          due = bool(set_mph and set_mph > mph + SETTLE_MPH and
+                     approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D)
           c = cands.get(key)
-          if c is None or va < c["va"]:
-                cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "va": va, "D": D,
-                          "at": self.odo + float(dist[run[-1]]),
-                              "entry": self.odo + float(dist[run[0]]), "S1": max(floor, T - DRIVE_GAP_MPH), "buf": buf}
-    # start: the car is at or above the highest speed from which it can still make it
+          if c is None or va < c["va"] or (due and not c["due"]):
+            cands[key] = {"T": T, "need": int(need[j]), "Tc": int(max(need[j], proven[j])), "va": va, "D": D, "due": due,
+                          "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]), "S1": S1, "buf": buf}
+    # start: the car is at or above the highest speed from which it can still make it (or, below its set speed, the start is due)
     for key, c in cands.items():
-      if key not in self.active and mph >= c["va"] and mph - c["T"] >= MIN_DROP_MPH:
+      if key not in self.active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         self.active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                             "since": t, "start_t": t, "start_over": mph - c["va"]}
         self.events.append({"kind": "start", "point": key, "T": c["T"], "need": c["need"], "floor": floor, "mph": round(mph, 1),
@@ -716,11 +724,14 @@ class Planner:
     for key, a_ in self.active.items():
       c = cands.get(key)
       va = c["va"] if c is not None else float(a_["T"])
-      if c is not None:
-        a_["T"] = min(a_["T"], c["T"])
+      mode = a_["mode"]
+      if c is not None and c["T"] < a_["T"]:
+        # A9-R2b: a lower constraint of this corner now binds: a corner "on target" for the higher one is pushed again
+        a_["T"] = c["T"]
+        if mode == "target":
+          mode = "push"
       T = a_["T"]
       S1 = max(floor, T - DRIVE_GAP_MPH)
-      mode = a_["mode"]
       late, on_plan = mph > va + BEHIND_MPH, mph <= va
       if c is not None and set_mph and mode in ("push", "behind"):
         # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
@@ -728,7 +739,7 @@ class Planner:
         pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True)
         late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
       if mode != "target":
-        if mph <= T + RAISE_AT_MPH:
+        if self._raise_due(mph, set_mph, T):
           mode = "target"
         elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
           mode = "behind"
@@ -784,6 +795,14 @@ class Planner:
     self.need_out = need_true
     return self._out(int(ceil), conf, True, True, why, cdist, corner, model_la, capped=capped, point=cpt, kind=kind,
                      past=kind == "hold")
+
+  @staticmethod
+  def _raise_due(mph, set_mph, T):
+    """Switch a corner to its target: with the dash pushed below T, when the model says the car raised now bottoms out at T
+    (CM.raise_due from the car settled on its current gap); otherwise within RAISE_AT_MPH of T."""
+    if set_mph is not None and set_mph < T:
+      return CM.raise_due(CM.Cruise(mph, float(set_mph), RAISE_SIM_DT_S), float(set_mph), T)
+    return mph <= T + RAISE_AT_MPH
 
   def _floor(self, floor_mph, ref_mph, set_mph, mph):
     """The floor, ONE source with the car side (fourth review, item 4): the car side's published floor (while it intervenes, or the

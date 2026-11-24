@@ -565,7 +565,7 @@ def _spread_flags(segments, flagged, vf_mph):
 def test_arrival_constants_are_the_approved_ones():
   assert P.AIM_MIN_LA == 1.3 and P.FLAG_MIN_LA == 1.3
   assert P.BUFFER_S == 0.3 and P.ENTRY_M == 0.0
-  assert P.ARRIVED_MPH == 1.5
+  assert P.ARRIVED_MPH == 0.5            # plan A8-R1 (was 1.5; 1.0 ruled, 0.5 the largest <= 1.0 that passes the lead-held e2e cases)
   # plan amendment A1: the reaction is the measured model's dead time (0.5 s, then a 0.5 s lag), the tap walk 0.30 s
   assert P.REACTION_S == CM.DELAY_S == 0.5 and P.TAP_S == CM.TAP_S == 0.30 and P.RESP_FACTOR == 1.0
 
@@ -629,13 +629,14 @@ def test_closed_loop_never_faster_than_the_envelope_before_the_aim_point(monkeyp
   assert max(in_b) <= t_b + P.ARRIVED_MPH + 0.05, (max(in_b), t_b)
 
 
-def test_approach_ends_at_target_plus_1_5_with_the_measured_model():
-  # rewritten for plan amendment A1: the planner's approach is ti_cruise_model's manoeuvre, stepped by hand here
+def test_approach_ends_at_target_plus_arrived_with_the_measured_model():
+  # rewritten for plan amendment A1: the planner's approach is ti_cruise_model's manoeuvre, stepped by hand here; A8-R1: it ends at
+  # T + ARRIVED_MPH (1.0; was ..._plus_1_5_... with the end hard-coded at T + 1.5)
   def ref(u, T, S1, dt=0.05):
     car = CM.Cruise(float(u), float(u), dt)
     setn, t, d, tap_t, raised = u, 0.0, 0.0, 0.0, False
-    while car.v > T + 1.5 and t < 90.0:
-      raised = raised or car.v <= T + P.RAISE_AT_MPH
+    while car.v > T + P.ARRIVED_MPH and t < 90.0:
+      raised = raised or CM.raise_due(car, setn, T)       # A9-R2a (was: within the fixed P.RAISE_AT_MPH of T)
       goal = T if raised else S1
       if t >= tap_t - 1e-9 and setn != goal:
         setn += 1 if goal > setn else -1
@@ -671,3 +672,21 @@ def test_single_corner_arrives_just_in_time():
   reached = [t for t, s, p, v in res if v <= need + P.ARRIVED_MPH + 0.05][0]
   t_entry = [t for t, s, p, v in res if s >= 1500][0]
   assert t_entry - reached < 2.0, t_entry - reached
+
+
+@pytest.mark.parametrize("v0, need", [(55, 45), (65, 52), (45, 37), (60, 47)])
+def test_a9_r2a_push_then_settle_at_target_no_dip_no_reacceleration(v0, need):
+  # plan A9-R2a: after a push below the target the dash is raised at the moment the model says the car will bottom out at T, so the
+  # speed never dips more than 0.5 mph below T and the car never speeds up before the corner's end
+  ks = np.linspace(0.0005, 0.03, 6000)
+  k = float(ks[np.argmin(np.abs(P.corner_mph(ks) - need))])
+  T = int(max(P.corner_mph(k)[0], v0 - 15))
+  assert T - P.DRIVE_GAP_MPH < T and max(v0 - 15, T - P.DRIVE_GAP_MPH) < T      # a push below T happens
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  res = drive(M.synthetic([tr]), tr, v0, 160, closed=True, set_mph=v0)
+  ceils = [p.ceil for t, s, p, v in res if p.kind == "corner"]
+  assert ceils and min(ceils) < T, "no push"
+  start = next(i for i, (t, s, p, v) in enumerate(res) if p.kind == "corner")
+  vs = [v for t, s, p, v in res[start:] if s <= 1650]
+  assert min(vs) >= T - 0.5, (min(vs), T)
+  assert all(b <= a + 0.02 for a, b in zip(vs, vs[1:])), "sped up before the corner's end"
