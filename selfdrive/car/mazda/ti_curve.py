@@ -892,8 +892,13 @@ class Curve:
     if not plan.get("trusted") and not self.trust_past and not past_end and not self.after_brake:
       return False, "road not matched: not restoring"
     if plan.get("model_k") is None:
-      return False, "no model preview"
-    if not P.fits(float(plan["model_k"]), inp.set_mph + 1):
+      # no preview (stale / dropped model message): the restore may go ahead only on the planner's own word that the road ahead is
+      # known and clear: a fresh plan (the caller passes None otherwise) on TRUSTED, matched memory; the caller's cap is the plan's
+      # "hold" ceiling (the next remembered bend) or the driver's set speed. Untrusted memory (not even the trust_past / past_end /
+      # after-brake exceptions above count here) keeps the block.
+      if not (plan.get("trusted") is True and plan.get("known")):
+        return False, "no model preview"
+    elif not P.fits(float(plan["model_k"]), inp.set_mph + 1):
       return False, "the model sees a bend ahead"
     return self._restore_common(inp)
 
