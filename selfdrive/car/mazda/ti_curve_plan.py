@@ -87,8 +87,9 @@ CONFIRM_SHARE = 0.6
 # the cap to its end ("s1_unconfirmed"; the warning covers the rest). A bend started with no preview able to confirm it (none: the
 # model not running; or one shorter than CONFIRM_LEAD_S, which could never reach the entry at the decision) has nothing to wait for:
 # no cap, decided at CONFIRM_LEAD_S as before.
-# ONE switch (the owner is to be asked): None = no cap (stage 1 walks its full graded ramp from the start, as before R16).
-S1_UNCONFIRMED_MAX_MPH = 5
+# ONE switch: None = no cap (stage 1 walks its full graded ramp from the start, as before R16). OFF (owner, 2026-11-24: an arbitrary
+# cap is rejected; the wrong-road cases it was for are solved by road matching, RM_* below). The cap path is kept, tested with 5.
+S1_UNCONFIRMED_MAX_MPH = None
 
 
 def s1_unconfirmed_ceiling(u0_mph):

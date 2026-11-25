@@ -978,7 +978,8 @@ def test_r16_switch_none_means_no_cap(monkeypatch):
   pl = P.Planner(mem)
   res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(tr, 45))
   assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.5
-  # with the cap on (the default) the same never-confirmed case keeps the dash at or above start - 5
+  # with the cap on (an explicit 5; the default is off since 2026-11-24) the same never-confirmed case keeps the dash at or above
+  # start - 5
   monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", 5)
   pl = P.Planner(mem)
   res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 45))
@@ -986,10 +987,39 @@ def test_r16_switch_none_means_no_cap(monkeypatch):
   assert min(v for t, s, p, v in res if s <= 1650) >= 45 - P.S1_UNCONFIRMED_MAX_MPH - 0.5
 
 
-def test_r16_unconfirmed_sheds_at_most_5_confirmed_gets_the_full_ramp():
-  # R16 (A15): before the forecast confirms, stage 1 sheds at most S1_UNCONFIRMED_MAX_MPH (5); the rest after. The one decision:
+def test_r16_default_is_no_cap_every_bend_gets_the_full_ramp():
+  # 2026-11-24: the owner rejected the arbitrary cap (S1_UNCONFIRMED_MAX_MPH = None by default); the wrong-road cases it was for are
+  # caught by road matching (test_rm_*). Same road and previews as the cap test below: every confirmed bend, whenever its preview
+  # arrives (or with none able to confirm), gets the full ramp on time; a preview that shows a straight road releases it at
+  # CONFIRM_LEAD_S and the speed comes back by the bend; nothing is "unconfirmed"
+  assert P.S1_UNCONFIRMED_MAX_MPH is None and P.s1_unconfirmed_ceiling(45.0) is None
+  k, T = k_needing(24), 30
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  mem = M.synthetic([tr])
+  f8 = road_preview(tr, 45)
+  for mf in (f8, lambda t, s: f8(t, s) if s < 1500 - 175 else None, _preview_reach(tr, 45, 6.0), None, _preview_reach(tr, 45, 4.0)):
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=mf)
+    kinds = [e["kind"] for e in pl.events]
+    assert kinds.count("start") == 1 and "s1_unconfirmed" not in kinds and "s1_release" not in kinds
+    assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.5
+    t_arr = next(t for t, s, p, v in res if v <= T + P.ARRIVED_MPH)
+    assert next(t for t, s, p, v in res if s >= 1500) - t_arr <= 1.0                  # no early dwell
+  # never confirmed (the preview reaches the entry and shows a straight road): released at CONFIRM_LEAD_S; with no cap the dash went
+  # deeper before the release (measured here: 45 -> 38.8 mph), and the speed is back by the bend
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 45, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 45))
+  assert "s1_release" in [e["kind"] for e in pl.events]
+  assert 45 - 7.0 <= min(v for t, s, p, v in res if s <= 1650) < 45 - 5
+  assert max(v for t, s, p, v in res if 1500 <= s <= 1650) > 43
+
+
+def test_r16_unconfirmed_sheds_at_most_5_confirmed_gets_the_full_ramp(monkeypatch):
+  # R16 (A15), the kept cap path with an explicit 5 (the default is off since 2026-11-24): before the forecast confirms, stage 1 sheds
+  # at most S1_UNCONFIRMED_MAX_MPH; the rest after. The one decision:
   # confirmed at the first tick a preview reaching the entry shows the bend (here the model's 8 s preview, ~8 s out), released at the
   # CONFIRM_LEAD_S point if it does not show it, unconfirmed (cap kept) if no preview reaches the entry by then
+  monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", 5)
   assert P.S1_UNCONFIRMED_MAX_MPH == 5 and P.s1_unconfirmed_ceiling(45.0) == 40 and P.s1_unconfirmed_ceiling(45.3) == 41
   k, T = k_needing(24), 30                                     # 45 -> 30 (the floor binds)
   tr = road((1500, 0.0), (150, k), (800, 0.0))
@@ -1206,12 +1236,20 @@ def test_other_lock_losses_keep_the_corner_too():
   assert any(p.ceil is None or p.kind == "hold" for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)
 
 
-def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend():
+def test_warning_predicts_the_r16_cap_of_an_unconfirmed_bend(monkeypatch):
   # Job 2: the warning predicts what the ramp will DO (A11): a stage-1 bend whose preview went before reaching its entry stays
-  # "unconfirmed" and capped (dash >= start - 5) to its end, so a bend needing 38 from 50 is reached at about 45: warned for
+  # "unconfirmed" and capped (dash >= start - 5) to its end, so a bend needing 38 from 50 is reached at about 45: warned for.
+  # The cap path with an explicit 5 (default off since 2026-11-24); with the default the same bend is reached on target, unwarned
   k = k_needing(38)
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  f8 = road_preview(tr, 50)
+  res = drive(mem, tr, 50, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 183 else None)
+  assert "s1_unconfirmed" not in [e["kind"] for e in pl.events]
+  assert next(v for t, s, p, v in res if s >= 1500) <= 38 + 1.0
+  assert not any(p.alert_mph for t, s, p, v in res)
+  monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", 5)
   pl = P.Planner(mem)
   f8 = road_preview(tr, 50)
   res = drive(mem, tr, 50, 160, closed=True, planner=pl, model_fn=lambda t, s: f8(t, s) if s < 1500 - 183 else None)   # start ~1314 m, reach ~1321 m
