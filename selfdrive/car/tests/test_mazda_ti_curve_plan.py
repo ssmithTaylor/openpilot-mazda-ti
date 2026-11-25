@@ -1194,9 +1194,12 @@ def test_map_bend_must_persist_a3():
   # a 2.1 s phantom at 60 mph never acts
   res = _drive_map(P.Planner(None), 60, 60, shown(46.0, 48.1))
   assert not any(p.src == "map" for t, s, p in res)
-  # at 45 mph the same 2.1 s showing acts at once (0 s persistence) when its start is due
-  res = _drive_map(P.Planner(None), 45, 80, shown(64.0, 66.1))
-  assert next(t for t, s, p in res if p.src == "map") == pytest.approx(64.0, abs=1e-6)
+  # at 45 mph the same 2.1 s showing acts at once (0 s persistence) when its start is due (winding fix 2+3: the restore "hold" a
+  # map bend used to publish from 6 s before its start is gone, so the showing begins 1 s after the start is due)
+  t_due = next(t for t, s, p in _drive_map(P.Planner(None), 45, 80, shown(0.0, 99.0)) if p.src == "map" and p.kind == "corner")
+  res = _drive_map(P.Planner(None), 45, 80, shown(t_due + 1.0, t_due + 3.1))
+  first = next(t for t, s, p in res if p.src == "map")
+  assert first == pytest.approx(t_due + 1.0, abs=1e-6), (first, t_due)
 
 
 def test_position_gap_keeps_an_active_corner_by_dead_reckoning():
@@ -1327,7 +1330,7 @@ def test_rm_steady_offset_beyond_8_m_trips_and_starts_nothing():
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
-  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (8.5, 0.0)))
+  res = drive(mem, tr, 55, 60, planner=pl, fix_fn=_beside(lambda t, s: (8.5, 0.0)))
   assert pl.locked and _rm_events(pl) and _rm_events(pl)[0]["why"] == "far"
   assert all(p.ceil is None and not p.trusted for t, s, p in res)
   assert not any(e["kind"] == "start" for e in pl.events)
@@ -1335,14 +1338,15 @@ def test_rm_steady_offset_beyond_8_m_trips_and_starts_nothing():
   assert beside and all(p.diag.get("rm") == "far" for p in beside)
   # an ordinary lane offset (3 m, steady) is on the road: slowed for as ever, no "rm" in the log
   pl = P.Planner(mem)
-  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (3.0, 0.0)))
-  assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res)
+  # (60 s, a corner ceiling: winding fix 2+3 removed the restore "hold" published from 6 s before the start, which the 50 s drive saw)
+  res = drive(mem, tr, 55, 60, planner=pl, fix_fn=_beside(lambda t, s: (3.0, 0.0)))
+  assert not _rm_events(pl) and any(p.ceil is not None and p.kind == "corner" for t, s, p in res)
   assert not any("rm" in (p.diag or {}) for t, s, p in res)
   # ... and ones below the limit (6.5 m, and 7.5 m: not beside, the old limit's reject) too
   for off in (6.5, 7.5):
     pl = P.Planner(mem)
-    res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s, off=off: (off, 0.0)))
-    assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res) and not _beside_ticks(res), off
+    res = drive(mem, tr, 55, 60, planner=pl, fix_fn=_beside(lambda t, s, off=off: (off, 0.0)))
+    assert not _rm_events(pl) and any(p.ceil is not None and p.kind == "corner" for t, s, p in res) and not _beside_ticks(res), off
 
 
 def test_rm_two_lane_offset_of_7_4_m_held_60_s_keeps_trust():

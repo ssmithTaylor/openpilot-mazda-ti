@@ -106,3 +106,17 @@ def test_class1_record_bound_kept_for_small_drops(fam, seed):
       nxt = [(a2, al2) for (a2, *_x), al2 in zip(r["bl"], r["allowed"]) if 0 < a2 - r["bl"][b["i"]][1] <= 150.0]
       if not any(al2 < b["allowed"] for _a, al2 in nxt):       # graded, unless a lower bend follows at once
         assert _bend_min_mph(r, b) >= b["allowed"] - 1.5, (b, _bend_min_mph(r, b))
+
+
+@pytest.mark.parametrize("fam,seed", (("F2", 0), ("F1", 3)))
+def test_class23_no_yoyo_between_bends_and_arrival(fam, seed):
+  """CLASSES 2+3: between bends the restore climbs only to what the next bend allows by the cruise model, against the bend's position
+  (F2/0: 46 -> 54 with 8 SET+, then 54 -> 34 within 4 s; F1/3: the next record bend allowed 37 reached at 39.1, no warning). No SET+
+  followed by a SET- within 5 s anywhere, and in F1/3 every bend the feature may slow for is reached at or under allowed + 1 mph."""
+  r = _run(fam, seed)
+  assert r["yoyo"] == 0, (r["yoyo"], r["restore_undone"])
+  if fam == "F1":
+    for b in r["bends"]:
+      if not b["drv"] and b["allowed"] >= b["floor"]:
+        assert b["peak"] <= b["allowed"] + 1.0, b
+

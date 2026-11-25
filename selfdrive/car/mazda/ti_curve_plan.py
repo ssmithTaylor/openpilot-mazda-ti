@@ -127,7 +127,22 @@ MAP_PERSIST_S = 2.5
 MAP_PERSIST_LO_MPH = 45.0
 MAP_PERSIST_HI_MPH = 50.0
 MAP_KEY_M = 40.0                # a map bend is the same bend from tick to tick while its end stays within this (odometer)
-HOLD_GAP_S = 6.0                # between corners: hold a reduced speed only if the next slowdown would start within this of now
+HOLD_GAP_S = 6.0                # (before the winding fix: hold only if the next slowdown would start within this; no longer used)
+# ---- between bends (winding fix, classes 2+3, 2026-11-25): the restore ceiling ("hold") after a bend, from the cruise model. The car,
+# its set speed walked up (one tap per TAP_S) to the driver's speed, speeds up at CM.ACCEL_MPH_S after CM.DELAY_S + CM.TAU_S; the
+# planner must start slowing for the next bend at the latest when the remaining distance is the model's approach from the speed and
+# dash reached then (approach_m, with the push and buffer the start will use). The ceiling is the whole mph at or above the speed at
+# that crossing (raising further buys nothing but extra SET- taps at the start), computed against the bend's POSITION and latched per
+# bend (it never falls as the car closes on the bend; the start itself is the safety, unchanged). A raise is made only when it buys a
+# real gain: on that trajectory the car spends at least RESTORE_GAIN_S at RESTORE_GAIN_MPH or more above its speed now before the
+# crossing. Derivation: from a tap the car first answers after DELAY_S + TAU_S (1.0 s) and gains 1 mph in a further 1 / ACCEL_MPH_S
+# (1.4 s); a raise the car cannot hold at least 1 mph (a dash step, the smallest change the driver sees and the speed window) above its
+# speed for 2 s (four planner ticks at 5 Hz: one tick's speed noise cannot make it) is button noise: the speed would be down again
+# before the passenger feels it.
+RESTORE_GAIN_MPH = 1.0
+RESTORE_GAIN_S = 2.0
+RESTORE_SIM_DT_S = 0.1
+RESTORE_SIM_MAX_S = 60.0
 # The on-road warning (first drive, 2026-11-23: a corner needing ~35 mph was reached at 40 and the car crossed the lane line, with no
 # alert). Raised, once per corner, when the corner's own speed is below what the feature may (the floor) or can (behind plan) reach,
 # early enough for the driver to brake calmly: lead ALERT_LEAD_S plus the distance to brake to the corner speed at CALM_BRAKE_MS2
@@ -666,6 +681,7 @@ class Planner:
     # ceiling published for it), until (its end + HOLD_AFTER_M, odometer), entry (odometer), ref (the driver's set speed then)}; while
     # one is alive the published ceiling is never above its cap (_guard_apply)
     self.guard = {}
+    self.hold_latch = {}                  # winding fix 2+3: bend key -> the restore ceiling latched for it (never falls)
     self.s2_seq = 0
     self._prof_cache = {}                 # corner key -> the last profile check and its inputs (_profile_cached)
 
@@ -1388,19 +1404,60 @@ class Planner:
                    kind="corner", corner=T, need=a_["Tc"], cap=a_.get("cap"), end=round(a_["at"] - self.odo, 1),
                    stage=a_["phase"], key=key, until=a_["at"] + HOLD_AFTER_M)
     if not active:
-      # no corner in progress: hold a reduced set speed for the NEXT corner only when its slowdown would have to start within
-      # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
+      # no corner in progress (winding fix 2+3): the restore ceiling ("hold") is the lowest over the bends ahead of the ceiling each
+      # allows (`_restore_ceiling`: model-derived, latched per bend, a raise only for a real gain); none below the driver's speed: none
+      top = int(math.floor(u_ref + 1e-6))
       hold = None
       for key, c in cands.items():
-        need_m = approach_m(int(u_ref), c.get("Tb", c["T"]), c["S1"]) + c["buf"] * u_ref * MPH
-        if (c["D"] - need_m) / max(v, 1.0) > HOLD_GAP_S:
-          continue
-        if hold is None or c["va"] < hold[0]:
-          hold = (c["va"], key, c)
-      if hold is not None and int(math.floor(hold[0])) < MAX_MPH:
-        out.update(ceil=int(math.floor(hold[0])), dist=round(hold[2]["D"], 1), point=hold[1] if isinstance(hold[1], int) else -1,
+        cl = self._restore_ceiling(key, c, mph, set_mph, top, v)
+        if cl < top and (hold is None or cl < hold[0]):
+          hold = (cl, key, c)
+      # latch the binding bend's ceiling (it never falls as the car closes on that bend); the others are recomputed each tick
+      self.hold_latch = {hold[1]: hold[0]} if hold is not None else {}
+      if hold is not None:
+        out.update(ceil=int(hold[0]), dist=round(hold[2]["D"], 1), point=hold[1] if isinstance(hold[1], int) else -1,
                    kind="hold", corner=hold[2]["T"], cap=hold[2]["cap"])
+    else:
+      self.hold_latch = {}
     return out
+
+  def _restore_ceiling(self, key, c, mph, set_mph, top, v):
+    """Winding fix 2+3: the highest set speed (whole mph, at most `top`) a restore may reach before bend `c` (a stage-1 candidate:
+    D, Tb / T, S1, buf), from the cruise model (RESTORE_*): the car, its dash walked from the set speed now toward `top`, speeds up
+    until the model's approach from its speed and dash needs the distance left; the ceiling is the whole mph at or above its speed
+    there. No raise (the set speed now) unless the car would spend RESTORE_GAIN_S at RESTORE_GAIN_MPH above its speed now first.
+    Latched per bend: never above an earlier value for the same bend (the ceiling does not fall as the car approaches: it is a
+    property of the bend's position, and the start is unchanged)."""
+    T, S1, buf, D_ = int(c.get("Tb", c["T"])), int(c["S1"]), float(c["buf"]), float(c["D"])
+    s0 = int(round(set_mph)) if set_mph else int(round(mph))
+    lat = self.hold_latch.get(key)
+    if lat is not None:
+      return min(lat, top)
+    # (only the BINDING bend's ceiling is latched, by the caller: a farther bend's figure assumes the car speeds up from here, which a
+    # nearer bend may not allow, so it is recomputed every tick until it binds)
+    # far enough that the car reaches `top` and can still slow from there: no ceiling (cost: no simulation)
+    t_up = CM.DELAY_S + CM.TAU_S + max(0.0, top - mph) / CM.ACCEL_MPH_S
+    if D_ > t_up * top * MPH + approach_m(top, T, S1, set0=top) + buf * top * MPH + top * MPH * RESTORE_GAIN_S:
+      return top
+    car = CM.Cruise(mph, float(s0), RESTORE_SIM_DT_S)
+    x, t, above, u_c = 0.0, 0.0, 0.0, None
+    while t < RESTORE_SIM_MAX_S:
+      dash = CM.dash_after(s0, top, t, tap_s=TAP_S, hold=CM.HOLD) if top > s0 else s0
+      cv = car.v
+      if cv > T and approach_m(math.ceil(cv - 1e-9), T, S1, set0=max(dash, cv)) + buf * cv * MPH >= D_ - x:
+        u_c = cv
+        break
+      car.step(dash)
+      x += car.v * MPH * RESTORE_SIM_DT_S
+      t += RESTORE_SIM_DT_S
+      if car.v >= mph + RESTORE_GAIN_MPH:
+        above += RESTORE_SIM_DT_S
+    if u_c is None:
+      return top
+    cl = min(top, int(math.ceil(u_c - 1e-6)))
+    if above < RESTORE_GAIN_S - 1e-9:
+      cl = min(cl, max(s0, int(math.floor(mph + 1e-6))))     # no raise that buys nothing: the set speed (or the speed) now
+    return cl
 
   def _map_stage(self, t, v, mph, set_mph, floor, ref_mph, map_k):
     """Stage 1 from the map (plan T6, A3) where no memory is known: map_k = (metres ahead, |curvature|) from
