@@ -150,6 +150,12 @@ ARRIVED_MPH = 0.5               # plan A8-R1: at the corner speed + this (was 1.
 RESP_FACTOR = 1.0               # plan with the measured deceleration
 BUFFER_S = 0.3                  # extra seconds of start-early margin (was 1.0; 2026-11-24, arrive just in time)
 ENTRY_M = 0.0                   # be at the corner speed this far before the aim point (was 10 m; 2026-11-24)
+RAISE_MARGIN_MPH = 4.0          # FAULT 2: with the tightest point ahead, no raise while the car is above its speed by more than this.
+                                # Why 4: the raise itself is model-timed against the TIGHTEST point's speed (CM.raise_due: the car,
+                                # raised now, bottoms out at it), and a raise must go out before the car is down there because the
+                                # cruise answers 0.5 s + 0.5 s late while still slowing at the push's gap: for the 6 mph push at
+                                # 40-55 mph the model raises at T + 3.2 .. 3.6 (A9-R2a: no dip below T). 4 admits that and nothing
+                                # more (tonight's raises were 5.7 mph above the rest of the bend's speed)
 COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
 REPUSH_MPH = 1.0                # ... and push again when back within this of v_allow
 BEHIND_GRACE_S = 3.0            # not "behind" in the first seconds of a start: a start fires AT the latest-start speed and the cruise
@@ -999,13 +1005,18 @@ class Planner:
         # planner tick early, so the walk never pauses there while the car side waits for the next plan): ONE ramp, no early dwell
         a_["phase"] = 2
         self.events.append({"kind": "s1_handover", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+      # FAULT 2 (2026-11-24 late drive: 3-4 SET+ at the bend's entry while the car was 3+ mph above what the rest of the bend
+      # needed): while the corner's tightest point is still ahead, no switch that RAISES the dash (to the target, or a let-off)
+      # while the car is above that point's speed by more than RAISE_MARGIN_MPH
+      ahead_low = c is not None and c.get("low_m", 0.0) > 0.0
+      may_raise = not ahead_low or mph <= T + RAISE_MARGIN_MPH
       if mode != "target":
-        if self._raise_due(mph, set_mph, T):
+        if self._raise_due(mph, set_mph, T) and may_raise:
           mode = "target"
         elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
           mode = "behind"
         elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
-          mode = "coast"
+          mode = "coast"                          # ahead of plan: let off (with the tightest point ahead, the dash is only held)
         elif mode == "behind" and on_plan:
           mode = "push"
         elif mode == "coast" and mph >= va - REPUSH_MPH:
@@ -1015,6 +1026,10 @@ class Planner:
                             "planned": round(va, 1), "T": T})
         a_["mode"], a_["since"] = mode, t
       cc = S1 if mode in ("push", "behind") else T
+      if mode == "coast" and not may_raise:
+        # ahead of plan but the tightest point still ahead and the car above its speed: no SET+; the dash stays where it is (the
+        # gap closes as the car slows, so the slowing eases without a raise)
+        cc = max(S1, min(T, int(round(set_mph)))) if set_mph else S1
       if a_["phase"] == 1:
         cc = max(cc, T + LATE_SHED_MPH)           # stage 1's part of the ramp
       if a_.get("cap_c") is not None:

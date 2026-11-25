@@ -144,6 +144,7 @@ CASES = [pytest.param(k, sh, ov, id=f"{'left' if k > 0 else 'right'}_{abs(k):.4f
 SET_MPH = 50
 DWELL_S = 1.5                       # the slowdown may start at most this much before the profile's latest start
 AT_POINT_MPH = 1.0                  # at each point: at or under its allowed speed, within this
+NO_RAISE_ABOVE_MPH = 4.0            # = P.RAISE_MARGIN_MPH, pinned here so a change to it shows
 
 
 def _passes(k_peak, shape, over):
@@ -162,6 +163,16 @@ def test_at_or_under_every_points_allowed_speed(k_peak, shape, over):
     if r["mph"] > a[j] + AT_POINT_MPH:
       bad.append((round(j * M.SPACING_M - LEAD_IN_M), int(a[j]), round(r["mph"], 1)))
   assert not bad, bad                # (metres into the bend, allowed mph, the car's speed there)
+
+
+@pytest.mark.parametrize("k_peak,shape,over", CASES)
+def test_no_set_plus_above_the_rest_of_the_bend(k_peak, shape, over):
+  log, tr, floor = _passes(k_peak, shape, over)
+  s_low, T = first_tight_m(tr, floor)
+  ups = [(round(r["s"] - LEAD_IN_M), round(r["mph"], 1)) for r in log
+         if r["btn"] == "SET_PLUS" and r["s"] < s_low and r["mph"] > T + NO_RAISE_ABOVE_MPH]
+  assert not ups, ups                # (metres into the bend, speed) of each SET+ while above the tightest point's speed + 4
+  assert NO_RAISE_ABOVE_MPH == P.RAISE_MARGIN_MPH
 
 
 DWELL_XFAIL = pytest.mark.xfail(strict=True, reason=(
