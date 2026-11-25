@@ -600,7 +600,9 @@ class Planner:
   MAX_SHED_MPH = 15               # mirrors ti_curve.MAX_SHED_MPH, only to flag in the log when a corner needs more
   ABS_FLOOR_MPH = 25              # mirrors ti_curve.ABS_FLOOR_MPH
 
-  def __init__(self, memory):
+  def __init__(self, memory, model=None):
+    """model: the driving model's name (the `Model` param, read once by the planner process); None (replays, tests): north-dakota,
+    the model every recorded drive ran. It selects the forecast's calibration (ti_curve_demand.fc_ratio_for)."""
     if not getattr(Planner, "_table_tried", False):
       Planner._table_tried = True
       Planner.table_keys = load_approach_table()   # once per process (cost only: the same values as computed)
@@ -629,7 +631,11 @@ class Planner:
         self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
     self.limit = None
+    self.model = D.DEFAULT_FC_MODEL if model is None else model
+    self.fc_ratio, fc_known = D.fc_ratio_for(self.model)
     self.reset()
+    if not fc_known:                    # logged once (the planner process drains events into the log)
+      self.events.append({"kind": "model_unknown", "mdl": str(self.model)[:24], "used": D.DEFAULT_FC_MODEL})
 
   def reset(self):
     self.t = None
@@ -979,9 +985,9 @@ class Planner:
         self.model_k = float(kk[j])
         self.fc = (ts, MODEL_K_SIGN * ks)
         self.fc_v = v
-        _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S)
+        _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S, ratio=self.fc_ratio)
         self.ahead_la = None if la3 is None else round(la3, 2)
-        la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1])
+        la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1], self.fc_ratio)
         self.ask = tuple(round(float(x), 2) for x in np.interp(ASK_LEADS, ts, la_all))
     mph = v / MPH
     # R14: plan on the capacity above the step (D.need_hi) while the car is at or above D.STEP_MPH, or while a bend (stage 1, map or
@@ -1277,7 +1283,7 @@ class Planner:
     or one that does not reach the entry (never released then)."""
     if self.fc is None or float(np.max(self.fc[0])) < lead_s - 1e-6:
       return None
-    _, _, la, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, MODEL_LOOK_S)
+    _, _, la, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, MODEL_LOOK_S, ratio=self.fc_ratio)
     if la is None:
       return None
     la_T = abs(la) * (T * MPH) ** 2 / max(v, 1.0) ** 2
@@ -1463,7 +1469,8 @@ class Planner:
     quiet = (self.fc is None or mph < S2_MIN_MPH or t - self.blink_t < BLINKER_HOLD_S)
     need, lead, side = None, None, D.UNKNOWN
     if not quiet:
-      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi)
+      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi,
+                                         ratio=self.fc_ratio)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
     if hit and RECORD and mem_ahead is not None and len(mem_ahead) >= 5 and         s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):

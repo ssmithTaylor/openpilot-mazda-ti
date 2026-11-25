@@ -26,7 +26,33 @@ CAP_BANKED = ((0.0, 1.41, 1.41), (32.0, 2.20, 2.20), (35.0, 2.48, 2.01), (45.0, 
 CAP_RAW = ((0.0, 1.41, 1.41), (32.0, 2.23, 2.30), (35.0, 2.49, 2.42), (45.0, 2.56, 2.19), (55.0, 2.48, 2.07))   # under 32: the banked figure
 # the model preview's lateral acceleration, raw over actual, per lead (s); flat beyond the last
 FC_LEAD_S = (0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0)
-FC_RATIO = (1.0, 0.951, 0.888, 0.839, 0.783, 0.700, 0.538)
+FC_RATIO = (1.0, 0.951, 0.888, 0.839, 0.783, 0.700, 0.538)      # north-dakota (every recorded drive and the memory ran it)
+
+# Per driving model (the `Model` param; the planner process reads it once at start). The calibration is model-specific: the same
+# recorded frames previewed by each model (2026-11-25) give, as median forecast / realised curvature on bends:
+#   E:/openpilot-mazda-ti-data/model-switch-20261125/results-20261124.txt (16 segments, 14,303 rows; 2,393 / 2,258 / 2,171 / 2,098
+#     bend rows at 2 / 4 / 5 / 6 s): north-dakota 0.997 / 0.971 / 0.932 / 0.893, dark-souls 1.023 / 0.931 / 0.912 / 0.840
+#     (dark-souls / north-dakota: 1.026 / 0.959 / 0.979 / 0.941);
+#   E:/openpilot-mazda-ti-data/model-compare-20261125/results.json (20 replays of 3 sets, 68 bend passes; ~12,800-13,250 bend rows
+#     per lead, pooled as the median over files of each file's median): dark-souls / north-dakota 0.965 / 0.958 / 0.912 / 0.884
+#     (19-20 files).
+# That measurement's own north-dakota figures are not FC_RATIO's (its realised curvature and bend rows are defined differently:
+# 0.893 at 6 s against FC_RATIO's 0.783), so dark-souls' entry is north-dakota's FC_RATIO times the measured dark-souls /
+# north-dakota ratio on the SAME frames (the model difference, not a second calibration). The two sources disagree at 2 and 5 s: the
+# larger bend sample (model-compare, ~12,800 rows a lead against ~2,100-2,400) is used at every lead; it is also the cautious one
+# (reads a bend higher). 0 s: 1.0 as north-dakota's; 8 and 10 s (not measured): the 6 s ratio carried on.
+DS_OVER_ND = (1.0, 0.965, 0.958, 0.912, 0.884, 0.884, 0.884)
+FC_RATIO_BY_MODEL = {
+  "north-dakota": FC_RATIO,
+  "dark-souls": tuple(round(a * b, 3) for a, b in zip(FC_RATIO, DS_OVER_ND)),   # 1.0, .918, .851, .765, .692, .619, .476
+}
+DEFAULT_FC_MODEL = "north-dakota"     # an unknown or unreadable name: north-dakota's values (the planner logs it once)
+
+
+def fc_ratio_for(model):
+  """-> (FC_RATIO table for the driving model `model`, known). Unknown / empty: DEFAULT_FC_MODEL's table and False."""
+  r = FC_RATIO_BY_MODEL.get(model or "")
+  return (r, True) if r is not None else (FC_RATIO_BY_MODEL[DEFAULT_FC_MODEL], False)
 
 
 # Ruling R7 (plan A12): capacity is CONTINUOUS in speed from 32 mph: linear between the band centres (32-34: 33, 35-44: 39.5, 45-54:
@@ -133,12 +159,13 @@ def fits(k_abs, mph):
   return all(abs(k_abs) * (s * MPH) ** 2 <= capacity(s, UNKNOWN) + 1e-12 for s in _window(mph))
 
 
-def calibrate(ts, la_raw):
-  """The model preview's lateral acceleration at leads `ts` (s) divided by FC_RATIO at that lead: what the bend will actually ask."""
-  return np.asarray(la_raw, np.float64) / np.interp(np.asarray(ts, np.float64), FC_LEAD_S, FC_RATIO)
+def calibrate(ts, la_raw, ratio=None):
+  """The model preview's lateral acceleration at leads `ts` (s) divided by FC_RATIO at that lead: what the bend will actually ask.
+  ratio: the driving model's table (fc_ratio_for), default FC_RATIO (north-dakota)."""
+  return np.asarray(la_raw, np.float64) / np.interp(np.asarray(ts, np.float64), FC_LEAD_S, FC_RATIO if ratio is None else ratio)
 
 
-def forecast_need(ts, k, v, lo_s, hi_s, hi=False):
+def forecast_need(ts, k, v, lo_s, hi_s, hi=False, ratio=None):
   """The forecast's sharpest bend between leads lo_s and hi_s (s): ts, k (signed curvature, LEFT POSITIVE) of the preview, v (m/s)
   the speed now; hi: the need as need_hi (R14: a car at or above STEP_MPH). -> (need mph, lead s, calibrated signed demand m/s^2 at
   the speed now, side +1 / -1), or (None, None, None, 0)."""
@@ -148,7 +175,7 @@ def forecast_need(ts, k, v, lo_s, hi_s, hi=False):
   if not sel.any():
     return None, None, None, 0
   v = max(float(v), 1.0)
-  la = calibrate(ts[sel], v * v * np.abs(k[sel]))
+  la = calibrate(ts[sel], v * v * np.abs(k[sel]), ratio)
   j = int(np.argmax(la))
   kj = float(k[sel][j])
   side = LEFT if kj > 0 else RIGHT if kj < 0 else UNKNOWN
