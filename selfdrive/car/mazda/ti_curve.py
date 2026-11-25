@@ -286,6 +286,7 @@ class Curve:
     self.cap_seen_f = None            # frame of the last plan at or under the cap
     self.cap_straight_f = None        # frame the road last became straight
     self.cap_held = False             # a SET+ was held back by the cap (logged once per cap)
+    self.cap_gap = False
     self.cap_armed = False            # the plan stream had a gap (plan missing or older than PLAN_STALE_S) since the cap was set
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
@@ -949,14 +950,16 @@ class Curve:
 
   def _cap_clear(self):
     self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
-    self.cap_held = self.cap_armed = False
+    self.cap_held = self.cap_armed = self.cap_gap = False
 
   def _cap_track(self, frame, inp):
     """Forget the remembered lowest ceiling when its end conditions hold (see CAP_STALE_S)."""
     if self.cap_lo is None:
       return
     if not self._plan_ok(inp):
-      self.cap_armed = True            # the plan stream went missing / stale (a restart): from now the cap binds
+      self.cap_gap = True              # the plan stream went missing / stale: the dead-planner restore is its own, older rule
+    elif self.cap_gap:
+      self.cap_armed = True            # ... and a plan is back after the gap (a restart): from now the cap binds
     vals = [abs(x) for x in (inp.la_now, inp.desired_la) if x is not None]
     if vals and max(vals) < BEND_IN_LA - BEND_HYST_LA:
       self.cap_straight_f = frame if self.cap_straight_f is None else self.cap_straight_f
