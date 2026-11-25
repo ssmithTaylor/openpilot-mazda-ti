@@ -472,9 +472,17 @@ def scatter_speed_ratio(mph, side):
   return np.sqrt(np.clip(1.0 - REC_SW / np.maximum(cap, 1e-3), 0.0, 1.0))
 
 
-def record_bound(v_trb, v_ok, k, table, hi=True):
+# Well-attested trouble (second drive 2026-11-24): with REC_ATTESTED or more troubled passes at the limit on a point AND a clean pass
+# below them, the bound is that proven-clean speed itself, not stopped by the table's scatter floor (the owner's regular trouble bend:
+# troubled at 39.8-40.1 mph on many passes, clean at 35.1-35.4; the scatter floor held it at 37, where tonight the car sat at the
+# limit with no margin). 3: one or two troubled passes are what the fluke protection exists for; three agreeing passes at the limit
+# are no longer a fluke (the night-2 analysis; the majority rule already makes them the majority at and above that speed).
+REC_ATTESTED = 3
+
+
+def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   """whole mph the record allows at each point (nan where it has no trouble), given the table's need there (`table`: need_hi when
-  hi, else need)."""
+  hi, else need); n_trb: troubled passes per point (None: all below REC_ATTESTED)."""
   vt = np.asarray(v_trb, np.float64) / MPH
   vo = np.asarray(v_ok, np.float64) / MPH
   tab = np.asarray(table, np.float64)
@@ -484,16 +492,34 @@ def record_bound(v_trb, v_ok, k, table, hi=True):
   if not sel.any():
     return out
   vt_, vo_, tab_, sd_ = vt[sel], vo[sel], tab[sel], side[sel]
+  att = (np.zeros(len(vt), bool) if n_trb is None else np.asarray(n_trb) >= REC_ATTESTED)[sel] & np.isfinite(vo_)
   q = 0.05                                                 # the file's float16 speeds are good to about 0.04 mph
   top = np.ceil(vt_ - q) - 1.0                             # at least 1 mph under the troubled speed
   b = np.where(np.isfinite(vo_), np.floor(vo_ + q), np.floor(vt_ * scatter_speed_ratio(vt_, sd_) + q))
   b = np.minimum(b, top)
-  b = np.maximum(b, np.floor(tab_ * scatter_speed_ratio(tab_, sd_) + q))   # never further under the table than the scatter
+  # never further under the table than the scatter, unless the trouble is well attested and a clean speed is proven below it
+  b = np.where(att, b, np.maximum(b, np.floor(tab_ * scatter_speed_ratio(tab_, sd_) + q)))
   b = np.maximum(b, float(D.CAR_MIN_MPH))
   if hi:                                                   # R14: never into the low zone where the table itself stays above it
     b = np.where(tab_ >= D.STEP_MPH, np.maximum(b, float(D.STEP_MPH)), b)
   out[sel] = np.minimum(b, tab_)                           # never raises
   return out
+
+
+def s2_history_clean(v_clean_mph, v_trb, dist, lead_m, mph):
+  """Stage 2's history check (second drive 2026-11-24): True when every remembered point of the forecast's bend (within FORK_NEAR_M
+  of lead_m ahead) has been driven cleanly at least REC_ATTESTED times at or above the car's speed now (Memory.v_clean: the
+  REC_ATTESTED-th highest clean speed; clean = car-steered, the command never above CLEAN_CMD_FRAC of its limit within 80 m, no
+  takeover or lane-line touch) and none has trouble on record. Then stage 2 neither acts nor warns there; otherwise it acts as before.
+  v_clean_mph: per look-ahead point (mph, nan none); v_trb: m/s (nan none); dist: m ahead."""
+  v_clean_mph = np.asarray(v_clean_mph, np.float64)
+  near = np.abs(np.asarray(dist, np.float64) - lead_m) <= FORK_NEAR_M
+  if not near.any():
+    return False
+  if np.any(np.isfinite(np.asarray(v_trb, np.float64)[near])):
+    return False
+  vc = v_clean_mph[near]
+  return bool(np.all(np.isfinite(vc)) and mph <= float(np.min(vc)) + 1e-9)
 
 
 def record_offset(cap_n, cap_res, z=None):
@@ -561,8 +587,8 @@ class Planner:
       self.need_hi = D.need_hi(self.kmed).astype(np.float64) if self.mem_stage else self.need
       # the bend's own record where the memory has one (a file without it: the table alone, as before)
       if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(np.isfinite(memory.v_trb)):
-        b = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need, hi=False)
-        bh = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need_hi, hi=True)
+        b = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need, hi=False, n_trb=memory.n_trb)
+        bh = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need_hi, hi=True, n_trb=memory.n_trb)
         self.need = np.where(np.isfinite(b), np.minimum(self.need, b), self.need)
         self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
@@ -1012,7 +1038,7 @@ class Planner:
     self.latch = {k: c for k, c in self.latch.items() if self.odo <= c["end"] + LATCH_PAST_M}
     corners = corners + [c for k, c in self.latch.items() if k not in keys]
     self.alert = self._warn(corners, mph, v, floor, acting, set_mph, lowering=True, u_ref=u_ref)
-    self._stage2(t, v, mph, set_mph, floor, (need, dist, u_ref))
+    self._stage2(t, v, mph, set_mph, floor, (need, dist, u_ref, self.mem.v_clean[idx] / MPH, self.mem.v_trb[idx]))
     # a warned corner whose need is below the floor is "capped" too, also on the tick before its slowdown starts
     warned_below_floor = self.alert is not None and self.alert < floor
     if ceil is None:
@@ -1334,7 +1360,7 @@ class Planner:
     ahead needing at least MIN_DROP_MPH below u_ref."""
     if mem_ahead is None:
       return False
-    need, dist, u_ref = mem_ahead
+    need, dist, u_ref = mem_ahead[:3]
     near = (dist >= lo_m) & (dist <= hi_m)
     return bool(np.any(near & ((u_ref - need) >= MIN_DROP_MPH)))
 
@@ -1350,6 +1376,8 @@ class Planner:
       need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
+    if hit and RECORD and mem_ahead is not None and len(mem_ahead) >= 5 and         s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):
+      hit = False                                        # this place has repeatedly been driven cleanly at this speed
     if hit:
       if self.s2_run == 0:
         self.s2_t0 = t

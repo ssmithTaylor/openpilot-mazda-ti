@@ -349,7 +349,7 @@ def build_library(passes):
 
 
 # rows columns (one per road point covered by a pass)
-C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART, C_EVENT, C_CAPRES, C_TRB = range(14)
+C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART, C_EVENT, C_CAPRES, C_TRB, C_CLN = range(15)
 # ---- the bend's own record (2026-11-24): what the car DELIVERED here with the command at its limit -------------------------------
 # An at-limit stretch (capacity-refit measure.py's rule): |ti_cmd| >= SAT_TI for >= CAP_MIN_S, lateral control active, the driver not
 # pressing and |driver torque| < TK_DRV counts, >= 19 mph, the command in the turn's direction. Its delivered lateral acceleration is
@@ -378,6 +378,13 @@ TRB_EVT_M = 60.0
 # anything an at-limit pass has delivered was not troubled by the bend.
 TRB_LOCAL_M = 5.0
 TRB_MIN_FRAC = 0.66
+# CLEAN evidence (second drive 2026-11-24; stage 2's history check): a car-steered pass is clean at a point when, within +-TRB_LIM_M,
+# the command never went above CLEAN_CMD_FRAC of its limit (a bend that always runs at 95 % is not clean; tonight's over-slowed
+# bends peaked at 569 = 0.95) and there was no takeover or lane-line touch. Per point: n_clean and v_clean = the CLEAN_N-th highest
+# clean speed (repeatedly: the same count as well-attested trouble, ti_curve_plan.REC_ATTESTED).
+CLEAN_CMD_FRAC = 0.9
+CLEAN_N = 3
+TI_LIMIT = 600.0
 EVENT_PROTECT_S = 3.0          # hand steering within this of a steering-limit event or a real takeover is never excluded
 EX_BLINK, EX_HAND, EX_SLOW, EX_LEAVE, EX_STOP, EX_JOIN = 1, 2, 4, 8, 16, 32
 EX_NAMES = {EX_BLINK: 'blinker +-5 s', EX_HAND: 'steering by hand +-2 s', EX_SLOW: 'below 19 mph', EX_LEAVE: 'last 150 m before leaving',
@@ -514,6 +521,32 @@ def outcome_bound(v, trb):
   return np.nan, np.nan
 
 
+def clean_speed(v):
+  """the CLEAN_N-th highest of the clean speeds v (nan with fewer)"""
+  v = np.sort(np.asarray(v, np.float64))
+  return float(v[-CLEAN_N]) if len(v) >= CLEAN_N else np.nan
+
+
+def clean_per_sample(p):
+  """per 20 Hz sample: 1.0 clean (see CLEAN_*), 0.0 car-steered and not clean, nan not car-steered (or no command recorded)"""
+  n = len(p['s'])
+  if 'ti' not in p:
+    return np.full(n, np.nan)
+  s = np.asarray(p['s'], np.float64)
+  lat = np.asarray(p.get('lat_act', np.ones(n)), np.float64) > .5
+  ti = np.abs(np.asarray(p['ti'], np.float64))
+  lo = np.searchsorted(s, s - TRB_LIM_M, side='left')
+  hi = np.searchsorted(s, s + TRB_LIM_M, side='right')
+  over = np.r_[0, np.cumsum(ti > CLEAN_CMD_FRAC * TI_LIMIT)]
+  ok = (over[hi] - over[lo]) == 0
+  ev = np.sort(np.r_[s[np.asarray(p['tk_i'], int)], s[np.asarray(p.get('lane_i', np.zeros(0, int)), int)]])
+  if len(ev):
+    ok &= ~(np.searchsorted(ev, s + TRB_LIM_M, side='right') > np.searchsorted(ev, s - TRB_LIM_M, side='left'))
+  out = np.where(ok, 1.0, 0.0)
+  out[~lat] = np.nan
+  return out
+
+
 def trouble_per_sample(p):
   """per 20 Hz sample: 1.0 troubled (see TRB_*), 0.0 car-steered and not troubled, nan not car-steered or cleared by the driver"""
   n = len(p['s'])
@@ -566,6 +599,7 @@ def collect(passes, lib, aligns):
     xb = excl_bits(p)
     cres = limit_residuals(p)
     trb = trouble_per_sample(p)
+    cln = clean_per_sample(p)
     la = (np.asarray(p['lat_act']) > .5) if 'lat_act' in p else np.ones(len(s), bool)
     for k in np.where(ok[:-1] & ok[1:] & (rd_of[:-1] != rd_of[1:]))[0]:
       ra, rb = rd_of[k], rd_of[k + 1]
@@ -630,7 +664,8 @@ def collect(passes, lib, aligns):
               evt |= np.searchsorted(es, sr + w, side='right') > np.searchsorted(es, sr - w, side='left')
           rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr, xb[i20], np.full(len(q), piece),
                             (q1 - q) * SP, clean, (q - q0) * SP, evt, cres[i20],
-                            np.where((xb[i20] & EX_STOP) == 0, trb[i20], np.nan)])
+                            np.where((xb[i20] & EX_STOP) == 0, trb[i20], np.nan),
+                            np.where((xb[i20] & EX_STOP) == 0, cln[i20], np.nan)])
           for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M),
                                   (lns, M.FLAG_LANE, LANE_M, LANE_M)):
             for e in evs:
@@ -638,7 +673,7 @@ def collect(passes, lib, aligns):
                 ge = float(np.interp(s[e], sr, g)) if len(sr) > 1 else float(g[0])
                 flags.append((rd, ge - lo, ge + hi, fl, float(p['v'][e])))
       k = k2 + 1
-  rows = np.concatenate(rows) if rows else np.zeros((0, 14))
+  rows = np.concatenate(rows) if rows else np.zeros((0, 15))
   return rows, flags, cuts, trans, pieces
 
 
@@ -717,6 +752,32 @@ def bend_demand_ok(v, k):
   k = np.asarray(k, np.float64)
   cap = np.array([CD.capacity(x / 0.44704, CD.LEFT if kk > 0 else CD.RIGHT) for x, kk in zip(v, k)]) if len(v) else np.zeros(0)
   return v * v * np.abs(k) >= TRB_MIN_FRAC * cap - 1e-12
+
+
+def clean_evidence(rows, NL, pass_drive):
+  """per library point: v_clean (clean_speed of the clean car-steered passes on it), n_clean; and every clean (point, drive, v) row
+  (private, leave-one-drive-out). A (point, pass) is clean only if ALL its samples there are."""
+  v_clean = np.full(NL, np.nan)
+  n_clean = np.zeros(NL, np.int64)
+  empty = (np.zeros(0, np.int64), np.zeros(0, object), np.zeros(0))
+  r = rows[np.isfinite(rows[:, C_CLN])] if len(rows) else rows
+  if not len(r):
+    return v_clean, n_clean, empty
+  key = r[:, C_PT].astype(np.int64) * 100000 + r[:, C_PASS].astype(np.int64)
+  o = np.lexsort((r[:, C_CLN], key))                 # the least clean sample first per (point, pass)
+  r, key = r[o], key[o]
+  _, first = np.unique(key, return_index=True)
+  r = r[first]
+  r = r[r[:, C_CLN] > .5]
+  pt = r[:, C_PT].astype(np.int64)
+  n_clean = np.bincount(pt, minlength=NL)[:NL]
+  o = np.lexsort((-r[:, C_V], pt))
+  r, pt = r[o], pt[o]
+  uk, st, cnt = np.unique(pt, return_index=True, return_counts=True)
+  ok = cnt >= CLEAN_N
+  v_clean[uk[ok]] = r[st[ok] + CLEAN_N - 1, C_V]
+  drv = np.array([pass_drive[int(i)] for i in r[:, C_PASS]], object)
+  return v_clean, n_clean, (pt, drv, r[:, C_V].astype(np.float64))
 
 
 def outcomes(rows, NL, pass_drive, kap_med=None):
@@ -995,6 +1056,7 @@ def build(passes, info=None):
   kap, v, bank, npass, grade, v_proven, kap_med = merge(rows, NL, usable)
   cap_n, cap_res, by_drive = record(rows, NL, [p['drive'] for p in passes])
   v_trb, v_ok, n_trb, trb_rows = outcomes(rows, NL, [p['drive'] for p in passes], kap_med)
+  v_clean, n_clean, cln_rows = clean_evidence(rows, NL, [p['drive'] for p in passes])
   nokap = ~np.isfinite(kap)
   kap = np.where(nokap, 0.0, kap)
   kap_med = np.where(np.isfinite(kap_med), kap_med, 0.0)
@@ -1006,7 +1068,8 @@ def build(passes, info=None):
     v_f[idx] = fill_nan(v[idx])
   arrays = dict(x=x, y=y, hdg=hdg, kap=kap[order], v=v_f[order], flags=fl[order], v_flag=vf[order], npass=npass[order],
                 bank=bank[order], grade=grade[order], v_proven=v_proven[order], kap_med=kap_med[order], trace_start=ts, trace_next=nxt,
-                cap_n=cap_n[order], cap_res=cap_res[order], v_trb=v_trb[order], v_ok=v_ok[order], n_trb=n_trb[order])
+                cap_n=cap_n[order], cap_res=cap_res[order], v_trb=v_trb[order], v_ok=v_ok[order], n_trb=n_trb[order],
+                v_clean=v_clean[order], n_clean=n_clean[order])
   carry_flags(arrays, flags, lib, tid)
   ph = single_pass_phantoms(arrays)
   arrays['kap'] = np.where(ph, 0.0, arrays['kap'])
@@ -1023,6 +1086,9 @@ def build(passes, info=None):
     info['record_trouble_points'] = int(np.isfinite(arrays['v_trb']).sum())
     t_pt = inv[trb_rows[0]] if len(trb_rows[0]) else np.zeros(0, np.int64)
     k_t = t_pt >= 0
+    c_pt = inv[cln_rows[0]] if len(cln_rows[0]) else np.zeros(0, np.int64)
+    k_c = c_pt >= 0
+    info['_clean_by_pass'] = dict(pt=c_pt[k_c], drive=np.asarray(cln_rows[1])[k_c], v=cln_rows[2][k_c])
     info['_outcomes_by_pass'] = dict(pt=t_pt[k_t], drive=np.asarray(trb_rows[1])[k_t], v=trb_rows[2][k_t], trb=trb_rows[3][k_t])
     info['rows'] = int(len(rows))
     if len(rows):                                   # per output point (private diagnostics, never written to the file)
@@ -1512,7 +1578,9 @@ def write_memory(passes, path, meta_extra):
     rb = info['_record_by_drive']           # private: point indices and drive ids only (no position), for LOO replays
     ob = info['_outcomes_by_pass']
     np.savez_compressed(side, pt=rb['pt'], drive=rb['drive'].astype(str), n=rb['n'], sum=rb['sum'],
-                        o_pt=ob['pt'], o_drive=ob['drive'].astype(str), o_v=ob['v'], o_trb=ob['trb'])
+                        o_pt=ob['pt'], o_drive=ob['drive'].astype(str), o_v=ob['v'], o_trb=ob['trb'],
+                        c_pt=info['_clean_by_pass']['pt'], c_drive=info['_clean_by_pass']['drive'].astype(str),
+                        c_v=info['_clean_by_pass']['v'])
   m = M.load(path)                   # validate
   return m, stats
 

@@ -38,6 +38,9 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
                troubled passes are at least half; nan where there is no such trouble. Read as nan when the file has none
   v_ok         OPTIONAL float16 m/s: the highest speed of an untroubled car-steered pass here below v_trb (nan: none)
   n_trb        OPTIONAL uint8: troubled passes here
+  v_clean      OPTIONAL float16 m/s: the 3rd highest speed of a CLEAN car-steered pass here (command never above 90 % of its limit within
+               80 m, no takeover or lane-line touch, not braking to a stop); nan with fewer than 3 such passes
+  n_clean      OPTIONAL uint8: clean car-steered passes here
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
   trace_next   int32 [n_traces]: the trace that continues this one past its last point (-1: none or ambiguous)
 """
@@ -54,7 +57,7 @@ FLAG_NOKAP = 4                   # no representative pass: kap is 0 here, not a 
 FLAG_LANE = 8                    # with lateral control active the car touched or crossed a lane line here on some pass
 CELL_M = 50.0                    # grid cell of the nearest-point index
 KEYS = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next")
-REC_KEYS = ("cap_n", "cap_res", "v_trb", "v_ok", "n_trb")
+REC_KEYS = ("cap_n", "cap_res", "v_trb", "v_ok", "n_trb", "v_clean", "n_clean")
 OPTIONAL_KEYS = ("bank", "grade", "v_proven", "kap_med") + REC_KEYS
 
 
@@ -91,6 +94,9 @@ class Memory:
     self.v_trb = np.asarray(arrays.get("v_trb", np.full(n, np.nan)), np.float64)
     self.v_ok = np.asarray(arrays.get("v_ok", np.full(n, np.nan)), np.float64)
     self.n_trb = np.asarray(arrays.get("n_trb", np.zeros(n)), np.int32)
+    # clean evidence (optional; second drive 2026-11-24): the REC_ATTESTED-th highest speed of a clean car-steered pass, and the count
+    self.v_clean = np.asarray(arrays.get("v_clean", np.full(n, np.nan)), np.float64)
+    self.n_clean = np.asarray(arrays.get("n_clean", np.zeros(n)), np.int32)
     self.trace_start = np.asarray(arrays["trace_start"], np.int64)
     self.trace_next = np.asarray(arrays["trace_next"], np.int64)
     self.n = len(self.x)
@@ -211,7 +217,8 @@ def save(path, arrays, meta):
     out["v_proven"] = np.asarray(arrays["v_proven"], np.float16)
   if "kap_med" in arrays:
     out["kap_med"] = np.asarray(arrays["kap_med"], np.float16)
-  for k, dt in (("cap_n", np.uint8), ("cap_res", np.float16), ("v_trb", np.float16), ("v_ok", np.float16), ("n_trb", np.uint8)):
+  for k, dt in (("cap_n", np.uint8), ("cap_res", np.float16), ("v_trb", np.float16), ("v_ok", np.float16), ("n_trb", np.uint8),
+                ("v_clean", np.float16), ("n_clean", np.uint8)):
     if k in arrays:
       a = np.asarray(arrays[k])
       out[k] = np.asarray(np.clip(a, 0, 255) if dt is np.uint8 else a, dt)

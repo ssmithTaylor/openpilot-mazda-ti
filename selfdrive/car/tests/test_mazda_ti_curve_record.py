@@ -29,13 +29,13 @@ def bend(k):
   return M.synthetic_trace([(200.0, 0.0), (400.0, k), (200.0, 0.0)])
 
 
-def mem_with(k, v_trb_mph=None, v_ok_mph=None, cap_n=0, cap_res=np.nan):
+def mem_with(k, v_trb_mph=None, v_ok_mph=None, cap_n=0, cap_res=np.nan, n_trb=1):
   tr = bend(k)
   on = np.abs(tr["kap"]) > 0
   nan = np.full(len(on), np.nan)
   rec = {"v_trb": [np.where(on, (v_trb_mph or np.nan) * MPH, np.nan)],
          "v_ok": [np.where(on, (v_ok_mph if v_ok_mph is not None else np.nan) * MPH, nan)],
-         "n_trb": [np.where(on & (v_trb_mph is not None), 1, 0)],
+         "n_trb": [np.where(on & (v_trb_mph is not None), n_trb, 0)],
          "cap_n": [np.where(on, cap_n, 0)], "cap_res": [np.where(on, cap_res, np.nan)]}
   return M.synthetic([tr], record=rec), tr
 
@@ -246,3 +246,64 @@ def test_trouble_far_below_the_bend_demand_is_not_the_bends():
   # a 45 mph pass on a nearly straight point: demand 0.5 m/s^2, far under 0.66 x the table
   assert not B.bend_demand_ok([45 * MPH], [0.5 / (45 * MPH) ** 2])[0]
   assert B.bend_demand_ok([45 * MPH], [2.0 / (45 * MPH) ** 2])[0]
+
+
+# ---- second drive of 2026-11-24 ------------------------------------------------------------------------------------------------------
+def test_well_attested_trouble_goes_to_the_proven_clean_speed():
+  # the owner's regular trouble bend: troubled at about 40 mph on 3+ passes, clean at 35.1: the bound is 35, not the table's scatter
+  k = bend_k(44, 2.4, -1)
+  t = table_peak(k)
+  assert t - table_floor(t, -1) < t - 35
+  m, _ = mem_with(k, v_trb_mph=39.8, v_ok_mph=35.1, n_trb=P.REC_ATTESTED)
+  assert peak(P.Planner(m)) == 35
+
+
+def test_fluke_protection_holds_below_the_attested_count():
+  k = bend_k(44, 2.4, -1)
+  t = table_peak(k)
+  for n in range(1, P.REC_ATTESTED):
+    m, _ = mem_with(k, v_trb_mph=39.8, v_ok_mph=25.0, n_trb=n)
+    assert peak(P.Planner(m)) == max(25, table_floor(t, -1)) >= t - 4
+
+
+def test_attested_bound_still_clamped_by_r14_and_never_raises():
+  k = bend_k(40, 2.0, 1)
+  m, _ = mem_with(k, v_trb_mph=30.0, v_ok_mph=22.0, n_trb=5)
+  assert peak(P.Planner(m)) >= 32
+  m2, _ = mem_with(k, v_trb_mph=80.0, v_ok_mph=70.0, n_trb=5)
+  assert peak(P.Planner(m2)) == table_peak(k)
+
+
+def test_clean_speed_statistic():
+  B = builder()
+  # the REC_ATTESTED-th highest clean speed; fewer clean passes: none
+  v = np.array([40.0, 50.0, 49.0, 48.0, 30.0]) * MPH
+  assert math.isclose(B.clean_speed(v) / MPH, 48.0, abs_tol=1e-6)
+  assert np.isnan(B.clean_speed(v[:2]))
+
+
+def test_clean_per_sample_needs_margin_under_the_limit():
+  B = builder()
+  p = synthetic_pass(n=600, lim=(0, 0))
+  p["ti"] = np.full(600, 500.0)
+  assert np.all(B.clean_per_sample(p) == 1.0)
+  p["ti"] = np.full(600, 569.0)                               # always at 95 %: not clean
+  assert np.all(B.clean_per_sample(p) == 0.0)
+  p2 = synthetic_pass(n=600, lim=(0, 0), tk=300)
+  p2["ti"] = np.full(600, 400.0)
+  c = B.clean_per_sample(p2)
+  assert c[300] == 0.0 and c[0] == 1.0                        # a takeover near: not clean
+  assert np.all(np.isnan(B.clean_per_sample(dict(p, lat_act=np.zeros(600)))))     # driver-steered: no evidence
+
+
+def test_stage2_history_veto():
+  dist = np.arange(0, 300, 5.0)
+  vc = np.full(len(dist), 52.0)
+  vt = np.full(len(dist), np.nan)
+  assert P.s2_history_clean(vc, vt, dist, 150.0, 50.0)          # driven cleanly at 52 repeatedly: 50 is fine
+  assert not P.s2_history_clean(vc, vt, dist, 150.0, 53.0)      # faster than the evidence
+  vt2 = vt.copy(); vt2[30] = 45 * MPH
+  assert not P.s2_history_clean(vc, vt2, dist, 150.0, 50.0)     # trouble on record: act as now
+  vc2 = vc.copy(); vc2[31] = np.nan
+  assert not P.s2_history_clean(vc2, vt, dist, 150.0, 50.0)     # a point of the bend with no clean evidence
+  assert not P.s2_history_clean(vc, vt, dist, 900.0, 40.0)      # the forecast's bend beyond the memory: no evidence
