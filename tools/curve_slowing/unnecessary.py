@@ -117,6 +117,58 @@ def apply_options(Pm, confirm_share=None, cap_scale=1.0, min_drop=None, min_pass
       CD._KMAX_HOLD = {k: CD._kmax_table(*k, True) for k in CD._KMAX_HOLD}
 
 
+# ---- raw position fixes (road matching, 2026-11-24) ----------------------------------------------------------------------------------
+# The replay's own fix is the memory point the governor snapped each sample onto (`pt`): it always lies ON a remembered trace, so a
+# rule that judges the car's offset from the trace (road matching, ti_curve_plan RM_*) cannot see anything with it. --raw-fixes
+# feeds the planner the RAW position instead (the llk position and heading, as ti_curve_plannerd feeds the car), read ONLY through
+# the governor's admitted segment list (common.allowed_tags) and the builder's own position reader, exactly as the road-matching
+# investigation's measure.py does. PRIVATE: held in memory for one drive, never printed, logged or written.
+GOV_CODE = os.path.join(G.GOV_DIR, 'wt', 'tools', 'curve_slowing', 'governor')
+_ALLOWED = {}
+
+
+def raw_positions(drive):
+  """The drive's runs (in G.load_runs order) as dicts of local X / Y (the memory's frame), hdg (rad, east = 0, ccw) and ok, from the
+  governor's admitted segments only. In memory only."""
+  if GOV_CODE not in sys.path:
+    sys.path.insert(0, GOV_CODE)
+  import common as C   # the governor's
+  B = C.builder()
+  if 'keep' not in _ALLOWED:
+    _ALLOWED['keep'] = C.allowed_tags(B)[0]
+  ts = {t: p for t, p in _ALLOWED['keep'].items() if t.split('-')[0] == drive}
+  # only tags whose 20 Hz data are already cached (nothing new is read)
+  have = lambda t: os.path.exists(os.path.join(B.SEG20, t + '.npz')) or (
+    os.path.exists(B._p('cache', 'rl20', t + '.npz')) and os.path.exists(B._p('cache', 'pos', t + '.npz')))
+  ts = {t: p for t, p in ts.items() if have(t)}
+  org = B.origin()
+  out = []
+  for _, tl in B.runs_of(list(ts)):
+    grids = []
+    for t in tl:
+      f = os.path.join(B.SEG20, t + '.npz')
+      if not os.path.exists(f):
+        f = B._p('cache', 'rl20', t + '.npz')
+      with np.load(f, allow_pickle=False) as z:
+        k = len(z['t'])
+      grids.append(B.seg_grid(t, k))
+    x = (np.concatenate([g[1] for g in grids]) - org['lon0']) * org['kx']
+    y = (np.concatenate([g[0] for g in grids]) - org['lat0']) * org['ky']
+    hdg = np.radians(90.0 - np.concatenate([g[3] for g in grids]))
+    ok = np.isfinite(x) & np.isfinite(y) & np.concatenate([g[2] for g in grids]).astype(bool) & np.isfinite(hdg)
+    out.append(dict(X=x, Y=y, hdg=hdg, ok=ok))
+  return out
+
+
+def fix_at(Pm, mem, r, i, raw=None):
+  """The planner's fix for sample i of run r: the governor's snapped memory point (default), or the raw position of the same sample
+  (`raw`: this run's raw_positions entry)."""
+  if raw is not None:
+    return Pm.Fix(True, float(raw['X'][i]), float(raw['Y'][i]), float(raw['hdg'][i])) if raw['ok'][i] else Pm.Fix(False)
+  pt = int(r['pt'][i])
+  return Pm.Fix(True, float(mem.x[pt]), float(mem.y[pt]), float(mem.hdg[pt])) if pt >= 0 else Pm.Fix(False)
+
+
 def steer_arrays(r):
   """The steering cache on the run's grid: rate (deg/s), ti_out, ti_state, lkas_eff, lkas_block; NaN (state -1) where absent."""
   n = len(r['v'])
@@ -287,8 +339,12 @@ def replay_drive(args):
   new = Pm is P
   sig = inspect.signature(Pm.Planner.step).parameters
   prov = opts.get('_prov', {})
-  res = dict(drive=drive, eng_s=0.0, eng_std_s=0.0, passes=[], slow=[], alerts=[], s3=[], s3_cov_s=0.0, signs=[])
-  for ri, r in enumerate(G.load_runs(drive)):
+  res = dict(drive=drive, eng_s=0.0, eng_std_s=0.0, passes=[], slow=[], alerts=[], s3=[], s3_cov_s=0.0, signs=[], events={})
+  runs = G.load_runs(drive)
+  raw = raw_positions(drive) if opts.get('raw_fixes') else None
+  if raw is not None:
+    assert len(raw) == len(runs), (drive, len(raw), len(runs))
+  for ri, r in enumerate(runs):
     v = np.asarray(r['v'], np.float64)
     n = len(v)
     kap = np.asarray(r['kap'], np.float64)
@@ -322,8 +378,7 @@ def replay_drive(args):
     mon_alert = False
     for i in range(n):
       if i % TICK == 0:
-        pt = int(r['pt'][i])
-        fix = Pm.Fix(True, float(mem.x[pt]), float(mem.y[pt]), float(mem.hdg[pt])) if pt >= 0 else Pm.Fix(False)
+        fix = fix_at(Pm, mem, r, i, None if raw is None else raw[ri])
         set_mph = float(r['cr_set'][i]) / MPH if r['cr_en'][i] > .5 and r['cr_set'][i] > .5 else None
         mk = None
         if pred is not None and pred_t is not None:
@@ -338,6 +393,8 @@ def replay_drive(args):
         # (whether and when the car side acts on a start: car_gate / act_window at scoring, R13)
         for e in planner.events:
           k = e.get('kind')
+          if k in ('rm_off', 'rm_on', 'lock', 'lock_lost', 'dead_reckon'):
+            res['events'][k] = res['events'].get(k, 0) + 1      # counts only (road matching's firing rate)
           if k in ('s1_release', 's1_confirm'):
             # the stage-1 bend's one decision (R13: a released bend is scored only up to its release; R16: the rest only after it)
             for x in reversed(res['slow']):
@@ -605,11 +662,12 @@ def main():
   ap.add_argument('--tap-s', type=float, default=None, help='the tap cycle the replay cruise model walks the dash with (R17; the planner is unchanged)')
   ap.add_argument('--min-passes', type=int, default=None, help='S1_MIN_PASSES (default: the planner value, 1)')
   ap.add_argument('--unconfirmed-cap', default=None, help='S1_UNCONFIRMED_MAX_MPH: a whole mph, or "none" for no cap (default: the planner value)')
+  ap.add_argument('--raw-fixes', action='store_true', help='feed the planner the RAW position fixes (road matching), not the snapped ones')
   ap.add_argument('--out', default='')
   a = ap.parse_args()
   drives = a.drives or G.drives()
   opts = dict(confirm_share=a.confirm_share, cap_scale=a.cap_scale, min_drop=a.min_drop, planner=a.planner or None, no_s3=a.no_s3,
-              tap_s=a.tap_s, min_passes=a.min_passes)
+              tap_s=a.tap_s, min_passes=a.min_passes, raw_fixes=a.raw_fixes)
   if a.unconfirmed_cap is not None:
     opts['unconfirmed_cap'] = None if a.unconfirmed_cap.lower() == 'none' else int(a.unconfirmed_cap)
   R = run(drives, a.mem, opts, a.workers)

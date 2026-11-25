@@ -87,8 +87,9 @@ CONFIRM_SHARE = 0.6
 # the cap to its end ("s1_unconfirmed"; the warning covers the rest). A bend started with no preview able to confirm it (none: the
 # model not running; or one shorter than CONFIRM_LEAD_S, which could never reach the entry at the decision) has nothing to wait for:
 # no cap, decided at CONFIRM_LEAD_S as before.
-# ONE switch (the owner is to be asked): None = no cap (stage 1 walks its full graded ramp from the start, as before R16).
-S1_UNCONFIRMED_MAX_MPH = 5
+# ONE switch: None = no cap (stage 1 walks its full graded ramp from the start, as before R16). OFF (owner, 2026-11-24: an arbitrary
+# cap is rejected; the wrong-road cases it was for are solved by road matching, RM_* below). The cap path is kept, tested with 5.
+S1_UNCONFIRMED_MAX_MPH = None
 
 
 def s1_unconfirmed_ceiling(u0_mph):
@@ -236,7 +237,31 @@ AMBIG_SHIFT_M = 50.0
 AMBIG_MAX = 3
 SWITCH_MARGIN_M = 3.0
 SWITCH_S = 1.0
-TRACK_WINDOW_M = 40.0           # while locked, a fix must land within this of the predicted along-road position
+# IS THE CAR ON the locked trace, or BESIDE it (owner, 2026-11-24: wrong-road cases, e.g. the highway beside a ramp, are solved by
+# matching on position and heading, not by caps). While locked, the car's signed cross-track offset from the trace (left +) and its
+# heading difference are low-passed (RM_TAU_S). Along one road that offset is a lane / position bias that stays CONSTANT; a car
+# leaving the trace's road shows it GROWING, or JUMPING at a link the car did not follow. Measured on raw position fixes on the
+# unambiguous traces at >= 50 mph (road-matching investigation 2026-11-24, out/noise_floor.txt, 111 drives, 152555 samples):
+#   per visit (>= 5 s on one trace) median |offset|: p95 5.5 m, p99 7.6 m, max 9.0 m
+#   offset change within a run: over 1 s p99 0.92 m; over 3 s p95 1.07 m, p99 2.36 m; over 10 s p95 2.59 m, p99 4.79 m
+#   heading difference, 1 s mean: p95 1.39 deg, p99 3.22 deg
+# A reference offset is (re-)seeded once the offset has been steady RM_STEADY_S; the car is BESIDE the trace while its offset departs
+# from the reference by more than RM_DIV_M, or the departure projected RM_LEAD_S ahead by the heading difference exceeds RM_PRED_M,
+# or a steady offset is beyond RM_ABS_M (more than about two lanes from the remembered line: another road). Beside: no NEW memory
+# slowdown starts on that trace; corners already in progress run on by dead reckoning, as for any trust loss; the lock keeps
+# tracking, and the reference carries across trace links. Back on (the offset steady RM_STEADY_S within the limits): trusted again.
+RM_ON = True
+RM_TAU_S = 1.0                  # low-pass of the offset and heading difference (1 s: the 1 s change p99 is 0.92 m)
+RM_SLOW_TAU_S = 3.0             # the slower "3 s average" the steadiness is judged against
+RM_DIV_M = 4.5                  # departure from the reference: the 10 s within-run change p99 is 4.79 m, the 3 s one 2.36 m
+RM_PRED_M = 5.5                 # ... projected RM_LEAD_S ahead (a ramp's growing offset is caught about a second earlier)
+RM_LEAD_S = 1.0
+RM_STEADY_S = 4.0               # steady this long: the offset is the car's lane on this road (re-seeds the reference)
+RM_STEADY_M = 1.0               # steady: within this of the 3 s average (the 3 s change p95 is 1.07 m) ...
+RM_STEADY_DEG = 1.5             # ... and the heading difference within this (its 1 s mean p95 is 1.39 deg)
+RM_ABS_M = 7.0                  # a steady offset beyond this is another road (per-visit median p95 5.5 m, p99 7.6 m; two lanes 7.4 m)
+RM_REF_TAU_S = 20.0             # while on and not yet steady the reference follows the offset this slowly
+TRACK_WINDOW_M = 40.0          # while locked, a fix must land within this of the predicted along-road position
 FIX_GAIN = 0.3                  # how far a fix pulls the dead-reckoned position
 STABLE_S = 3.0                  # a new match must stay consistent this long before it is trusted
 MISS_S = 2.0                    # fixes that do not agree for this long: lock lost
@@ -338,6 +363,8 @@ class Planner:
     self.cand = None                    # (trace, along metres, odometer) of the tentative match
     self.miss_s = 0.0
     self.alts, self.off_s = [], 0.0     # other remembered roads as near as the locked one; seconds one has been nearer
+    self.rm, self.rm_off, self.rm_why = None, False, ""   # road matching (RM_*): offset state; beside the trace; why (for the log)
+    self.rm_n = 0
     self.fix_age = 1e9
     self.odo = 0.0
     self.live_k = 0.0
@@ -402,6 +429,7 @@ class Planner:
     self.locked, self.cand, self.stable_s, self.miss_s = False, None, 0.0, 0.0
     self.trace = -1
     self.alts, self.off_s = [], 0.0
+    self.rm, self.rm_off, self.rm_why = None, False, ""
     self.cmp = []
     if not keep_active:
       self.active = {}
@@ -445,6 +473,8 @@ class Planner:
           self.miss_s = 0.0
           if best[1] == self.trace:
             self.pos += FIX_GAIN * best[3]
+          if RM_ON:
+            self._rm_update(dt, fix, v, best[1], int(round(best[2])))
           # the other remembered roads here (not this trace nor its continuation): as near sideways, or nearer
           alts, seen = [], set()
           for lat, tr, p in cands:
@@ -477,6 +507,9 @@ class Planner:
           if self.stable_s >= STABLE_S:
             self.locked, self.trace, self.pos = True, tr, p
             self.miss_s = 0.0
+            self.rm, self.rm_off, self.rm_why = None, False, ""
+            if RM_ON:
+              self._rm_update(0.0, fix, v, tr, int(round(p)))
             self.cmp = []
             self.cmp_next = self.odo
             self.events.append({"kind": "lock", "trace": tr, "point": int(p)})
@@ -487,6 +520,67 @@ class Planner:
         self.cand, self.stable_s = None, 0.0
       if self.locked and self.fix_age >= FIX_LOST_S:
         self._lose("no position fix")
+
+  def _rm_update(self, dt, fix, v, tr, i):
+    """Road matching (RM_*): the car's offset from the locked trace at its point i (trace tr) against the reference; sets self.rm_off
+    (beside the trace) and self.rm_why ("far": a steady offset beyond RM_ABS_M; "dev": departed by more than RM_DIV_M; "lead": the
+    departure projected RM_LEAD_S ahead beyond RM_PRED_M; "link": a jump beyond RM_DIV_M where the match moved to a linked trace)."""
+    mem = self.mem
+    # the matched trace's own point (the prototype rounded the fractional match, which at a trace's last point could land on the
+    # FIRST point of the next record and measure against that one's geometry)
+    i = min(max(int(i), int(mem.trace_start[tr])), int(mem.trace_end(tr)) - 1)
+    _, lat = mem.project(i, fix.x, fix.y)
+    dh = M.wrap(fix.hdg - mem.hdg[i])
+    st = self.rm
+    link = False
+    if st is None:
+      st = self.rm = dict(lat=lat, dh=dh, slow=lat, raw=lat, tr=tr, steady=0.0, ref=(lat if abs(lat) <= RM_ABS_M else None))
+    else:
+      # at a trace link the remembered line itself may step sideways (two records joined): the filter is on the OLD line's geometry,
+      # so a step beyond RM_DIV_M there is taken at once (the car cannot move that far sideways in one tick: 1 s change p99 0.92 m)
+      link = tr != st["tr"] and abs(lat - st["raw"]) > RM_DIV_M
+      if link:
+        st["lat"] = lat
+      else:
+        a = 1.0 if dt <= 0 else min(1.0, dt / RM_TAU_S)
+        st["lat"] += a * (lat - st["lat"])
+      a = 1.0 if dt <= 0 else min(1.0, dt / RM_TAU_S)
+      st["dh"] += a * M.wrap(dh - st["dh"])
+      a3 = 1.0 if dt <= 0 else min(1.0, dt / RM_SLOW_TAU_S)
+      st["slow"] += a3 * (st["lat"] - st["slow"])
+      st["raw"], st["tr"] = lat, tr
+    lat_f, dh_f = st["lat"], st["dh"]
+    steady = not link and abs(lat_f - st["slow"]) < RM_STEADY_M and abs(math.degrees(dh_f)) < RM_STEADY_DEG
+    st["steady"] = st["steady"] + dt if steady else 0.0
+    if st["steady"] >= RM_STEADY_S:
+      st["ref"] = lat_f if abs(lat_f) <= RM_ABS_M else None      # a steady offset is the car's lane on this road, unless too far
+    off, why = self.rm_off, self.rm_why
+    if st["ref"] is None:
+      off, why = True, (why if self.rm_off else "far")
+    else:
+      dev = lat_f - st["ref"]
+      # projected RM_LEAD_S ahead of NOW: the low-passed offset is itself about RM_TAU_S behind a steadily growing one, so the heading
+      # projects over both (the prototype projected RM_LEAD_S from the lagged value only: a 1 m per 25 m ramp at 75 mph took 4.4 s)
+      pred = dev + max(v, 0.0) * math.sin(dh_f) * (RM_TAU_S + RM_LEAD_S)
+      if abs(dev) > RM_DIV_M or abs(pred) > RM_PRED_M:
+        if not self.rm_off:
+          why = "link" if link else "dev" if abs(dev) > RM_DIV_M else "lead"
+        off = True
+      elif st["steady"] >= RM_STEADY_S:
+        off = False
+      elif not off:
+        st["ref"] += (0.0 if dt <= 0 else min(1.0, dt / RM_REF_TAU_S)) * dev
+    if off != self.rm_off:
+      self.rm_off, self.rm_why = off, (why if off else "")
+      if off:
+        self.rm_n += 1
+      # relative figures only (metres across, degrees): never a position
+      self.events.append({"kind": "rm_off" if off else "rm_on", "why": why if off else "", "trace": self.trace,
+                          "lat": round(lat_f, 1), "dh": round(math.degrees(dh_f), 1)})
+      if off and self.active:
+        self.dr_why = "beside the remembered road"
+        self.events.append({"kind": "dead_reckon", "why": self.dr_why, "n": len(self.active),
+                            "T": int(min(a_["T"] for a_ in self.active.values()))})
 
   def _either_road(self, need, dist, look, mph):
     """While the car may as well be on another remembered road (self.alts), a point's allowed speed is at least the lowest the other
@@ -644,6 +738,8 @@ class Planner:
       untrusted = (conf, known, "matching the remembered road" if self.cand is not None else "road not known here")
     elif conf < MIN_TRUST_CONF:
       untrusted = (conf, True, "position uncertain")
+    elif RM_ON and self.rm_off:
+      untrusted = (conf, True, "beside the remembered road")     # the lock tracks on; nothing new starts on this trace
     if untrusted is not None:
       # a corner latched while the road was trusted is still warned for, by the odometer, until it is passed: a GPS gap or a matcher
       # miss never drops (or delays) a warning (fourth review, MUST 1). Nothing more is tapped down without trust: predicted so.
@@ -1233,6 +1329,8 @@ class Planner:
     diag = {"stage": stage, "ceil": ceil, "kind": kind, "need": need if isinstance(need, (int, np.integer)) else None,
             "cap": cap, "ahead": ahead, "behind": behind, "alert": alert, "src": src,
             "rel": len(getattr(self, "released", {}) or {})}
+    if getattr(self, "rm_off", False):
+      diag["rm"] = self.rm_why                    # beside the remembered road: why ("far" / "dev" / "lead" / "link")
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
                 self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
                 point, stage, src, ahead, cap, bool(getattr(self, "released", None)), diag, getattr(self, "ask", None))

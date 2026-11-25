@@ -295,6 +295,8 @@ def tick_log(plan, extras):
   d.update(st=plan.stage, src=plan.src, ceil=plan.ceil, kind=plan.kind, need=plan.need_mph, cap=_r(plan.cap, 2),
            ahead=_r(plan.ahead_la, 2), alert=plan.alert_mph, beh=int(bool(plan.behind)),
            rel=(plan.diag or {}).get("rel", int(bool(plan.released))))
+  if (plan.diag or {}).get("rm"):
+    d["rm"] = plan.diag["rm"]       # beside the remembered road (road matching): why, "far" / "dev" / "lead" / "link"
   for k, nd in (("v", 1), ("gap", 1), ("a", 2), ("dec", 2), ("lay", 2), ("lacc", 2), ("des", 2), ("rate", 1)):
     if k in d:
       d[k] = _r(d[k], nd)
