@@ -321,3 +321,42 @@ def test_tick_log_decodes_the_interceptor_and_accelerometer():
   la = D.lat_accel_from_can([frame(0x75, [0, 0, (raw >> 8) & 0x0F, raw & 0xFF, 0, 0, 0, 0])])
   assert abs(la - (188 + 14.31) / 93.857) < 1e-9
   assert D.lat_accel_from_can([frame(0x76, [0] * 8)]) is None
+
+
+# ---- 2026-11-25: a different driving model (heavier on the CPU): a stale preview is no preview -----------------------------------
+def _model(drop=0.0):
+  t = [0.0, 1.0, 2.0, 4.0]
+  return NS(orientationRate=NS(z=[0.0, 0.01, 0.02, 0.02], t=t), velocity=NS(x=[20.0] * 4), frameDropPerc=drop)
+
+
+def test_fresh_model_is_passed_through():
+  mk, why = D.fresh_model(_model(), int(100.0 * 1e9), 100.1)
+  assert mk is not None and why == ""
+
+
+def test_old_model_is_no_preview():
+  mk, why = D.fresh_model(_model(), int(100.0 * 1e9), 100.0 + D.MODEL_MAX_AGE_S + 0.05)
+  assert mk is None and why == "old"
+  assert D.fresh_model(_model(), int(100.0 * 1e9), 100.0 + D.MODEL_MAX_AGE_S - 0.05)[0] is not None
+
+
+def test_dropping_model_is_no_preview():
+  mk, why = D.fresh_model(_model(drop=D.MODEL_MAX_DROP_PERC + 1.0), int(100.0 * 1e9), 100.05)
+  assert mk is None and why == "drops"
+  assert D.fresh_model(_model(drop=D.MODEL_MAX_DROP_PERC), int(100.0 * 1e9), 100.05)[0] is not None
+  assert D.fresh_model(None, 0, 100.0) == (None, "none")
+
+
+def test_tick_log_carries_model_name_step_time_and_stale_reason():
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+  plan = P.Plan(None, 1.0, True, True, "", None, None, False, None, False)
+  d = D.tick_log(plan, dict(seq=1, fcx="old", mdl="dark-souls", step_us=812))
+  assert d["fcx"] == "old" and d["mdl"] == "dark-souls" and d["step_us"] == 812
+
+
+def test_model_name_read_from_the_param():
+  class Pm:
+    def get(self, k, encoding=None):
+      return "dark-souls" if k == "Model" else None
+  assert D.model_name(Pm()) == "dark-souls"
+  assert D.model_name(object()) == ""

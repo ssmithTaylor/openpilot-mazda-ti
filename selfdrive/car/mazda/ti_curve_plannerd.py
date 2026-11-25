@@ -48,6 +48,35 @@ def model_curvature(m):
     return None
 
 
+MODEL_MAX_AGE_S = 0.3          # a driving-model preview older than this (its log time against this tick) is no preview (2026-11-25:
+MODEL_MAX_DROP_PERC = 20.0      # a different, heavier driving model on the CPU); nor one whose frameDropPerc is above this
+
+
+def fresh_model(m, log_mono_ns, now_s):
+  """The model preview for the planner, or None when it is stale: -> (model_curvature(m) or None, why: "" / "old" / "drops" /
+  "none"). Stale counts as no preview everywhere (stage 2 does not act; stage 1's confirmation and release read nothing: the
+  remembered bend is kept)."""
+  if m is None or not log_mono_ns:
+    return None, "none"
+  if now_s - float(log_mono_ns) * 1e-9 > MODEL_MAX_AGE_S:
+    return None, "old"
+  try:
+    if float(m.frameDropPerc) > MODEL_MAX_DROP_PERC:
+      return None, "drops"
+  except Exception:
+    pass
+  mk = model_curvature(m)
+  return mk, "" if mk is not None else "none"
+
+
+def model_name(params):
+  """The driving model's name as the Model param holds it (read once at start), or ""."""
+  try:
+    return (params.get("Model", encoding="utf-8") or "")[:24]
+  except Exception:
+    return ""
+
+
 MAP_PARAM = "MapCurvatures"     # written by the map service (pfeiferj mapd v1.12.0, ~1 Hz) to /dev/shm/params: a JSON list of
 MAP_FILE = "/dev/shm/params/d/" + MAP_PARAM   # {"latitude", "longitude", "curvature" (1/m, unsigned, 3-node average)} for the nodes of the
 MAP_STALE_S = 3.0               # current way from its first node in the direction of travel, then the ways it predicts next
@@ -179,7 +208,8 @@ TI_FEEDBACK_ADDR, TI_FEEDBACK_BUS = 0x24A, 1
 CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
-             "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms")
+             "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
+             "fcx", "mdl", "step_us")
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
 
 
@@ -375,6 +405,8 @@ def main():
   cloudlog.event("ti_curve_plan", kind="memory", loaded=mem is not None, why=why_none, seconds=round(time.monotonic() - t0, 2),
                  traces=getattr(mem, "n_traces", 0), points=getattr(mem, "n", 0))
   planner = P.Planner(mem)
+  mdl = model_name(Params())          # the driving model (logs are split by it); read once
+  cloudlog.event("ti_curve_plan", kind="model", mdl=mdl)
   sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can", "carOutput"])
   rk = Ratekeeper(RATE_HZ, print_delay_threshold=None)
   seq = 0
@@ -428,9 +460,12 @@ def main():
       if ok:
         map_k = map_input(params_memory, ok, llk.positionGeodetic.value[0], llk.positionGeodetic.value[1],
                           math.degrees(llk.calibratedOrientationNED.value[2]))     # plan T6: stage 1 where no memory is known
-      plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=model_curvature(sm["modelV2"]), limit_mph=limit,
+      mk_, fcx = fresh_model(sm["modelV2"] if sm.alive["modelV2"] else None, sm.logMonoTime["modelV2"], t)
+      s0 = time.perf_counter()
+      plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=mk_, limit_mph=limit,
                           ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k,
                           blinker=bool(cs.leftBlinker or cs.rightBlinker))     # stage 2 is off with a blinker (plan T5)
+      step_us = int(round(1e6 * (time.perf_counter() - s0)))
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")
       params_memory.put(tc.PARAM_PLAN, json.dumps(d))
@@ -469,7 +504,7 @@ def main():
                     ti=list(ti_fb) if ti_fb is not None and t - ti_t < 0.5 else None, ln=lane_summary(sm["modelV2"]),
                     drv=(DRV_PRESSED * bool(cs.steeringPressed) | DRV_BRAKE * bool(cs.brakePressed) | DRV_GAS * bool(cs.gasPressed) |
                          DRV_BUTTON * bool(len(cs.buttonEvents)) | DRV_LBLINK * bool(cs.leftBlinker) | DRV_RBLINK * bool(cs.rightBlinker)),
-                    tq=int(round(float(cs.steeringTorque))), cpu=cpu_us,
+                    tq=int(round(float(cs.steeringTorque))), cpu=cpu_us, fcx=fcx or None, mdl=mdl, step_us=step_us,
                     # review (minor): the CAN frame lacc / ti were last read from may be up to 0.5 s old (only the latest can message
                     # of each update is read): their age in ms, so a tick never reports a stale value as current
                     lacc_ms=int(round((t - lacc_t) * 1000)) if t - lacc_t < 0.5 else None,
