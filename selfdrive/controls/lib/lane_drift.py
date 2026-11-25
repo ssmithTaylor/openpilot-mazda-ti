@@ -54,6 +54,20 @@ LATCH_S = 1.5                # s: gate stays open this long after its last open 
 LATCH_RELEASE_S = 0.3        # s: ... and is released once the steering has been clear of its limit this long
 REINDEX_JUMP_FRAC = 0.6      # a lane line moving more than this fraction of the lane width between ticks is a re-index, not a car movement
 
+# Predictive opening (2026-11-24, lanegate round 3). Position alone (within 0.30 m) cannot beat a fast drift with the 0.7 s Take Control
+# hold: on the night drive's two hard-bend crossings the alert came 0.4-0.5 s AFTER the car's side was over the line. So in a turn at the
+# steering limit the gate also opens when the car's side will reach the outside line within PREDICT_HORIZON_S at its present closing rate.
+# Closing rate = least-squares slope of the outside clearance over the last RATE_WINDOW_S of model frames (NOT a tick difference).
+# Line-position noise measured on the night drive (lines seen, at the limit): sd 0.04-0.05 m per frame (frame-to-frame difference sd
+# 0.069 m), so a frame difference at 20 Hz would be +-1.4 m/s; a 0.6 s (13 frame) slope has sd 0.05*sqrt(12/(13*168))/0.05 s = 0.07 m/s,
+# and PREDICT_MIN_RATE of 0.30 m/s is over 4 sd of it: noise alone cannot open the gate. Steady clearance (rate 0) and slow drifts below
+# 0.30 m/s never predict; they reach the positional rule as before. Horizon = the 0.7 s hold + 0.8 s allowance for the driver (the logged
+# drivers braked 0.4-0.5 s after the alert came).
+RATE_WINDOW_S = 0.6
+RATE_MIN_FRAMES = 8
+PREDICT_MIN_RATE = 0.30      # m/s
+PREDICT_HORIZON_S = 2.5      # s: 0.7 hold + 0.5 s lead wanted + ~1.3 s for the slope estimate lagging the true rate (replayed: 1.5 s gave no lead, 2.0 s ~0, 2.5 s 0.55-0.65 s)
+
 
 def lane_drift_evidence(model, curvature=None, lane_width=None):
   return _evidence(model, curvature, lane_width)[0]
@@ -93,6 +107,28 @@ def _evidence(model, curvature, lane_width):
   return min(seen) < DRIFT_CLEARANCE, True
 
 
+def outside_clearance(model, curvature, lane_width=None):
+  """The car's side clearance to the outside line in a turn (None on a straight or with no reference): the outside line when seen,
+  else the outside edge, else what the inside line implies (lane width - car width - inside clearance)."""
+  try:
+    k = float(curvature)
+  except (TypeError, ValueError):
+    return None
+  if not (math.isfinite(k) and abs(k) >= STRAIGHT_CURVATURE):
+    return None
+  left, right = side_clearances(model)
+  e_left, e_right = edge_clearances(model)
+  out_line, out_edge = (left, e_left) if k > 0 else (right, e_right)
+  inside = right if k > 0 else left
+  if out_line is not None:
+    return out_line
+  if out_edge is not None:
+    return out_edge
+  if inside is not None:
+    return (lane_width or DEFAULT_LANE_WIDTH) - 2 * CAR_HALF_WIDTH - inside
+  return None
+
+
 def lane_width_seen(model):
   """The lane width in metres when both adjacent lines are seen with confidence and the width is plausible, else None."""
   try:
@@ -127,9 +163,32 @@ class LaneDriftGate:
     self.latch_left = 0.0
     self.clear_s = 0.0
     self.prev_ys = None
+    self.t = 0.0
+    self.samples = []            # (time, outside clearance) per model frame, newest last
 
   def reset(self):
     self.latch_left, self.clear_s, self.prev_ys = 0.0, 0.0, None
+    self.samples = []
+
+  def closing_rate(self, model, curvature, reindex):
+    """Low-passed closing rate (m/s, positive = approaching the outside line) or None: a least-squares slope over RATE_WINDOW_S of
+    model frames. A re-index (line jump) restarts the series."""
+    if reindex:
+      self.samples = []
+    c = outside_clearance(model, curvature, self.width)
+    if c is None:
+      self.samples = []
+      return None
+    if not self.samples or c != self.samples[-1][1]:       # one sample per new model frame
+      self.samples.append((self.t, c))
+    self.samples = [(t, v) for t, v in self.samples if self.t - t <= RATE_WINDOW_S + 1e-9]
+    if len(self.samples) < RATE_MIN_FRAMES:
+      return None
+    n = len(self.samples)
+    mt = sum(t for t, _ in self.samples) / n
+    mv = sum(v for _, v in self.samples) / n
+    den = sum((t - mt) ** 2 for t, _ in self.samples)
+    return -sum((t - mt) * (v - mv) for t, v in self.samples) / den if den > 0 else None
 
   def update(self, model, curvature, at_limit, lane_change=False):
     w = lane_width_seen(model)
@@ -147,7 +206,13 @@ class LaneDriftGate:
     if ys is not None and self.prev_ys is not None:
       reindex = any(abs(a - b) > REINDEX_JUMP_FRAC * (self.width or DEFAULT_LANE_WIDTH) for a, b in zip(ys, self.prev_ys))
     self.prev_ys = ys
+    self.t += self.dt
     now, referenced = _evidence(model, curvature, self.width)
+    rate = self.closing_rate(model, curvature, reindex)
+    if at_limit and not now and rate is not None and rate >= PREDICT_MIN_RATE:
+      c = self.samples[-1][1]
+      if c - rate * PREDICT_HORIZON_S <= 0.0:      # the car's side reaches the line within the horizon
+        now = referenced = True
     if not at_limit:
       self.clear_s += self.dt
       if self.clear_s >= LATCH_RELEASE_S:

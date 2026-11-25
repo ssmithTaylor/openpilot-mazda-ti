@@ -220,3 +220,86 @@ def test_unseen_outside_line_is_not_evidence_and_failing_open_does_not_arm_the_l
   assert gate.update(hug, RIGHT_TURN, True) is False           # no latch from the fail-open tick
   # the inside line far (car wide) with the outside unseen: open (lane width default)
   assert lane_drift_evidence(tick_model((0, -3.0, 2.3, .1, .9)), RIGHT_TURN) is True
+
+
+# ---- round 3: predictive opening. Logged model frames (L1y, L2y, pL1, pL2) every 0.05 s, right turn (outside = LEFT) on both passes ----
+PASS_1_T0 = 744.04
+PASS_1 = [
+  (-1.76, 1.28, 0.78, 0.86), (-1.75, 1.23, 0.79, 0.85), (-1.79, 1.21, 0.81, 0.87), (-1.88, 1.21, 0.8, 0.87),
+  (-1.87, 1.17, 0.81, 0.88), (-1.87, 1.18, 0.8, 0.88), (-1.88, 1.19, 0.8, 0.88), (-1.88, 1.18, 0.82, 0.89),
+  (-1.92, 1.22, 0.81, 0.89), (-1.87, 1.2, 0.8, 0.88), (-1.83, 1.21, 0.85, 0.92), (-1.82, 1.2, 0.84, 0.92),
+  (-1.81, 1.25, 0.83, 0.9), (-1.8, 1.34, 0.83, 0.89), (-1.78, 1.36, 0.82, 0.89), (-1.78, 1.39, 0.84, 0.91),
+  (-1.75, 1.37, 0.83, 0.89), (-1.74, 1.38, 0.84, 0.9), (-1.72, 1.4, 0.85, 0.92), (-1.68, 1.42, 0.83, 0.9),
+  (-1.69, 1.43, 0.85, 0.91), (-1.66, 1.43, 0.85, 0.92), (-1.68, 1.47, 0.86, 0.92), (-1.68, 1.51, 0.86, 0.92),
+  (-1.64, 1.53, 0.83, 0.91), (-1.65, 1.56, 0.82, 0.91), (-1.64, 1.58, 0.84, 0.92), (-1.63, 1.61, 0.85, 0.92),
+  (-1.64, 1.63, 0.87, 0.92), (-1.6, 1.61, 0.87, 0.93), (-1.6, 1.66, 0.88, 0.93), (-1.56, 1.66, 0.89, 0.94),
+  (-1.51, 1.67, 0.91, 0.95), (-1.53, 1.67, 0.89, 0.94), (-1.48, 1.76, 0.9, 0.95), (-1.41, 1.81, 0.86, 0.93),
+  (-1.42, 1.81, 0.86, 0.93), (-1.37, 1.83, 0.81, 0.91), (-1.34, 1.88, 0.76, 0.92), (-1.33, 1.94, 0.76, 0.93),
+  (-1.27, 1.93, 0.79, 0.94), (-1.29, 1.92, 0.76, 0.94), (-1.26, 1.93, 0.78, 0.94), (-1.21, 1.94, 0.79, 0.95),
+  (-1.1, 1.97, 0.85, 0.96), (-1.02, 2.05, 0.85, 0.96), (-0.92, 2.2, 0.88, 0.95), (-0.9, 2.21, 0.89, 0.97),
+  (-0.87, 2.29, 0.89, 0.97), (-0.85, 2.29, 0.9, 0.97), (-0.8, 2.33, 0.88, 0.96), (-0.81, 2.3, 0.9, 0.97),
+  (-0.78, 2.29, 0.91, 0.96), (-0.69, 2.43, 0.92, 0.96), (-0.63, 2.51, 0.91, 0.95), (-0.65, 2.5, 0.88, 0.9),
+  (-0.57, 2.62, 0.9, 0.93), (-0.57, 2.56, 0.9, 0.94), (-0.5, 2.66, 0.92, 0.95), (-0.52, 2.7, 0.91, 0.95),
+]
+PASS_2_T0 = 1156.85
+PASS_2 = [
+  (-2.03, 1.29, 0.79, 0.07), (-2.03, 1.31, 0.77, 0.04), (-2.06, 1.26, 0.78, 0.05), (-1.99, 1.34, 0.8, 0.03),
+  (-1.94, 1.33, 0.8, 0.02), (-1.94, 1.3, 0.8, 0.05), (-1.91, 1.3, 0.8, 0.05), (-1.83, 1.36, 0.8, 0.03),
+  (-1.82, 1.36, 0.82, 0.05), (-1.77, 1.37, 0.84, 0.04), (-1.79, 1.37, 0.86, 0.07), (-1.81, 1.38, 0.89, 0.1),
+  (-1.83, 1.44, 0.9, 0.17), (-1.8, 1.46, 0.91, 0.18), (-1.77, 1.55, 0.87, 0.09), (-1.73, 1.61, 0.89, 0.16),
+  (-1.7, 1.63, 0.9, 0.16), (-1.67, 1.67, 0.91, 0.12), (-1.63, 1.7, 0.9, 0.09), (-1.59, 1.72, 0.88, 0.12),
+  (-1.54, 1.79, 0.85, 0.08), (-1.49, 1.81, 0.89, 0.14), (-1.42, 1.96, 0.88, 0.05), (-1.41, 1.88, 0.88, 0.07),
+  (-1.38, 1.92, 0.87, 0.12), (-1.38, 1.91, 0.88, 0.15), (-1.36, 1.93, 0.89, 0.41), (-1.35, 1.93, 0.91, 0.45),
+  (-1.27, 2.02, 0.9, 0.47), (-1.21, 2.02, 0.85, 0.52), (-1.13, 2.05, 0.85, 0.56), (-1.1, 2.04, 0.82, 0.51),
+  (-1.1, 2.19, 0.8, 0.47), (-1.28, 1.86, 0.77, 0.6), (-0.95, 2.28, 0.82, 0.61), (-1.05, 2.11, 0.8, 0.66),
+  (-0.88, 2.33, 0.84, 0.83), (-0.9, 2.29, 0.84, 0.86), (-0.93, 2.23, 0.8, 0.83), (-0.82, 2.3, 0.83, 0.87),
+  (-0.75, 2.43, 0.88, 0.88), (-0.72, 2.48, 0.86, 0.87), (-0.77, 2.37, 0.83, 0.84), (-0.99, 2.1, 0.8, 0.83),
+  (-1.4, 1.78, 0.64, 0.7), (-1.92, 0.95, 0.57, 0.67),
+]
+
+
+def frame_model(l1, l2, p1=0.9, p2=0.9):
+  return tick_model((0, l1, l2, p1, p2))
+
+
+def run_frames(frames, t0, k=RIGHT_TURN, mirror=False):
+  """Feed 20 Hz model frames (held for 5 control ticks of 10 ms) into a gate at the limit; returns (first open time, Take Control time)."""
+  gate, timer, first, fired = LaneDriftGate(0.01), HoldTimer(TAKE_CONTROL_HOLD_S, 0.01), None, None
+  for n, (l1, l2, p1, p2) in enumerate(frames):
+    m = tick_model((0, l1, l2, p1, p2), mirror)
+    for i in range(5):
+      t = t0 + n * 0.05 + i * 0.01
+      g = gate.update(m, k, True)
+      first = t if (g and first is None) else first
+      if timer.step(g) and fired is None:
+        fired = t
+  return first, fired
+
+
+def test_predictive_gate_gives_take_control_before_the_car_is_over_the_line_on_both_passes():
+  # car's side over the outside (left) line: clearance -L1y - 0.92 <= 0. Logged: 746.3 and 1158.55; the previous gate fired 0.4-0.5 s after
+  for frames, t0, cross in ((PASS_1, PASS_1_T0, 746.3), (PASS_2, PASS_2_T0, 1158.55)):
+    for mirror, k in ((False, RIGHT_TURN), (True, LEFT_TURN)):
+      first, fired = run_frames(frames, t0, k, mirror)
+      assert fired is not None and fired <= cross - 0.5, (fired, cross)
+
+
+def test_steady_half_metre_clearance_at_the_limit_never_opens():
+  for mirror, k in ((False, RIGHT_TURN), (True, LEFT_TURN)):
+    frames = [(-1.42 + 0.03 * ((i * 7) % 3 - 1), 1.9, 0.9, 0.9) for i in range(200)]       # 0.5 m clearance +-0.03 m frame noise, 10 s
+    assert run_frames(frames, 0.0, k, mirror)[0] is None
+
+
+def test_slow_drift_does_not_open_before_the_positional_rule():
+  # 0.1 m/s closing from 1.0 m clearance: opens only when the clearance is under 0.30 m (t = 7 s)
+  for mirror, k in ((False, RIGHT_TURN), (True, LEFT_TURN)):
+    frames = [(-(1.92 - 0.1 * 0.05 * i), 1.9, 0.9, 0.9) for i in range(200)]
+    first, _ = run_frames(frames, 0.0, k, mirror)
+    assert first is not None and first >= 7.0 - 0.1
+
+
+def test_frame_noise_alone_does_not_predict():
+  import random
+  rnd = random.Random(5)
+  frames = [(-1.72 + rnd.gauss(0, 0.05), 1.9, 0.9, 0.9) for _ in range(600)]      # 0.8 m clearance, sd 0.05 m noise, 30 s
+  assert run_frames(frames, 0.0)[0] is None
