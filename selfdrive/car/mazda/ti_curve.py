@@ -46,6 +46,8 @@ car does not surge into the corner when the lead leaves).
 
 Pure: no clock, no params; the car controller does the I/O (carcontroller.py `curve_step`). Events go to the `ti_curve` log channel.
 """
+# RUNTIME: runs in card at 100 Hz (gc disabled) and ti_curve_plannerd at 5 Hz (gc frozen) (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound; never a position in a log or param.
 import math
 from typing import NamedTuple, Optional
 

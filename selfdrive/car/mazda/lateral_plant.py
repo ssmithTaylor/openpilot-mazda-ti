@@ -34,6 +34,8 @@ actuator state.
 Sign convention here: `u` (counts) and `la` (m/s^2) are both positive = left, matching the wire.
 The controller works in its own frame and handles signs at the call site.
 """
+# RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import numpy as np
 
 from openpilot.selfdrive.controls.lib.scalar_np import Interp, clip as _clip, sign as _sign

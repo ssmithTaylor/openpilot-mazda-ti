@@ -15,6 +15,8 @@ road changed, corner start with the planned and actual speed and the grade, mode
 (plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed).
 Never a position: trace and point indices, distances, speeds and curvatures only.
 """
+# RUNTIME: runs in ti_curve_plannerd at 5 Hz; gc frozen after load, collector on (see docs/RUNTIME_CONSTRAINTS.md).
+# Per tick: caches keyed by finite domains only; never a position in a log or param; tick budget 20 ms p99.
 import gc
 import json
 import math

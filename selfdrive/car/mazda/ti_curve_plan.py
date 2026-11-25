@@ -29,6 +29,8 @@ Output (`Plan`): ceiling in whole mph (None: no ceiling), confidence, trusted, k
 model's own preview (largest predicted lateral acceleration in the next MODEL_LOOK_S), which the car side needs before it restores.
 No position ever leaves this module: logs carry trace / point indices, distances and curvatures only.
 """
+# RUNTIME: runs in ti_curve_plannerd at 5 Hz; gc frozen after load, collector on (see docs/RUNTIME_CONSTRAINTS.md).
+# Per tick: caches keyed by finite domains only; never a position in a log or param; tick budget 20 ms p99.
 import hashlib
 import math
 import os

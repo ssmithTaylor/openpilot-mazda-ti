@@ -20,6 +20,8 @@ GENTLY (ti_curve: at most one tap per GENTLE_TAP_S, about 1 mph/s; A2).
 
 Signs: every lateral figure here is LEFT positive (m/s^2), the steering angle rate too (deg/s, openpilot's steeringRateDeg).
 """
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 import math
 from typing import NamedTuple, Optional
 

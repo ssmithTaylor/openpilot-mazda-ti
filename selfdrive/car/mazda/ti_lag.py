@@ -19,6 +19,8 @@ the guard cannot cycle pause / resume / pause. A gap longer than GAP_S (the proc
 `LagGuard.tick(t, ctl=None)` once per car-controller cycle: `t` monotonic seconds; `ctl` the latest (log time in seconds, cumLagMs) of
 controlsState, or None. Returns whether the tests are held. Constant cost per cycle.
 """
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 from collections import deque
 
 HOLD_MS = 10.3

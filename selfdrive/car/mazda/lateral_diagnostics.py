@@ -1,4 +1,6 @@
 """Rlog input identities for the Mazda plant controller; no control decisions."""
+# RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 
 INPUT_SERVICES = ('carState', 'frogpilotCarState', 'modelV2', 'liveParameters', 'liveTorqueParameters', 'liveDelay', 'carOutput', 'liveLocationKalman')
 

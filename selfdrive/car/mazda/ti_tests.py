@@ -29,6 +29,8 @@ deletion cannot bring the entry back, the UI also leaves {"_reset": {<test id>: 
 publish drops that entry again, removes the marker, flushes flash at once and echoes the token in
 _live.reset_done; the UI repeats the request until it sees the echo (no second key).
 """
+# RUNTIME: runs in controlsd and card at 100 Hz; gc disabled in both (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import json
 import math
 import re

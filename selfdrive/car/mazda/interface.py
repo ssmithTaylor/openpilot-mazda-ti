@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 from math import exp, fabs
 import numpy as np
 

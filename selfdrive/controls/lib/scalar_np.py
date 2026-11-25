@@ -12,6 +12,8 @@ selfdrive/controls/lib/tests/test_scalar_np.py and the evidence script it names)
                     when that is NaN.
 Values only: clip and sign return a Python number (the callers wrap them in float() or int()); Interp returns a Python float.
 """
+# RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 
 
 def clip(x, lo, hi):

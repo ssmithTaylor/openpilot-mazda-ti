@@ -44,6 +44,8 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
   trace_next   int32 [n_traces]: the trace that continues this one past its last point (-1: none or ambiguous)
 """
+# RUNTIME: runs in ti_curve_plannerd at 5 Hz; gc frozen after load, collector on (see docs/RUNTIME_CONSTRAINTS.md).
+# Per tick: caches keyed by finite domains only; never a position in a log or param; tick budget 20 ms p99.
 import json
 import math
 

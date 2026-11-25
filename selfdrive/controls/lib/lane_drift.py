@@ -5,6 +5,8 @@ On this car the steering command sitting at its limit is normal on bends it hold
 Lane-line y values from the model are measured from the car's CENTRE (y positive to the right); the car's side is
 CAR_HALF_WIDTH nearer the line than the centre is.
 """
+# RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import math
 
 CAR_HALF_WIDTH = 0.92        # m

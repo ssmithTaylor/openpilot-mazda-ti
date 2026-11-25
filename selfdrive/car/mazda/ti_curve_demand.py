@@ -11,6 +11,8 @@ A bend's speed (`need_mph`) is the highest whole mph at which its demand stays w
 
 The driving model's preview under-reads the bend the further ahead it looks: FC_RATIO (raw / actual, measured per lead) calibrates it.
 """
+# RUNTIME: runs in card at 100 Hz (gc disabled) and ti_curve_plannerd at 5 Hz (gc frozen) (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound; never a position in a log or param.
 import math
 
 import numpy as np

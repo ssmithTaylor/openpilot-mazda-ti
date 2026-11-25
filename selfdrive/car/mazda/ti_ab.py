@@ -45,6 +45,8 @@ switch (every change of value: from, to, ramp frames, wash-in frames), pin, unpi
 alone (exactly; test_mazda_ti_ab.py checks it against the live module), and `verify_schedule` recomputes every block's arm
 from the seed.
 """
+# RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import hashlib
 import json
 import math

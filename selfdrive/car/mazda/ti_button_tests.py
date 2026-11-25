@@ -59,6 +59,8 @@ Never CANCEL or RESUME; every frame goes through mazdacan.create_button_cmd from
 cruise check's taps). Pure (no clock, no params): the car controller does the I/O (`button_tests_step`), the tests drive it frame by
 frame (selfdrive/car/tests/test_mazda_ti_button_tests.py). Every step is logged (`events`, channel `ti_button`).
 """
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 from typing import NamedTuple, Optional
 
 from openpilot.selfdrive.car.mazda.ti_cruise_taps import (DT, MIN_TAP_GAP_S, TAP_CYCLE_SLOW_S, HoldGuard, PressGuard, Tap,

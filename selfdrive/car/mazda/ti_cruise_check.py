@@ -42,6 +42,8 @@ Everything here is a pure function of the inputs and the frame number (no clock,
 Every step is logged (`events`) in the `ti_cruise` log channel: frames sent with their counters, set speed before and after, timings,
 abort reason, result.
 """
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 from typing import NamedTuple, Optional
 
 # The tap machinery and its caps live in ti_cruise_taps.py (shared with curve slowing), unchanged; re-exported here by name.

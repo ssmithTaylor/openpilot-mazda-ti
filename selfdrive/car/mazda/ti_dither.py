@@ -35,6 +35,8 @@ Reconstruction from logs (no new log fields).
                      opposite sign, but its magnitude never exceeds the preset's peak (22 counts for preset 1).
 The unit waveform is `waveform(frame)` with frame = carOutput.applySequence - 1 (the car controller's frame counter).
 """
+# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 import math
 
 DT = 0.01

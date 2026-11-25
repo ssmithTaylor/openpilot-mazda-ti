@@ -17,6 +17,8 @@ Hand-over (the scheduler runs in controlsd, the tests in the car controller; the
 A plan that is stale (not refreshed for STALE_S), unreadable, in error ("dead") or missing allows no test at all.
 Plan events (kind "plan") go in the `ti_ab` log channel: `mode` (off, hold, ab, tests), `why`, `seq`.
 """
+# RUNTIME: runs in controlsd and card at 100 Hz; gc disabled in both (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import json
 import os
 from typing import NamedTuple

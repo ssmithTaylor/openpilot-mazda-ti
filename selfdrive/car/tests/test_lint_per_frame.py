@@ -54,3 +54,34 @@ def test_a_waiver_on_the_line_or_the_line_above_counts():
   hits = L.lint_source(src)
   assert hits and all(h["waived"] for h in hits)
   assert L.lint_source("SEEN = []\ndef f(x):\n  SEEN.append(x)  # per-frame-ok:\n")[0]["waived"] is False   # a reason is required
+
+
+# ---- the inventory: every per-frame module carries the RUNTIME header, every new per-frame import is classified -----------------------
+def test_every_per_frame_module_has_the_runtime_header():
+  assert not L.check_headers(), [h["path"] for h in L.check_headers()]
+
+
+def test_header_must_sit_under_the_docstring():
+  assert L.header_ok('"""Doc."""\n# RUNTIME: runs in card at 100 Hz; gc disabled.\nimport math\n')
+  assert L.header_ok("#!/usr/bin/env python3\n# RUNTIME: runs in card at 100 Hz\nimport math\n")
+  assert not L.header_ok('"""Doc."""\nimport math\n\n\n\n\n# RUNTIME: runs in card\n')
+
+
+def test_every_module_a_per_frame_entry_point_imports_is_classified():
+  assert not L.check_classified(), [h["path"] for h in L.check_classified()]
+
+
+def test_a_new_unclassified_ti_module_imported_by_a_per_frame_module_fails(tmp_path):
+  for rel in L.ENTRY_FILES + L.PER_FRAME_MODULES:
+    (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / rel).write_text('"""x"""\n')
+  (tmp_path / "selfdrive/car/mazda/carcontroller.py").write_text("from openpilot.selfdrive.car.mazda import ti_new_feature\n")
+  (tmp_path / "selfdrive/car/mazda/ti_new_feature.py").write_text("X = 1\n")
+  hits = L.check_classified(tmp_path)
+  assert [h["path"] for h in hits] == ["selfdrive/car/mazda/ti_new_feature.py"]
+
+
+def test_the_inventory_page_lists_every_per_frame_module():
+  page = (_P.parent / "PER_FRAME_INVENTORY.md").read_text(encoding="utf-8")
+  missing = [m for m in L.PER_FRAME_MODULES if m.split("/")[-1] not in page]
+  assert not missing, missing

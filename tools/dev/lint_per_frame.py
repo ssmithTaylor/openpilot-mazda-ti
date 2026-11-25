@@ -10,45 +10,28 @@ Flags, inside any function (not at module or class level):
   PF4  a module-level dict / list / set written inside a function with no visible bound in that function (len(), clear(), pop,
        del, or a slice trim);
   PF5  `+=` on a `self.` attribute that is a str / list / bytes (initialised so in the class, or a str / list / bytes added).
+And over the inventory (tools/dev/per_frame_inventory.json):
+  PF6  a per-frame module without the `# RUNTIME: runs in <process> ...` header right under its docstring;
+  PF7  a ti_*.py, lateral_* / friction_* or selfdrive/controls/lib/*.py module imported by controlsd, card or a per-frame module that
+       is in neither `per_frame` nor `not_per_frame` (new per-frame code must be classified before it lands).
 A line (or the line just above it) carrying `# per-frame-ok: <reason>` is waived. Exit 1 when any unwaived hit remains.
 """
 import ast
+import json
 import re
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-# The per-frame modules (tools/dev/PER_FRAME_INVENTORY.md): code this fork added that card, controlsd or ti_curve_plannerd run every
-# frame / tick.
-PER_FRAME_MODULES = (
-  "selfdrive/controls/lib/lane_drift.py",
-  "selfdrive/controls/lib/latcontrol_torque.py",
-  "selfdrive/controls/lib/scalar_np.py",
-  "selfdrive/car/mazda/lateral_plant.py",
-  "selfdrive/car/mazda/lateral_reference.py",
-  "selfdrive/car/mazda/lateral_diagnostics.py",
-  "selfdrive/car/mazda/friction_release.py",
-  "selfdrive/car/mazda/ti_ab.py",
-  "selfdrive/car/mazda/ti_plan.py",
-  "selfdrive/car/mazda/carcontroller.py",
-  "selfdrive/car/mazda/carstate.py",
-  "selfdrive/car/mazda/interface.py",
-  "selfdrive/car/mazda/ti_dither.py",
-  "selfdrive/car/mazda/ti_stuck_guard.py",
-  "selfdrive/car/mazda/ti_tests.py",
-  "selfdrive/car/mazda/ti_ident.py",
-  "selfdrive/car/mazda/ti_lag.py",
-  "selfdrive/car/mazda/ti_cruise_check.py",
-  "selfdrive/car/mazda/ti_cruise_taps.py",
-  "selfdrive/car/mazda/ti_cruise_model.py",
-  "selfdrive/car/mazda/ti_button_tests.py",
-  "selfdrive/car/mazda/ti_curve.py",
-  "selfdrive/car/mazda/ti_curve_monitor.py",
-  "selfdrive/car/mazda/ti_curve_demand.py",
-  "selfdrive/car/mazda/ti_curve_plan.py",
-  "selfdrive/car/mazda/ti_curve_plannerd.py",
-  "selfdrive/car/mazda/ti_curve_memory.py",
-)
+# The per-frame modules: tools/dev/per_frame_inventory.json (human view: tools/dev/PER_FRAME_INVENTORY.md).
+INVENTORY_PATH = Path(__file__).resolve().with_name("per_frame_inventory.json")
+INVENTORY = json.loads(INVENTORY_PATH.read_text(encoding="utf-8"))
+PER_FRAME_MODULES = tuple(INVENTORY["per_frame"])
+# What a per-frame module imports from these places must be classified in the inventory (per_frame or not_per_frame).
+CLASSIFY = (re.compile(r"^selfdrive/car/mazda/ti_[^/]+\.py$"), re.compile(r"^selfdrive/controls/lib/[^/]+\.py$"),
+            re.compile(r"^selfdrive/car/mazda/(lateral|friction)_[^/]+\.py$"))
+ENTRY_FILES = ("selfdrive/controls/controlsd.py", "selfdrive/car/card.py")
+HEADER = re.compile(r"^# RUNTIME: runs in \S")
 WAIVER = re.compile(r"#\s*per-frame-ok:\s*\S")
 WRITE_METHODS = {"append", "add", "update", "setdefault", "extend", "insert", "appendleft", "__setitem__"}
 BOUND_METHODS = {"clear", "pop", "popitem", "popleft", "remove", "discard"}
@@ -216,9 +199,59 @@ def lint_files(paths):
   return out
 
 
+def header_ok(src):
+  """The RUNTIME header within the 3 lines after the module docstring (or the first 5 lines when there is none)."""
+  tree = ast.parse(src)
+  lines = src.splitlines()
+  doc = tree.body[0] if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(getattr(tree.body[0], "value", None),
+                                                                                         ast.Constant) else None
+  start = doc.end_lineno if doc is not None else 0
+  return any(HEADER.match(ln) for ln in lines[start:start + 4])
+
+
+def check_headers(root=REPO):
+  return [{"path": m, "line": 1, "code": "PF6", "msg": "missing '# RUNTIME: runs in <process> at <rate>; gc ...' header under the "
+           "docstring", "waived": False, "text": ""} for m in PER_FRAME_MODULES
+          if (root / m).exists() and not header_ok((root / m).read_text(encoding="utf-8"))]
+
+
+def _imported_files(path, root=REPO):
+  tree = ast.parse((root / path).read_text(encoding="utf-8"))
+  out = set()
+  for n in ast.walk(tree):
+    mods = []
+    if isinstance(n, ast.ImportFrom) and n.module:
+      m = n.module.removeprefix("openpilot.")
+      mods.append(m)
+      mods += [f"{m}.{a.name}" for a in n.names]
+    elif isinstance(n, ast.Import):
+      mods += [a.name.removeprefix("openpilot.") for a in n.names]
+    for m in mods:
+      f = m.replace(".", "/") + ".py"
+      if (root / f).exists():
+        out.add(f)
+  return out
+
+
+def check_classified(root=REPO):
+  known = set(INVENTORY["per_frame"]) | set(INVENTORY["not_per_frame"])
+  hits = []
+  for src in ENTRY_FILES + PER_FRAME_MODULES:
+    if not (root / src).exists():
+      continue
+    for f in sorted(_imported_files(src, root)):
+      if any(c.match(f) for c in CLASSIFY) and f not in known:
+        hits.append({"path": f, "line": 1, "code": "PF7", "msg": f"imported by {src} but not classified in "
+                     "tools/dev/per_frame_inventory.json (per_frame with its process, or not_per_frame with the reason)",
+                     "waived": False, "text": ""})
+  return hits
+
+
 def main(argv=None):
   argv = sys.argv[1:] if argv is None else argv
   hits = lint_files(argv or PER_FRAME_MODULES)
+  if not argv:
+    hits += check_headers() + check_classified()
   for h in hits:
     print(f"{h['path']}:{h['line']}: {h['code']} {'(waived) ' if h['waived'] else ''}{h['msg']}  | {h['text']}")
   bad = [h for h in hits if not h["waived"]]
