@@ -252,6 +252,34 @@ def ti_from_can(can_msg):
   return None
 
 
+def can_reads(can_msg):
+  """(yaw_from_can, lat_accel_from_can, ti_from_can) of one CAN batch in ONE pass from the newest frame back (cost, perf 2026-11-25:
+  the three scans read each frame's capnp fields up to three times, 1.3 ms a tick on the comma for a 60-frame batch without the
+  frames). Same frames chosen (the newest that each function would take), same arithmetic."""
+  yaw = lacc = ti = None
+  need_y = need_l = need_t = True
+  for f in reversed(can_msg):
+    a = f.address
+    if a == 0x75:
+      if (need_y or need_l) and f.src == 0:
+        dat = f.dat
+        n = len(dat)
+        if need_y and n >= 6:
+          raw = (dat[4] << 8) | dat[5]
+          yaw, need_y = -(raw * YAW_SCALE + YAW_OFF), False
+        if need_l and n >= 4:
+          raw = ((dat[2] & 0x0F) << 8) | dat[3]
+          lacc, need_l = (raw - 2000 + 14.31) / 93.857, False
+    elif a == TI_FEEDBACK_ADDR:
+      if need_t and f.src == TI_FEEDBACK_BUS:
+        dat = f.dat
+        if len(dat) >= 5:
+          ti, need_t = (int(dat[3]), int(dat[4])), False
+    if not (need_y or need_l or need_t):
+      break
+  return yaw, lacc, ti
+
+
 def mem_summary(planner, look_m=TICK_MEM_STEP_M * TICK_MEM_N):
   """The remembered road ahead while locked: peak |kap_med| (signed, x1e4), its distance (m) and pass count, and kap_med (x1e4) every
   TICK_MEM_STEP_M to look_m. None when not locked or there is no memory stage. Point indices and positions never leave here."""
@@ -444,13 +472,11 @@ def main():
     c0 = time.process_time()
     try:
       if sm.updated["can"]:
-        y = yaw_from_can(sm["can"])
+        y, la_, tf = can_reads(sm["can"])     # = yaw_from_can, lat_accel_from_can, ti_from_can in one pass
         if y is not None:
           yaw, yaw_t = y, t
-        la_ = lat_accel_from_can(sm["can"])
         if la_ is not None:
           lacc, lacc_t = la_, t
-        tf = ti_from_can(sm["can"])
         if tf is not None:
           ti_fb, ti_t = tf, t
       llk = sm["liveLocationKalman"]
