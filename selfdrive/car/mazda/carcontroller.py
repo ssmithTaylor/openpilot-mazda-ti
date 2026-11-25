@@ -979,6 +979,8 @@ class CarController(CarControllerBase):
         except Exception:
           pass
     read = self.frame % 10 == 5
+    if getattr(CS, "crz_btns_set", False):
+      self.curve_set_latch = True          # a one-frame driver SET between read frames is kept until the next read
     exiting = ex is not None and ex.active
     if not read and not self.curve_on and cv.state == "off" and not exiting:
       return None
@@ -1002,7 +1004,10 @@ class CarController(CarControllerBase):
         elif raw is None and not off_idle:
           self.curve_plan = None
       if not self.curve_on and cv.state == "off" and not exiting:
-        if read and getattr(CS, "crz_btns_set", False) and (cv.restart_note or cv.off_note):
+        set_seen = bool(getattr(self, "curve_set_latch", False))
+        if read:
+          self.curve_set_latch = False
+        if read and set_seen and (cv.restart_note or cv.off_note):
           cv.restart_note = cv.off_note = ""    # the driver's own SET+ / SET-: the "check it" note has been answered
           cv.restore_failed = None
           self.curve_published = None

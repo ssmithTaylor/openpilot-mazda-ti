@@ -395,3 +395,58 @@ def test_faultC_set_at_a_low_speed_after_an_internal_error_clears_the_record_and
                                       driver_set=btn, driver_set_plus=False))
     if f >= 0:
       assert C.set_left(None, ex, setv) is None, (f, setv)
+
+
+# ---- item 5 (owner's drive log): switched off at standstill with the dash 1 mph under the reference ------------------------------------
+def _off_at_light(monkeypatch):
+  import json
+  cc, mem, CC, CS, clock = _cc({}, monkeypatch)
+  cv = cc.curve
+  cv.state, cv.ref, cv.off_note = "off", 55, "Set speed 54 mph (was 55): set it yourself"
+  cc.curve_exit.ref = 55
+  cc.curve_inp_last = C.Inputs(set_mph=54)
+  CS.out.cruiseState.speed = 54 * 0.44704
+  log = []
+  real = mem.put
+  mem.put = lambda k, v, *a, **kw: (log.append((clock["k"], k, v)), real(k, v, *a, **kw))[1]
+  return cc, mem, CC, CS, clock, log, json
+
+
+def _record_ok(mem, clock, json, now_expected):
+  d = json.loads(mem.d[C.PARAM_LEFT]) if C.PARAM_LEFT in mem.d else None
+  return d
+
+
+def test_item5_off_at_a_light_one_steady_alert_and_the_record_never_ages_past_the_gate(monkeypatch):
+  cc, mem, CC, CS, clock, log, json = _off_at_light(monkeypatch)
+  worst = 0.0
+  for k in range(6000):                                        # 60 s
+    _frames(cc, CC, CS, clock, 1, k0=k, set_mph=[54])
+    if C.PARAM_LEFT in mem.d:
+      d = json.loads(mem.d[C.PARAM_LEFT])
+      if d.get("now") is not None and k > 10:
+        worst = max(worst, k * 0.01 - d["m"])
+  assert worst <= 1.0 - 1e-6, worst
+  writes = [json.loads(v) for _, key, v in log if key == C.PARAM_LEFT]
+  assert writes and all(w["now"] == 54 and w["was"] == 55 for w in writes)
+
+
+@pytest.mark.parametrize("press_frame", [3001, 3003, 3005, 3007, 3012])
+def test_item5_one_frame_driver_set_plus_on_any_frame_clears_it_at_once_and_it_stays(monkeypatch, press_frame):
+  cc, mem, CC, CS, clock, log, json = _off_at_light(monkeypatch)
+  _frames(cc, CC, CS, clock, 3000, set_mph=[54])
+  assert json.loads(mem.d[C.PARAM_LEFT])["now"] == 54
+  for k in range(3000, 3400):
+    CS.crz_btns_set = k == press_frame                          # one frame of the driver's SET+
+    if k > press_frame:
+      CS.out.cruiseState.speed = 55 * 0.44704                   # the dash moved to 55
+    _frames(cc, CC, CS, clock, 1, k0=k, set_mph=[55 if k > press_frame else 54])
+  assert json.loads(mem.d[C.PARAM_LEFT])["now"] is None
+
+
+def test_item5_dash_reaching_the_reference_by_any_means_clears_it(monkeypatch):
+  cc, mem, CC, CS, clock, log, json = _off_at_light(monkeypatch)
+  _frames(cc, CC, CS, clock, 3000, set_mph=[54])
+  CS.out.cruiseState.speed = 55 * 0.44704                       # no button seen at all
+  _frames(cc, CC, CS, clock, 200, k0=3000, set_mph=[55])
+  assert json.loads(mem.d[C.PARAM_LEFT])["now"] is None
