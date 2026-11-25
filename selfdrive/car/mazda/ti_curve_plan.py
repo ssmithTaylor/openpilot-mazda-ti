@@ -150,6 +150,12 @@ ARRIVED_MPH = 0.5               # plan A8-R1: at the corner speed + this (was 1.
 RESP_FACTOR = 1.0               # plan with the measured deceleration
 BUFFER_S = 0.3                  # extra seconds of start-early margin (was 1.0; 2026-11-24, arrive just in time)
 ENTRY_M = 0.0                   # be at the corner speed this far before the aim point (was 10 m; 2026-11-24)
+RAISE_MARGIN_MPH = 4.0          # FAULT 2: with the tightest point ahead, no raise while the car is above its speed by more than this.
+                                # Why 4: the raise itself is model-timed against the TIGHTEST point's speed (CM.raise_due: the car,
+                                # raised now, bottoms out at it), and a raise must go out before the car is down there because the
+                                # cruise answers 0.5 s + 0.5 s late while still slowing at the push's gap: for the 6 mph push at
+                                # 40-55 mph the model raises at T + 3.2 .. 3.6 (A9-R2a: no dip below T). 4 admits that and nothing
+                                # more (tonight's raises were 5.7 mph above the rest of the bend's speed)
 COAST_BELOW_MPH = 3.0           # pushing and this far below v_allow: let off to the corner speed
 REPUSH_MPH = 1.0                # ... and push again when back within this of v_allow
 BEHIND_GRACE_S = 3.0            # not "behind" in the first seconds of a start: a start fires AT the latest-start speed and the cruise
@@ -882,21 +888,28 @@ class Planner:
       if key not in active and u_ref - float(shed_to[run[ok]].min()) <= LATE_SHED_MPH:
         continue                                   # plan T6 / A6: a bend needing at most LATE_SHED_MPH off is stage 2's
       lowest = run[ok][int(np.argmin(need[run[ok]]))]
-      # aimed at the corner's ENTRY (entry_point: the first point whose demand reaches ENTRY_LA at the corner's speed), not at the
-      # run's first point (a gentle lead-in). GUARD: every tight point before the entry is a constraint of its own at its own speed
-      # and distance, so the car is never planned to arrive at an earlier point faster than the capacity there allows. The lowest
-      # point (the first of equals at or after the entry) is always a constraint.
+      # The WHOLE corner is the constraint (2026-11-24 late drive: the first target was the entry's 49, the tightest point's 44 took
+      # over only inside the bend). Every point of the tight run ahead is a constraint at its own allowed speed and distance; the
+      # corner's TARGET is the lowest of them (the tightest point still ahead, the first of equals), the push is planned for that
+      # target (one push to T - DRIVE_GAP_MPH, raised for T), and the START comes from the BINDING point: the one whose latest start,
+      # with that same push (the measured cruise model, the taps' own time, the 0.5 s + 0.5 s response), is soonest (lowest
+      # v_allow). The entry point (ENTRY_LA) stays only as the release / confirmation decision's reference.
       aim = entry_point(run, kab, int(shed_to[run].min()))
-      tied = run[ok & (need[run] <= need[lowest]) & (run >= aim)]
+      tied = run[ok & (need[run] <= need[lowest])]
       lowest = int(tied[0]) if len(tied) else int(lowest)
-      pts = {int(aim), int(lowest)}
-      pts.update(int(j) for j in run[ok & (run < aim)])
       side = int(sign[lowest])
-      for j in sorted(pts):
+      Tmin = int(shed_to[lowest])
+      S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), Tmin - DRIVE_GAP_MPH)
+      prof = []
+      best = None
+      for j in run[ok]:
+        j = int(j)
         T = int(shed_to[j])
         D_ = float(dist[j]) - ENTRY_M
+        prof.append((D_, T))
+        if T >= u_ref - 0.5 or D_ < 0.0:
+          continue                                 # a point the car is already at or under (or passed): no start of its own
         buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0)
-        S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)
         va = v_allow(D_, T, S1, buf)
         # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
         # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
@@ -904,11 +917,15 @@ class Planner:
         due = bool(set_mph and set_mph > mph + SETTLE_MPH and
                    approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D_ and
                    approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D_)
-        c = cands.get(key)
-        if c is None or va < c["va"] or (due and not c["due"]):
-          cands[key] = {"T": T, "need": int(need[j]), "Tc": int(need[j]), "va": va, "D": D_, "due": due,
-                        "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
-                        "aim_at": self.odo + float(dist[aim]), "S1": S1, "buf": buf, "cap": D.capacity(T, side), "side": side}
+        if best is None or va < best[0] or (due and not best[3]):
+          best = (va, D_, T, due, buf)
+      if best is None:
+        best = (float(Tmin), max(0.0, float(dist[lowest]) - ENTRY_M), Tmin, False, BUFFER_S)
+      va, D_, Tb, due, buf = best
+      cands[key] = {"T": Tmin, "Tb": Tb, "need": int(need[lowest]), "Tc": int(need[lowest]), "va": va, "D": D_, "due": due,
+                    "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
+                    "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
+                    "cap": D.capacity(Tmin, side), "side": side}
     return cands
 
   def _release_check(self, v, T, cap, lead_s):
@@ -955,10 +972,10 @@ class Planner:
       late, on_plan = mph > va + BEHIND_MPH, mph <= va
       if c is not None and set_mph and mode in ("push", "behind"):
         # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
-        # an on-plan car behind. Judge with the same model instead: where it will be at the constraint with the taps it is getting,
-        # with the SAME push-and-raise manoeuvre as the warning (R8, plan A12)
-        pred = self._arrive(v, max(0.0, c["D"]), float(set_mph), float(S1), True, T=T)
-        late, on_plan = pred > T + ARRIVED_MPH + BEHIND_MPH, pred <= T + ARRIVED_MPH
+        # an on-plan car behind. Judge with the same model instead: where it will be at EVERY point of the corner still ahead with
+        # the taps it is getting, with the SAME push-and-raise manoeuvre as the warning (R8, plan A12); the worst point decides
+        over = self._profile_over(v, c.get("prof") or [(max(0.0, c["D"]), T)], float(set_mph), float(S1), T)
+        late, on_plan = over > ARRIVED_MPH + BEHIND_MPH, over <= ARRIVED_MPH
       d_aim = a_["aim_at"] - self.odo
       early = (not a_.get("decided") and a_.get("cap_c") is not None and self.fc is not None and
                CONFIRM_LEAD_S * max(v, 1.0) < d_aim <= MODEL_LOOK_S * max(v, 1.0))
@@ -990,13 +1007,18 @@ class Planner:
         # planner tick early, so the walk never pauses there while the car side waits for the next plan): ONE ramp, no early dwell
         a_["phase"] = 2
         self.events.append({"kind": "s1_handover", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+      # FAULT 2 (2026-11-24 late drive: 3-4 SET+ at the bend's entry while the car was 3+ mph above what the rest of the bend
+      # needed): while the corner's tightest point is still ahead, no switch that RAISES the dash (to the target, or a let-off)
+      # while the car is above that point's speed by more than RAISE_MARGIN_MPH
+      ahead_low = c is not None and c.get("low_m", 0.0) > 0.0
+      may_raise = not ahead_low or mph <= T + RAISE_MARGIN_MPH
       if mode != "target":
-        if self._raise_due(mph, set_mph, T):
+        if self._raise_due(mph, set_mph, T) and may_raise:
           mode = "target"
         elif late and (t - a_["start_t"] >= BEHIND_GRACE_S or a_["start_over"] > BEHIND_MPH):
           mode = "behind"
         elif mode == "push" and mph < va - COAST_BELOW_MPH and t - a_["since"] >= MIN_SWITCH_S:
-          mode = "coast"
+          mode = "coast"                          # ahead of plan: let off (with the tightest point ahead, the dash is only held)
         elif mode == "behind" and on_plan:
           mode = "push"
         elif mode == "coast" and mph >= va - REPUSH_MPH:
@@ -1006,6 +1028,10 @@ class Planner:
                             "planned": round(va, 1), "T": T})
         a_["mode"], a_["since"] = mode, t
       cc = S1 if mode in ("push", "behind") else T
+      if mode == "coast" and not may_raise:
+        # ahead of plan but the tightest point still ahead and the car above its speed: no SET+; the dash stays where it is (the
+        # gap closes as the car slows, so the slowing eases without a raise)
+        cc = max(S1, min(T, int(round(set_mph)))) if set_mph else S1
       if a_["phase"] == 1:
         cc = max(cc, T + LATE_SHED_MPH)           # stage 1's part of the ramp
       if a_.get("cap_c") is not None:
@@ -1021,7 +1047,7 @@ class Planner:
       # HOLD_GAP_S anyway (from the speed the chain started from); otherwise restore fully and slow again later (traffic behind)
       hold = None
       for key, c in cands.items():
-        need_m = approach_m(int(u_ref), c["T"], c["S1"]) + c["buf"] * u_ref * MPH
+        need_m = approach_m(int(u_ref), c.get("Tb", c["T"]), c["S1"]) + c["buf"] * u_ref * MPH
         if (c["D"] - need_m) / max(v, 1.0) > HOLD_GAP_S:
           continue
         if hold is None or c["va"] < hold[0]:
@@ -1207,6 +1233,36 @@ class Planner:
     it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5). With T
     (above s1): the planner's own manoeuvre, a push to s1 and the model-timed raise back to T (plan A11)."""
     return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T, hold=CM.HOLD)
+
+  def _profile_over(self, v, prof, set0, s1, T):
+    """The worst excess (mph) over the corner's points ahead: prof = [(metres ahead, allowed mph)], the car answering the planner's
+    own push to s1 and model-timed raise to T from now (as `_arrive`, ONE simulation for every point)."""
+    pts = sorted((d, a) for d, a in prof if d >= 0.0)
+    if not pts:
+      return -1e9
+    if CM.HOLD:
+      return max(self._arrive(v, d, set0, s1, True, T=T) - a for d, a in pts)
+    car = CM.Cruise(v / MPH, set0, SIM_DT_S, scale=self.resp)
+    x, t, k, worst = 0.0, 0.0, 0, -1e9
+    setn, tap_t, raised, chk = int(round(set0)), 0.0, s1 >= T, 0.0
+    while k < len(pts) and t < 120.0:
+      while k < len(pts) and x >= pts[k][0]:
+        worst = max(worst, car.v - pts[k][1])
+        k += 1
+      if k >= len(pts):
+        break
+      if not raised and t >= tap_t - 1e-9 and t >= chk - 1e-9 and car.v <= T + CM.RAISE_CHECK_MPH:
+        raised, chk = CM.raise_due(car, setn, T), t + CM.RAISE_CHECK_S
+      g = T if raised else s1
+      if t >= tap_t - 1e-9 and setn != g:
+        setn += 1 if g > setn else -1
+        tap_t = t + TAP_S
+      car.step(setn)
+      x += car.v * MPH * SIM_DT_S
+      t += SIM_DT_S
+    for d, a in pts[k:]:
+      worst = max(worst, car.v - a)
+    return worst
 
   def _warn(self, corners, mph, v, floor, acting, set_mph, lowering, u_ref=None):
     """THE warning, one rule. For each corner the car is too fast for (`_corners` on trusted road; the LATCHED ones, by the odometer,
