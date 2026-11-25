@@ -33,6 +33,11 @@ Format (numpy .npz, version 1). Every point is SPACING_M along its trace from th
                read as 0 when the file has none (the planner then plans from the fleet table alone, as before)
   cap_res      OPTIONAL float16 m/s^2: the mean over those passes of (lateral acceleration delivered at the limit - the fleet table at that
                pass's speed and direction): the place's own residual capacity; nan where cap_n is 0
+  v_trb        OPTIONAL float16 m/s: the bend's own record, OUTCOMES (what the planner uses): the lowest speed of a TROUBLED car-steered
+               pass here (>= 2 s at the limit within 80 m and a firm takeover or lane-line touch within 60 m) at and above which
+               troubled passes are at least half; nan where there is no such trouble. Read as nan when the file has none
+  v_ok         OPTIONAL float16 m/s: the highest speed of an untroubled car-steered pass here below v_trb (nan: none)
+  n_trb        OPTIONAL uint8: troubled passes here
   trace_start  int32 [n_traces + 1]: trace t is points trace_start[t] .. trace_start[t+1]-1
   trace_next   int32 [n_traces]: the trace that continues this one past its last point (-1: none or ambiguous)
 """
@@ -49,7 +54,8 @@ FLAG_NOKAP = 4                   # no representative pass: kap is 0 here, not a 
 FLAG_LANE = 8                    # with lateral control active the car touched or crossed a lane line here on some pass
 CELL_M = 50.0                    # grid cell of the nearest-point index
 KEYS = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next")
-OPTIONAL_KEYS = ("bank", "grade", "v_proven", "kap_med", "cap_n", "cap_res")
+REC_KEYS = ("cap_n", "cap_res", "v_trb", "v_ok", "n_trb")
+OPTIONAL_KEYS = ("bank", "grade", "v_proven", "kap_med") + REC_KEYS
 
 
 def wrap(a):
@@ -78,9 +84,13 @@ class Memory:
     self.grade = np.asarray(arrays.get("grade", np.zeros(len(self.x))), np.float64)
     self.v_proven = np.asarray(arrays.get("v_proven", np.full(len(self.x), np.nan)), np.float64)
     # the bend's own record (optional; a file without it behaves as before: no record anywhere)
-    self.has_record = "cap_n" in arrays and "cap_res" in arrays
-    self.cap_n = np.asarray(arrays["cap_n"], np.int32) if self.has_record else np.zeros(len(self.x), np.int32)
-    self.cap_res = np.asarray(arrays["cap_res"], np.float64) if self.has_record else np.full(len(self.x), np.nan)
+    n = len(self.x)
+    self.has_record = "v_trb" in arrays and "v_ok" in arrays
+    self.cap_n = np.asarray(arrays.get("cap_n", np.zeros(n)), np.int32)
+    self.cap_res = np.asarray(arrays.get("cap_res", np.full(n, np.nan)), np.float64)
+    self.v_trb = np.asarray(arrays.get("v_trb", np.full(n, np.nan)), np.float64)
+    self.v_ok = np.asarray(arrays.get("v_ok", np.full(n, np.nan)), np.float64)
+    self.n_trb = np.asarray(arrays.get("n_trb", np.zeros(n)), np.int32)
     self.trace_start = np.asarray(arrays["trace_start"], np.int64)
     self.trace_next = np.asarray(arrays["trace_next"], np.int64)
     self.n = len(self.x)
@@ -101,7 +111,7 @@ class Memory:
 
   def _check(self):
     n = self.n
-    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade", "v_proven", "kap_med", "cap_n", "cap_res"):
+    for name in ("y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "grade", "v_proven", "kap_med") + REC_KEYS:
       if len(getattr(self, name)) != n:
         raise ValueError(f"memory: {name} has {len(getattr(self, name))} points, x has {n}")
     if len(self.trace_start) < 1 or self.trace_start[0] != 0 or self.trace_start[-1] != n or np.any(np.diff(self.trace_start) < 1):
@@ -174,7 +184,7 @@ def load(path):
     meta = json.loads(str(z["meta"]))
     if int(meta.get("version", -1)) != VERSION:
       raise ValueError(f"memory: version {meta.get('version')} (expected {VERSION})")
-    arrays = {k: z[k] for k in KEYS + ("grade", "v_proven", "kap_med", "cap_n", "cap_res") if k in z.files}
+    arrays = {k: z[k] for k in KEYS + ("grade", "v_proven", "kap_med") + REC_KEYS if k in z.files}
   missing = [k for k in KEYS if k not in arrays and k not in OPTIONAL_KEYS]
   if missing:
     raise ValueError(f"memory: missing {missing}")
@@ -201,9 +211,10 @@ def save(path, arrays, meta):
     out["v_proven"] = np.asarray(arrays["v_proven"], np.float16)
   if "kap_med" in arrays:
     out["kap_med"] = np.asarray(arrays["kap_med"], np.float16)
-  if "cap_n" in arrays and "cap_res" in arrays:
-    out["cap_n"] = np.asarray(np.clip(arrays["cap_n"], 0, 255), np.uint8)
-    out["cap_res"] = np.asarray(arrays["cap_res"], np.float16)
+  for k, dt in (("cap_n", np.uint8), ("cap_res", np.float16), ("v_trb", np.float16), ("v_ok", np.float16), ("n_trb", np.uint8)):
+    if k in arrays:
+      a = np.asarray(arrays[k])
+      out[k] = np.asarray(np.clip(a, 0, 255) if dt is np.uint8 else a, dt)
   with open(path, "wb") as f:
     np.savez_compressed(f, **out)
 
@@ -242,9 +253,9 @@ def synthetic(traces, v=25.0, nexts=None, flags=None, v_flag=None, kap_med=True,
   arrays = {"x": cat("x"), "y": cat("y"), "hdg": cat("hdg"), "kap": cat("kap"), "v": np.full(n, v), "flags": fl, "v_flag": vf,
             "npass": np.full(n, 3), "bank": np.full(n, np.nan), "trace_start": starts,
             "trace_next": np.array(nexts if nexts is not None else [-1] * len(traces))}
-  if record is not None:                 # (per-trace cap_n arrays, per-trace cap_res arrays): the bend's own record
-    arrays["cap_n"] = np.concatenate(record[0])
-    arrays["cap_res"] = np.concatenate(record[1])
+  if record is not None:                 # the bend's own record: {key: per-trace arrays} for any of REC_KEYS
+    for k, per in record.items():
+      arrays[k] = np.concatenate(per)
   if kap_med is True:
     arrays["kap_med"] = cat("kap").copy()
   elif kap_med is not False:

@@ -1,4 +1,4 @@
-"""The bend's own record (2026-11-24): a remembered point's allowed speed from what the car delivered there at its limit. SYNTHETIC
+"""The bend's own record (2026-11-24): a remembered point's allowed speed from how earlier passes through it turned out. SYNTHETIC
 roads and passes only (no recorded position is ever used in a test)."""
 import math
 import os
@@ -11,109 +11,167 @@ from openpilot.selfdrive.car.mazda import ti_curve_plan as P
 from openpilot.selfdrive.car.mazda import ti_curve_demand as D
 
 MPH = D.MPH
+HERE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "tools", "curve_slowing"))
+
+
+def builder():
+  if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+  import build_memory as B
+  return B
 
 
 def bend_k(mph, la, side=1):
   return side * la / (mph * MPH) ** 2
 
 
-def mem_with(k, n, res, length=400.0):
-  tr = M.synthetic_trace([(200.0, 0.0), (length, k), (200.0, 0.0)])
-  npt = len(tr["x"])
-  cn = np.where(np.abs(tr["kap"]) > 0, n, 0).astype(np.int32)
-  cr = np.where(cn > 0, res, np.nan)
-  return M.synthetic([tr], record=([cn], [cr])), tr, npt
+def bend(k):
+  return M.synthetic_trace([(200.0, 0.0), (400.0, k), (200.0, 0.0)])
 
 
-def peak_need(pl):
+def mem_with(k, v_trb_mph=None, v_ok_mph=None, cap_n=0, cap_res=np.nan):
+  tr = bend(k)
+  on = np.abs(tr["kap"]) > 0
+  nan = np.full(len(on), np.nan)
+  rec = {"v_trb": [np.where(on, (v_trb_mph or np.nan) * MPH, np.nan)],
+         "v_ok": [np.where(on, (v_ok_mph if v_ok_mph is not None else np.nan) * MPH, nan)],
+         "n_trb": [np.where(on & (v_trb_mph is not None), 1, 0)],
+         "cap_n": [np.where(on, cap_n, 0)], "cap_res": [np.where(on, cap_res, np.nan)]}
+  return M.synthetic([tr], record=rec), tr
+
+
+def peak(pl):
   return float(np.min(pl.need_hi))
 
 
-def test_zero_offset_is_the_table_exactly():
+def table_peak(k):
+  return peak(P.Planner(M.synthetic([bend(k)])))
+
+
+# ---- the planner ---------------------------------------------------------------------------------------------------------------------
+def test_no_record_or_no_trouble_plans_as_before():
+  k = bend_k(45, 2.6)
+  assert not M.synthetic([bend(k)]).has_record
+  m, _ = mem_with(k)                                  # a record without trouble
+  assert m.has_record and peak(P.Planner(m)) == table_peak(k)
+  assert np.array_equal(P.Planner(m).need, P.Planner(M.synthetic([bend(k)])).need)
+
+
+def test_trouble_lowers_to_the_highest_untroubled_speed_below_it():
+  k = bend_k(45, 2.3, -1)                             # the table lets this bend go at about 45
+  assert table_peak(k) >= 44
+  m, _ = mem_with(k, v_trb_mph=36.2, v_ok_mph=35.1)   # troubled from 36.2 mph, untroubled at 35.1
+  assert peak(P.Planner(m)) == 35
+
+
+def test_record_never_raises_the_table():
+  k = bend_k(45, 2.8, 1)
+  t = table_peak(k)
+  m, _ = mem_with(k, v_trb_mph=60.0, v_ok_mph=55.0)
+  assert peak(P.Planner(m)) == t
+
+
+def test_untroubled_at_the_troubled_speed_still_one_below():
+  k = bend_k(45, 2.0, 1)
+  m, _ = mem_with(k, v_trb_mph=44.0, v_ok_mph=43.99)
+  assert peak(P.Planner(m)) == 43
+
+
+def test_no_untroubled_pass_below_uses_the_place_capacity_and_stays_under_the_trouble():
+  k = bend_k(45, 2.4, -1)
+  m_low, _ = mem_with(k, v_trb_mph=44.5, cap_n=5, cap_res=-0.6)      # the place delivers well under the table
+  m_none, _ = mem_with(k, v_trb_mph=44.5)                           # no capacity evidence: the table, under the trouble
+  lo = peak(P.Planner(m_low))
+  assert lo < 40 and peak(P.Planner(m_none)) == min(table_peak(k), 43)
+
+
+def test_record_off_switch_restores_table():
+  k = bend_k(45, 2.4, -1)
+  m, _ = mem_with(k, v_trb_mph=40.0, v_ok_mph=38.0)
+  P.RECORD = False
+  try:
+    off = peak(P.Planner(m))
+  finally:
+    P.RECORD = True
+  assert off == table_peak(k)
+
+
+def test_record_need_zero_offset_is_the_table_exactly():
   k = np.linspace(-0.012, 0.012, 241)
   assert np.array_equal(P.record_need(k, np.zeros_like(k)), D.need_mph(k).astype(float))
   assert np.array_equal(P.record_need(k, np.full_like(k, np.nan)), D.need_mph(k).astype(float))
   assert np.array_equal(P.record_need_hi(k, np.zeros_like(k)), D.need_hi(k).astype(float))
 
 
-def test_no_record_plans_as_before():
-  tr = M.synthetic_trace([(200.0, 0.0), (400.0, bend_k(45, 2.6)), (200.0, 0.0)])
-  old = P.Planner(M.synthetic([tr]))
-  assert not M.synthetic([tr]).has_record
-  new = P.Planner(M.synthetic([tr], record=([np.zeros(len(tr["x"]), np.int32)], [np.full(len(tr["x"]), np.nan)])))
-  assert np.array_equal(old.need_hi, new.need_hi) and np.array_equal(old.need, new.need)
-
-
-def test_record_off_switch_restores_table():
-  mem, tr, _ = mem_with(bend_k(45, 2.4, -1), 10, -0.5)
-  P.RECORD = False
-  try:
-    off = P.Planner(mem).need_hi.copy()
-  finally:
-    P.RECORD = True
-  assert np.array_equal(off, P.Planner(M.synthetic([tr])).need_hi)
-
-
-def test_low_delivering_place_slows_more_and_high_one_less():
-  k = bend_k(45, 2.45, -1)          # a right bend at about the table's capacity at 45 mph
-  table = peak_need(P.Planner(M.synthetic([M.synthetic_trace([(200.0, 0.0), (400.0, k), (200.0, 0.0)])])))
-  low = peak_need(P.Planner(mem_with(k, 15, -0.45)[0]))
-  high = peak_need(P.Planner(mem_with(k, 15, +0.35)[0]))
-  assert low < table - 3 and high > table
-
-
-def test_graded_a_bend_just_at_its_own_limit_costs_1_to_2_mph():
-  # a place that delivers exactly the table, seen many times; a bend asking exactly that at 45 mph: a small, graded drop
-  for side in (1, -1):
-    cap = D.capacity(45, side)
-    k = bend_k(45, cap, side)
-    need = peak_need(P.Planner(mem_with(k, 30, 0.0)[0]))
-    table = float(D.need_hi(np.array([k]))[0])          # 44: the table's own speed window already costs 1 mph here
-    assert 0 <= table - need <= 2 and need >= 42, (side, need, table)
-  # and no cliff: the need falls smoothly as the bend sharpens
-  ns = [peak_need(P.Planner(mem_with(bend_k(45, la, -1), 10, 0.0)[0])) for la in np.arange(2.0, 3.2, 0.05)]
-  assert all(0 <= a - b <= 2 for a, b in zip(ns[:-1], ns[1:]))
-
-
-def test_one_pass_already_outweighs_the_table():
-  k = bend_k(45, 2.4, -1)
-  n1 = peak_need(P.Planner(mem_with(k, 1, -0.5)[0]))
-  n10 = peak_need(P.Planner(mem_with(k, 10, -0.5)[0]))
-  table = peak_need(P.Planner(M.synthetic([M.synthetic_trace([(200.0, 0.0), (400.0, k), (200.0, 0.0)])])))
-  assert n10 <= n1 < table
-  # the weight of the place's own mean after one pass: n / (n + sw^2 / tau^2) > 0.5
+def test_capacity_shrinkage_one_pass_outweighs_the_table():
   assert 1 / (1 + P.REC_SW ** 2 / P.REC_TAU ** 2) > 0.5
+  off1 = P.record_offset([1], [-0.5], 0.0)[0]
+  off9 = P.record_offset([9], [-0.5], 0.0)[0]
+  assert -0.5 < off9 < off1 < -0.25
 
 
-def test_more_passes_narrow_the_quantile():
-  # the same mean residual with more passes: less uncertainty, so a higher allowed speed (never lower)
-  k = bend_k(45, 2.3, 1)
-  ns = [peak_need(P.Planner(mem_with(k, n, 0.0)[0])) for n in (1, 2, 4, 9, 30)]
-  assert all(b >= a for a, b in zip(ns[:-1], ns[1:]))
-
-
-def test_file_round_trip_and_old_loader_compat(tmp_path):
-  mem, tr, npt = mem_with(bend_k(45, 2.4, -1), 7, -0.2)
-  arrays = {k: getattr(mem, k) for k in ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next",
-                                         "kap_med", "cap_n", "cap_res")}
+# ---- the file -----------------------------------------------------------------------------------------------------------------------
+def test_file_round_trip_and_old_files(tmp_path):
+  m, _ = mem_with(bend_k(45, 2.4, -1), v_trb_mph=40.0, v_ok_mph=38.0, cap_n=7, cap_res=-0.2)
+  keys = ("x", "y", "hdg", "kap", "v", "flags", "v_flag", "npass", "bank", "trace_start", "trace_next", "kap_med") + M.REC_KEYS
+  arrays = {k: getattr(m, k) for k in keys}
   p = os.path.join(str(tmp_path), "m.npz")
   M.save(p, arrays, {"version": M.VERSION})
   m2 = M.load(p)
-  assert m2.has_record and int(m2.cap_n.max()) == 7 and np.nanmin(m2.cap_res) < -0.19
-  # a file without the record (v6 / v8) loads with none
-  del arrays["cap_n"], arrays["cap_res"]
+  assert m2.has_record and int(m2.cap_n.max()) == 7 and abs(np.nanmax(m2.v_trb) / MPH - 40.0) < 0.05
+  assert peak(P.Planner(m2)) == 38
+  for k in M.REC_KEYS:                                # a v6 / v8 file: no record, the table as before
+    del arrays[k]
   M.save(p, arrays, {"version": M.VERSION})
   m3 = M.load(p)
-  assert not m3.has_record and int(m3.cap_n.max()) == 0
-  # an OLD loader reads only its own keys: the new keys are extra arrays in the npz and are ignored
-  with np.load(p) as z:
-    assert "cap_n" not in z.files
+  assert not m3.has_record and np.all(np.isnan(m3.v_trb))
+  assert peak(P.Planner(m3)) == table_peak(bend_k(45, 2.4, -1))
+
+
+# ---- the builder --------------------------------------------------------------------------------------------------------------------
+def test_outcome_bound_majority_rule():
+  B = builder()
+  # troubled from 36.2 mph, untroubled at 35.1: (36.2, 35.1)
+  vt, vo = B.outcome_bound(np.array([35.1, 36.2, 36.5, 44.8, 44.9]) * MPH, [False, True, True, True, False])
+  assert math.isclose(vt / MPH, 36.2, abs_tol=1e-6) and math.isclose(vo / MPH, 35.1, abs_tol=1e-6)
+  # conflicting evidence: troubled at 44 five times, clean at 45 once: trouble wins, nothing untroubled below
+  vt, vo = B.outcome_bound(np.array([44.0] * 5 + [45.0]) * MPH, [True] * 5 + [False])
+  assert math.isclose(vt / MPH, 44.0, abs_tol=1e-6) and np.isnan(vo)
+  # one fluke at 44 among ten clean passes at 44-47: no trouble bound
+  vt, vo = B.outcome_bound(np.array([44.0] + [44.5 + 0.25 * i for i in range(10)]) * MPH, [True] + [False] * 10)
+  assert np.isnan(vt) and np.isnan(vo)
+  # one troubled pass is enough
+  vt, _ = B.outcome_bound([20.0], [True])
+  assert vt == 20.0
+  assert all(np.isnan(x) for x in B.outcome_bound([20.0, 21.0], [False, False]))
+
+
+def synthetic_pass(n=600, lim=(200, 260), tk=None, lane=None, lat=True):
+  v = np.full(n, 45 * MPH)
+  la = np.full(n, 2.0)
+  i = np.arange(n)
+  return dict(s=i * float(v[0]) * 0.05, v=v, kap=la / v ** 2, ti=np.where((i >= lim[0]) & (i < lim[1]), 600.0, 300.0),
+              lat_act=np.full(n, 1.0 if lat else 0.0), pressed=np.zeros(n), drv=np.zeros(n),
+              tk_i=np.array([] if tk is None else [tk], int), lane_i=np.array([] if lane is None else [lane], int))
+
+
+def test_trouble_per_sample_and_cleared_hook():
+  B = builder()
+  t = B.trouble_per_sample(synthetic_pass(tk=250))
+  assert t[240] == 1.0 and t[0] == 0.0                       # 3 s at the limit + a takeover; far away: car-steered, untroubled
+  assert np.all(B.trouble_per_sample(synthetic_pass(lim=(200, 220), tk=210)) == 0.0)     # 1 s at the limit: not trouble
+  assert np.all(B.trouble_per_sample(synthetic_pass()) == 0.0)                           # at the limit, no takeover / lane: not trouble
+  assert B.trouble_per_sample(synthetic_pass(lane=255))[240] == 1.0
+  assert np.all(np.isnan(B.trouble_per_sample(synthetic_pass(tk=250, lat=False))))       # the car was not steering: no evidence
+  c = B.trouble_per_sample(dict(synthetic_pass(tk=250), cleared_i=np.array([250])))
+  assert np.isnan(c[240]) and c[0] == 0.0                    # HOOK: cleared by the driver: no evidence there
+  p = synthetic_pass(tk=250)
+  del p["ti"]
+  assert np.all(np.isnan(B.trouble_per_sample(p)))           # an older cache without the command: no evidence
 
 
 def test_builder_limit_residuals_and_cleared_hook():
-  here = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "tools", "curve_slowing"))
-  sys.path.insert(0, here)
-  import build_memory as B
+  B = builder()
   n = 200
   v = np.full(n, 45 * MPH)
   la = np.full(n, 2.0)
@@ -122,12 +180,7 @@ def test_builder_limit_residuals_and_cleared_hook():
   r = B.limit_residuals(p)
   assert np.all(np.isnan(r[:50])) and np.all(np.isnan(r[100:]))
   assert math.isclose(r[60], 2.0 - D.capacity(45, D.LEFT), abs_tol=1e-6)
-  # the driver pressing, or a stretch shorter than 0.5 s, gives no record
-  p2 = dict(p, pressed=np.where(np.arange(n) >= 50, 1.0, 0.0))
-  assert np.all(np.isnan(B.limit_residuals(p2)))
-  p3 = dict(p, ti=np.where((np.arange(n) >= 50) & (np.arange(n) < 58), 600.0, 300.0))
-  assert np.all(np.isnan(B.limit_residuals(p3)))
-  # HOOK: a stretch the driver cleared does not count
+  assert np.all(np.isnan(B.limit_residuals(dict(p, pressed=np.where(np.arange(n) >= 50, 1.0, 0.0)))))
+  assert np.all(np.isnan(B.limit_residuals(dict(p, ti=np.where((np.arange(n) >= 50) & (np.arange(n) < 58), 600.0, 300.0)))))
   assert np.all(np.isnan(B.limit_residuals(dict(p, cleared_i=np.array([70])))))
-  # an older cached pass without `ti`: no record
   assert np.all(np.isnan(B.limit_residuals({k: x for k, x in p.items() if k != "ti"})))

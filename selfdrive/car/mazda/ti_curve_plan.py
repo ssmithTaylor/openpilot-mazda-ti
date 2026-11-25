@@ -335,21 +335,42 @@ def bearing_to_hdg(bearing_deg):
   return M.wrap(math.radians(90.0 - bearing_deg))
 
 
-# ---- the bend's own record (2026-11-24): a remembered point's allowed speed from what the car DELIVERED there at its limit -----------
-# Where earlier passes had the steering command at its limit on a point (Memory.cap_n > 0), the capacity planned on there is the fleet
-# table PLUS the place's own residual (Memory.cap_res: delivered - table), shrunk toward the corpus by the measured scatter and held to
-# a low quantile of what the NEXT pass may deliver: off = mu + REC_Z sqrt(REC_SW^2 + var_post), mu and var_post the normal posterior of
-# the place's residual from cap_n passes (prior REC_PRIOR, sd REC_TAU; one pass sd REC_SW). All three from the corpus (bend-record
-# study, leave-one-drive-out, E:/openpilot-mazda-ti-data/bend-record): REC_SW within-place sd of one pass, REC_TAU between places,
-# REC_PRIOR the mean place residual; with n passes the place's own mean weighs n / (n + REC_SW^2 / REC_TAU^2) (0.75 passes: one pass
-# already outweighs the table). Graded by construction: the allowed speed follows sqrt(capacity / curvature), so a bend just at the
-# limit costs the quantile's share (about 1-2 mph at 45 mph), never a cliff. Points without a record, and files without one (v6, v8),
-# plan from the table exactly as before. RECORD False switches the record off (replays: the baseline).
+# ---- the bend's own record (2026-11-24): a remembered point's allowed speed from how earlier passes through it turned out ----------
+# Where earlier car-steered passes were TROUBLED on a point (Memory.v_trb: >= 2 s at the limit and a firm takeover or a lane-line touch,
+# the replay's ground truth; conflicting evidence by majority, builder outcome_bound), the point's allowed speed is at most the highest
+# speed at which a pass there was NOT troubled below that (Memory.v_ok, whole mph down); with none below it, what the place itself
+# delivered at its limit there (record_need on Memory.cap_res, the posterior mean, REC_Z_FALLBACK) and at least 1 mph under v_trb.
+# The record only LOWERS the table's speed (leave-one-drive-out evaluation, bend-record 2026-11-24: letting clean passes RAISE it
+# lost a fifth of the troubled passes; the place's delivered capacity alone did not beat the table). Points without trouble, and
+# files without a record (v6, v8), plan from the table exactly as before. One troubled pass is enough (owner: one pass is enough).
+# A trouble spot the driver cleared on the device gives no evidence (builder hook `cleared_i`). RECORD False: the table alone.
+# The capacity terms below (REC_SW, REC_TAU, REC_PRIOR) are the measured scatter of one pass's delivered-at-limit residual within a
+# place, between places, and the mean place residual (capacity-refit corpus): the posterior mean of a place's residual after n
+# passes weighs its own mean n / (n + REC_SW^2 / REC_TAU^2) (0.75 passes: one pass already outweighs the table).
 RECORD = True
 REC_SW = 0.276
 REC_TAU = 0.318
 REC_PRIOR = -0.121
-REC_Z = -0.5
+REC_Z = -0.5                   # the capacity rule's quantile (evaluated, NOT used for planning: see above)
+REC_Z_FALLBACK = 0.0
+
+
+def record_bound(v_trb, v_ok, k, cap_n, cap_res):
+  """whole mph the record allows at each point (nan where it has no trouble)."""
+  vt = np.asarray(v_trb, np.float64) / MPH
+  vo = np.asarray(v_ok, np.float64) / MPH
+  out = np.full(len(vt), np.nan)
+  sel = np.isfinite(vt)
+  if not sel.any():
+    return out
+  q = 0.05                                                 # the file's float16 speeds are good to about 0.04 mph
+  hi = np.ceil(vt - q) - 1.0                              # at least 1 mph under the troubled speed
+  out[sel & np.isfinite(vo)] = np.minimum(np.floor(vo + q), hi)[sel & np.isfinite(vo)]
+  fb = sel & ~np.isfinite(vo)
+  if fb.any():
+    cap = record_need(np.asarray(k, np.float64)[fb], record_offset(np.asarray(cap_n)[fb], np.asarray(cap_res)[fb], REC_Z_FALLBACK))
+    out[fb] = np.minimum(cap, hi[fb])
+  return out
 
 
 def record_offset(cap_n, cap_res, z=None):
@@ -413,10 +434,11 @@ class Planner:
       # R14: the need of a car at or above D.STEP_MPH (never planned into the low-capacity zone merely because capacity steps there)
       self.need_hi = D.need_hi(self.kmed).astype(np.float64) if self.mem_stage else self.need
       # the bend's own record where the memory has one (a file without it: the table alone, as before)
-      if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(memory.cap_n > 0):
-        off = record_offset(memory.cap_n, memory.cap_res)
-        self.need = record_need(self.kmed, off)
-        self.need_hi = record_need_hi(self.kmed, off)
+      if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(np.isfinite(memory.v_trb)):
+        b = record_bound(memory.v_trb, memory.v_ok, self.kmed, memory.cap_n, memory.cap_res)
+        has = np.isfinite(b)
+        self.need = np.where(has, np.minimum(self.need, b), self.need)
+        self.need_hi = np.where(has, np.minimum(self.need_hi, b), self.need_hi)
       self.kabs = np.abs(self.kmed)
     self.limit = None
     self.reset()
