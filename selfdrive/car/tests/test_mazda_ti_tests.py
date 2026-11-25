@@ -665,7 +665,10 @@ def test_qt_key_sets_and_names_agree():
   assert '"/data/error_logs/error.txt"' in (ROOT / 'selfdrive/ui/qt/onroad/alerts.cc').read_text(encoding='utf-8')
   values = (ROOT / 'selfdrive/car/mazda/values.py').read_text(encoding='utf-8')
   assert re.search(r'TORQUE_INTERCEPTOR = (\d+)', values).group(1) == '8'
-  assert 'getFlags() & 8) != 0' in src
+  # the flag test moved into ti_pages_logic.h (carKnown) with the Tests-entry fix; sidebar.cc must pass the car's flags to it
+  logic = (ROOT / 'selfdrive/ui/qt/ti_pages_logic.h').read_text(encoding='utf-8')
+  assert '(flags & 8ULL) != 0' in logic
+  assert 'ti_pages::carKnown(cp.getCarName().cStr(), cp.getFlags())' in src
 
 
 def test_definitions_path_seen_from_the_ui_resolves_to_the_file():
