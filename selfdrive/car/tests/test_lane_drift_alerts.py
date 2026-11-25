@@ -107,3 +107,21 @@ def test_straight_road_unchanged():
     assert lane_drift_evidence(model(-1.8, 1.8), k) is False
     assert lane_drift_evidence(model(-1.12, 2.48), k) is True
     assert lane_drift_evidence(model(-0.5, 3.1, p=0.2), k) is True
+
+
+def test_crossed_outside_line_reindexed_as_inside_opens_the_gate():
+  # left turn (outside RIGHT): centre 0.2 m short of the line (side 0.0 + ... line at 1.12), exactly on it, 0.5 m past it
+  assert lane_drift_evidence(model2(left_y=-1.8, right_y=1.12), LEFT_TURN) is True
+  assert lane_drift_evidence(model2(left_y=-1.8, right_y=0.0), LEFT_TURN) is True
+  assert lane_drift_evidence(model2(left_y=-0.5, right_y=3.2), LEFT_TURN) is True      # line now indexed on the inside
+  # right turn (outside LEFT), mirrored
+  assert lane_drift_evidence(model2(left_y=-1.12, right_y=1.8), RIGHT_TURN) is True
+  assert lane_drift_evidence(model2(left_y=0.0, right_y=1.8), RIGHT_TURN) is True
+  assert lane_drift_evidence(model2(left_y=-3.2, right_y=0.5), RIGHT_TURN) is True
+
+
+def test_mid_lane_in_a_turn_still_suppressed_and_weak_inside_line_ignored():
+  for k in (LEFT_TURN, RIGHT_TURN):
+    assert lane_drift_evidence(model2(left_y=-1.8, right_y=1.8), k) is False
+  # a low-probability line near the centre is not evidence
+  assert lane_drift_evidence(model2(left_y=-0.5, right_y=3.2, p_left=0.2), LEFT_TURN) is False
