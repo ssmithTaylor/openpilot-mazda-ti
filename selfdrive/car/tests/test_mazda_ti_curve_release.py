@@ -99,19 +99,27 @@ def test_few_pass_bend_with_a_straight_forecast_is_still_released():
   assert max(v for t, s, p, v in res if 1500 <= s <= 1650) > 53      # released: the speed is back by the bend
 
 
-def test_many_pass_bend_is_not_released_by_a_straight_forecast():
+def test_many_pass_bend_without_a_record(monkeypatch):
+  # owner's decision (2026-11-24 night): only a trouble record makes a bend unreleasable by default (REL_STRONG "record"); a
+  # many-pass bend the forecast genuinely does not show is released. The other setting (record or 10+ passes) still holds it.
   k = k_needing(40)
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   mem = memory(tr, npass=P.REL_STRONG_PASSES)
+  assert P.REL_STRONG == "record"
+  pl = P.Planner(mem)
+  drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 55))
+  assert "s1_release" in kinds(pl)
+  monkeypatch.setattr(P, "REL_STRONG", "record_or_passes")
   pl = P.Planner(mem)
   res = drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 55))
   assert "s1_release" not in kinds(pl)
   assert next(v for t, s, p, v in res if s >= 1500) <= int(np.min(pl.need_hi)) + 1.5
 
 
-def test_a_late_start_is_not_released():
-  # the planner locks onto the road only ~120 m before the bend (STABLE_S of matching first): its start falls inside the decision
-  # window, so the decision point has passed: the bend is known, it is slowed for, never released on the forecast (straight here)
+def test_a_late_start_is_not_released_on_its_own_reading():
+  # the planner locks onto the road only ~210 m before the bend: its start falls inside the decision window. The start's own tick
+  # and the next are not read (the drive's fault: start and release on one reading); after that the two-reading rule applies, so a
+  # genuinely straight forecast still releases it, never sooner than REL_LATE_SKIP_S + REL_TICKS ticks after the start
   k = k_needing(40)
   tr = road((1500, 0.0), (150, k), (800, 0.0))
   mem = memory(tr, npass=3)
@@ -119,5 +127,9 @@ def test_a_late_start_is_not_released():
   res = drive(mem, tr, 55, 60, start=1500 - 210, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 55))
   st = [e for e in pl.events if e["kind"] == "start"]
   assert st and st[0]["dist"] <= P.CONFIRM_LEAD_S * 55 * MPH, st     # the case: a late start
-  assert "s1_release" not in kinds(pl), kinds(pl)
-  assert min(v for t, s, p, v in res if s <= 1650) < 55 - 3
+  i_start = next(i for i, e in enumerate(pl.events) if e["kind"] == "start")
+  i_rel = next((i for i, e in enumerate(pl.events) if e["kind"] == "s1_release"), None)
+  assert i_rel is not None
+  t_start = next(t for t, s, p, v in res if p.kind == "corner")
+  t_rel = next(t for t, s, p, v in res if p.released)
+  assert t_rel - t_start >= P.REL_LATE_SKIP_S + (P.REL_TICKS - 1) * 0.2 - 1e-6, (t_start, t_rel)

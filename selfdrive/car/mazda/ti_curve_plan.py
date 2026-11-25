@@ -91,13 +91,14 @@ CONFIRM_SHARE = 0.6
 #  * a bend whose points carry a trouble record (finite v_trb) or REL_STRONG_PASSES or more passes is never released by the forecast:
 #    the memory is the stronger witness there (whether the car is ON that road is road matching's job: off the trace no stage-1 bend
 #    starts and RM keeps working as before; the release only ever answered "is this remembered bend really there");
-#  * a start already inside the decision window (a late start: the decision point has passed) is not released: the bend is known,
-#    so it is slowed for;
+#  * a start already inside the decision window (a late start, as on the drive) is not released on the readings of its own tick and
+#    the next (REL_LATE_SKIP_S); after that the rules above apply (a start anywhere in the window is normal: just in time);
 #  * a bend never read validly by its entry is kept (slowed for), as one never confirmed is.
 REL_ON = True                     # False: the old single-tick release (measurement baseline only)
-REL_STRONG = "record_or_passes"   # which memory is never released: "record_or_passes" (a trouble record or REL_STRONG_PASSES
+REL_STRONG = "record"             # which memory is never released: "record_or_passes" (a trouble record or REL_STRONG_PASSES
                                   # passes), "record" (a trouble record only), "none" (only the reading rules apply)
 REL_TICKS = 2
+REL_LATE_SKIP_S = 0.4             # a start inside the decision window: its readings count only from this long after it (2 ticks)
 REL_STRONG_PASSES = 10
 REL_AFTER_BEND_S = 2.0
 REL_BEND_HYST_LA = 0.3            # = ti_curve.BEND_HYST_LA
@@ -1236,8 +1237,8 @@ class Planner:
     st = a_.get("strong") or ""
     if st and (REL_STRONG == "record_or_passes" or (REL_STRONG == "record" and st == "record")):
       return None, "memory_" + st
-    if a_.get("late"):
-      return None, "late"
+    if a_.get("late") and t - a_.get("start_t", t) < REL_LATE_SKIP_S - 1e-6:
+      return None, "late"                          # the start's own tick (and the next): not that reading; the rules after it
     if d_aim <= 0.0:
       return None, "entry"                         # never validly read by its entry: kept
     if self.fc is None or float(np.max(self.fc[0])) < CONFIRM_LEAD_S - 1e-6:
@@ -1328,7 +1329,7 @@ class Planner:
                                 "why": "absent"})
             del active[key]
             continue
-        elif rel is False or not REL_ON or why in ("memory_record", "memory_passes", "late", "entry", "no model"):
+        elif rel is False or not REL_ON or why in ("memory_record", "memory_passes", "entry", "no model"):
           a_["decided"], a_["cap_c"] = True, None
           self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
                               "preview": rel is False, "why": why})
