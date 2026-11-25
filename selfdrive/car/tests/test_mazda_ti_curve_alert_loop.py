@@ -110,3 +110,20 @@ def test_driver_set_plus_answers_the_alert_and_is_adopted():
 def test_a_restore_that_works_is_unchanged():
   car, cv, ex, log, alerts = scenario("RES")
   assert car.set == 50 and cv.restore_failed is None and not alerts
+
+
+def test_switching_off_after_a_failed_restore_then_driver_set_leaves_no_alert():
+  car, cv, ex, log, alerts = scenario("RES", fail_restore=True)
+  assert cv.restore_failed == 50 and C.set_left(cv, ex, car.set) is not None
+  inp = C.Inputs(on=False, engaged=True, cruise_on=True, cruise_available=True, mph=45.0, set_mph=car.set, counter=car.counter,
+                 plan=None, plan_age=None, mono=999.0)
+  C.run_frame(cv, ex, 99990, inp)
+  assert cv.state == "off" and cv.restore_failed is None
+  # the driver presses SET- to 40: the car controller's off path answers the note (carcontroller: cv.restart_note = cv.off_note = "")
+  cv.restart_note = cv.off_note = ""
+  assert C.set_left(cv, ex, 40) is None
+  # (and a SET press seen by the Curve itself while off)
+  cv.restore_failed = 50
+  C.run_frame(cv, ex, 99991, inp._replace(driver_button=True, driver_set=True))
+  C.run_frame(cv, ex, 99992, inp._replace(driver_button=True, driver_set=True))
+  assert cv.restore_failed is None

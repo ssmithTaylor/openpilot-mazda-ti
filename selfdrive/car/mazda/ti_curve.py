@@ -433,6 +433,7 @@ class Curve:
 
     if not inp.on:
       if self.state != "off":
+        self.restore_failed = None            # switched off: the failed restore is the off note's business now
         self._cut_tap()
         lowered = self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and \
           (self.intervening() or self.stop_lowered)
@@ -448,6 +449,7 @@ class Curve:
         self._to(frame, "off")
       if btn_rose and inp.driver_set:
         self.off_note = self.restart_note = ""
+        self.restore_failed = None
         self.own_press = True
       self.off_view(inp.plan, inp.plan_age, inp.set_mph, inp.mph)
       return None

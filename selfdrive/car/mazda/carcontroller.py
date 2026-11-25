@@ -1004,6 +1004,7 @@ class CarController(CarControllerBase):
       if not self.curve_on and cv.state == "off" and not exiting:
         if read and getattr(CS, "crz_btns_set", False) and (cv.restart_note or cv.off_note):
           cv.restart_note = cv.off_note = ""    # the driver's own SET+ / SET-: the "check it" note has been answered
+          cv.restore_failed = None
           self.curve_published = None
         if read:
           out = CS.out
