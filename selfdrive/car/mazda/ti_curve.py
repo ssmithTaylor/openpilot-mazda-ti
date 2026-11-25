@@ -405,7 +405,14 @@ class Curve:
   # ---- one frame ----------------------------------------------------------------------------------------------------------------
   def step(self, frame, inp):
     """The button to send this frame: None, "SET_MINUS" or "SET_PLUS"."""
-    if inp.plan is not None and not plan_valid(inp.plan):
+    plan = inp.plan
+    if plan is not None:
+      # cost (perf 2026-11-25): the planner's message is read at 10 Hz and kept as one dict (never changed after the read); its
+      # check is reused while the same object comes back (held here, so the object cannot be replaced by another at its address)
+      pv = getattr(self, "_plan_checked", None)
+      if pv is None or pv[0] is not plan:
+        pv = self._plan_checked = (plan, plan_valid(plan))
+    if plan is not None and not pv[1]:
       inp = inp._replace(plan=None, plan_age=None)   # malformed: as no planner output (the late / dead path, which restores)
       if not getattr(self, "bad_plan_logged", False):
         self.bad_plan_logged = True
