@@ -335,6 +335,65 @@ def bearing_to_hdg(bearing_deg):
   return M.wrap(math.radians(90.0 - bearing_deg))
 
 
+# ---- the bend's own record (2026-11-24): a remembered point's allowed speed from what the car DELIVERED there at its limit -----------
+# Where earlier passes had the steering command at its limit on a point (Memory.cap_n > 0), the capacity planned on there is the fleet
+# table PLUS the place's own residual (Memory.cap_res: delivered - table), shrunk toward the corpus by the measured scatter and held to
+# a low quantile of what the NEXT pass may deliver: off = mu + REC_Z sqrt(REC_SW^2 + var_post), mu and var_post the normal posterior of
+# the place's residual from cap_n passes (prior REC_PRIOR, sd REC_TAU; one pass sd REC_SW). All three from the corpus (bend-record
+# study, leave-one-drive-out, E:/openpilot-mazda-ti-data/bend-record): REC_SW within-place sd of one pass, REC_TAU between places,
+# REC_PRIOR the mean place residual; with n passes the place's own mean weighs n / (n + REC_SW^2 / REC_TAU^2) (0.75 passes: one pass
+# already outweighs the table). Graded by construction: the allowed speed follows sqrt(capacity / curvature), so a bend just at the
+# limit costs the quantile's share (about 1-2 mph at 45 mph), never a cliff. Points without a record, and files without one (v6, v8),
+# plan from the table exactly as before. RECORD False switches the record off (replays: the baseline).
+RECORD = True
+REC_SW = 0.276
+REC_TAU = 0.318
+REC_PRIOR = -0.121
+REC_Z = -0.5
+
+
+def record_offset(cap_n, cap_res, z=None):
+  """m/s^2 added to the table's capacity at each point (nan where the point has no record)."""
+  z = REC_Z if z is None else z
+  n = np.asarray(cap_n, np.float64)
+  r = np.asarray(cap_res, np.float64)
+  sw2, tau2 = REC_SW ** 2, REC_TAU ** 2
+  var_post = 1.0 / (n / sw2 + 1.0 / tau2)
+  mu = var_post * (n * np.nan_to_num(r) / sw2 + REC_PRIOR / tau2)
+  off = mu + z * np.sqrt(sw2 + var_post)
+  return np.where((n > 0) & np.isfinite(r), off, np.nan)
+
+
+def record_need(k, off, hold_step=False):
+  """As ti_curve_demand.need_mph (whole mph over its speed window, CAP_RAW, no bank) with the capacity raised or lowered by `off`
+  per point; points with off nan get the table's own need. -> float array."""
+  k = np.atleast_1d(np.asarray(k, np.float64))
+  off = np.broadcast_to(np.asarray(off, np.float64), k.shape)
+  out = D.need_mph(k, hold_step=hold_step).astype(np.float64)
+  sel = np.isfinite(off)
+  if not sel.any():
+    return out
+  ka, o = np.abs(k[sel]), off[sel]
+  left = k[sel] > 0
+  res = np.full(len(ka), float(D.CAR_MIN_MPH))
+  done = np.zeros(len(ka), bool)
+  for r in range(D.MAX_MPH, D.CAR_MIN_MPH - 1, -1):
+    ok = ~done
+    for sp in D._window(r):
+      cap = np.where(left, D.capacity(sp, D.LEFT, hold_step=hold_step), D.capacity(sp, D.RIGHT, hold_step=hold_step))
+      ok &= (sp * D.MPH) ** 2 * ka <= np.maximum(cap + o, 0.0) + 1e-12
+    res[ok] = r
+    done |= ok
+  out[sel] = res
+  return out
+
+
+def record_need_hi(k, off):
+  """R14 for record_need (as D.need_hi)."""
+  hold = record_need(k, off, hold_step=True)
+  return np.where(hold >= D.STEP_MPH, hold, record_need(k, off))
+
+
 class Planner:
   MAX_SHED_MPH = 15               # mirrors ti_curve.MAX_SHED_MPH, only to flag in the log when a corner needs more
   ABS_FLOOR_MPH = 25              # mirrors ti_curve.ABS_FLOOR_MPH
@@ -353,6 +412,11 @@ class Planner:
       self.need = D.need_mph(self.kmed).astype(np.float64) if self.mem_stage else np.full(memory.n, float(MAX_MPH))
       # R14: the need of a car at or above D.STEP_MPH (never planned into the low-capacity zone merely because capacity steps there)
       self.need_hi = D.need_hi(self.kmed).astype(np.float64) if self.mem_stage else self.need
+      # the bend's own record where the memory has one (a file without it: the table alone, as before)
+      if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(memory.cap_n > 0):
+        off = record_offset(memory.cap_n, memory.cap_res)
+        self.need = record_need(self.kmed, off)
+        self.need_hi = record_need_hi(self.kmed, off)
       self.kabs = np.abs(self.kmed)
     self.limit = None
     self.reset()

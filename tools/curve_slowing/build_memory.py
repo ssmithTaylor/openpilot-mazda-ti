@@ -86,10 +86,10 @@ import time
 import numpy as np
 
 try:
-  from openpilot.selfdrive.car.mazda import ti_curve_memory as M
+  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_demand as CD
 except ImportError:
   sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-  from selfdrive.car.mazda import ti_curve_memory as M
+  from selfdrive.car.mazda import ti_curve_memory as M, ti_curve_demand as CD
 
 DATA_DIR = r'E:\openpilot-mazda-ti-data\curve-slowing\memory'
 STUDY = 'E:/openpilot-mazda-ti-data/remembered-roads-20261123'
@@ -349,7 +349,17 @@ def build_library(passes):
 
 
 # rows columns (one per road point covered by a pass)
-C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART, C_EVENT = range(12)
+C_PT, C_PASS, C_KAP, C_V, C_BANK, C_GRADE, C_EXCL, C_PIECE, C_TOEND, C_CLEAN, C_FROMSTART, C_EVENT, C_CAPRES = range(13)
+# ---- the bend's own record (2026-11-24): what the car DELIVERED here with the command at its limit -------------------------------
+# An at-limit stretch (capacity-refit measure.py's rule): |ti_cmd| >= SAT_TI for >= CAP_MIN_S, lateral control active, the driver not
+# pressing and |driver torque| < TK_DRV counts, >= 19 mph, the command in the turn's direction. Its delivered lateral acceleration is
+# the median of v^2 kap (yaw-based, in the turn's direction) after its first CAP_RISE_S; stored as the RESIDUAL against the fleet table
+# at the stretch's median speed (ti_curve_demand.capacity, CAP_RAW, the turn's side): cap_res = mean residual of the passes with a
+# stretch on the point, cap_n = how many. The planner shrinks it toward the table by the measured scatter (ti_curve_plan.record_need).
+# DRIVER-CLEARED trouble (on-device clear mark, owner 2026-11-24; not built yet): a pass dict may carry `cleared_i` (sample indices the
+# driver cleared); an at-limit stretch overlapping one is not counted. HOOK: prepare_runs fills `cleared_i` once the mark exists.
+CAP_MIN_S = 0.5
+CAP_RISE_S = 0.3
 EVENT_PROTECT_S = 3.0          # hand steering within this of a steering-limit event or a real takeover is never excluded
 EX_BLINK, EX_HAND, EX_SLOW, EX_LEAVE, EX_STOP, EX_JOIN = 1, 2, 4, 8, 16, 32
 EX_NAMES = {EX_BLINK: 'blinker +-5 s', EX_HAND: 'steering by hand +-2 s', EX_SLOW: 'below 19 mph', EX_LEAVE: 'last 150 m before leaving',
@@ -439,6 +449,35 @@ def lane_events(lane_d, lat_act, blink):
   return np.array([int(a) for a, b in ed if b - a >= LANE_MIN], int)
 
 
+def limit_residuals(p):
+  """per 20 Hz sample of pass p: the residual (m/s^2, delivered - table) of the at-limit stretch it lies in, nan elsewhere (and
+  everywhere when the pass has no `ti`, e.g. an older cache)"""
+  n = len(p['s'])
+  out = np.full(n, np.nan)
+  if 'ti' not in p:
+    return out
+  v = np.asarray(p['v'], np.float64)
+  la = np.asarray(p['kap'], np.float64) * v * v
+  ti = np.asarray(p['ti'], np.float64)
+  lat = np.asarray(p.get('lat_act', np.ones(n)), np.float64) > .5
+  prs = np.asarray(p.get('pressed', np.zeros(n)), np.float64) > .5
+  drv = np.abs(np.asarray(p.get('drv', np.zeros(n)), np.float64))
+  m = lat & ~prs & (drv < TK_DRV) & (np.abs(ti) >= SAT_TI) & (v >= SLOW_MPH * 0.44704) & (np.sign(ti) == np.sign(la))
+  cl = np.zeros(n, bool)
+  ci = np.asarray(p.get('cleared_i', np.zeros(0, int)), int)
+  cl[ci[(ci >= 0) & (ci < n)]] = True
+  d = np.diff(np.r_[0, m.astype(np.int8), 0])
+  rise = int(round(CAP_RISE_S / DT))
+  for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+    if (b - a) * DT < CAP_MIN_S - 1e-9 or cl[a:b].any():
+      continue
+    sg = float(np.sign(np.median(la[a:b])))
+    deliv = float(np.median(sg * la[a + rise:b]))
+    mph = float(np.median(v[a:b])) / 0.44704
+    out[a:b] = deliv - CD.capacity(mph, CD.LEFT if sg > 0 else CD.RIGHT)
+  return out
+
+
 def collect(passes, lib, aligns):
   """Per-pass samples on road points, flag intervals, road-to-road transitions (cut points) and the pieces (a pass's stretch on
   one road) with how each one ends: ('same',) the pass carries on along the road after a position gap, ('road', rb, qb) it moved
@@ -458,6 +497,7 @@ def collect(passes, lib, aligns):
     lns = np.asarray(p.get('lane_i', np.zeros(0, int)), int)
     ev_s = np.sort(np.r_[s[sats], s[tks], s[lns]]) if len(sats) + len(tks) + len(lns) else np.zeros(0)
     xb = excl_bits(p)
+    cres = limit_residuals(p)
     la = (np.asarray(p['lat_act']) > .5) if 'lat_act' in p else np.ones(len(s), bool)
     for k in np.where(ok[:-1] & ok[1:] & (rd_of[:-1] != rd_of[1:]))[0]:
       ra, rb = rd_of[k], rd_of[k + 1]
@@ -521,7 +561,7 @@ def collect(passes, lib, aligns):
               es = np.sort(s[ix])
               evt |= np.searchsorted(es, sr + w, side='right') > np.searchsorted(es, sr - w, side='left')
           rows.append(np.c_[base[rd] + q, np.full(len(q), pi), kap, p['v'][i20], p['bank'][i20], gr, xb[i20], np.full(len(q), piece),
-                            (q1 - q) * SP, clean, (q - q0) * SP, evt])
+                            (q1 - q) * SP, clean, (q - q0) * SP, evt, cres[i20]])
           for evs, fl, lo, hi in ((sats, M.FLAG_LIMIT, LIMIT_BEFORE_M, LIMIT_AFTER_M), (tks, M.FLAG_TAKEOVER, TK_M, TK_M),
                                   (lns, M.FLAG_LANE, LANE_M, LANE_M)):
             for e in evs:
@@ -529,7 +569,7 @@ def collect(passes, lib, aligns):
                 ge = float(np.interp(s[e], sr, g)) if len(sr) > 1 else float(g[0])
                 flags.append((rd, ge - lo, ge + hi, fl, float(p['v'][e])))
       k = k2 + 1
-  rows = np.concatenate(rows) if rows else np.zeros((0, 12))
+  rows = np.concatenate(rows) if rows else np.zeros((0, 13))
   return rows, flags, cuts, trans, pieces
 
 
@@ -600,6 +640,34 @@ def merge(rows, NL, usable=None):
   cl = rows[:, C_CLEAN] > .5
   np.fmax.at(v_proven, pt[cl], rows[cl, C_V])
   return kap, v, bank, npass, grade, v_proven, kap_med
+
+
+def record(rows, NL, pass_drive):
+  """per library point: cap_n (passes with an at-limit stretch on the point) and cap_res (their mean residual, nan where none);
+  and per (point, drive) the count and residual sum (private, leave-one-drive-out)"""
+  cap_n = np.zeros(NL, np.int64)
+  cap_res = np.full(NL, np.nan)
+  empty = (np.zeros(0, np.int64), np.zeros(0, object), np.zeros(0, np.int64), np.zeros(0))
+  if not len(rows):
+    return cap_n, cap_res, empty
+  r = rows[np.isfinite(rows[:, C_CAPRES])]
+  if not len(r):
+    return cap_n, cap_res, empty
+  key = r[:, C_PT].astype(np.int64) * 100000 + r[:, C_PASS].astype(np.int64)
+  _, first = np.unique(key, return_index=True)     # one value per (point, pass)
+  r = r[first]
+  pt = r[:, C_PT].astype(np.int64)
+  cap_n = np.bincount(pt, minlength=NL)[:NL]
+  s = np.bincount(pt, weights=r[:, C_CAPRES], minlength=NL)[:NL]
+  cap_res = np.where(cap_n > 0, s / np.maximum(cap_n, 1), np.nan)
+  dk = collections.defaultdict(lambda: [0, 0.0])
+  for q, pi, x in zip(pt, r[:, C_PASS].astype(np.int64), r[:, C_CAPRES]):
+    e = dk[(int(q), pass_drive[int(pi)])]
+    e[0] += 1
+    e[1] += float(x)
+  ks = list(dk)
+  return cap_n, cap_res, (np.array([k[0] for k in ks], np.int64), np.array([k[1] for k in ks], object),
+                          np.array([dk[k][0] for k in ks], np.int64), np.array([dk[k][1] for k in ks]))
 
 
 def spread_flags(flags, lib, kap=None):
@@ -808,6 +876,7 @@ def build(passes, info=None):
     excl = excl | np.where(joining[pc] & (rows[:, C_FROMSTART] <= LEAVE_M), EX_JOIN, 0).astype(np.uint8)
   usable = excl == 0
   kap, v, bank, npass, grade, v_proven, kap_med = merge(rows, NL, usable)
+  cap_n, cap_res, by_drive = record(rows, NL, [p['drive'] for p in passes])
   nokap = ~np.isfinite(kap)
   kap = np.where(nokap, 0.0, kap)
   kap_med = np.where(np.isfinite(kap_med), kap_med, 0.0)
@@ -818,13 +887,21 @@ def build(passes, info=None):
     idx = order[ts[t]:ts[t + 1]]
     v_f[idx] = fill_nan(v[idx])
   arrays = dict(x=x, y=y, hdg=hdg, kap=kap[order], v=v_f[order], flags=fl[order], v_flag=vf[order], npass=npass[order],
-                bank=bank[order], grade=grade[order], v_proven=v_proven[order], kap_med=kap_med[order], trace_start=ts, trace_next=nxt)
+                bank=bank[order], grade=grade[order], v_proven=v_proven[order], kap_med=kap_med[order], trace_start=ts, trace_next=nxt,
+                cap_n=cap_n[order], cap_res=cap_res[order])
   carry_flags(arrays, flags, lib, tid)
   ph = single_pass_phantoms(arrays)
   arrays['kap'] = np.where(ph, 0.0, arrays['kap'])
   arrays['flags'] = (arrays['flags'] | np.where(ph, M.FLAG_NOKAP, 0)).astype(np.uint8)
   if info is not None:
     info['single_pass_phantom_points'] = int(ph.sum())
+    info['record_points'] = int((arrays['cap_n'] > 0).sum())
+    # private (never in the file): per output point and drive, the at-limit count and residual sum, for leave-one-drive-out replays
+    inv = np.full(NL, -1, np.int64)
+    inv[order] = np.arange(len(order))
+    o_pt = inv[by_drive[0]] if len(by_drive[0]) else np.zeros(0, np.int64)
+    k_o = o_pt >= 0
+    info['_record_by_drive'] = dict(pt=o_pt[k_o], drive=np.asarray(by_drive[1])[k_o], n=by_drive[2][k_o], sum=by_drive[3][k_o])
     info['rows'] = int(len(rows))
     if len(rows):                                   # per output point (private diagnostics, never written to the file)
       stp = (excl & EX_STOP) > 0
@@ -1094,7 +1171,7 @@ def prepare_runs(tags, org, replay=False):
     p['sat_i'], p['tk_i'] = run_events(sig['ti'], sig['lat_act'], sig['pressed'], sig['en'], sig['drv'], brk=brk, v=v, s=p['s'],
                                        blink=p['blink'], lead=np.nan_to_num(lead, nan=0.0) if np.isfinite(lead).any() else None,
                                        kap=p['kap'], lane_i=p['lane_i'])
-    for nm in ('pressed', 'drv', 'lat_act'):
+    for nm in ('pressed', 'drv', 'lat_act', 'ti'):
       p[nm] = sig[nm]
     if all('aego' in z for z in zs):
       p['aego'] = cat(lambda z, q: z['aego']).astype(np.float32)
@@ -1292,6 +1369,9 @@ def load_passes(tags, workers):
   return [p for p in P if all(t in keep for t in p['tags'])] if keep != set(allt) else P
 
 
+RECORD_SIDECAR = None
+
+
 def write_memory(passes, path, meta_extra):
   org = origin()
   info = {}
@@ -1305,6 +1385,10 @@ def write_memory(passes, path, meta_extra):
               kap_rule='second<=', stats=stats)
   os.makedirs(os.path.dirname(path), exist_ok=True)
   M.save(path, arrays, meta)
+  side = RECORD_SIDECAR or os.environ.get('CURVE_RECORD_SIDECAR')
+  if side and '_record_by_drive' in info:
+    rb = info['_record_by_drive']           # private: point indices and drive ids only (no position), for LOO replays
+    np.savez_compressed(side, pt=rb['pt'], drive=rb['drive'].astype(str), n=rb['n'], sum=rb['sum'])
   m = M.load(path)                   # validate
   return m, stats
 
@@ -1452,11 +1536,15 @@ def main():
   ap.add_argument('--check', action='store_true', help='position-free validation printout')
   ap.add_argument('--source', choices=('gate', 'all'), default='gate',
                   help="gate: the seg20 gate-checked set (default; LOO and replay); all: every recorded drive on this PC (on-car memory)")
+  ap.add_argument('--record-sidecar', default=None, help='also write the per (point, drive) at-limit record here (private; LOO replays)')
   ap.add_argument('--releases', default=None, help='folder of the simulator release records (default: tools/mazda_sim/releases)')
   a = ap.parse_args()
   if a.releases:
     global RELEASES
     RELEASES = os.environ['CURVE_RELEASES'] = a.releases
+  if a.record_sidecar:
+    global RECORD_SIDECAR
+    RECORD_SIDECAR = a.record_sidecar
   low_priority()
   os.makedirs(_p('cache'), exist_ok=True)
   workers = max(1, min(a.workers, 6))
