@@ -15,6 +15,7 @@ road changed, corner start with the planned and actual speed and the grade, mode
 (plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed).
 Never a position: trace and point indices, distances, speeds and curvatures only.
 """
+import gc
 import json
 import math
 import os
@@ -85,6 +86,30 @@ MAP_HDG_DEG = 45.0              # ... on a piece pointing within this of the car
 EARTH_R = 6371000.0
 
 
+_MAP_PARSED = [None, None]      # cost (perf 2026-11-25): (raw text, its parsed points) of the last list read
+
+
+def _map_points(raw):
+  """The map list's (latitudes, longitudes, |curvatures|), or None when unreadable, shorter than 2 or not finite. Cached on the raw
+  text: the map service writes ~1 Hz and the planner reads at 5 Hz, and the parse (JSON + checks) was ~1.5 ms a tick on the comma
+  for a 150-node list. Same text, same values."""
+  if _MAP_PARSED[0] is not None and _MAP_PARSED[0] == raw:
+    return _MAP_PARSED[1]
+  try:
+    pts = json.loads(raw)
+    out = None
+    if isinstance(pts, list) and len(pts) >= 2:
+      la = [float(p["latitude"]) for p in pts]
+      lo = [float(p["longitude"]) for p in pts]
+      ks = [abs(float(p["curvature"])) for p in pts]
+      if all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
+        out = (la, lo, ks)
+  except Exception:
+    out = None
+  _MAP_PARSED[0], _MAP_PARSED[1] = raw, out
+  return out
+
+
 def map_profile(raw, age_s, lat, lon, bearing_deg):
   """The map service's curvature list as (metres along the road from the car, |curvature|), for the planner; None (no map opinion) when
   missing, older than MAP_STALE_S, unreadable, or not matched to the car (no polyline piece within MAP_MATCH_M pointing its way).
@@ -92,14 +117,10 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
   try:
     if raw is None or age_s is None or not (0.0 <= age_s <= MAP_STALE_S):
       return None
-    pts = json.loads(raw)
-    if not isinstance(pts, list) or len(pts) < 2:
+    parsed = _map_points(raw)
+    if parsed is None:
       return None
-    la = [float(p["latitude"]) for p in pts]
-    lo = [float(p["longitude"]) for p in pts]
-    ks = [abs(float(p["curvature"])) for p in pts]
-    if not all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
-      return None
+    la, lo, ks = parsed
     cl = math.cos(math.radians(lat))
     xs = [math.radians(b - lon) * cl * EARTH_R for b in lo]
     ys = [math.radians(a - lat) * EARTH_R for a in la]
@@ -108,10 +129,11 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
     for i in range(len(xs) - 1):
       cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
     best = None
+    hdg_cos = math.cos(math.radians(MAP_HDG_DEG))     # once per call, not per piece (same value)
     for i in range(len(xs) - 1):
       dx, dy = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
       L = math.hypot(dx, dy)
-      if L < 0.1 or (dx * hx + dy * hy) / L < math.cos(math.radians(MAP_HDG_DEG)):
+      if L < 0.1 or (dx * hx + dy * hy) / L < hdg_cos:
         continue
       tt = max(0.0, min(1.0, -(xs[i] * dx + ys[i] * dy) / (L * L)))
       lat_m = math.hypot(xs[i] + tt * dx, ys[i] + tt * dy)
@@ -231,6 +253,34 @@ def ti_from_can(can_msg):
   return None
 
 
+def can_reads(can_msg):
+  """(yaw_from_can, lat_accel_from_can, ti_from_can) of one CAN batch in ONE pass from the newest frame back (cost, perf 2026-11-25:
+  the three scans read each frame's capnp fields up to three times, 1.3 ms a tick on the comma for a 60-frame batch without the
+  frames). Same frames chosen (the newest that each function would take), same arithmetic."""
+  yaw = lacc = ti = None
+  need_y = need_l = need_t = True
+  for f in reversed(can_msg):
+    a = f.address
+    if a == 0x75:
+      if (need_y or need_l) and f.src == 0:
+        dat = f.dat
+        n = len(dat)
+        if need_y and n >= 6:
+          raw = (dat[4] << 8) | dat[5]
+          yaw, need_y = -(raw * YAW_SCALE + YAW_OFF), False
+        if need_l and n >= 4:
+          raw = ((dat[2] & 0x0F) << 8) | dat[3]
+          lacc, need_l = (raw - 2000 + 14.31) / 93.857, False
+    elif a == TI_FEEDBACK_ADDR:
+      if need_t and f.src == TI_FEEDBACK_BUS:
+        dat = f.dat
+        if len(dat) >= 5:
+          ti, need_t = (int(dat[3]), int(dat[4])), False
+    if not (need_y or need_l or need_t):
+      break
+  return yaw, lacc, ti
+
+
 def mem_summary(planner, look_m=TICK_MEM_STEP_M * TICK_MEM_N):
   """The remembered road ahead while locked: peak |kap_med| (signed, x1e4), its distance (m) and pass count, and kap_med (x1e4) every
   TICK_MEM_STEP_M to look_m. None when not locked or there is no memory stage. Point indices and positions never leave here."""
@@ -306,6 +356,8 @@ def _r(x, nd):
 
 
 def _clip_str(o):
+  if o is None or type(o) in (int, float, bool):     # cost: most values are numbers (returned as they are, as below)
+    return o
   if isinstance(o, str):
     return o[:TICK_STR_MAX]
   if isinstance(o, list):
@@ -407,6 +459,9 @@ def main():
   planner = P.Planner(mem)
   mdl = model_name(Params())          # the driving model (logs are split by it); read once
   cloudlog.event("ti_curve_plan", kind="model", mdl=mdl)
+  # cost (perf 2026-11-25): everything loaded so far (the road memory, the approach table's ~23k entries) lives for the whole process;
+  # a full garbage collection walking it took 54 ms on the comma. Frozen, the collector skips it (no output depends on collection).
+  gc.freeze()
   sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can", "carOutput"])
   rk = Ratekeeper(RATE_HZ, print_delay_threshold=None)
   seq = 0
@@ -423,13 +478,11 @@ def main():
     c0 = time.process_time()
     try:
       if sm.updated["can"]:
-        y = yaw_from_can(sm["can"])
+        y, la_, tf = can_reads(sm["can"])     # = yaw_from_can, lat_accel_from_can, ti_from_can in one pass
         if y is not None:
           yaw, yaw_t = y, t
-        la_ = lat_accel_from_can(sm["can"])
         if la_ is not None:
           lacc, lacc_t = la_, t
-        tf = ti_from_can(sm["can"])
         if tf is not None:
           ti_fb, ti_t = tf, t
       llk = sm["liveLocationKalman"]
