@@ -1005,12 +1005,15 @@ class CarController(CarControllerBase):
         if read and getattr(CS, "crz_btns_set", False) and (cv.restart_note or cv.off_note):
           cv.restart_note = cv.off_note = ""    # the driver's own SET+ / SET-: the "check it" note has been answered
           self.curve_published = None
-        if read and (self.curve_published is None or self.frame % 100 == 5):
-          age = None if self.curve_plan_read is None else self.curve_plan_age + (now - self.curve_plan_read)
+        if read:
           out = CS.out
           speed = float(out.cruiseState.speed or 0.0)
-          cv.off_view(self.curve_plan, age, int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None, float(out.vEgo) * CV.MS_TO_MPH)
-          self._curve_publish(cv, force=True)
+          live_set = int(round(speed * CV.MS_TO_MPH)) if speed > 0.5 else None      # the LIVE set speed (not the last on-path frame's)
+          self._curve_left(cv, ex, live_set)     # every read frame: written every 0.5 s like the on path (the planner drops 1.0 s)
+        if read and (self.curve_published is None or self.frame % 100 == 5):
+          age = None if self.curve_plan_read is None else self.curve_plan_age + (now - self.curve_plan_read)
+          cv.off_view(self.curve_plan, age, live_set, float(out.vEgo) * CV.MS_TO_MPH)
+          self._curve_publish(cv, force=True, set_mph=live_set, left_done=True)
         return None
       age = None
       if self.curve_plan is not None and self.curve_plan_read is not None:
@@ -1112,11 +1115,14 @@ class CarController(CarControllerBase):
                                                                "now": None, "was": None}))
     self.curve_left = left
 
-  def _curve_publish(self, cv, force=False):
+  def _curve_publish(self, cv, force=False, set_mph=None, left_done=False):
     ex = getattr(self, "curve_exit", None)
     inp = getattr(self, "curve_inp_last", None)
-    self._curve_left(cv, ex, getattr(inp, "set_mph", None))
-    mk = None if ex is None else ex.marker(cv, getattr(inp, "set_mph", None))
+    if set_mph is None:
+      set_mph = getattr(inp, "set_mph", None)
+    if not left_done:
+      self._curve_left(cv, ex, set_mph)
+    mk = None if ex is None else ex.marker(cv, set_mph)
     ex_lines = (ex.line1, ex.line2) if ex is not None and ex.active else None
     key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph, json.dumps(mk), ex_lines)
     # the exit marker is published at once when it changes (a controls restart must find it)

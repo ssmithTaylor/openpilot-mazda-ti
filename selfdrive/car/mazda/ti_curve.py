@@ -72,7 +72,7 @@ MPH = 0.44704
 GAS_MAX_S = 1.0                  # gas held longer than this stops the intervention
 GAS_RESUME_S = 0.5               # shorter gas: no tap starts while pressed nor until this long after it is released
 OTHER_BUTTON_PAUSE_S = 2.0       # after RES / distance / mode / cancel
-PAUSE_S = 10.0                   # after the driver's own cruise button (owner, first drive: 30 s was too long, "like 10 seconds")
+PAUSE_S = 5.0                    # after the driver's own cruise button (owner: 30 s too long, then 2026-11-24 "10 seconds is still too long": 5 s)
 CLEAR_S = 2.0
 PLAN_STALE_S = 1.0               # planner output older than this is not used (it publishes at 5 Hz)
 PLAN_DEAD_S = 3.0                # ... older than this: the planner is taken as dead
@@ -126,6 +126,17 @@ NET_MARGIN_MPH = 0.0             # ... and acting when it would bottom out AT th
 BEND_IN_LA = P.ENTRY_LA
 BEND_HYST_LA = 0.3
 BEND_OUT_S = 1.0
+
+# ---- a lowest ceiling remembered per slowdown (planner restart mid-bend, 2026-11-24) ----------------------------------------------
+# A planner that restarts inside a bend has lost its guard and may publish a higher trusted ceiling (or none). The car side remembers
+# the lowest corner speed it has acted on in this slowdown (`cap_lo`) and sends no SET+ above it merely because the published ceiling
+# rose or vanished. It is forgotten when (a) the road has been straight (lateral acceleration under BEND_IN_LA - BEND_HYST_LA) for
+# BEND_OUT_S AND the car is past where the planner last said that corner ends (no end known: straight alone); (b) the car is
+# TRUST_HOLD_M past that end whatever the lateral acceleration says; (c) CAP_STALE_S (= TRUST_HOLD_MAX_S, the existing bound for
+# a planner whose word cannot be trusted) passes with no plan that confirms the cap (a ceiling at or under it); or (d) the intervention
+# or the stop ends it. It binds ONLY after a gap in the plan stream (plan missing or older than PLAN_STALE_S, the one restart signal the
+# car side sees reliably) while it is set: a continuous stream that revises or drops a corner is obeyed as ever.
+CAP_STALE_S = 30.0
 
 
 class HoldRun:
@@ -270,6 +281,14 @@ class Curve:
     self.bend_low_f = None            # frame the lateral acceleration first fell under the exit level
     self.bend_lo = None               # the highest a SET+ may bring the dash while in this bend (None: no limit known)
     self.bend_held = False            # a SET+ was held back by the bend rule (logged once per bend)
+    self.restore_failed = None        # the ref a restore failed to ("set speed did not respond"): not tried again by itself
+    self.cap_lo = None                # the lowest corner speed acted on in this slowdown: no SET+ above it (see CAP_STALE_S)
+    self.cap_end = None               # odometer where the planner last said that corner ends
+    self.cap_seen_f = None            # frame of the last plan at or under the cap
+    self.cap_straight_f = None        # frame the road last became straight
+    self.cap_held = False             # a SET+ was held back by the cap (logged once per cap)
+    self.cap_gap = False
+    self.cap_armed = False            # the plan stream had a gap (plan missing or older than PLAN_STALE_S) since the cap was set
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -298,6 +317,9 @@ class Curve:
 
   def _stop(self, frame, inp, why):
     self._cut_tap()
+    self._cap_clear()
+    if why == "set speed did not respond" and self.state == "restoring" and self.ref is not None:
+      self.restore_failed = self.ref      # held for the driver: SET+ / SET- (a new ref) or the set speed back at ref ends it
     lowered = self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and self.intervening()
     self.stop_lowered = lowered
     if lowered:
@@ -345,6 +367,7 @@ class Curve:
     self.hold = None
 
   def _end_intervention(self, frame):
+    self._cap_clear()
     self._cut_hold(frame, "intervention ended")
     self.hold_off = False
     self.press_floor = None
@@ -373,6 +396,7 @@ class Curve:
         self.chose_note = f"Your set speed is now {set_mph} (was {self.ref})"
       self.ref = set_mph
       self.left_at, self.own_press, self.left_doubt, self.lowered_from = None, False, False, None
+      self.restore_failed = None
       self.after_brake = False
     elif set_mph != self.left_at:
       self.left_doubt = True              # neither ours nor a RES to the stored value: leave it alone, keep the message
@@ -396,6 +420,7 @@ class Curve:
     self.btn_was = btn
     self.odo += max(0.0, inp.mph) * MPH * DT
     self._bend_track(frame, inp)
+    self._cap_track(frame, inp)
     if inp.gas:
       self.gas_off_at = None
     elif self.gas_hold and self.gas_off_at is None:
@@ -448,6 +473,7 @@ class Curve:
           self.own_press = False
         if inp.driver_set:
           self.own_press = True
+          self.restore_failed = None          # SET+ / SET-: answered (RES is not)
           self.press_plus = bool(inp.driver_set_plus)
           self.chose_note = ""
         if self.intervening() or self.state in ("ready", "stopped", "waiting"):
@@ -557,6 +583,8 @@ class Curve:
       self.ref = inp.set_mph
     if self.left_at is not None and inp.set_mph is not None and self.ref is not None and inp.set_mph >= self.ref:
       self.left_at, self.own_press, self.left_doubt = None, False, False     # back at the driver's own set speed
+    if self.restore_failed is not None and (self.restore_failed != self.ref or (inp.set_mph is not None and inp.set_mph >= self.ref)):
+      self.restore_failed = None
 
     if self.left_doubt:
       self._cut_tap()
@@ -682,6 +710,7 @@ class Curve:
         self.lowered_from = self.ref
         self.restore_wait_since = None
         self.trust_past = False
+        self.restore_failed = None            # a new slowdown: the failed restore is history
         self._ev("start", frame, ceil=ceil, corner=plan.get("corner"), floor=self.floor, limit=lim, mph=round(inp.mph, 1),
                  set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
       # the set speed the planner asks for now (the push below the corner speed, then the corner speed), within the floor and
@@ -702,6 +731,8 @@ class Curve:
         self.press_floor = self.floor           # the push net acted: no push below the floor for the rest of this intervention
         self.target = max(self.target, min(self.floor, self.ref))
       self.shown = min(max(int(corner), self.floor), self.ref)
+      if not gentle:
+        self._cap_note(frame, self.shown, plan.get("end") is not None)
       if self.in_bend:
         self.bend_lo = self.shown if self.bend_lo is None else min(self.bend_lo, self.shown)
       need_true = plan.get("need") if plan.get("need") is not None else corner
@@ -744,6 +775,12 @@ class Curve:
         self._to(frame, "holding", "next corner close")
         self.line1 = f"HOLDING FOR THE NEXT CORNER: {inp.set_mph} mph"
         self.line2 = f"back to {self.ref} mph after it"
+        return None
+      if self.restore_failed is not None:
+        self.target = self.shown = inp.set_mph
+        self._to(frame, "holding", "restore failed: left to you")
+        self.line1 = f"ON: set speed {inp.set_mph} mph"
+        self.line2 = self._left_text(inp.set_mph)
         return None
       self.target = self.shown = cap
       if self.left_doubt:
@@ -925,6 +962,46 @@ class Curve:
     else:
       self.bend_low_f = None
 
+  def _cap_clear(self):
+    self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
+    self.cap_held = self.cap_armed = self.cap_gap = False
+
+  def _cap_track(self, frame, inp):
+    """Forget the remembered lowest ceiling when its end conditions hold (see CAP_STALE_S)."""
+    if self.cap_lo is None:
+      return
+    if not self._plan_ok(inp):
+      self.cap_gap = True              # the plan stream went missing / stale: the dead-planner restore is its own, older rule
+    elif self.cap_gap:
+      self.cap_armed = True            # ... and a plan is back after the gap (a restart): from now the cap binds
+    vals = [abs(x) for x in (inp.la_now, inp.desired_la) if x is not None]
+    if vals and max(vals) < BEND_IN_LA - BEND_HYST_LA:
+      self.cap_straight_f = frame if self.cap_straight_f is None else self.cap_straight_f
+    else:
+      self.cap_straight_f = None
+    past_end = self.cap_end is None or self.odo >= self.cap_end
+    straight = self.cap_straight_f is not None and (frame - self.cap_straight_f) * DT >= BEND_OUT_S - 1e-9
+    if (straight and past_end) or (self.cap_end is not None and self.odo >= self.cap_end + TRUST_HOLD_M) or        (frame - self.cap_seen_f) * DT >= CAP_STALE_S:
+      self._cap_clear()
+
+  def _cap_note(self, frame, shown, end_known):
+    """A plan acted on (corner speed `shown`): the cap follows the lowest, and a plan at or under it confirms it."""
+    if self.cap_lo is None or shown <= self.cap_lo:
+      if self.cap_lo is None or shown < self.cap_lo:
+        self.cap_held = False
+      self.cap_lo, self.cap_seen_f = shown, frame
+      if end_known and self.corner_end_odo is not None:
+        self.cap_end = self.corner_end_odo          # only the planner's own "end" (a "dist" is the corner's START)
+
+  def _cap_blocks(self, frame, inp, button, exempt):
+    """True: a SET+ above the lowest ceiling acted on in this slowdown (the push net and the safe exit are exempt)."""
+    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or inp.set_mph is None or        inp.set_mph + 1 <= self.cap_lo:
+      return False
+    if not self.cap_held:
+      self.cap_held = True
+      self._ev("cap_hold", frame, set_mph=inp.set_mph, allowed=self.cap_lo, target=self.target, state=self.state)
+    return True
+
   def _bend_blocks(self, frame, inp, button, exempt):
     """True: a SET+ that would take the dash above what the bend allows (BEND_*); the push net and the safe exit are exempt."""
     if button != "SET_PLUS" or exempt or not self.in_bend or inp.set_mph is None:
@@ -946,7 +1023,7 @@ class Curve:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
-    if not correcting and self._bend_blocks(frame, inp, button, exempt):
+    if not correcting and (self._bend_blocks(frame, inp, button, exempt) or self._cap_blocks(frame, inp, button, exempt)):
       return None
     if self.in_bend and button == "SET_PLUS":
       allow_hold = False                  # in a bend a raise is tapped, one step at a time, each checked against the bend's limit
@@ -1196,6 +1273,7 @@ class SafeExit:
     self.ref_unknown = False
     self.armed_f = None
     self.wait_since = None
+    self.left_cleared = False     # a driver cruise button was seen while the Curve was gone: the set-speed-left record is answered
     self.result = None            # None, "done", "driver", "cruise off", "changed", "failed", "gave up", "curve slowing back in charge"
     self.guard = PressGuard()
     self.tap = None
@@ -1238,7 +1316,9 @@ class SafeExit:
       k = ev.get("kind")
       if k == "driver_button":
         self.cancel(frame, "driver")
-      elif k == "stop" and ev.get("why") not in EXIT_EXEMPT:
+      elif k == "stop" and ev.get("why") not in EXIT_EXEMPT and not cv.left_doubt:
+        # (left_doubt: the set speed moved unexpectedly, possibly the driver's own press the button flag missed: nothing is pressed
+        # until the driver acts; the set-speed-left record / on-road alert shows instead)
         self.arm(frame, inp, ev.get("why") or "stopped")
       elif k == "switched_off" and EXIT_RAISE_ON_SWITCH_OFF:
         self.arm(frame, inp, "switched off")
@@ -1258,6 +1338,7 @@ class SafeExit:
     if not restart and (inp is None or inp.set_mph is None):
       return False
     self.active, self.why, self.line, self.result = True, why, line, None
+    self.left_cleared = False
     self.armed_f, self.wait_since = frame, None
     self.tap = self.tap_to = self.tap_first = None
     self._ev("exit_armed", frame, why=why, set_mph=None if inp is None else inp.set_mph, ref=self.ref, floor=self.floor, line=line)
@@ -1387,6 +1468,8 @@ def run_frame(cv, ex, frame, inp):
       ex.observe(frame, cv, inp)
   if ex is None:
     return button
+  if cv is None and inp.driver_button:
+    ex.left_cleared = True        # as the live Curve does: any driver cruise button answers the set-speed-left record
   b2 = ex.step(frame, inp, gas_recent=bool(cv.gas_hold) if cv is not None else False)
   return button if button is not None else b2
 
@@ -1480,8 +1563,10 @@ def set_left(cv, ex, set_mph):
   ref = cv.ref if cv is not None else (ex.ref if ex is not None else None)
   if set_mph is None or ref is None or int(set_mph) >= int(ref):
     return None
+  if cv is not None and cv.restore_failed is not None and cv.restore_failed == cv.ref and int(set_mph) < int(cv.ref):
+    return int(set_mph), int(cv.ref)       # a restore failed: held for the driver, one steady alert until SET+ / SET-
   if cv is None:
-    return int(set_mph), int(ref)
+    return None if ex is not None and ex.left_cleared else (int(set_mph), int(ref))
   if cv.state == "stopped" and not cv.after_brake:
     return int(set_mph), int(ref)
   if cv.state == "off" and cv.off_note:

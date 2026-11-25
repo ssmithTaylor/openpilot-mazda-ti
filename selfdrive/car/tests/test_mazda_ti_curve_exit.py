@@ -1,6 +1,6 @@
 """Review C2 (2026-11-24): the SAFE EXIT. Any stop of curve slowing while the dash is pushed below the 15-mph line (other than the
-driver's own cruise button or the cruise going off) raises the dash back to the line, independent of the intervention's state
-machine: after a raise tap not read back, the switch going off, the cruise check, an unexpected set-speed change, an internal error
+driver's own cruise button, the cruise going off or an unexpected set-speed change, which is left to the driver) raises the dash back to the line, independent of the intervention's state
+machine: after a raise tap not read back, the switch going off, the cruise check, an internal error
 (the Curve object gone) and a controls restart (state lost, the persisted marker found). Closed loop with the ONE cruise model, both
 braking tables: the car's actual speed never goes more than 0.5 mph below the line after the stop; no tap after a driver button;
 nothing ever above the driver's set speed."""
@@ -35,6 +35,7 @@ def _drive(event, depth, variant=CM.TIMING, ref=55, seconds=40.0, keep_ignoring=
     on, check, driver = True, False, False
     if st["hit"] is None and car.set <= fl - depth:
       st["hit"] = f
+      st["set_at_hit"] = car.set
       if event == "changed":
         car.set -= 1                                    # a set-speed change nobody asked for
       elif event == "internal_error":
@@ -94,6 +95,12 @@ def test_every_stop_reason_raises_back_to_the_line(monkeypatch, event, depth, va
   if depth > P.DRIVE_GAP_MPH:
     monkeypatch.setattr(P, "DRIVE_GAP_MPH", 10)        # the held-button push depth (DRIVE_GAP_MPH 10 with CM.HOLD)
   car, cv, ex, st, lo, hi, fl, _ = _drive(event, depth, variant)
+  if event == "changed" and st["hit"] is not None:
+    # the doubt case (an unflagged drop may be the driver's own press): the exit does NOT arm and sends nothing; the set speed
+    # stays where it went, the on-road alert says so (rewritten from "raises back to the line", pending the owner's ruling (asked 2026-11-24))
+    assert not ex.active and ex.result is None and car.set == st["set_at_hit"] - 1 and hi <= 55
+    assert C.set_left(cv, ex, car.set) == (car.set, 55)
+    return
   if st["hit"] is None:
     # with the timing table the push net raises the dash before it ever reads floor - 10: the stop cannot come there; the whole run
     # still never takes the car more than 0.5 mph under the line
@@ -343,3 +350,58 @@ def test_monitor_does_no_work_and_logs_nothing_while_off(monkeypatch):
   monkeypatch.setattr(type(cc), "_curve_monitor", lambda self, *a: calls.append(1))
   _frames(cc, CC, CS, clock, 300, set_mph=[55])
   assert not calls and cc.curve.state == "off"
+
+
+# ---- fixes 2026-11-24 (reviewed faults 1 and 2) ----------------------------------------------------------------------------------
+def test_fault1_doubt_stop_does_not_arm_and_keeps_the_alert_until_a_driver_button():
+  car, cv, ex, st, lo, hi, fl, _ = _drive("changed", 6)       # mid-push at 34, an unflagged 1 mph drop -> 33
+  assert st["hit"] is not None and car.set == 33 and ex.result is None and not ex.active
+  assert cv.state == "stopped" and cv.left_doubt and C.set_left(cv, ex, car.set) == (33, 55)
+  inp = C.Inputs(on=True, engaged=True, cruise_on=True, cruise_available=True, mph=car.mph, set_mph=33, lead=False,
+                 driver_button=True, counter=car.counter, plan=T.plan(C.ABS_FLOOR_MPH, corner=fl, dist=300.0), plan_age=0.1, mono=99.0)
+  C.run_frame(cv, ex, 99999, inp)
+  assert C.set_left(cv, ex, 33) is None                         # the driver pressed a cruise button: the alert clears
+
+
+def test_fault2_driver_button_clears_the_record_after_an_internal_error():
+  ex = C.SafeExit()
+  ex.ref, ex.floor = 55, 40
+  assert C.set_left(None, ex, 34) == (34, 55)
+  for i, kw in enumerate(({"driver_set": True, "driver_set_plus": False}, {"driver_set": True, "driver_set_plus": True}, {})):
+    ex = C.SafeExit()
+    ex.ref, ex.floor = 55, 40
+    assert C.set_left(None, ex, 34) == (34, 55)
+    C.run_frame(None, ex, 10 * i, C.Inputs(on=True, engaged=True, cruise_on=True, set_mph=34, mph=45.0, driver_button=True, counter=3, **kw))
+    assert C.set_left(None, ex, 34) is None                     # SET-, SET+, RES / CANCEL: any cruise button
+    assert C.set_left(None, ex, 30) is None                     # and it stays cleared when the driver then picks a lower speed
+
+
+# ---- fault B (2026-11-24): the switched-off path rewrites TiSetSpeedLeft at 0.5 s, from the LIVE set speed --------------------------
+def test_switched_off_path_rewrites_the_left_record_every_half_second_from_the_live_set_speed(monkeypatch):
+  import json
+  cc, mem, CC, CS, clock = _cc({}, monkeypatch)
+  cv = cc.curve
+  cv.state, cv.ref, cv.off_note = "off", 55, "Set speed 34 mph (was 55): set it yourself"
+  cc.curve_exit.ref = 55
+  cc.curve_inp_last = C.Inputs(set_mph=50)                  # stale: the last frame the on path ran
+  CS.out.cruiseState.speed = 34 * 0.44704
+  writes = []
+  real = mem.put
+  mem.put = lambda k, v, *a, **kw: (writes.append((clock["k"], k, v)), real(k, v, *a, **kw))[1]
+  _frames(cc, CC, CS, clock, 600, set_mph=[34])
+  left = [(k, json.loads(v)) for k, key, v in writes if key == C.PARAM_LEFT]
+  assert left and all(d["now"] == 34 and d["was"] == 55 for _, d in left), left[:3]
+  gaps = [b[0] - a[0] for a, b in zip(left, left[1:])]
+  assert gaps and max(gaps) <= 50, gaps                     # the planner drops a record 1.0 s old: every 0.5 s
+
+
+def test_faultC_set_at_a_low_speed_after_an_internal_error_clears_the_record_and_it_stays_cleared():
+  ex = C.SafeExit()
+  ex.ref, ex.floor = 50, 40
+  assert C.set_left(None, ex, 44) == (44, 50)
+  # the driver picks 30 with SET-: the press frame, then quiet frames at the new speed (ex.ref is never updated with no Curve)
+  for f, (btn, setv) in enumerate([(True, 44), (True, 43), (True, 30)] + [(False, 30)] * 50):
+    C.run_frame(None, ex, f, C.Inputs(on=True, engaged=True, cruise_on=True, set_mph=setv, mph=45.0, driver_button=btn, counter=3,
+                                      driver_set=btn, driver_set_plus=False))
+    if f >= 0:
+      assert C.set_left(None, ex, setv) is None, (f, setv)

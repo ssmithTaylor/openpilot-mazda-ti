@@ -934,8 +934,8 @@ def test_brake_then_res_with_a_real_corner_ahead_keeps_it_low():
   assert max(h[1] for h in car.history if h[0] >= f0 + 50) <= 42
 
 
-def test_pause_after_a_driver_button_is_10_s():
-  assert C.PAUSE_S == 10.0
+def test_pause_after_a_driver_button_is_5_s():
+  assert C.PAUSE_S == 5.0
 
 
 def test_m2_any_set_press_defines_the_drivers_speed():

@@ -277,7 +277,7 @@ def test_driver_press_during_a_hold_wins_at_once():
       t_press["f"] = f
     return "f" in t_press and f < t_press["f"] + 30
 
-  out = drive(c, car, 800, lambda f, car: plan(35), driver_button=btn, driver_set=btn)
+  out = drive(c, car, 450, lambda f, car: plan(35), driver_button=btn, driver_set=btn)   # 450 frames: inside PAUSE_S (5 s) of the press, so "paused" is still the state to assert
   f0 = t_press["f"]
   assert all(b is None for f, b, _, _ in out if f >= f0)              # not one more frame from the press's own frame on
   assert c.state == "paused" and c.hold is None
