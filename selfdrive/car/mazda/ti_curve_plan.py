@@ -416,6 +416,27 @@ MISS_S = 2.0                    # fixes that do not agree for this long: lock lo
 FIX_STALE_S = 1.0               # no valid fix for this long: confidence reduced
 FIX_LOST_S = 5.0                # ... for this long: trust dropped
 MIN_TRUST_CONF = 0.7
+# DEAD RECKONING through a position gap (winding fix class 5, 2026-11-25: a gorge road has no junctions for long stretches and loses
+# position there as the norm). While position fixes are ABSENT or flagged invalid (Fix.valid False; NOT a fix that says the car is
+# beside the trace: that is road matching, RM_*, unchanged), the lock stays and the planner keeps its place on the trace by the
+# distance driven (wheel speed), trusted, for as long as the car's yaw-sensor curvature keeps agreeing with the remembered curvature
+# along the way, up to DR_MAX_M. Agreement: over the last DR_WIN_M driven, the mean live curvature against the mean remembered
+# curvature at the dead-reckoned positions, at the best along-road shift within -(DR_SHIFT_M + the live filter's lag) .. +DR_SHIFT_M
+# (the passes' own along-road scatter, 15 m typical: see _check_change), differs by more than DR_K_TOL + CHANGE_LEVEL_SHARE x the
+# larger level (the change detection's measured level share). DR_K_TOL = 2 x CHANGE_FLAT_STD: twice the curvature spread of a
+# shapeless remembered window, which also covers the yaw sensor's own curvature noise at road speed (assumption: ~0.2 deg/s yaw-rate
+# noise is 0.00015 1/m at 20 m/s). A disagreement held for more than DR_BAD_M ends it (the car left the road: a remembered bend of
+# 400 m radius or tighter missing, or one taken where the memory is straight). DR_MAX_M from the odometer drift (DR_DRIFT, 2 % of the
+# distance: wheel-speed scale error and the lane line against the trace's centre line): 1500 m gives at most 30 m of along-road error,
+# 1.2 s at 55 mph against the just-in-time start of a slowdown, so the start margin is widened by DR_DRIFT x the distance dead-
+# reckoned (in seconds at the speed now) while it lasts. Fixes coming back re-anchor through the ordinary FIX_GAIN pull (no jump).
+DR_ON = True
+DR_MAX_M = 1500.0
+DR_DRIFT = 0.02
+DR_WIN_M = 60.0
+DR_SHIFT_M = 15.0
+DR_K_TOL = 0.0012
+DR_BAD_M = 40.0
 
 # ---- the road may have changed (study's change detection, kept simple) -----------------------------------------------------------
 CHANGE_WINDOW_M = 300.0
@@ -647,6 +668,8 @@ class Planner:
     self.rm, self.rm_off, self.rm_why = None, False, ""   # road matching (RM_*): offset state; beside the trace; why (for the log)
     self.rm_n = 0
     self.fix_age = 1e9
+    self.dr_m, self.dr_bad_m, self.dr_hist = 0.0, 0.0, []   # dead reckoning (DR_*): metres since the last fix, in disagreement; (odo,
+    #                                                         live k, pos)
     self.odo = 0.0
     self.live_k = 0.0
     self.bend_on, self.bend_low_t, self.bend_left_t = False, None, -1e9   # the car's own in-bend state (REL_*), for the release
@@ -745,6 +768,7 @@ class Planner:
       self.cand = (self.cand[0], self.cand[1] + v * dt / mem.spacing)
     if fix.valid:
       self.fix_age = 0.0
+      self.dr_m, self.dr_bad_m, self.dr_hist = 0.0, 0.0, []
       cands = self._candidates(fix)
       if self.locked:
         best = None
@@ -802,8 +826,41 @@ class Planner:
       self.alts = []
       if self.cand is not None and not self.locked:
         self.cand, self.stable_s = None, 0.0
-      if self.locked and self.fix_age >= FIX_LOST_S:
+      if self.locked and DR_ON:
+        self._dead_reckon_check(dt, v)
+      elif self.locked and self.fix_age >= FIX_LOST_S:
         self._lose("no position fix")
+
+  def dr_active(self):
+    """Dead reckoning (DR_*) in force: locked, the fix gone for more than FIX_STALE_S, and its checks still passing."""
+    return DR_ON and self.locked and self.fix_age >= FIX_STALE_S and self.dr_m > 0.0
+
+  def _dead_reckon_check(self, dt, v):
+    """DR_*: one tick without a fix while locked: the distance, the yaw agreement, the limits (drops the lock when they fail)."""
+    self.dr_m += v * dt
+    if self.dr_m > DR_MAX_M:
+      self._lose("no position fix: dead reckoning limit")
+      return
+    self.dr_hist.append((self.odo, self.live_k, self.pos))
+    while self.dr_hist and self.odo - self.dr_hist[0][0] > DR_WIN_M:
+      self.dr_hist.pop(0)
+    if len(self.dr_hist) < 3 or self.odo - self.dr_hist[0][0] < 0.5 * DR_WIN_M:
+      return
+    live = np.array([h[1] for h in self.dr_hist])
+    pos = np.array([h[2] for h in self.dr_hist])
+    ml = float(np.mean(live))
+    sp = self.mem.spacing
+    lag = v * LIVE_K_TAU_S
+    best = None
+    for sh in np.arange(-(DR_SHIFT_M + lag), DR_SHIFT_M + 1e-6, sp):
+      ii = np.clip(np.round(pos + sh / sp).astype(int), 0, self.mem.n - 1)
+      mr = float(np.mean(self.kmed[ii]))
+      d = abs(ml - mr) - (DR_K_TOL + CHANGE_LEVEL_SHARE * max(abs(ml), abs(mr)))
+      best = d if best is None else min(best, d)
+    self.dr_bad_m = self.dr_bad_m + v * dt if best > 0.0 else 0.0
+    if self.dr_bad_m > DR_BAD_M:
+      self.events.append({"kind": "dr_off", "why": "yaw disagrees", "dr_m": round(self.dr_m), "k": round(ml, 4)})
+      self._lose("no position fix: the yaw disagrees with the remembered road")
 
   def _rm_update(self, dt, fix, v, tr, i):
     """Road matching (RM_*): the car's offset from the locked trace at its point i (trace tr) against the reference; sets self.rm_off
@@ -1011,6 +1068,8 @@ class Planner:
     conf = 0.0
     if self.locked:
       conf = 1.0 if self.fix_age < FIX_STALE_S else max(0.0, 1.0 - (self.fix_age - FIX_STALE_S) / (FIX_LOST_S - FIX_STALE_S))
+      if self.dr_active():
+        conf = max(conf, MIN_TRUST_CONF)          # DR_*: trusted on the odometer while the yaw agrees (the extra start margin below)
     elif self.cand is not None:
       conf = 0.5 * min(1.0, self.stable_s / STABLE_S)
     known = self.locked or self.cand is not None
@@ -1216,7 +1275,7 @@ class Planner:
         prof.append((D_, T))
         if T >= u_ref - 0.5 or D_ < 0.0:
           continue                                 # a point the car is already at or under (or passed): no start of its own
-        buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0)
+        buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0) + self._dr_buf_s(mph)
         # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
         # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
         # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
@@ -1244,6 +1303,10 @@ class Planner:
                     "strong": ("record" if trb is not None and np.any(np.isfinite(trb[run])) else
                                "passes" if npass is not None and np.any(npass[run] >= REL_STRONG_PASSES) else "")}
     return cands
+
+  def _dr_buf_s(self, mph):
+    """DR_*: the extra start margin (s) for the odometer's drift over the distance dead-reckoned (0 with a fix)."""
+    return DR_DRIFT * self.dr_m / max(mph * MPH, 1.0) if self.dr_active() else 0.0
 
   def _track_bend(self, t, la):
     """The car's own in-bend state from its yaw-sensor lateral acceleration (REL_*; the car side's BEND_* rule)."""

@@ -397,9 +397,17 @@ def test_gps_dropout_short_keeps_trust_long_drops():
   tr, mem = single_corner()
   short = drive(mem, tr, 50, 60, fix_fn=lambda t, s, f: P.Fix(False) if 20 <= t < 20.8 else f)
   assert all(p.trusted for t, s, p in short if 21 <= t <= 30)
+  # winding fix class 5 (DR_*): a 10 s dropout no longer drops trust: the lock is kept by the odometer while the yaw agrees
   long = drive(mem, tr, 50, 60, fix_fn=lambda t, s, f: P.Fix(False) if 20 <= t < 30 else f)
-  assert any(not p.trusted for t, s, p in long if 22 <= t < 30)
-  assert all(p.ceil is None for t, s, p in long if 20 + P.FIX_LOST_S + 0.5 <= t < 30)
+  assert all(p.trusted and p.conf >= P.MIN_TRUST_CONF for t, s, p in long if 20 <= t < 31)
+  assert all(p.ceil is None for t, s, p in long if 20 + P.FIX_LOST_S + 0.5 <= t < 30)       # (straight there: nothing to slow for)
+  # ... but only up to DR_MAX_M: a dropout from 5 s on loses trust past DR_MAX_M (+ the planner tick), and once the corner it was
+  # dead-reckoning through is passed, there is no ceiling
+  s0 = 50 * P.MPH * 5.0
+  lost = drive(mem, tr, 50, 100, fix_fn=lambda t, s, f: P.Fix(False) if t >= 5 else f)
+  assert all(p.trusted for t, s, p in lost if 5 <= t and s <= s0 + P.DR_MAX_M - 10)
+  assert all(not p.trusted for t, s, p in lost if s >= 1650 + P.HOLD_AFTER_M + 20)
+  assert all(p.ceil is None for t, s, p in lost if s >= 1650 + P.HOLD_AFTER_M + 20)
 
 
 def test_gps_jump_loses_lock_not_wild_ceiling():
@@ -1216,7 +1224,9 @@ def test_position_gap_keeps_an_active_corner_by_dead_reckoning():
   assert inside and (inside[-1][0] - next(t for t, s, p in inside if s >= gap[0])) > P.FIX_LOST_S   # the gap outlasts FIX_LOST_S
   assert all(p.ceil is not None and p.ceil <= want for t, s, p in inside if s <= 1650), \
     [(round(s), p.ceil, p.stage, p.src) for t, s, p in inside if p.ceil is None or p.ceil > want][:5]
-  assert any(e["kind"] == "lock_lost" and e["why"] == "no position fix" for e in pl.events)
+  # winding fix class 5 (DR_*): the lock itself is now kept through the gap (the yaw agrees), trusted
+  assert not any(e["kind"] == "lock_lost" for e in pl.events)
+  assert all(p.trusted for t, s, p in inside if s <= 1650)
   assert next(v for t, s, p, v in res if s >= 1500) <= want + 1.0
   # passed: released by the odometer, not kept for ever
   assert any(p.ceil is None for t, s, p, v in res if s > 1650 + P.HOLD_AFTER_M + 20)

@@ -120,3 +120,75 @@ def test_class23_no_yoyo_between_bends_and_arrival(fam, seed):
       if not b["drv"] and b["allowed"] >= b["floor"]:
         assert b["peak"] <= b["allowed"] + 1.0, b
 
+
+@pytest.mark.parametrize("fam,seed", (("F5", 16),))
+def test_class5_record_bends_kept_through_a_position_gap(fam, seed):
+  """CLASS 5: a 10-60 s loss of position (fixes absent / invalid) turned record bends into table-only bends, unwarned (F5/16: set 55,
+  record, a 60 s gap: a bend allowed 32 driven at 42 with no warning). The planner keeps its place by the odometer while the yaw
+  agrees: no lock loss, and every bend is reached at or under max(allowed, floor) + 1 mph."""
+  r = _run(fam, seed)
+  assert not any(e["kind"] == "lock_lost" for e in r["pl_events"]), [e for e in r["pl_events"] if e["kind"] == "lock_lost"]
+  for b in r["bends"]:
+    if not b["drv"]:
+      assert b["peak"] <= max(b["allowed"], b["floor"]) + 1.0, b
+
+
+def _dr_drive(fix_at, yaw_at, segs, mph=50.0, seconds=None):
+  """open-loop planner drive at a constant speed over the synthetic road `segs`: fix_at(s, (x, y, h)) -> Fix; yaw_at(s, k) -> live k"""
+  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P
+  import numpy as np
+  tr = M.synthetic_trace(segs)
+  mem = M.synthetic([tr])
+  pl = P.Planner(mem)
+  s_road = np.arange(len(tr["x"])) * M.SPACING_M
+  v = mph * P.MPH
+  end = s_road[-1] - 50.0
+  out = []
+  t = 0.0
+  while v * t < end:
+    s = v * t
+    i = min(int(s // M.SPACING_M), len(s_road) - 1)
+    xyh = (float(np.interp(s, s_road, tr["x"])), float(np.interp(s, s_road, tr["y"])), float(tr["hdg"][i]))
+    p = pl.step(t, fix_at(s, xyh), v, set_mph=mph, yaw_k=yaw_at(s, float(tr["kap"][i])), ref_mph=mph)
+    out.append((s, p, any(e["kind"] == "dr_off" for e in pl.events[-3:])))
+    t += 0.2
+  return pl, out
+
+
+def test_class5_car_leaving_the_road_in_a_gap_stops_dead_reckoning():
+  """DR_*: the fixes go at 1000 m and the car takes a straight road off the remembered one, which bends at 1200 m: the dead
+  reckoning ends (the yaw disagrees with the remembered bend) within DR_WIN_M + DR_BAD_M of the bend's start."""
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+  segs = [(1200.0, 0.0), (200.0, 0.01), (1500.0, 0.0)]
+  pl, out = _dr_drive(lambda s, f: P.Fix(True, *f) if s < 1000.0 else P.Fix(False),
+                      lambda s, k: k if s < 1000.0 else 0.0, segs)
+  off = [e for e in pl.events if e["kind"] == "dr_off"]
+  assert off, [e for e in pl.events if e["kind"] in ("lock_lost", "dr_off")]
+  s_off = next(s for s, p, o in out if o)
+  assert 1200.0 <= s_off <= 1200.0 + P.DR_WIN_M + P.DR_BAD_M, s_off
+  # on the agreeing road (the yaw as remembered) the same gap keeps the lock to the end of the bend and beyond
+  pl2, out2 = _dr_drive(lambda s, f: P.Fix(True, *f) if s < 1000.0 else P.Fix(False), lambda s, k: k, segs)
+  assert not any(e["kind"] == "dr_off" for e in pl2.events)
+  assert [e["why"] for e in pl2.events if e["kind"] == "lock_lost"] == ["no position fix: dead reckoning limit"]
+  assert all(p.trusted for s, p, o in out2 if 1000.0 <= s <= 1000.0 + P.DR_MAX_M - 10.0)
+
+
+def test_class5_fixes_returning_12_m_sideways_start_no_slowdown():
+  """DR_*: fixes gone 1000-1600 m, then back 12 m sideways (the gorge offset case) on a straight with a remembered bend 400 m on: the
+  return starts no slowdown and publishes no corner ceiling before the bend's own approach could (no jump, no re-match start)."""
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+  import math
+  segs = [(2000.0, 0.0), (150.0, 0.012), (1500.0, 0.0)]
+
+  def fix_at(s, f):
+    if s < 1000.0:
+      return P.Fix(True, *f)
+    if s < 1600.0:
+      return P.Fix(False)
+    x, y, h = f
+    return P.Fix(True, x - math.sin(h) * 12.0, y + math.cos(h) * 12.0, h)
+  pl, out = _dr_drive(fix_at, lambda s, k: k, segs)
+  starts_m = [s for s, p, o in out if 1600.0 <= s <= 1700.0 and p.ceil is not None and p.kind == "corner"]
+  assert not starts_m, starts_m
+  assert all(p.trusted or p.why == "beside the remembered road" for s, p, o in out if 1000.0 <= s <= 1700.0), \
+    [(round(s), p.why) for s, p, o in out if 1000.0 <= s <= 1700.0 and not p.trusted][:5]
