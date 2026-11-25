@@ -88,7 +88,8 @@ CONFIRM_SHARE = 0.6
 #  * no reading counts while the car is in a bend itself or left one less than REL_AFTER_BEND_S ago (the same in-bend test as the car
 #    side's BEND_*: |lateral acceleration| from the yaw sensor >= ENTRY_LA on, < ENTRY_LA - REL_BEND_HYST_LA for REL_BEND_OUT_S off);
 #    the drive's under-reading lasted ~1.5 s after the exit, so 2.0 s;
-#  * a bend whose points carry a trouble record (finite v_trb) or REL_STRONG_PASSES or more passes is never released by the forecast:
+#  * a bend whose points carry an ATTESTED trouble record (record_attested: REC_ATTESTED+ troubled passes and a clean pass below; I1:
+#    one or two troubled passes do not count) or REL_STRONG_PASSES or more passes is never released by the forecast:
 #    the memory is the stronger witness there (whether the car is ON that road is road matching's job: off the trace no stage-1 bend
 #    starts and RM keeps working as before; the release only ever answered "is this remembered bend really there");
 #  * a start already inside the decision window (a late start, as on the drive) is not released on the readings of its own tick and
@@ -502,6 +503,15 @@ def scatter_speed_ratio(mph, side):
 REC_ATTESTED = 3
 
 
+def record_attested(v_trb, v_ok, n_trb):
+  """Per point: the trouble record is ATTESTED (REC_ATTESTED or more troubled passes at the limit, and a clean pass proven below
+  them), the one test the bound (record_bound) and the release (the "strong" bend, I1) share. n_trb None: never attested."""
+  vt = np.asarray(v_trb, np.float64)
+  if n_trb is None:
+    return np.zeros(len(vt), bool)
+  return np.isfinite(vt) & (np.asarray(n_trb) >= REC_ATTESTED) & np.isfinite(np.asarray(v_ok, np.float64))
+
+
 def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   """whole mph the record allows at each point (nan where it has no trouble), given the table's need there (`table`: need_hi when
   hi, else need); n_trb: troubled passes per point (None: all below REC_ATTESTED)."""
@@ -514,7 +524,7 @@ def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   if not sel.any():
     return out
   vt_, vo_, tab_, sd_ = vt[sel], vo[sel], tab[sel], side[sel]
-  att = (np.zeros(len(vt), bool) if n_trb is None else np.asarray(n_trb) >= REC_ATTESTED)[sel] & np.isfinite(vo_)
+  att = record_attested(v_trb, v_ok, n_trb)[sel]
   q = 0.05                                                 # the file's float16 speeds are good to about 0.04 mph
   top = np.ceil(vt_ - q) - 1.0                             # at least 1 mph under the troubled speed
   b = np.where(np.isfinite(vo_), np.floor(vo_ + q), np.floor(vt_ * scatter_speed_ratio(vt_, sd_) + q))
@@ -595,6 +605,10 @@ class Planner:
       Planner._table_tried = True
       Planner.table_keys = load_approach_table()   # once per process (cost only: the same values as computed)
     self.mem = memory
+    # I1: the points whose trouble record is attested (the release's "strong" bend; the bound uses the same test)
+    vt = getattr(memory, "v_trb", None)
+    self._attested = (None if vt is None else
+                      record_attested(vt, getattr(memory, "v_ok", np.full(len(vt), np.nan)), getattr(memory, "n_trb", None)))
     self.need = None
     self.need_hi = None
     self.hi = True                      # R14: this tick plans on D.need_hi (the car at or above STEP_MPH, or a bend started there)
@@ -1047,8 +1061,7 @@ class Planner:
     sign = np.sign(self.kmed[idx])
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
                              self.active, grade_of=None if grade is None else self._grade_fn(grade, idx, dist),
-                             npass=self.mem.npass[idx], trb=getattr(self.mem, "v_trb", None)[idx]
-                             if getattr(self.mem, "v_trb", None) is not None else None)
+                             npass=self.mem.npass[idx], trb=self._attested[idx] if self._attested is not None else None)
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
     cap, need_true, cend, behind, stage = r["cap"], r["need"], r["end"], r["behind"], r["stage"]
@@ -1137,6 +1150,7 @@ class Planner:
 
   def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None,
                   trb=None):
+    # trb: per look-ahead point, True where the trouble record is attested (record_attested), or None
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
@@ -1212,8 +1226,11 @@ class Planner:
                     "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
                     "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
                     "cap": D.capacity(Tmin, side), "side": side,
-                    # REL_*: the memory is the stronger witness (never released by the forecast)
-                    "strong": ("record" if trb is not None and np.any(np.isfinite(trb[run])) else
+                    # REL_*: the memory is the stronger witness (never released by the forecast) only where its record is
+                    # ATTESTED (I1, the owner's fluke rule, 2026-11-25): one or two troubled passes (132 of 142 record points in
+                    # memory v12, 53 of them on roads with 23-28 passes) must not change a bend's treatment beyond the bound;
+                    # such a bend is released by the ordinary rules (REL_TICKS valid readings etc.)
+                    "strong": ("record" if trb is not None and np.any(trb[run]) else
                                "passes" if npass is not None and np.any(npass[run] >= REL_STRONG_PASSES) else "")}
     return cands
 

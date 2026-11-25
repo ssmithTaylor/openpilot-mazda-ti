@@ -133,3 +133,42 @@ def test_a_late_start_is_not_released_on_its_own_reading():
   t_start = next(t for t, s, p, v in res if p.kind == "corner")
   t_rel = next(t for t, s, p, v in res if p.released)
   assert t_rel - t_start >= P.REL_LATE_SKIP_S + (P.REL_TICKS - 1) * 0.2 - 1e-6, (t_start, t_rel)
+
+
+def _record_memory(tr, npass, n_trb, v_trb_mph=40.0, v_ok_mph=35.0):
+  """A remembered right bend whose points carry a trouble record: `n_trb` troubled passes at v_trb_mph of `npass`, the highest
+  untroubled pass below them at v_ok_mph (nan: none)."""
+  on = tr["kap"] < 0
+  nan = np.full(len(on), np.nan)
+  rec = {"v_trb": [np.where(on, v_trb_mph * MPH, np.nan)], "v_ok": [np.where(on, v_ok_mph * MPH, np.nan)],
+         "n_trb": [np.where(on, n_trb, 0)], "cap_n": [np.zeros(len(on), np.uint8)], "cap_res": [nan]}
+  mem = M.synthetic([tr], record=rec)
+  mem.npass[:] = npass
+  return mem
+
+
+def test_attested_trouble_bend_keeps_its_protection_against_a_straight_forecast():
+  # the owner's regular trouble bend: 26 passes, 3 troubled at the limit (~40 mph), clean below at 35: an attested record; the
+  # memory is the stronger witness and a forecast that does not show the bend never releases it
+  k = k_needing(42, -1.0)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  mem = _record_memory(tr, npass=26, n_trb=P.REC_ATTESTED)
+  pl = P.Planner(mem)
+  res = drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 55))
+  assert "start" in kinds(pl) and "s1_release" not in kinds(pl), kinds(pl)
+  T = [e for e in pl.events if e["kind"] == "start"][0]["T"]   # the record's 35, held at the 15 mph shed floor (40) from 55
+  assert T <= 40
+  assert next(v for t, s, p, v in res if s >= 1500) <= T + 1.5
+
+
+def test_one_troubled_pass_does_not_make_a_bend_unreleasable():
+  # the fluke rule (I1): one troubled pass of 28 is not an attested record; the ordinary release rules apply, and a forecast
+  # that validly reads the bend absent releases it
+  k = k_needing(42, -1.0)
+  tr = road((1500, 0.0), (150, k), (800, 0.0))
+  for n_trb, v_ok in ((1, 35.0), (2, 35.0), (P.REC_ATTESTED, float("nan"))):
+    mem = _record_memory(tr, npass=28, n_trb=n_trb, v_ok_mph=v_ok)
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 55, 160, closed=True, planner=pl, model_fn=road_preview(road((3000, 0.0)), 55))
+    assert kinds(pl)[:2] == ["start", "s1_release"], (n_trb, kinds(pl))
+    assert max(v for t, s, p, v in res if 1500 <= s <= 1650) > 53, n_trb
