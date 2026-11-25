@@ -95,12 +95,6 @@ def test_every_stop_reason_raises_back_to_the_line(monkeypatch, event, depth, va
   if depth > P.DRIVE_GAP_MPH:
     monkeypatch.setattr(P, "DRIVE_GAP_MPH", 10)        # the held-button push depth (DRIVE_GAP_MPH 10 with CM.HOLD)
   car, cv, ex, st, lo, hi, fl, _ = _drive(event, depth, variant)
-  if event == "changed" and st["hit"] is not None:
-    # the doubt case (an unflagged drop may be the driver's own press): the exit does NOT arm and sends nothing; the set speed
-    # stays where it went, the on-road alert says so (rewritten from "raises back to the line", pending the owner's ruling (asked 2026-11-24))
-    assert not ex.active and ex.result is None and car.set == st["set_at_hit"] - 1 and hi <= 55
-    assert C.set_left(cv, ex, car.set) == (car.set, 55)
-    return
   if st["hit"] is None:
     # with the timing table the push net raises the dash before it ever reads floor - 10: the stop cannot come there; the whole run
     # still never takes the car more than 0.5 mph under the line
@@ -353,14 +347,10 @@ def test_monitor_does_no_work_and_logs_nothing_while_off(monkeypatch):
 
 
 # ---- fixes 2026-11-24 (reviewed faults 1 and 2) ----------------------------------------------------------------------------------
-def test_fault1_doubt_stop_does_not_arm_and_keeps_the_alert_until_a_driver_button():
+def test_doubt_case_unexpected_set_speed_change_raises_to_the_line_as_on_a517fab0():
+  # doubt case: raise to the line (standing rule); owner's ruling on staying silent asked 2026-11-24
   car, cv, ex, st, lo, hi, fl, _ = _drive("changed", 6)       # mid-push at 34, an unflagged 1 mph drop -> 33
-  assert st["hit"] is not None and car.set == 33 and ex.result is None and not ex.active
-  assert cv.state == "stopped" and cv.left_doubt and C.set_left(cv, ex, car.set) == (33, 55)
-  inp = C.Inputs(on=True, engaged=True, cruise_on=True, cruise_available=True, mph=car.mph, set_mph=33, lead=False,
-                 driver_button=True, counter=car.counter, plan=T.plan(C.ABS_FLOOR_MPH, corner=fl, dist=300.0), plan_age=0.1, mono=99.0)
-  C.run_frame(cv, ex, 99999, inp)
-  assert C.set_left(cv, ex, 33) is None                         # the driver pressed a cruise button: the alert clears
+  assert st["hit"] is not None and ex.result == "done" and car.set >= fl and lo >= fl - 0.5 and hi <= 55
 
 
 def test_fault2_driver_button_clears_the_record_after_an_internal_error():
