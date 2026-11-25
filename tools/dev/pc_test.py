@@ -46,6 +46,8 @@ CURVE_TESTS = (
   "selfdrive/car/tests/test_mazda_ti_curve_push.py",
   "selfdrive/car/tests/test_mazda_ti_curve_monitor.py",
   "selfdrive/car/tests/test_mazda_ti_curve_exit.py",
+  "selfdrive/car/tests/test_mazda_ti_curve_cap.py",
+  "selfdrive/car/tests/test_mazda_ti_curve_alert_loop.py",
   "tools/curve_slowing/test_early_dwell.py",
   "tools/curve_slowing/test_build_memory.py",
 )
