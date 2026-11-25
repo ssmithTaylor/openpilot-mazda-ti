@@ -125,6 +125,20 @@ def test_options_switch_min_passes_and_unconfirmed_cap():
   assert m.S1_UNCONFIRMED_MAX_MPH == 5
 
 
+def test_fix_default_is_the_snapped_point_raw_option_feeds_the_raw_fix():
+  # road matching (2026-11-24): by default the planner gets the governor's snapped memory point (unchanged); with --raw-fixes the
+  # raw position of the same sample, and no fix where the raw one is invalid. Synthetic numbers only
+  P = U.P
+  mem = NS(x=np.array([10.0, 20.0]), y=np.array([1.0, 2.0]), hdg=np.array([0.1, 0.2]))
+  r = {'pt': np.array([1, -1])}
+  assert U.fix_at(P, mem, r, 0) == P.Fix(True, 20.0, 2.0, 0.2)
+  assert U.fix_at(P, mem, r, 1) == P.Fix(False)
+  raw = dict(X=np.array([21.5, 0.0]), Y=np.array([-3.0, 0.0]), hdg=np.array([0.25, 0.0]), ok=np.array([True, False]))
+  assert U.fix_at(P, mem, r, 0, raw) == P.Fix(True, 21.5, -3.0, 0.25)
+  assert U.fix_at(P, mem, r, 1, raw) == P.Fix(False)
+  assert '--raw-fixes' in open(U.__file__).read()
+
+
 def test_replay_push_uses_the_planner_push_floor():
   # hold-branch merge: the replay's stage-1 push goes as deep as the planner's (CM.push_floor: below the 15 mph line by the push
   # depth, never below 25), not clamped at the floor
