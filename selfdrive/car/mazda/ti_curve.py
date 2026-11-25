@@ -134,7 +134,8 @@ BEND_OUT_S = 1.0
 # BEND_OUT_S AND the car is past where the planner last said that corner ends (no end known: straight alone); (b) the car is
 # TRUST_HOLD_M past that end whatever the lateral acceleration says; (c) CAP_STALE_S (= TRUST_HOLD_MAX_S, the existing bound for
 # a planner whose word cannot be trusted) passes with no plan that confirms the cap (a ceiling at or under it); or (d) the intervention
-# or the stop ends it.
+# or the stop ends it. It binds ONLY after a gap in the plan stream (plan missing or older than PLAN_STALE_S, the one restart signal the
+# car side sees reliably) while it is set: a continuous stream that revises or drops a corner is obeyed as ever.
 CAP_STALE_S = 30.0
 
 
@@ -285,6 +286,7 @@ class Curve:
     self.cap_seen_f = None            # frame of the last plan at or under the cap
     self.cap_straight_f = None        # frame the road last became straight
     self.cap_held = False             # a SET+ was held back by the cap (logged once per cap)
+    self.cap_armed = False            # the plan stream had a gap (plan missing or older than PLAN_STALE_S) since the cap was set
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -721,7 +723,7 @@ class Curve:
         self.target = max(self.target, min(self.floor, self.ref))
       self.shown = min(max(int(corner), self.floor), self.ref)
       if not gentle:
-        self._cap_note(frame, self.shown)
+        self._cap_note(frame, self.shown, plan.get("end") is not None)
       if self.in_bend:
         self.bend_lo = self.shown if self.bend_lo is None else min(self.bend_lo, self.shown)
       need_true = plan.get("need") if plan.get("need") is not None else corner
@@ -947,12 +949,14 @@ class Curve:
 
   def _cap_clear(self):
     self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
-    self.cap_held = False
+    self.cap_held = self.cap_armed = False
 
   def _cap_track(self, frame, inp):
     """Forget the remembered lowest ceiling when its end conditions hold (see CAP_STALE_S)."""
     if self.cap_lo is None:
       return
+    if not self._plan_ok(inp):
+      self.cap_armed = True            # the plan stream went missing / stale (a restart): from now the cap binds
     vals = [abs(x) for x in (inp.la_now, inp.desired_la) if x is not None]
     if vals and max(vals) < BEND_IN_LA - BEND_HYST_LA:
       self.cap_straight_f = frame if self.cap_straight_f is None else self.cap_straight_f
@@ -963,18 +967,18 @@ class Curve:
     if (straight and past_end) or (self.cap_end is not None and self.odo >= self.cap_end + TRUST_HOLD_M) or        (frame - self.cap_seen_f) * DT >= CAP_STALE_S:
       self._cap_clear()
 
-  def _cap_note(self, frame, shown):
+  def _cap_note(self, frame, shown, end_known):
     """A plan acted on (corner speed `shown`): the cap follows the lowest, and a plan at or under it confirms it."""
     if self.cap_lo is None or shown <= self.cap_lo:
       if self.cap_lo is None or shown < self.cap_lo:
         self.cap_held = False
       self.cap_lo, self.cap_seen_f = shown, frame
-      if self.corner_end_odo is not None:
-        self.cap_end = self.corner_end_odo
+      if end_known and self.corner_end_odo is not None:
+        self.cap_end = self.corner_end_odo          # only the planner's own "end" (a "dist" is the corner's START)
 
   def _cap_blocks(self, frame, inp, button, exempt):
     """True: a SET+ above the lowest ceiling acted on in this slowdown (the push net and the safe exit are exempt)."""
-    if button != "SET_PLUS" or exempt or self.cap_lo is None or inp.set_mph is None or inp.set_mph + 1 <= self.cap_lo:
+    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or inp.set_mph is None or        inp.set_mph + 1 <= self.cap_lo:
       return False
     if not self.cap_held:
       self.cap_held = True
