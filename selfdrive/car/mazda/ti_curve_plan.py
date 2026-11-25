@@ -94,6 +94,9 @@ CONFIRM_SHARE = 0.6
 #  * a start already inside the decision window (a late start: the decision point has passed) is not released: the bend is known,
 #    so it is slowed for;
 #  * a bend never read validly by its entry is kept (slowed for), as one never confirmed is.
+REL_ON = True                     # False: the old single-tick release (measurement baseline only)
+REL_STRONG = "record_or_passes"   # which memory is never released: "record_or_passes" (a trouble record or REL_STRONG_PASSES
+                                  # passes), "record" (a trouble record only), "none" (only the reading rules apply)
 REL_TICKS = 2
 REL_STRONG_PASSES = 10
 REL_AFTER_BEND_S = 2.0
@@ -1209,8 +1212,8 @@ class Planner:
                     "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
                     "cap": D.capacity(Tmin, side), "side": side,
                     # REL_*: the memory is the stronger witness (never released by the forecast)
-                    "strong": bool((npass is not None and np.any(npass[run] >= REL_STRONG_PASSES)) or
-                                   (trb is not None and np.any(np.isfinite(trb[run]))))}
+                    "strong": ("record" if trb is not None and np.any(np.isfinite(trb[run])) else
+                               "passes" if npass is not None and np.any(npass[run] >= REL_STRONG_PASSES) else "")}
     return cands
 
   def _track_bend(self, t, la):
@@ -1226,8 +1229,13 @@ class Planner:
 
   def _release_reading(self, v, T, a_, d_aim, t):
     """One tick of the release decision (REL_*). -> (True: absent this tick / False: present / None: no valid reading, why)."""
-    if a_.get("strong"):
-      return None, "memory"
+    if not REL_ON:
+      # the old single decision: the first tick in the window, on that tick's preview reaching the entry
+      r = self._release_check(v, T, a_["cap"], d_aim / max(v, 1.0))
+      return (r, "read") if r is not None else (None, "no preview" if a_.get("cap_c") is not None else "no model")
+    st = a_.get("strong") or ""
+    if st and (REL_STRONG == "record_or_passes" or (REL_STRONG == "record" and st == "record")):
+      return None, "memory_" + st
     if a_.get("late"):
       return None, "late"
     if d_aim <= 0.0:
@@ -1265,8 +1273,8 @@ class Planner:
       if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
-                       "side": c["side"], "hi": self.hi, "strong": bool(c.get("strong")),
-                       "late": c["aim_at"] - self.odo <= CONFIRM_LEAD_S * max(v, 1.0),
+                       "side": c["side"], "hi": self.hi, "strong": c.get("strong") or "",
+                       "late": REL_ON and c["aim_at"] - self.odo <= CONFIRM_LEAD_S * max(v, 1.0),
                        "low_at": self.odo + float(c.get("low_m", c["D"])), "absent": 0,
                        "cap_c": s1_unconfirmed_ceiling(mph) if (self.fc is not None and
                                                                  float(np.max(self.fc[0])) >= CONFIRM_LEAD_S - 1e-6) else None}  # R16
@@ -1312,14 +1320,15 @@ class Planner:
           self.events.append({"kind": "s1_unconfirmed", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
         elif rel is True:
           a_["absent"] += 1
-          if a_["absent"] >= REL_TICKS:
+          if a_["absent"] >= (REL_TICKS if REL_ON else 1):
             a_["decided"] = True
             self.released[key] = a_["at"]
             self.guard.pop(key, None)             # the explicit release decision: the one early drop of a corner in progress
-            self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+            self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
+                                "why": "absent"})
             del active[key]
             continue
-        elif rel is False or why in ("memory", "late", "entry", "no model"):
+        elif rel is False or not REL_ON or why in ("memory_record", "memory_passes", "late", "entry", "no model"):
           a_["decided"], a_["cap_c"] = True, None
           self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
                               "preview": rel is False, "why": why})

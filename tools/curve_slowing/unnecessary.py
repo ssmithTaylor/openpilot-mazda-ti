@@ -397,9 +397,11 @@ def replay_drive(args):
             res['events'][k] = res['events'].get(k, 0) + 1      # counts only (road matching's firing rate)
           if k in ('s1_release', 's1_confirm'):
             # the stage-1 bend's one decision (R13: a released bend is scored only up to its release; R16: the rest only after it)
+            kw_ = f"{k}:{e.get('why', '')}"
+            res['events'][kw_] = res['events'].get(kw_, 0) + 1     # counts by reason (the planner's release rules, REL_*)
             for x in reversed(res['slow']):
               if x['run'] == ri and x['stage'] == 1 and x['key'] == str(e.get('point')) and 'i_dec' not in x:
-                x['i_dec'], x['rel'] = i, k == 's1_release'
+                x['i_dec'], x['rel'], x['why'] = i, k == 's1_release', e.get('why', '')
                 break
             continue
           if k == 'start' and mph - e['T'] >= (opts.get('min_drop') or 2):
