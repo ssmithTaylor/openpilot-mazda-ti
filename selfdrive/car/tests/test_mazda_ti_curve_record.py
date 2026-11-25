@@ -307,3 +307,32 @@ def test_stage2_history_veto():
   vc2 = vc.copy(); vc2[31] = np.nan
   assert not P.s2_history_clean(vc2, vt, dist, 150.0, 50.0)     # a point of the bend with no clean evidence
   assert not P.s2_history_clean(vc, vt, dist, 900.0, 40.0)      # the forecast's bend beyond the memory: no evidence
+
+
+# ---- comparable passes only (owner, 2026-11-24: experimental controllers / tunings must not shape the record) -----------------------
+def test_record_evidence_only_from_comparable_segments():
+  B = builder()
+  p = synthetic_pass(n=600, tk=250)
+  p["tags"] = ["0000aaaa-0", "0000aaaa-1"]
+  p["off"] = np.array([0, 300, 600])
+  saved = B.COMPARABLE
+  try:
+    B.COMPARABLE = None                                       # no map: every segment counts (older builds)
+    c, t, k = B.record_evidence(p)
+    assert t[240] == 1.0
+    B.COMPARABLE = {"0000aaaa-0": False, "0000aaaa-1": True}
+    c, t, k = B.record_evidence(p)
+    assert np.all(np.isnan(t[:300])) and np.all(np.isnan(k[:300])) and np.all(np.isnan(c[:300]))
+    assert np.all(np.isfinite(k[300:]))
+    B.COMPARABLE = {"0000aaaa-1": True}                       # a segment missing from the map is NOT comparable
+    assert np.all(np.isnan(B.record_evidence(p)[1][:300]))
+  finally:
+    B.COMPARABLE = saved
+
+
+def test_load_comparable_map(tmp_path):
+  B = builder()
+  f = os.path.join(str(tmp_path), "c.json")
+  import json
+  json.dump({"x-0": [True, "comparable"], "x-1": [False, "test toggle"]}, open(f, "w"))
+  assert B.load_comparable(f) == {"x-0": True, "x-1": False}

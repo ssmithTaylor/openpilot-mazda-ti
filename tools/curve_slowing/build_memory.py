@@ -521,6 +521,38 @@ def outcome_bound(v, trb):
   return np.nan, np.nan
 
 
+# ---- comparable passes only (owner, 2026-11-24): "are you excluding historical runs that had different parameters set on the comma?"
+# The record (trouble, clean evidence, capacity residuals) is taken ONLY from segments comparable to the current controller: a map
+# {tag: comparable} (--comparable FILE: json {tag: [flag, reason]}, made by the bend-record provenance step from the governor's
+# provenance scan: the last epoch's steering settings, no test toggle, no A/B / identification event, live diagnostics agreeing).
+# A segment missing from the map is NOT comparable. Curvature, speed and npass (the road) still use every pass. None: no map (every
+# segment counts, as before).
+COMPARABLE = None
+
+
+def load_comparable(path):
+  with open(path) as f:
+    return {t: bool(v[0]) for t, v in json.load(f).items()}
+
+
+def comparable_mask(p):
+  n = len(p['s'])
+  if COMPARABLE is None:
+    return np.ones(n, bool)
+  m = np.zeros(n, bool)
+  off = np.asarray(p.get('off', [0, n]))
+  for k, t in enumerate(p.get('tags', [])):
+    if COMPARABLE.get(t, False):
+      m[int(off[k]):int(off[k + 1])] = True
+  return m
+
+
+def record_evidence(p):
+  """(capacity residual, trouble, clean) per sample, nan outside comparable segments"""
+  cm = comparable_mask(p)
+  return tuple(np.where(cm, x, np.nan) for x in (limit_residuals(p), trouble_per_sample(p), clean_per_sample(p)))
+
+
 def clean_speed(v):
   """the CLEAN_N-th highest of the clean speeds v (nan with fewer)"""
   v = np.sort(np.asarray(v, np.float64))
@@ -597,9 +629,7 @@ def collect(passes, lib, aligns):
     lns = np.asarray(p.get('lane_i', np.zeros(0, int)), int)
     ev_s = np.sort(np.r_[s[sats], s[tks], s[lns]]) if len(sats) + len(tks) + len(lns) else np.zeros(0)
     xb = excl_bits(p)
-    cres = limit_residuals(p)
-    trb = trouble_per_sample(p)
-    cln = clean_per_sample(p)
+    cres, trb, cln = record_evidence(p)
     la = (np.asarray(p['lat_act']) > .5) if 'lat_act' in p else np.ones(len(s), bool)
     for k in np.where(ok[:-1] & ok[1:] & (rd_of[:-1] != rd_of[1:]))[0]:
       ra, rb = rd_of[k], rd_of[k + 1]
@@ -1728,12 +1758,17 @@ def main():
   ap.add_argument('--check', action='store_true', help='position-free validation printout')
   ap.add_argument('--source', choices=('gate', 'all'), default='gate',
                   help="gate: the seg20 gate-checked set (default; LOO and replay); all: every recorded drive on this PC (on-car memory)")
+  ap.add_argument('--comparable', default=None, help='json {tag: [comparable, reason]}: the record uses comparable segments only')
   ap.add_argument('--record-sidecar', default=None, help='also write the per (point, drive) at-limit record here (private; LOO replays)')
   ap.add_argument('--releases', default=None, help='folder of the simulator release records (default: tools/mazda_sim/releases)')
   a = ap.parse_args()
   if a.releases:
     global RELEASES
     RELEASES = os.environ['CURVE_RELEASES'] = a.releases
+  if a.comparable:
+    global COMPARABLE
+    COMPARABLE = load_comparable(a.comparable)
+    print(f'comparable map: {sum(COMPARABLE.values())} of {len(COMPARABLE)} segments', flush=True)
   if a.record_sidecar:
     global RECORD_SIDECAR
     RECORD_SIDECAR = a.record_sidecar
