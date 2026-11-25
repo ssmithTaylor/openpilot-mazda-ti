@@ -1130,7 +1130,8 @@ class CarController(CarControllerBase):
       self._curve_left(cv, ex, set_mph)
     mk = None if ex is None else ex.marker(cv, set_mph)
     ex_lines = (ex.line1, ex.line2) if ex is not None and ex.active else None
-    key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph, json.dumps(mk), ex_lines)
+    # cost (perf 2026-11-25): no marker is the common case at 100 Hz; "null" is what json.dumps(None) gives
+    key = (cv.state, cv.why, cv.line1, cv.line2, cv.alert_mph, "null" if mk is None else json.dumps(mk), ex_lines)
     # the exit marker is published at once when it changes (a controls restart must find it)
     marker_changed = self.curve_published is not None and len(self.curve_published) > 5 and key[5] != self.curve_published[5]
     if force or marker_changed or (key != self.curve_published and self.frame % 10 == 5) or self.frame % curve_mod.STATUS_EVERY == 5:
