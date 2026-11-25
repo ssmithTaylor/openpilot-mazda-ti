@@ -48,6 +48,11 @@ def table_peak(k):
   return peak(P.Planner(M.synthetic([bend(k)])))
 
 
+def table_floor(t, side):
+  """the lowest the record may go under a table speed t (review fix: the single-pass scatter)"""
+  return math.floor(t * float(P.scatter_speed_ratio(np.array([float(t)]), np.array([side]))[0]) + 0.05)
+
+
 # ---- the planner ---------------------------------------------------------------------------------------------------------------------
 def test_no_record_or_no_trouble_plans_as_before():
   k = bend_k(45, 2.6)
@@ -61,7 +66,8 @@ def test_trouble_lowers_to_the_highest_untroubled_speed_below_it():
   k = bend_k(45, 2.3, -1)                             # the table lets this bend go at about 45
   assert table_peak(k) >= 44
   m, _ = mem_with(k, v_trb_mph=36.2, v_ok_mph=35.1)   # troubled from 36.2 mph, untroubled at 35.1
-  assert peak(P.Planner(m)) == 35
+  t = table_peak(k)
+  assert peak(P.Planner(m)) == max(35, table_floor(t, -1)) < t
 
 
 def test_record_never_raises_the_table():
@@ -74,15 +80,16 @@ def test_record_never_raises_the_table():
 def test_untroubled_at_the_troubled_speed_still_one_below():
   k = bend_k(45, 2.0, 1)
   m, _ = mem_with(k, v_trb_mph=44.0, v_ok_mph=43.99)
-  assert peak(P.Planner(m)) == 43
+  t = table_peak(k)
+  assert peak(P.Planner(m)) == min(t, max(43, table_floor(t, 1)))
 
 
-def test_no_untroubled_pass_below_uses_the_place_capacity_and_stays_under_the_trouble():
+def test_no_untroubled_pass_below_ignores_the_place_capacity_fallback():
+  # review fix: the unbounded capacity fallback is gone; a low-delivering place gives the same bound as none
   k = bend_k(45, 2.4, -1)
-  m_low, _ = mem_with(k, v_trb_mph=44.5, cap_n=5, cap_res=-0.6)      # the place delivers well under the table
-  m_none, _ = mem_with(k, v_trb_mph=44.5)                           # no capacity evidence: the table, under the trouble
-  lo = peak(P.Planner(m_low))
-  assert lo < 40 and peak(P.Planner(m_none)) == min(table_peak(k), 43)
+  m_low, _ = mem_with(k, v_trb_mph=44.5, cap_n=5, cap_res=-0.6)
+  m_none, _ = mem_with(k, v_trb_mph=44.5)
+  assert peak(P.Planner(m_low)) == peak(P.Planner(m_none)) >= table_floor(table_peak(k), -1)
 
 
 def test_record_off_switch_restores_table():
@@ -119,7 +126,7 @@ def test_file_round_trip_and_old_files(tmp_path):
   M.save(p, arrays, {"version": M.VERSION})
   m2 = M.load(p)
   assert m2.has_record and int(m2.cap_n.max()) == 7 and abs(np.nanmax(m2.v_trb) / MPH - 40.0) < 0.05
-  assert peak(P.Planner(m2)) == 38
+  assert peak(P.Planner(m2)) == max(38, table_floor(table_peak(bend_k(45, 2.4, -1)), -1))
   for k in M.REC_KEYS:                                # a v6 / v8 file: no record, the table as before
     del arrays[k]
   M.save(p, arrays, {"version": M.VERSION})
@@ -184,3 +191,58 @@ def test_builder_limit_residuals_and_cleared_hook():
   assert np.all(np.isnan(B.limit_residuals(dict(p, ti=np.where((np.arange(n) >= 50) & (np.arange(n) < 58), 600.0, 300.0)))))
   assert np.all(np.isnan(B.limit_residuals(dict(p, cleared_i=np.array([70])))))
   assert np.all(np.isnan(B.limit_residuals({k: x for k, x in p.items() if k != "ti"})))
+
+
+# ---- review fixes (2026-11-24) ------------------------------------------------------------------------------------------------------
+def test_fluke_on_a_45_mph_bend_cannot_cap_it_hard():
+  # one takeover at 25 mph, nothing untroubled below, on a bend the table allows at about 45: at most the scatter under the table
+  k = bend_k(45, 2.3, -1)
+  t = table_peak(k)
+  m, _ = mem_with(k, v_trb_mph=25.0)
+  b = peak(P.Planner(m))
+  assert b >= math.floor(t * float(P.scatter_speed_ratio(np.array([t]), np.array([-1]))[0]) + 0.05) and b >= t - 4, (t, b)
+
+
+def test_no_untroubled_below_bound_is_the_scatter_under_the_troubled_speed():
+  k = bend_k(45, 2.6, 1)                                   # table about 42
+  t = table_peak(k)
+  m, _ = mem_with(k, v_trb_mph=41.0)
+  r = float(P.scatter_speed_ratio(np.array([41.0]), np.array([1]))[0])
+  assert 0.9 < r < 0.97
+  assert peak(P.Planner(m)) == max(math.floor(41.0 * r + 0.05), math.floor(t * float(P.scatter_speed_ratio(np.array([t]), np.array([1]))[0]) + 0.05))
+
+
+def test_bound_never_under_19_nor_into_the_r14_zone_and_never_raises():
+  k = bend_k(40, 2.0, 1)
+  t = table_peak(k)
+  assert t >= 32
+  m, _ = mem_with(k, v_trb_mph=24.0, v_ok_mph=20.0)
+  pl = P.Planner(m)
+  assert peak(pl) >= 32 and float(np.min(pl.need)) >= 19
+  m2, _ = mem_with(k, v_trb_mph=80.0, v_ok_mph=70.0)
+  assert peak(P.Planner(m2)) == t
+
+
+def test_outcome_bound_ties_are_order_independent_and_count_as_trouble():
+  B = builder()
+  a = B.outcome_bound(np.array([40.0, 40.0]) * MPH, [True, False])
+  b = B.outcome_bound(np.array([40.0, 40.0]) * MPH, [False, True])
+  assert a[0] == b[0] and np.isnan(a[1]) and np.isnan(b[1])
+  a = B.outcome_bound(np.array([38.0, 40.0, 40.0]) * MPH, [False, True, False])
+  b = B.outcome_bound(np.array([40.0, 40.0, 38.0]) * MPH, [False, True, False])
+  assert a == b and math.isclose(a[1] / MPH, 38.0)
+
+
+def test_trouble_needs_the_limit_at_the_point():
+  B = builder()
+  p = synthetic_pass(n=1200, lim=(200, 300), tk=255)          # limit at samples 200-299 (about 1 m each)
+  t = B.trouble_per_sample(p)
+  assert t[230] == 1.0
+  assert t[310] == 0.0 and t[195] == 0.0                     # ~10 / 5 m past the limit: within the old smear, takeover near
+
+
+def test_trouble_far_below_the_bend_demand_is_not_the_bends():
+  B = builder()
+  # a 45 mph pass on a nearly straight point: demand 0.5 m/s^2, far under 0.66 x the table
+  assert not B.bend_demand_ok([45 * MPH], [0.5 / (45 * MPH) ** 2])[0]
+  assert B.bend_demand_ok([45 * MPH], [2.0 / (45 * MPH) ** 2])[0]

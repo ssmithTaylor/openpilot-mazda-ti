@@ -342,40 +342,54 @@ def bearing_to_hdg(bearing_deg):
 
 
 # ---- the bend's own record (2026-11-24): a remembered point's allowed speed from how earlier passes through it turned out ----------
-# Where earlier car-steered passes were TROUBLED on a point (Memory.v_trb: >= 2 s at the limit and a firm takeover or a lane-line touch,
-# the replay's ground truth; conflicting evidence by majority, builder outcome_bound), the point's allowed speed is at most the highest
-# speed at which a pass there was NOT troubled below that (Memory.v_ok, whole mph down); with none below it, what the place itself
-# delivered at its limit there (record_need on Memory.cap_res, the posterior mean, REC_Z_FALLBACK) and at least 1 mph under v_trb.
-# The record only LOWERS the table's speed (leave-one-drive-out evaluation, bend-record 2026-11-24: letting clean passes RAISE it
-# lost a fifth of the troubled passes; the place's delivered capacity alone did not beat the table). Points without trouble, and
-# files without a record (v6, v8), plan from the table exactly as before. One troubled pass is enough (owner: one pass is enough).
-# A trouble spot the driver cleared on the device gives no evidence (builder hook `cleared_i`). RECORD False: the table alone.
-# The capacity terms below (REC_SW, REC_TAU, REC_PRIOR) are the measured scatter of one pass's delivered-at-limit residual within a
-# place, between places, and the mean place residual (capacity-refit corpus): the posterior mean of a place's residual after n
-# passes weighs its own mean n / (n + REC_SW^2 / REC_TAU^2) (0.75 passes: one pass already outweighs the table).
+# Where earlier car-steered passes were TROUBLED on a point (Memory.v_trb; builder: the command at its limit AT the point, >= 2 s at
+# the limit on the pass, a firm takeover or lane-line touch within 60 m, and the point's demand at that speed at least TRB_MIN_FRAC of
+# the table: a pass troubled far below what any at-limit pass delivered was not troubled by the bend; conflicting evidence by
+# majority), the point's allowed speed is LOWERED, never raised, and only as far as the evidence supports (review fix 2026-11-24):
+#   with an untroubled pass below the troubled speed: that speed (Memory.v_ok, whole mph down), at least 1 mph under v_trb;
+#   with none: the troubled speed reduced by what one pass's capacity scatter justifies there (REC_SW one sd below the table's
+#     capacity at that speed: the capacity ratio 1 - REC_SW / cap, the speed ratio its square root; about 0.94 at 45 mph);
+#   never further under the TABLE's own speed than that same scatter (so one pass cannot take a bend 20 mph under its table speed);
+#   never under CAR_MIN_MPH, and (R14) never into the under-STEP_MPH zone where the table's need is at or above STEP_MPH.
+# Points without trouble, and files without a record (v6, v8), plan from the table exactly as before. A trouble spot the driver
+# cleared on the device gives no evidence (builder hook `cleared_i`). RECORD False: the table alone.
+# REC_SW / REC_TAU / REC_PRIOR: the measured scatter of one pass's delivered-at-limit residual within a place, between places, and the
+# mean place residual (capacity-refit corpus).
 RECORD = True
 REC_SW = 0.276
 REC_TAU = 0.318
 REC_PRIOR = -0.121
-REC_Z = -0.5                   # the capacity rule's quantile (evaluated, NOT used for planning: see above)
-REC_Z_FALLBACK = 0.0
+REC_Z = -0.5                   # the capacity rule's quantile (evaluated, NOT used for planning)
 
 
-def record_bound(v_trb, v_ok, k, cap_n, cap_res):
-  """whole mph the record allows at each point (nan where it has no trouble)."""
+def scatter_speed_ratio(mph, side):
+  """speed ratio one pass's capacity scatter justifies at `mph` turning to `side`: sqrt(1 - REC_SW / capacity)."""
+  cap = np.where(np.asarray(side) > 0, np.vectorize(lambda m: D.capacity(m, D.LEFT, hold_step=True))(mph),
+                 np.vectorize(lambda m: D.capacity(m, D.RIGHT, hold_step=True))(mph))
+  return np.sqrt(np.clip(1.0 - REC_SW / np.maximum(cap, 1e-3), 0.0, 1.0))
+
+
+def record_bound(v_trb, v_ok, k, table, hi=True):
+  """whole mph the record allows at each point (nan where it has no trouble), given the table's need there (`table`: need_hi when
+  hi, else need)."""
   vt = np.asarray(v_trb, np.float64) / MPH
   vo = np.asarray(v_ok, np.float64) / MPH
+  tab = np.asarray(table, np.float64)
+  side = np.where(np.asarray(k, np.float64) > 0, 1, -1)
   out = np.full(len(vt), np.nan)
   sel = np.isfinite(vt)
   if not sel.any():
     return out
+  vt_, vo_, tab_, sd_ = vt[sel], vo[sel], tab[sel], side[sel]
   q = 0.05                                                 # the file's float16 speeds are good to about 0.04 mph
-  hi = np.ceil(vt - q) - 1.0                              # at least 1 mph under the troubled speed
-  out[sel & np.isfinite(vo)] = np.minimum(np.floor(vo + q), hi)[sel & np.isfinite(vo)]
-  fb = sel & ~np.isfinite(vo)
-  if fb.any():
-    cap = record_need(np.asarray(k, np.float64)[fb], record_offset(np.asarray(cap_n)[fb], np.asarray(cap_res)[fb], REC_Z_FALLBACK))
-    out[fb] = np.minimum(cap, hi[fb])
+  top = np.ceil(vt_ - q) - 1.0                             # at least 1 mph under the troubled speed
+  b = np.where(np.isfinite(vo_), np.floor(vo_ + q), np.floor(vt_ * scatter_speed_ratio(vt_, sd_) + q))
+  b = np.minimum(b, top)
+  b = np.maximum(b, np.floor(tab_ * scatter_speed_ratio(tab_, sd_) + q))   # never further under the table than the scatter
+  b = np.maximum(b, float(D.CAR_MIN_MPH))
+  if hi:                                                   # R14: never into the low zone where the table itself stays above it
+    b = np.where(tab_ >= D.STEP_MPH, np.maximum(b, float(D.STEP_MPH)), b)
+  out[sel] = np.minimum(b, tab_)                           # never raises
   return out
 
 
@@ -441,10 +455,10 @@ class Planner:
       self.need_hi = D.need_hi(self.kmed).astype(np.float64) if self.mem_stage else self.need
       # the bend's own record where the memory has one (a file without it: the table alone, as before)
       if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(np.isfinite(memory.v_trb)):
-        b = record_bound(memory.v_trb, memory.v_ok, self.kmed, memory.cap_n, memory.cap_res)
-        has = np.isfinite(b)
-        self.need = np.where(has, np.minimum(self.need, b), self.need)
-        self.need_hi = np.where(has, np.minimum(self.need_hi, b), self.need_hi)
+        b = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need, hi=False)
+        bh = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need_hi, hi=True)
+        self.need = np.where(np.isfinite(b), np.minimum(self.need, b), self.need)
+        self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
     self.limit = None
     self.reset()

@@ -370,6 +370,14 @@ CAP_RISE_S = 0.3
 TRB_LIM_S = 2.0
 TRB_LIM_M = 80.0
 TRB_EVT_M = 60.0
+# Review fix (2026-11-24): the trouble must plausibly be the BEND's. (1) The command was at its limit AT the point on the troubled
+# pass (within +-TRB_LOCAL_M; the +-TRB_LIM_M window only decides whether the pass had >= TRB_LIM_S at the limit): no smear onto
+# points where the command was not at the limit, and a takeover or brake without the limit gives no record. (2) The point's demand at
+# the troubled speed (v^2 |kap_med|) is at least TRB_MIN_FRAC of the table's capacity there: 0.66 is the 1st percentile of
+# delivered / table over the corpus's 196 at-limit passes (bend-record study; mean 1.03, sd 0.20): a pass troubled at a demand below
+# anything an at-limit pass has delivered was not troubled by the bend.
+TRB_LOCAL_M = 5.0
+TRB_MIN_FRAC = 0.66
 EVENT_PROTECT_S = 3.0          # hand steering within this of a steering-limit event or a real takeover is never excluded
 EX_BLINK, EX_HAND, EX_SLOW, EX_LEAVE, EX_STOP, EX_JOIN = 1, 2, 4, 8, 16, 32
 EX_NAMES = {EX_BLINK: 'blinker +-5 s', EX_HAND: 'steering by hand +-2 s', EX_SLOW: 'below 19 mph', EX_LEAVE: 'last 150 m before leaving',
@@ -495,17 +503,15 @@ def outcome_bound(v, trb):
   trb = np.asarray(trb, bool)
   if not trb.any():
     return np.nan, np.nan
-  o = np.argsort(v, kind='stable')
-  v, trb = v[o], trb[o]
-  n = len(v)
-  tail_t = np.cumsum(trb[::-1])[::-1]               # troubled passes at index j and above
-  tail_n = n - np.arange(n)
-  ok = trb & (2 * tail_t >= tail_n)
-  if not ok.any():
-    return np.nan, np.nan
-  j = int(np.argmax(ok))
-  below = v[:j][~trb[:j]]
-  return float(v[j]), float(below.max()) if len(below) else np.nan
+  # order-independent (review fix): candidates are the troubled SPEEDS; a pass AT a candidate speed counts as troubled (a tie is
+  # trouble), and untroubled means strictly below
+  for u in np.unique(v[trb]):
+    at_up = v >= u
+    t = int((at_up & (trb | (v == u))).sum())
+    if 2 * t >= int(at_up.sum()):
+      below = v[~trb & (v < u)]
+      return float(u), float(below.max()) if len(below) else np.nan
+  return np.nan, np.nan
 
 
 def trouble_per_sample(p):
@@ -522,6 +528,9 @@ def trouble_per_sample(p):
   lo = np.searchsorted(s, s - TRB_LIM_M, side='left')
   hi = np.searchsorted(s, s + TRB_LIM_M, side='right')
   lim = csat[hi] - csat[lo] >= TRB_LIM_S - 1e-9
+  lo2 = np.searchsorted(s, s - TRB_LOCAL_M, side='left')
+  hi2 = np.searchsorted(s, s + TRB_LOCAL_M, side='right')
+  lim &= csat[hi2] - csat[lo2] > 0                    # the command at its limit AT this point
   ev = np.sort(np.r_[s[np.asarray(p['tk_i'], int)], s[np.asarray(p.get('lane_i', np.zeros(0, int)), int)]])
   if len(ev):
     evt = np.searchsorted(ev, s + TRB_EVT_M, side='right') > np.searchsorted(ev, s - TRB_EVT_M, side='left')
@@ -702,7 +711,15 @@ def merge(rows, NL, usable=None):
   return kap, v, bank, npass, grade, v_proven, kap_med
 
 
-def outcomes(rows, NL, pass_drive):
+def bend_demand_ok(v, k):
+  """troubled rows whose demand v^2 |k| is at least TRB_MIN_FRAC of the table's capacity at that speed and side"""
+  v = np.asarray(v, np.float64)
+  k = np.asarray(k, np.float64)
+  cap = np.array([CD.capacity(x / 0.44704, CD.LEFT if kk > 0 else CD.RIGHT) for x, kk in zip(v, k)]) if len(v) else np.zeros(0)
+  return v * v * np.abs(k) >= TRB_MIN_FRAC * cap - 1e-12
+
+
+def outcomes(rows, NL, pass_drive, kap_med=None):
   """per library point: v_trb / v_ok (outcome_bound over the car-steered passes on it; nan where none) and n_trb (troubled passes);
   and, for the points with any troubled pass, every (point, drive, v, troubled) row (private, leave-one-drive-out)"""
   v_trb, v_ok = np.full(NL, np.nan), np.full(NL, np.nan)
@@ -710,7 +727,13 @@ def outcomes(rows, NL, pass_drive):
   empty = (np.zeros(0, np.int64), np.zeros(0, object), np.zeros(0), np.zeros(0, bool))
   if not len(rows):
     return v_trb, v_ok, n_trb, empty
-  r = rows[np.isfinite(rows[:, C_TRB])]
+  r = rows[np.isfinite(rows[:, C_TRB])].copy()
+  if kap_med is not None and len(r):
+    # a troubled row far below what the bend can ask is not the bend's trouble: no evidence (review fix)
+    tb0 = r[:, C_TRB] > .5
+    km = np.nan_to_num(np.asarray(kap_med, np.float64)[r[:, C_PT].astype(np.int64)])
+    bad = tb0 & ~bend_demand_ok(r[:, C_V], km)
+    r = r[~bad]
   if not len(r):
     return v_trb, v_ok, n_trb, empty
   key = r[:, C_PT].astype(np.int64) * 100000 + r[:, C_PASS].astype(np.int64)
@@ -971,7 +994,7 @@ def build(passes, info=None):
   usable = excl == 0
   kap, v, bank, npass, grade, v_proven, kap_med = merge(rows, NL, usable)
   cap_n, cap_res, by_drive = record(rows, NL, [p['drive'] for p in passes])
-  v_trb, v_ok, n_trb, trb_rows = outcomes(rows, NL, [p['drive'] for p in passes])
+  v_trb, v_ok, n_trb, trb_rows = outcomes(rows, NL, [p['drive'] for p in passes], kap_med)
   nokap = ~np.isfinite(kap)
   kap = np.where(nokap, 0.0, kap)
   kap_med = np.where(np.isfinite(kap_med), kap_med, 0.0)
