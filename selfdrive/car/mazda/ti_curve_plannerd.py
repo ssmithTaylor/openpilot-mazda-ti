@@ -15,6 +15,7 @@ road changed, corner start with the planned and actual speed and the grade, mode
 (plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed).
 Never a position: trace and point indices, distances, speeds and curvatures only.
 """
+import gc
 import json
 import math
 import os
@@ -456,6 +457,9 @@ def main():
   planner = P.Planner(mem)
   mdl = model_name(Params())          # the driving model (logs are split by it); read once
   cloudlog.event("ti_curve_plan", kind="model", mdl=mdl)
+  # cost (perf 2026-11-25): everything loaded so far (the road memory, the approach table's ~23k entries) lives for the whole process;
+  # a full garbage collection walking it took 54 ms on the comma. Frozen, the collector skips it (no output depends on collection).
+  gc.freeze()
   sm = messaging.SubMaster(["liveLocationKalman", "carState", "modelV2", "frogpilotPlan", "can", "carOutput"])
   rk = Ratekeeper(RATE_HZ, print_delay_threshold=None)
   seq = 0
