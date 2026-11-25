@@ -81,6 +81,24 @@ MODEL_CONFIRM_SHARE = 0.6       # the model confirms a remembered bend when its 
 # bend acting only once it has persisted map_persist_s (0 s up to MAP_PERSIST_LO_MPH, rising linearly to MAP_PERSIST_S at
 # MAP_PERSIST_HI_MPH and above: phantoms last <= 2.1 s); a missing or stale map (plannerd passes None) has no map stage.
 CONFIRM_SHARE = 0.6
+# The release decision (2026-11-24 night drive, the owner's trouble bend, twice: the start and the release in the SAME tick, on ONE 6 s
+# preview read as the car was leaving the opposite bend of an S-bend; 1.5 s later the preview showed the bend at ~5 m/s^2). Now:
+#  * "absent" must be read on REL_TICKS consecutive planner ticks, each with a preview reaching the bend's TIGHTEST point (at least
+#    FC_LO_S ahead, where the read window starts): a preview not covering the bend says nothing about it;
+#  * no reading counts while the car is in a bend itself or left one less than REL_AFTER_BEND_S ago (the same in-bend test as the car
+#    side's BEND_*: |lateral acceleration| from the yaw sensor >= ENTRY_LA on, < ENTRY_LA - REL_BEND_HYST_LA for REL_BEND_OUT_S off);
+#    the drive's under-reading lasted ~1.5 s after the exit, so 2.0 s;
+#  * a bend whose points carry a trouble record (finite v_trb) or REL_STRONG_PASSES or more passes is never released by the forecast:
+#    the memory is the stronger witness there (whether the car is ON that road is road matching's job: off the trace no stage-1 bend
+#    starts and RM keeps working as before; the release only ever answered "is this remembered bend really there");
+#  * a start already inside the decision window (a late start: the decision point has passed) is not released: the bend is known,
+#    so it is slowed for;
+#  * a bend never read validly by its entry is kept (slowed for), as one never confirmed is.
+REL_TICKS = 2
+REL_STRONG_PASSES = 10
+REL_AFTER_BEND_S = 2.0
+REL_BEND_HYST_LA = 0.3            # = ti_curve.BEND_HYST_LA
+REL_BEND_OUT_S = 1.0              # = ti_curve.BEND_OUT_S
 # R16 (A15): before the forecast confirms a stage-1 bend, stage 1 sheds at most S1_UNCONFIRMED_MAX_MPH (the dash no lower than the
 # speed at the start minus this); the rest only after confirmation. ONE decision per bend, ONE definition: the bend is CONFIRMED at
 # the first tick a preview REACHING its entry (and no further than MODEL_LOOK_S) shows it asking at least CONFIRM_SHARE x its
@@ -582,6 +600,7 @@ class Planner:
     self.fix_age = 1e9
     self.odo = 0.0
     self.live_k = 0.0
+    self.bend_on, self.bend_low_t, self.bend_left_t = False, None, -1e9   # the car's own in-bend state (REL_*), for the release
     self.cmp = []                       # (odometer, live k, remembered k), every spacing of travel while locked
     self.cmp_next = 0.0
     self.change_strikes = 0
@@ -899,6 +918,7 @@ class Planner:
     if yaw_k is not None and math.isfinite(yaw_k):
       a = 1.0 if dt <= 0 else min(1.0, dt / LIVE_K_TAU_S)
       self.live_k += a * (yaw_k - self.live_k)
+    self._track_bend(t, abs(self.live_k) * v * v)
     model_la = None
     self.model_k = None
     self.fc = None                      # (lead times, LEFT-positive curvature) of the model preview this tick
@@ -997,7 +1017,8 @@ class Planner:
     sign = np.sign(self.kmed[idx])
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
                              self.active, grade_of=None if grade is None else self._grade_fn(grade, idx, dist),
-                             npass=self.mem.npass[idx])
+                             npass=self.mem.npass[idx], trb=getattr(self.mem, "v_trb", None)[idx]
+                             if getattr(self.mem, "v_trb", None) is not None else None)
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
     cap, need_true, cend, behind, stage = r["cap"], r["need"], r["end"], r["behind"], r["stage"]
@@ -1084,7 +1105,8 @@ class Planner:
       return GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
     return 0.0
 
-  def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None):
+  def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None,
+                  trb=None):
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
@@ -1159,8 +1181,43 @@ class Planner:
       cands[key] = {"T": Tmin, "Tb": Tb, "need": int(need[lowest]), "Tc": int(need[lowest]), "va": va, "D": D_, "due": due,
                     "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
                     "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
-                    "cap": D.capacity(Tmin, side), "side": side}
+                    "cap": D.capacity(Tmin, side), "side": side,
+                    # REL_*: the memory is the stronger witness (never released by the forecast)
+                    "strong": bool((npass is not None and np.any(npass[run] >= REL_STRONG_PASSES)) or
+                                   (trb is not None and np.any(np.isfinite(trb[run]))))}
     return cands
+
+  def _track_bend(self, t, la):
+    """The car's own in-bend state from its yaw-sensor lateral acceleration (REL_*; the car side's BEND_* rule)."""
+    if la >= ENTRY_LA:
+      self.bend_on, self.bend_low_t = True, None
+    elif self.bend_on and la < ENTRY_LA - REL_BEND_HYST_LA:
+      self.bend_low_t = t if self.bend_low_t is None else self.bend_low_t
+      if t - self.bend_low_t >= REL_BEND_OUT_S - 1e-9:
+        self.bend_on, self.bend_low_t, self.bend_left_t = False, None, t
+    else:
+      self.bend_low_t = None
+
+  def _release_reading(self, v, T, a_, d_aim, t):
+    """One tick of the release decision (REL_*). -> (True: absent this tick / False: present / None: no valid reading, why)."""
+    if a_.get("strong"):
+      return None, "memory"
+    if a_.get("late"):
+      return None, "late"
+    if d_aim <= 0.0:
+      return None, "entry"                         # never validly read by its entry: kept
+    if self.fc is None or float(np.max(self.fc[0])) < CONFIRM_LEAD_S - 1e-6:
+      # no preview able to read the bend at all: nothing to wait for (kept, as before); R16 (cap on): a bend started WITH one is
+      # "unconfirmed" (its cap stays), as before
+      return None, ("no preview" if a_.get("cap_c") is not None else "no model")
+    if self.bend_on or t - self.bend_left_t < REL_AFTER_BEND_S:
+      return None, "in a bend"
+    lead_low = max(0.0, a_.get("low_at", self.odo + d_aim) - self.odo) / max(v, 1.0)
+    if float(np.max(self.fc[0])) < max(d_aim / max(v, 1.0), lead_low) - 1e-6:
+      return None, "no preview"
+    if lead_low < FC_LO_S:
+      return None, "too near"
+    return self._release_check(v, T, a_["cap"], lead_low), "read"
 
   def _release_check(self, v, T, cap, lead_s):
     """Plan T6: True when the preview, REACHING the bend's entry (lead_s ahead), shows it asking less than CONFIRM_SHARE x its
@@ -1182,7 +1239,9 @@ class Planner:
       if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
-                       "side": c["side"], "hi": self.hi,
+                       "side": c["side"], "hi": self.hi, "strong": bool(c.get("strong")),
+                       "late": c["aim_at"] - self.odo <= CONFIRM_LEAD_S * max(v, 1.0),
+                       "low_at": self.odo + float(c.get("low_m", c["D"])), "absent": 0,
                        "cap_c": s1_unconfirmed_ceiling(mph) if (self.fc is not None and
                                                                  float(np.max(self.fc[0])) >= CONFIRM_LEAD_S - 1e-6) else None}  # R16
         self.events.append({"kind": "start", "point": key if isinstance(key, int) else -1, "T": c["T"], "need": c["need"],
@@ -1219,24 +1278,28 @@ class Planner:
         self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
                             "preview": True})
       if not a_.get("decided") and d_aim <= CONFIRM_LEAD_S * max(v, 1.0):
-        # the release decision, once per bend, CONFIRM_LEAD_S before its entry (also when the hand-over came earlier)
-        a_["decided"] = True
-        rel = self._release_check(v, T, a_["cap"], d_aim / max(v, 1.0))
-        if rel is None and a_.get("cap_c") is not None:
+        # the release decision (REL_*), from CONFIRM_LEAD_S before the bend's entry until the entry
+        rel, why = self._release_reading(v, T, a_, d_aim, t)
+        if rel is None and a_.get("cap_c") is not None and why == "no preview":
           # R16: no preview reaching the entry: never confirmed; the cap stays to the bend's end
+          a_["decided"] = True
           self.events.append({"kind": "s1_unconfirmed", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
-          rel = "unconfirmed"
-        if rel is True:
-          self.released[key] = a_["at"]
-          self.guard.pop(key, None)               # the explicit release decision: the one early drop of a corner in progress
-          self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
-          del active[key]
-          continue
-        if rel != "unconfirmed":
-          a_["cap_c"] = None
+        elif rel is True:
+          a_["absent"] += 1
+          if a_["absent"] >= REL_TICKS:
+            a_["decided"] = True
+            self.released[key] = a_["at"]
+            self.guard.pop(key, None)             # the explicit release decision: the one early drop of a corner in progress
+            self.events.append({"kind": "s1_release", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1)})
+            del active[key]
+            continue
+        elif rel is False or why in ("memory", "late", "entry", "no model"):
+          a_["decided"], a_["cap_c"] = True, None
           self.events.append({"kind": "s1_confirm", "point": key if isinstance(key, int) else -1, "T": T, "mph": round(mph, 1),
-                              "preview": rel is not None})
-      if a_["phase"] == 1 and (a_.get("decided") or (set_mph is not None and set_mph <= T + LATE_SHED_MPH + 1.5)):
+                              "preview": rel is False, "why": why})
+        else:
+          a_["absent"] = 0                        # no valid reading this tick: the count starts again
+      if a_["phase"] == 1 and (a_.get("decided") or d_aim <= CONFIRM_LEAD_S * max(v, 1.0) or (set_mph is not None and set_mph <= T + LATE_SHED_MPH + 1.5)):
         # stage 1 -> 2 hand-over: at the release decision, or as soon as the dash is within one tap of T + LATE_SHED_MPH (judged a
         # planner tick early, so the walk never pauses there while the car side waits for the next plan): ONE ramp, no early dwell
         a_["phase"] = 2
