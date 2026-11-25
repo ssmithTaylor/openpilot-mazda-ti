@@ -676,7 +676,11 @@ def main(argv=None):
   ap.add_argument("--quick", action="store_true", help="one-period windows (the install check, about 20-30 s on the comma)")
   ap.add_argument("--only", nargs="*", default=None)
   ap.add_argument("--json", action="store_true")
+  ap.add_argument("--readiness", action="store_true", help="print only the readiness line (free disk on /data, memory used)")
   a = ap.parse_args(argv)
+  if a.readiness:
+    print(readiness())
+    return 0
   t0 = time.time()
   bad = []
   for name in (a.only or list(SCENARIOS)):

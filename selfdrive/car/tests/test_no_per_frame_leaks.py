@@ -105,3 +105,10 @@ def test_install_check_quick_mode_runs_every_scenario_and_passes(capsys):
   for name in NAMES:
     assert name in out
   assert "0 failure(s)" in out
+
+
+def test_install_script_runs_the_guard_and_prints_readiness_on_every_exit():
+  from pathlib import Path
+  sh = (Path(__file__).resolve().parents[3] / "tools" / "dev" / "comma_checks.sh").read_text()
+  assert "ti_mem_check.py --quick" in sh and "trap 'python3 selfdrive/car/mazda/ti_mem_check.py --readiness" in sh
+  assert MC.main(["--readiness"]) == 0

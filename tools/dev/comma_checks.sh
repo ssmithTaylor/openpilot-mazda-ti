@@ -15,29 +15,31 @@ done
 export PYTHONPATH="${PYTHONPATH:-/data/pythonpath}"
 T0=$(date +%s)
 stage() { echo; echo "=== [comma_checks $(( $(date +%s) - T0 )) s] $*"; }
+# readiness line at the end of every install, pass or fail: free disk on /data, memory used (WARNING under 20 % free disk)
+trap 'python3 selfdrive/car/mazda/ti_mem_check.py --readiness || true' EXIT
 changed() { [ -n "$BASE" ] && git diff --name-only "$BASE" HEAD | grep -qE "$1"; }
 
-stage "1/5 cost check (budget 300 us/cycle; device timing)"
+stage "1/6 cost check (budget 300 us/cycle; device timing)"
 python3 selfdrive/car/mazda/ti_cost_check.py
 
-stage "2/5 params sync (compiled params extension)"
+stage "2/6 params sync (compiled params extension)"
 python3 frogpilot/tools/check_params_sync.py
 
-stage "3/5 scalar/numpy evidence (only when its inputs changed)"
+stage "3/6 scalar/numpy evidence (only when its inputs changed)"
 if [ -z "$BASE" ] || changed '^(selfdrive/controls/lib/|selfdrive/car/mazda/ti_|selfdrive/controls/lib/tests/scalar_np_evidence.py)'; then
   python3 selfdrive/controls/lib/tests/scalar_np_evidence.py
 else
   echo "skipped: no change under selfdrive/controls/lib or selfdrive/car/mazda/ti_* since $BASE"
 fi
 
-stage "4/5 curve planner dry run (tick budget on the device)"
+stage "4/6 curve planner dry run (tick budget on the device)"
 if [ ${#RLOGS[@]} -gt 0 ]; then
   python3 selfdrive/car/mazda/ti_curve_dryrun.py --rlog "${RLOGS[@]}"
 else
   python3 tools/dev/profile_curve_plan.py --memory /data/ti_curve/curve_memory_v1.npz --traces 3
 fi
 
-stage "5/5 smoke import of changed processes"
+stage "5/6 smoke import of changed processes"
 CHANGED_PY=$(git diff --name-only "${BASE:-HEAD~1}" HEAD -- '*.py' || true)
 MODS=$(echo "$CHANGED_PY" | grep -vE '(^|/)test_|/tests/|^tools/' | sed 's/\.py$//; s#/#.#g' || true)
 # the real process entry points too, whenever anything under them changed (a module can import fine alone and still break them)
@@ -50,5 +52,8 @@ for m in $(echo $MODS | tr ' ' '\n' | awk '!seen[$0]++'); do
   [ -f "${m//.//}.py" ] || continue
   python3 -c "import importlib; import openpilot.system.sentry; importlib.import_module('openpilot.$m')" && echo "ok   $m" || { echo "FAIL $m"; exit 1; }
 done
+
+stage "6/6 per-frame memory guard (gc off, ~20-30 s: cyclic garbage, retained growth; thresholds as the PC tests)"
+python3 selfdrive/car/mazda/ti_mem_check.py --quick
 
 stage "all comma checks passed"
