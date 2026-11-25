@@ -132,16 +132,25 @@ def outside_clearance(model, curvature, lane_width=None):
   return None
 
 
+class _ProbView:
+  """A view of the model whose laneLineProbs are replaced; everything else is read through.
+  Defined ONCE at module level: a class defined inside the function was a new class per call, and a class is a reference
+  cycle that only the cycle collector frees. controlsd runs with gc disabled (config_realtime_process), so at 100 Hz that
+  leaked about 1-2 GB per engaged hour and kept every modelV2 message alive (2026-11-25: low memory after ~65 min)."""
+  __slots__ = ("_model", "laneLineProbs")
+
+  def __init__(self, model, probs):
+    self._model, self.laneLineProbs = model, probs
+
+  def __getattr__(self, name):
+    return getattr(self._model, name)
+
+
 def _with_line_probs(model, probs12):
   """A view of the model whose laneLineProbs[1] / [2] are replaced (the hysteresis); everything else read through."""
-  class _View:
-    def __getattr__(self, name):
-      return getattr(model, name)
-  v = _View()
   p = list(model.laneLineProbs)
   p[1], p[2] = probs12
-  v.laneLineProbs = p
-  return v
+  return _ProbView(model, p)
 
 
 def lane_width_seen(model):

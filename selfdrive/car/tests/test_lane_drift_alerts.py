@@ -335,3 +335,51 @@ def test_line_probability_hysteresis_keeps_a_fading_line_but_not_one_never_confi
     gate = LaneDriftGate(0.05)
     for n in range(4):                       # never above 0.5: not evidence at 0.4 (outside unseen, inside near: closed)
       assert gate.update(tick_model((0, -1.12 - 0.002 * n, 1.9, 0.4, .9), mirror), k, False) is False
+
+
+# ---- memory: controlsd runs with the cycle collector off (config_realtime_process), so per-frame code must leave no cyclic garbage --
+# 2026-11-25: _with_line_probs defined a class inside the function; each call left an uncollectable class holding the modelV2
+# message. At 100 Hz that was about 1-2 GB per engaged hour: "controls lagging", then "low memory 92 %" about 65 minutes into a drive.
+from openpilot.selfdrive.controls.lib import lane_drift as LD  # noqa: E402
+
+
+def _cyclic_garbage_after(fn, n):
+  import gc
+  was = gc.isenabled()
+  gc.collect()
+  gc.disable()
+  try:
+    for i in range(n):
+      fn(i)
+    return gc.collect()
+  finally:
+    if was:
+      gc.enable()
+
+
+def test_line_prob_view_leaves_no_cyclic_garbage_with_gc_off():
+  m = NS(laneLineProbs=[0.1, 0.9, 0.9, 0.1], laneLines=[], roadEdges=[])
+  assert _cyclic_garbage_after(lambda i: LD._with_line_probs(m, (0.8, 0.7)), 2000) == 0
+
+
+def test_gate_update_leaves_no_cyclic_garbage_with_gc_off_over_a_minute_of_frames():
+  """6000 frames (one engaged minute at 100 Hz) of the gate as controlsd drives it, lines near and far, probabilities crossing the
+  hysteresis both ways: nothing for the cycle collector to find, so nothing accumulates when it is off."""
+  g = LD.LaneDriftGate(0.01)
+
+  def frame(i):
+    near = (i // 300) % 2 == 0
+    p = 0.2 + 0.7 * ((i // 50) % 2)
+    y = 0.95 if near else 1.6
+    model = NS(laneLineProbs=[0.1, p, p, 0.1],
+               laneLines=[NS(y=[-5.0]), NS(y=[-y]), NS(y=[y]), NS(y=[5.0])],
+               roadEdges=[NS(y=[-6.0]), NS(y=[6.0])], roadEdgeStds=[0.3, 0.3], laneLineStds=[0.5, 0.1, 0.1, 0.5])
+    g.update(model, 0.002 if near else 0.0, at_limit=near)
+  assert _cyclic_garbage_after(frame, 6000) == 0
+
+
+def test_line_prob_view_reads_through_and_replaces_only_the_two_probabilities():
+  m = NS(laneLineProbs=[0.1, 0.9, 0.9, 0.1], laneLines=["a"], other=7)
+  v = LD._with_line_probs(m, (0.8, 0.7))
+  assert v.laneLineProbs == [0.1, 0.8, 0.7, 0.1] and v.laneLines == ["a"] and v.other == 7
+  assert m.laneLineProbs == [0.1, 0.9, 0.9, 0.1]
