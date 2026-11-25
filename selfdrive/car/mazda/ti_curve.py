@@ -282,6 +282,7 @@ class Curve:
     self.bend_lo = None               # the highest a SET+ may bring the dash while in this bend (None: no limit known)
     self.bend_held = False            # a SET+ was held back by the bend rule (logged once per bend)
     self.restore_failed = None        # the ref a restore failed to ("set speed did not respond"): not tried again by itself
+    self.extent_lo = None             # inside a corner's extent per the plan (dist 0, end ahead): the corner speed a SET+ may not pass
     self.cap_lo = None                # the lowest corner speed acted on in this slowdown: no SET+ above it (see CAP_STALE_S)
     self.cap_end = None               # odometer where the planner last said that corner ends
     self.cap_seen_f = None            # frame of the last plan at or under the cap
@@ -667,6 +668,7 @@ class Curve:
       return self._dead_restore(frame, inp)
 
     plan = inp.plan if plan_ok else None
+    self.extent_lo = None
     ceil = plan.get("ceil") if plan else None
     trusted = bool(plan.get("trusted")) if plan else False
     kind = plan.get("kind", "corner") if plan else ""
@@ -718,10 +720,15 @@ class Curve:
                  set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
       # the set speed the planner asks for now (the push below the corner speed, then the corner speed), within the floor and
       # never above the driver's own set speed
-      if not (bool(inp.lead) and inp.mph < self.ref - 2.0):
+      in_extent = plan.get("dist") is not None and float(plan["dist"]) <= 0.0 and plan.get("end") is not None and         float(plan["end"]) > 0.0
+      if not (bool(inp.lead) and inp.mph < self.ref - 2.0) and not in_extent:      # (in a corner's extent the floor does not rise)
         lim_ = plan.get("limit") if plan.get("limit") and abs(float(plan["limit"]) - inp.mph) <= LIMIT_PLAUSIBLE_MPH else None
         self.floor = max(self.floor, ABS_FLOOR_MPH, self.ref - MAX_SHED_MPH, (int(lim_) - MAX_SHED_MPH) if lim_ else 0)
       corner = plan.get("corner") if plan.get("corner") is not None else ceil
+      if in_extent:
+        # the plan says the car is INSIDE this corner's extent (its start passed, its end ahead): a SET+ (the floor rising when a lead
+        # goes, a planner revision) may not pass the corner speed, whatever the lateral acceleration says (F6 seed 46)
+        self.extent_lo = int(corner)
       if int(ceil) < int(corner) and not gentle:
         # a PUSH below the corner speed (plan A10): the maximum drop binds the corner speed, the push may go P.DRIVE_GAP_MPH below
         # it but never below the push floor (ABS_FLOOR_MPH, the car's minimum)
@@ -892,8 +899,13 @@ class Curve:
     if not plan.get("trusted") and not self.trust_past and not past_end and not self.after_brake:
       return False, "road not matched: not restoring"
     if plan.get("model_k") is None:
-      return False, "no model preview"
-    if not P.fits(float(plan["model_k"]), inp.set_mph + 1):
+      # no preview (stale / dropped model message): the restore may go ahead only on the planner's own word that the road ahead is
+      # known and clear: a fresh plan (the caller passes None otherwise) on TRUSTED, matched memory; the caller's cap is the plan's
+      # "hold" ceiling (the next remembered bend) or the driver's set speed. Untrusted memory (not even the trust_past / past_end /
+      # after-brake exceptions above count here) keeps the block.
+      if not (plan.get("trusted") is True and plan.get("known")):
+        return False, "no model preview"
+    elif not P.fits(float(plan["model_k"]), inp.set_mph + 1):
       return False, "the model sees a bend ahead"
     return self._restore_common(inp)
 
@@ -965,6 +977,14 @@ class Curve:
     else:
       self.bend_low_f = None
 
+  def _extent_blocks(self, frame, inp, button, exempt):
+    if button != "SET_PLUS" or exempt or self.extent_lo is None or inp.set_mph is None or inp.set_mph + 1 <= self.extent_lo:
+      return False
+    if not getattr(self, "extent_held", False):
+      self.extent_held = True
+      self._ev("extent_hold", frame, set_mph=inp.set_mph, allowed=self.extent_lo, target=self.target, state=self.state)
+    return True
+
   def _cap_clear(self):
     self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
     self.cap_held = self.cap_armed = self.cap_gap = self.cap_on_straight = False
@@ -1028,7 +1048,8 @@ class Curve:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
-    if not correcting and (self._bend_blocks(frame, inp, button, exempt) or self._cap_blocks(frame, inp, button, exempt)):
+    if not correcting and (self._bend_blocks(frame, inp, button, exempt) or self._cap_blocks(frame, inp, button, exempt) or
+                            self._extent_blocks(frame, inp, button, exempt)):
       return None
     if self.in_bend and button == "SET_PLUS":
       allow_hold = False                  # in a bend a raise is tapped, one step at a time, each checked against the bend's limit
