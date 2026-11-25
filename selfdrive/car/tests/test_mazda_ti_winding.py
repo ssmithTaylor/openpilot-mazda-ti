@@ -192,3 +192,29 @@ def test_class5_fixes_returning_12_m_sideways_start_no_slowdown():
   assert not starts_m, starts_m
   assert all(p.trusted or p.why == "beside the remembered road" for s, p, o in out if 1000.0 <= s <= 1700.0), \
     [(round(s), p.why) for s, p, o in out if 1000.0 <= s <= 1700.0 and not p.trusted][:5]
+
+
+def test_i2_floor_bound_push_in_a_chain_f7_52():
+  """I2 (gorge-fix): F7/52: after a restore to the hold ceiling 41 inside a chain (the push net had acted: the car side keeps the dash
+  at the floor 35), a bend allowed 34 was entered at 36.7 with the warning 1.3 s before entry: the planner planned a push to 29 the
+  dash could not take. Every bend: at or under max(allowed, floor) + 1 mph; any warning there comes >= 4 s before entry."""
+  r = _run("F7", 52)
+  for b in r["bends"]:
+    if not b["drv"]:
+      assert b["peak"] <= max(b["allowed"], b["floor"]) + 1.0, b
+      assert b["warn_lead_s"] is None or b["warn_lead_s"] >= 4.0, b
+
+
+def test_i2_push_floor_is_the_floor_inside_an_intervention():
+  """I2 unit: the push may go DRIVE_GAP_MPH under the floor (plan A10) only when no intervention is in progress; with the dash below
+  the driver's set speed after a corner of the intervention has passed (a chain) it is planned at the floor, and the start for the same bend comes earlier (no shorter approach)."""
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P, ti_cruise_model as CM
+  pl = P.Planner(None)
+  pl.step(0.0, P.Fix(False), 41 * P.MPH, set_mph=41, ref_mph=50, floor_mph=35)
+  assert not pl.chain                                  # lowered, but no corner of the intervention passed yet: A10's push
+  pl.int_passed = True                                 # (as _ramp sets it when a corner of the intervention is passed)
+  pl.step(0.1, P.Fix(False), 41 * P.MPH, set_mph=41, ref_mph=50, floor_mph=35)
+  assert pl.chain and pl._push_floor(35) == 35
+  pl.step(0.2, P.Fix(False), 50 * P.MPH, set_mph=50, ref_mph=50, floor_mph=35)
+  assert not pl.chain and pl._push_floor(35) == CM.push_floor(35, P.DRIVE_GAP_MPH) < 35
+  assert P.approach_m(41, 35, 35) > P.approach_m(41, 35, 29)

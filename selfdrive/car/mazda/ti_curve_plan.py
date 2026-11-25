@@ -1048,6 +1048,12 @@ class Planner:
     self.ref_now = int(ref_mph) if ref_mph else None
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
     v = max(0.0, float(v))
+    # I2 (gorge-fix): an intervention already in progress (the dash below the driver's own set speed): the car side's push net may
+    # have acted in it, and then it allows no push below the floor for the rest of the intervention; plan such a push at the floor
+    # (a corner of it already passed: the push net acts, if at all, at the end of a push, so the first corner keeps A10's push)
+    lowered = bool(set_mph and ref_mph and float(set_mph) < float(ref_mph) - 0.5)
+    self.int_passed = lowered and getattr(self, "int_passed", False)
+    self.chain = self.int_passed
     self.odo += v * dt
     self._observe(t, v / MPH, set_mph)
     if yaw_k is not None and math.isfinite(yaw_k):
@@ -1292,7 +1298,7 @@ class Planner:
       lowest = int(tied[0]) if len(tied) else int(lowest)
       side = int(sign[lowest])
       Tmin = int(shed_to[lowest])
-      S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), Tmin - DRIVE_GAP_MPH)
+      S1 = max(active[key].get("pf", self._push_floor(floor)) if key in active else self._push_floor(floor), Tmin - DRIVE_GAP_MPH)
       prof = []
       best = None
       va_near = {}                                 # (speed, buffer) -> va of its nearest point ahead
@@ -1338,6 +1344,11 @@ class Planner:
   def _dr_buf_s(self, mph):
     """DR_*: the extra start margin (s) for the odometer's drift over the distance dead-reckoned (0 with a fix)."""
     return DR_DRIFT * self.dr_m / max(mph * MPH, 1.0) if self.dr_active() else 0.0
+
+  def _push_floor(self, floor):
+    """The lowest dash a push may use (I2, gorge-fix): CM.push_floor, or the floor itself while an intervention is already in
+    progress (self.chain: the car side's push net may have acted, after which it holds the dash at the floor)."""
+    return int(floor) if getattr(self, "chain", False) else CM.push_floor(floor, DRIVE_GAP_MPH)
 
   def _track_bend(self, t, la):
     """The car's own in-bend state from its yaw-sensor lateral acceleration (REL_*; the car side's BEND_* rule)."""
@@ -1396,7 +1407,7 @@ class Planner:
       if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
-                       "side": c["side"], "hi": self.hi, "strong": c.get("strong") or "",
+                       "side": c["side"], "hi": self.hi, "strong": c.get("strong") or "", "pf": self._push_floor(floor),
                        "late": REL_ON and c["aim_at"] - self.odo <= CONFIRM_LEAD_S * max(v, 1.0),
                        "low_at": self.odo + float(c.get("low_m", c["D"])), "absent": 0,
                        "cap_c": s1_unconfirmed_ceiling(mph) if (self.fc is not None and
@@ -1405,6 +1416,7 @@ class Planner:
                             "floor": floor, "mph": round(mph, 1), "planned": round(c["va"], 1), "dist": round(c["D"], 1)})
     for key in [k for k, a_ in active.items() if self.odo > a_["at"] + HOLD_AFTER_M]:
       self.events.append({"kind": "passed", "point": key if isinstance(key, int) else -1, "T": active[key]["T"], "mph": round(mph, 1)})
+      self.int_passed = True                      # I2: a corner of this intervention is behind (see step: self.chain)
       del active[key]
     out = {"ceil": None, "dist": None, "point": -1, "kind": "", "corner": None, "need": None, "cap": None, "end": None,
            "behind": False, "stage": 1, "key": None, "until": None}
@@ -1417,7 +1429,7 @@ class Planner:
         if mode == "target":
           mode = "push"
       T = a_["T"]
-      S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)
+      S1 = max(a_.get("pf", CM.push_floor(floor, DRIVE_GAP_MPH)), T - DRIVE_GAP_MPH)
       va = c["va"] if c is not None else float(T)
       late, on_plan = mph > va + BEHIND_MPH, mph <= va
       if c is not None and set_mph and mode in ("push", "behind"):
@@ -1818,7 +1830,8 @@ class Planner:
         arrive = self._arrive(v, d_low - d1, float(set_mph), min(float(set_mph), T2), True)
       elif acting and lowering and (u_ref - max(need, int(floor)) > LATE_SHED_MPH or c.get("rec")):
         T = max(need, int(floor))
-        arrive = self._arrive(v, d_low, float(set_mph), float(max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)), True, T=T)
+        pf = self.active[key].get("pf", self._push_floor(floor)) if key in self.active else self._push_floor(floor)
+        arrive = self._arrive(v, d_low, float(set_mph), float(max(pf, T - DRIVE_GAP_MPH)), True, T=T)
       else:
         arrive = self._arrive(v, d_low, float(set_mph), float(set_mph), False)
       if key in self.alerting:
