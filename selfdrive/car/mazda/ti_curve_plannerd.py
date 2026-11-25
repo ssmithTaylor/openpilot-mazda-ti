@@ -356,6 +356,8 @@ def _r(x, nd):
 
 
 def _clip_str(o):
+  if o is None or type(o) in (int, float, bool):     # cost: most values are numbers (returned as they are, as below)
+    return o
   if isinstance(o, str):
     return o[:TICK_STR_MAX]
   if isinstance(o, list):
