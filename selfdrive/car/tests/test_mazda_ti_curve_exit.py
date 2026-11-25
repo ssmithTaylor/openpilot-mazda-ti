@@ -393,3 +393,15 @@ def test_switched_off_path_rewrites_the_left_record_every_half_second_from_the_l
   assert left and all(d["now"] == 34 and d["was"] == 55 for _, d in left), left[:3]
   gaps = [b[0] - a[0] for a, b in zip(left, left[1:])]
   assert gaps and max(gaps) <= 50, gaps                     # the planner drops a record 1.0 s old: every 0.5 s
+
+
+def test_faultC_set_at_a_low_speed_after_an_internal_error_clears_the_record_and_it_stays_cleared():
+  ex = C.SafeExit()
+  ex.ref, ex.floor = 50, 40
+  assert C.set_left(None, ex, 44) == (44, 50)
+  # the driver picks 30 with SET-: the press frame, then quiet frames at the new speed (ex.ref is never updated with no Curve)
+  for f, (btn, setv) in enumerate([(True, 44), (True, 43), (True, 30)] + [(False, 30)] * 50):
+    C.run_frame(None, ex, f, C.Inputs(on=True, engaged=True, cruise_on=True, set_mph=setv, mph=45.0, driver_button=btn, counter=3,
+                                      driver_set=btn, driver_set_plus=False))
+    if f >= 0:
+      assert C.set_left(None, ex, setv) is None, (f, setv)
