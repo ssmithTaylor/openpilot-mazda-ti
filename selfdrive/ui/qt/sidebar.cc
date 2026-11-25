@@ -473,12 +473,71 @@ bool tiTestsAlertShowing(const UIState &s, const FrogPilotUIState &fs) {
          static_cast<cereal::ControlsState::AlertSize>(fpcs.getAlertSize()) != cereal::ControlsState::AlertSize::NONE;
 }
 
+ti_pages::CarKnown tiCarFromBytes(const std::string &bytes) {
+  if (bytes.empty()) {
+    return ti_pages::CarKnown::Unknown;
+  }
+  try {
+    AlignedBuffer aligned_buf;
+    capnp::FlatArrayMessageReader cmsg(aligned_buf.align(bytes.data(), bytes.size()));
+    const cereal::CarParams::Reader cp = cmsg.getRoot<cereal::CarParams>();
+    return ti_pages::carKnown(cp.getCarName().cStr(), cp.getFlags());
+  } catch (...) {
+    return ti_pages::CarKnown::Unknown;   // a half-written or foreign value: as not known yet
+  }
+}
+
+// This drive's car and the last known one, for the way into the Tests pages (ti_pages_logic.h testsEntry). card.py sends
+// the carParams message once at its start and then every 50 s (card.py state_publish); a UI that is not yet reading the
+// queue at that first message (the UI still coming up with the device at ignition, or re-attaching after card's publisher
+// reset the queue) waited up to 50 s for the next one. The CarParams param is written by card just before that first
+// message and cleared at every onroad transition (common/params.cc), so it is this drive's car; it is read at most every
+// 5 UI frames (4 a second), and only until this drive's car is known.
+struct TiCarCache {
+  bool have = false;
+  uint64_t started_frame = 0;
+  uint64_t read_frame = 0;
+  ti_pages::CarKnown this_drive = ti_pages::CarKnown::Unknown;
+  ti_pages::CarKnown last_drive = ti_pages::CarKnown::Unknown;
+};
+
+const TiCarCache &tiCar(const UIState &s) {
+  static TiCarCache c;
+  static Params car_params;
+  const SubMaster &sm = *(s.sm);
+  if (!c.have || c.started_frame != s.scene.started_frame) {   // a new drive (or the UI's first look)
+    c = TiCarCache();
+    c.have = true;
+    c.started_frame = s.scene.started_frame;
+    c.last_drive = tiCarFromBytes(car_params.get("CarParamsPersistent"));
+    if (sm.rcv_frame("carParams") > 0) {                          // an earlier drive's message: the last known car
+      const cereal::CarParams::Reader cp = sm["carParams"].getCarParams();
+      c.last_drive = ti_pages::carKnown(cp.getCarName().cStr(), cp.getFlags());
+    }
+  }
+  if (c.this_drive != ti_pages::CarKnown::Unknown) {
+    return c;
+  }
+  if (sm.rcv_frame("carParams") > s.scene.started_frame) {      // this drive's message
+    const cereal::CarParams::Reader cp = sm["carParams"].getCarParams();
+    c.this_drive = ti_pages::carKnown(cp.getCarName().cStr(), cp.getFlags());
+  } else if (s.scene.started && (c.read_frame == 0 || sm.frame >= c.read_frame + 5)) {   // this drive's param (onroad only)
+    c.read_frame = sm.frame;
+    c.this_drive = tiCarFromBytes(car_params.get("CarParams"));
+  }
+  return c;
+}
+
+// The way into the tests: on the driving screen of a TI-equipped Mazda at tuning level 3 (as the Settings toggle), shown
+// greyed while this drive's car is not known yet
+ti_pages::TestsEntry tiTestsEntry(const UIState &s, const FrogPilotUIState &fs, bool onroad) {
+  const TiCarCache &car = tiCar(s);
+  return ti_pages::testsEntry(onroad, fs.frogpilot_toggles.value("tuning_level").toInt() >= 3, car.this_drive, car.last_drive);
+}
+
 // The tests card and page exist only on a TI-equipped Mazda at tuning level 3, as the Settings toggle does
 bool tiTestsAllowed(const UIState &s, const FrogPilotUIState &fs) {
-  auto &sm = *(s.sm);
-  return sm.rcv_frame("carParams") > 0 && fs.frogpilot_toggles.value("car_make").toString() == "mazda" &&
-         (sm["carParams"].getCarParams().getFlags() & 8) != 0 &&  // MazdaFlags.TORQUE_INTERCEPTOR (selfdrive/car/mazda/values.py)
-         fs.frogpilot_toggles.value("tuning_level").toInt() >= 3;
+  return tiTestsEntry(s, fs, true) == ti_pages::TestsEntry::Ready;
 }
 
 }  // namespace
@@ -3136,6 +3195,7 @@ void Sidebar::drawMetric(QPainter &p, const QPair<QString, QString> &label, QCol
 
 // drawMetric, but in the taller test_rect and a size smaller so "NOT APPLIED" fits on one line
 void Sidebar::drawTestCard(QPainter &p) {
+  p.setOpacity(testReady ? 1.0 : 0.45);   // greyed while this drive's car is not known yet: coming, not tappable
   p.setPen(Qt::NoPen);
   p.setBrush(QBrush(test_status.second));
   p.setClipRect(test_rect.x() + 4, test_rect.y(), 18, test_rect.height(), Qt::ClipOperation::ReplaceClip);
@@ -3151,6 +3211,7 @@ void Sidebar::drawTestCard(QPainter &p) {
   p.setPen(QColor(0xff, 0xff, 0xff));
   p.setFont(InterFont(30, QFont::DemiBold));
   p.drawText(test_rect.adjusted(22, 0, 0, 0), Qt::AlignCenter, test_status.first.first + "\n" + test_status.first.second);
+  p.setOpacity(1.0);
 }
 
 Sidebar::Sidebar(QWidget *parent) : QFrame(parent), onroad(false), flag_pressed(false), settings_pressed(false) {
@@ -3201,7 +3262,7 @@ void Sidebar::showEvent(QShowEvent *event) {
   // The tests card, when it is up, reads the definitions again each time the sidebar opens (a small file) and
   // shows the state at once
   testTick = UI_FREQ - 1;
-  if (showTest) {
+  if (testReady) {
     tiTests.load();
     tiTests.poll(frogpilotUIState()->frogpilot_toggles);
     updateTestStatus();
@@ -3219,7 +3280,7 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
   static int showMemory = 0;
   static int showTemp = 0;
 
-  if (onroad && showTest && test_rect.contains(pos)) {
+  if (onroad && testReady && test_rect.contains(pos)) {
     // Opens the Tests page on release, the way the settings button opens Settings
     tests_pressed = true;
   } else if (cpuRect.contains(pos) && isDeveloperUI) {
@@ -3261,7 +3322,7 @@ void Sidebar::mousePressEvent(QMouseEvent *event) {
 }
 
 void Sidebar::mouseReleaseEvent(QMouseEvent *event) {
-  const bool open_tests = tests_pressed && onroad && showTest && test_rect.contains(event->pos());
+  const bool open_tests = tests_pressed && onroad && testReady && test_rect.contains(event->pos());
   tests_pressed = false;
 
   if (flag_pressed || settings_pressed) {
@@ -3288,6 +3349,9 @@ void Sidebar::offroadTransition(bool offroad) {
     tiTests.load();
     tiTests.driveEnded();
   }
+
+  // the tests card is looked at on the first update of the driving screen, not up to a second later
+  testTick = UI_FREQ - 1;
 
   // FrogPilot variables
   if (onroad) {
@@ -3386,22 +3450,27 @@ void Sidebar::updateState(const UIState &s, const FrogPilotUIState &fs) {
     }
   }
 
-  // Mazda TI tests card, refreshed once a second
-  if (++testTick >= UI_FREQ) {
+  // Mazda TI tests card, refreshed once a second; while it waits for this drive's car, on every update
+  if (++testTick >= UI_FREQ || (showTest && !testReady)) {
     testTick = 0;
 
     // Driving screen only: nothing is read or shown offroad or on any other car
-    const bool testVisible = onroad && tiTestsAllowed(s, fs);
-    if (testVisible != showTest) {
-      showTest = testVisible;
-      if (showTest) {
+    const ti_pages::TestsEntry entry = onroad ? tiTestsEntry(s, fs, true) : ti_pages::TestsEntry::Hidden;
+    const bool ready = entry == ti_pages::TestsEntry::Ready;
+    const bool visible = entry != ti_pages::TestsEntry::Hidden;
+    if (ready != testReady || visible != showTest) {
+      if (ready && !testReady) {
         tiTests.load();
       }
+      testReady = ready;
+      showTest = visible;
       update();
     }
-    if (showTest) {
+    if (testReady) {
       tiTests.poll(fs.frogpilot_toggles);
       updateTestStatus();
+    } else if (showTest) {
+      setProperty("testStatus", QVariant::fromValue(ItemStatus{{tr("TESTS"), tr("WAITING\nFOR CAR")}, QColor(0x54, 0x54, 0x54)}));
     }
   }
 }

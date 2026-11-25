@@ -361,7 +361,8 @@ private:
   bool isStorageUsed;
 
   // Mazda TI tests card (TI car at tuning level 3, driving screen only): opens the Tests page
-  bool showTest = false;
+  bool showTest = false;    // the card is drawn (greyed while this drive's car is not known yet)
+  bool testReady = false;   // this drive's car is a TI Mazda: the card is live and opens the page
   bool tests_pressed = false;
 
   int testTick = UI_FREQ - 1;

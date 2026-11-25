@@ -1734,4 +1734,30 @@ inline ButtonsLook buttonsLook(const ButtonsView &v, const std::string &others) 
   return k;
 }
 
+// ---- the way into the Tests pages: the TESTS card on the sidebar -----------------------------------------------------
+// The card must be there as soon as the driving screen is. All it needs is "this drive's car is a TI Mazda", which the UI
+// can learn before any carParams message: card.py sends that message once at its start and then only every 50 s, so a UI
+// that comes up (or re-attaches to the queue) after the first one used to wait up to 50 s. sidebar.cc also reads the
+// CarParams param, which card.py writes just before its first carParams message and which is cleared at every onroad
+// transition (common/params.cc), so it is this drive's car. Until this drive's car is known the card shows greyed
+// ("WAITING FOR CAR", not tappable) unless the last drive's car (CarParamsPersistent) is known not to be a TI Mazda.
+// This is only the way in: every test still arms only on its own conditions, on the car side.
+enum class CarKnown { Unknown, Ti, Other };
+enum class TestsEntry { Hidden, Waiting, Ready };
+
+inline CarKnown carKnown(const std::string &car_name, unsigned long long flags) {
+  return (car_name == "mazda" && (flags & 8ULL) != 0) ? CarKnown::Ti : CarKnown::Other;  // 8: MazdaFlags.TORQUE_INTERCEPTOR
+}
+
+// onroad: the driving screen; tuning_ok: tuning level >= 3 (as the Settings toggle)
+inline TestsEntry testsEntry(bool onroad, bool tuning_ok, CarKnown this_drive, CarKnown last_drive) {
+  if (!onroad || !tuning_ok || this_drive == CarKnown::Other) {
+    return TestsEntry::Hidden;
+  }
+  if (this_drive == CarKnown::Ti) {
+    return TestsEntry::Ready;
+  }
+  return last_drive == CarKnown::Other ? TestsEntry::Hidden : TestsEntry::Waiting;
+}
+
 }  // namespace ti_pages

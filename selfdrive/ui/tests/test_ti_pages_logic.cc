@@ -990,7 +990,30 @@ static void buttonsRules() {
   }
 }
 
+// The way into the Tests pages: there from the first frame of the driving screen on a TI Mazda, greyed while this drive's
+// car is not known yet, never offroad, never below tuning level 3, never on a car known not to be a TI Mazda
+static void testsEntryRules() {
+  CHECK(carKnown("mazda", 9) == CarKnown::Ti);   // GEN1 | TORQUE_INTERCEPTOR, as drive 00000345 reported
+  CHECK(carKnown("mazda", 8) == CarKnown::Ti);
+  CHECK(carKnown("mazda", 1) == CarKnown::Other);
+  CHECK(carKnown("toyota", 8) == CarKnown::Other);
+  const CarKnown all[] = {CarKnown::Unknown, CarKnown::Ti, CarKnown::Other};
+  for (CarKnown now : all) {
+    for (CarKnown last : all) {
+      CHECK(testsEntry(false, true, now, last) == TestsEntry::Hidden);    // offroad
+      CHECK(testsEntry(true, false, now, last) == TestsEntry::Hidden);    // tuning level below 3
+      if (now == CarKnown::Ti) CHECK(testsEntry(true, true, now, last) == TestsEntry::Ready);   // whatever the last drive was
+      if (now == CarKnown::Other) CHECK(testsEntry(true, true, now, last) == TestsEntry::Hidden);
+    }
+  }
+  // drive just started, nothing from the car yet: greyed and visible, unless the last car is known not to be a TI Mazda
+  CHECK(testsEntry(true, true, CarKnown::Unknown, CarKnown::Ti) == TestsEntry::Waiting);
+  CHECK(testsEntry(true, true, CarKnown::Unknown, CarKnown::Unknown) == TestsEntry::Waiting);
+  CHECK(testsEntry(true, true, CarKnown::Unknown, CarKnown::Other) == TestsEntry::Hidden);
+}
+
 int main() {
+  testsEntryRules();
   buttonsRules();
   cruiseRules();
   curveRules();
