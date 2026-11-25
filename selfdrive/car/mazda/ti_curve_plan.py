@@ -269,6 +269,7 @@ def load_approach_table(path=APPROACH_TABLE):
   except (OSError, KeyError, ValueError):
     return 0
   for k, d in zip(keys.tolist(), dist.tolist()):
+    # per-frame-ok: the approach table's ~23k keys, once at start
     _APPROACH.setdefault(tuple(int(x) for x in k), float(d))
   return len(dist)
 
@@ -283,6 +284,7 @@ def approach_m(u, T, S1, dt=0.05, set0=None):
     return r
   _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=None, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S,
                          set0=float(key[3]), hold=CM.HOLD)
+  # per-frame-ok: keyed by whole mph (u, T, S1, set0) in the cruise range; 2 h soak flat at 22722 entries
   _APPROACH[key] = dist
   return dist
 
@@ -361,6 +363,7 @@ def _raise_threshold(set_mph, T):
     ok = all(_raise_due_at(lo - d, set_mph, T) for d in RAISE_THR_CHECK if lo - d >= set_mph) and \
       not any(_raise_due_at(hi + d, set_mph, T) for d in RAISE_THR_CHECK if hi + d <= float(T) + RAISE_THR_SPAN_MPH)
     thr = lo if ok else None
+  # per-frame-ok: keyed by (set speed from the CAN signal, whole-mph T, HOLD): finite; 2 h soak flat at 5 entries
   _RAISE_THR[key] = thr
   return thr
 

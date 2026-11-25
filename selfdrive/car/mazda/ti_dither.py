@@ -89,6 +89,7 @@ _PEAK_ALL = []
 
 def _peak_all():
   if not _PEAK_ALL:
+    # per-frame-ok: one element, appended only while empty
     _PEAK_ALL.append(max(peak_counts(p) for p in PRESETS))
   return _PEAK_ALL[0]
 

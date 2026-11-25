@@ -273,6 +273,7 @@ def steps_in_band(key, label):
   """Number of steps captured in a band (the first ones of the table). Constant per (test, band): kept once computed."""
   got = _STEPS_IN_BAND.get((key, label))
   if got is None:
+    # per-frame-ok: keyed by (test, band): 3 tests x the LADDER_CAPS bands
     got = _STEPS_IN_BAND[(key, label)] = (sum(1 for a in LADDER_AMPS if a <= LADDER_CAPS[label]) if key == LADDER else n_steps(key))
   return got
 
@@ -285,6 +286,7 @@ def step_params(key, step):
   (it is asked many times a frame)."""
   got = _STEP_PARAMS.get((key, step))
   if got is None:
+    # per-frame-ok: keyed by (test, step): 3 tests x their step tables
     got = _STEP_PARAMS[(key, step)] = _step_params(key, step)
   return got
 
@@ -309,6 +311,7 @@ _SMALL = {}
 def small(key, step):
   got = _SMALL.get((key, step))
   if got is None:
+    # per-frame-ok: keyed by (test, step): finite like _STEP_PARAMS
     got = _SMALL[(key, step)] = step_params(key, step)[1] <= SMALL_AMP
   return got
 
@@ -320,6 +323,7 @@ def small_flags(key, band):
   """small(key, s) for each step captured in `band`, as a tuple. Constant per (test, band): kept once computed."""
   got = _SMALL_FLAGS.get((key, band))
   if got is None:
+    # per-frame-ok: keyed by (test, band): finite like _STEPS_IN_BAND
     got = _SMALL_FLAGS[(key, band)] = tuple(small(key, s) for s in range(steps_in_band(key, band)))
   return got
 
@@ -458,6 +462,7 @@ _PEAK = {}
 def peak_counts(key):
   got = _PEAK.get(key)
   if got is None:
+    # per-frame-ok: keyed by test: 3 entries
     got = _PEAK[key] = max(step_params(key, s)[1] for s in range(n_steps(key)))
   return got
 
@@ -1251,6 +1256,7 @@ def _class_rep():
   if not _REP:
     for k in KEYS:
       for s in range(n_steps(k)):
+        # per-frame-ok: filled once while empty, keyed by small() (2 values)
         _REP.setdefault(small(k, s), (k, s))
   return _REP
 
