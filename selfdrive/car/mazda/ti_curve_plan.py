@@ -207,6 +207,13 @@ MIN_SWITCH_S = 3.0              # no push / let-off reversal within this unless 
 GRADE_STEEP_DEG = 3.0           # remembered approach steeper downhill than this: start earlier
 GRADE_BUFFER_S_PER_DEG = 0.5    # ... by this per degree beyond GRADE_STEEP_DEG (no data beyond +-3 degrees: a guess, logged)
 MIN_DROP_MPH = 2                # a point needing less than this below the speed is ignored (the car can hold it at its speed)
+# ... unless the point's need comes from the bend's OWN outcome record (the record lowers it below the table: Planner.rec_hi /
+# rec_lo): then one set-speed step (1 mph) is acted on. Why: a table need is a corpus median (single passes scatter about
+# +-0.3 m/s^2, a couple of mph, around it), so 1 mph against it is noise; a need from recorded trouble at THIS bend is evidence, and
+# the owner tunes bend speeds in fine steps from whether the steering reached / sat at its limit (drive 348 at 300.6 s, 2026-11-25:
+# record 44, car at 44.9 on a 45 set speed, nothing done, 1.4 s at the limit, 0.36 m over the outside line). Stage 1 only: stage 2
+# (forecast) and the memory-straight check keep MIN_DROP_MPH.
+MIN_DROP_REC_MPH = 1
 HOLD_AFTER_M = 30.0             # keep the ceiling this far past the last tight point
 
 
@@ -1263,7 +1270,9 @@ class Planner:
     (R15, off by default: the owner's one-pass rule) only points with at least that many constrain stage 1, and a bend with none such
     is not stage 1's."""
     cands = {}
-    tight = np.nonzero((u_ref - shed_to) >= MIN_DROP_MPH)[0]
+    # the least drop acted on, per point: one set-speed step where the bend's own record sets the need (MIN_DROP_REC_MPH)
+    min_drop = MIN_DROP_MPH if rec is None else np.where(rec, MIN_DROP_REC_MPH, MIN_DROP_MPH)
+    tight = np.nonzero((u_ref - shed_to) >= min_drop)[0]
     if not len(tight):
       return cands
     breaks = np.nonzero(np.diff(tight) > 1)[0]
@@ -1333,6 +1342,7 @@ class Planner:
                     "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
                     "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
                     "cap": D.capacity(Tmin, side), "side": side,
+                    "fine": rec is not None and bool(rec[lowest]),   # the target is the record's: MIN_DROP_REC_MPH applies
                     # REL_*: the memory is the stronger witness (never released by the forecast) only where its record is
                     # ATTESTED (I1, the owner's fluke rule, 2026-11-25): one or two troubled passes (132 of 142 record points in
                     # memory v12, 53 of them on roads with 23-28 passes) must not change a bend's treatment beyond the bound;
@@ -1404,7 +1414,13 @@ class Planner:
     `active` holds the bends in progress. -> dict(ceil, dist, point, kind, corner, need, cap, end, behind, stage)."""
     # start: the car is at or above the highest speed from which it can still make it (or, below its set speed, the start is due)
     for key, c in cands.items():
-      if key not in active and (mph >= c["va"] or c["due"]) and mph - c["T"] >= MIN_DROP_MPH:
+      # a record-set target (c["fine"]): one step below the speed the cruise holds the car at (its set speed; the speed reads a few
+      # tenths either side of it: 44.9 on a 45 set speed in drive 348), MIN_DROP_REC_MPH
+      if c.get("fine"):
+        drop = max(mph, float(set_mph) if set_mph else 0.0) - c["T"] >= MIN_DROP_REC_MPH
+      else:
+        drop = mph - c["T"] >= MIN_DROP_MPH
+      if key not in active and (mph >= c["va"] or c["due"]) and drop:
         active[key] = {"T": c["T"], "need": c["need"], "Tc": c["Tc"], "at": c["at"], "entry": c["entry"], "mode": "push",
                        "since": t, "start_t": t, "start_over": mph - c["va"], "cap": c["cap"], "phase": 1, "aim_at": c["aim_at"],
                        "side": c["side"], "hi": self.hi, "strong": c.get("strong") or "", "pf": self._push_floor(floor),

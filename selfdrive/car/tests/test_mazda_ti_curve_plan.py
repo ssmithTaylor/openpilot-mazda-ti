@@ -1486,3 +1486,92 @@ def test_calibration_cancels_the_driving_model_difference():
   pl = P.Planner(None, model="north-dakota")
   pl.fc = (_FC_T, real * np.interp(_FC_T, D.FC_LEAD_S, ds))
   assert pl._release_check(v, T, cap, 6.0) is True
+
+
+# ---- fine steps where the bend's own record backs the need (drive 348 at 300.6 s, 2026-11-25) ----------------------------------------
+# The case: a left bend the table puts at 46 (remembered median curvature about 0.0056), lowered to 44 by the bend's own trouble record;
+# the car arrived at 44.9 on a 45 set speed, nothing was done (44 is under MIN_DROP_MPH = 2 below 45), the steering sat at its limit
+# 1.4 s and the car ran 0.36 m over the outside line. SYNTHETIC road and record (no recorded position).
+FINE_K = 0.0056
+
+
+def _rec_mem(tr, v_trb_mph=None, v_ok_mph=None, n_trb=1):
+  """M.synthetic with a trouble record on every bend point of `tr` (None: no record at all)."""
+  if v_trb_mph is None:
+    return M.synthetic([tr])
+  on = np.abs(tr["kap"]) > 0
+  rec = {"v_trb": [np.where(on, v_trb_mph * MPH, np.nan)],
+         "v_ok": [np.where(on, (v_ok_mph if v_ok_mph is not None else np.nan) * MPH, np.nan)],
+         "n_trb": [np.where(on, n_trb, 0)], "cap_n": [np.zeros(len(on), int)], "cap_res": [np.full(len(on), np.nan)]}
+  return M.synthetic([tr], record=rec)
+
+
+def _fine_road(k=FINE_K):
+  return road((1500, 0.0), (300, k), (600, 0.0))
+
+
+def test_fine_case_inputs_table_46_record_44():
+  tr = _fine_road()
+  assert float(np.min(P.Planner(_rec_mem(tr)).need_hi)) == 46
+  pl = P.Planner(_rec_mem(tr, 45.0, 44.0))
+  assert float(np.min(pl.need_hi)) == 44 and pl.rec_hi.any()
+
+
+def test_record_backed_bend_one_mph_under_is_slowed_for_one_step():
+  # the real case: need 44 from the bend's own record, the car at 44.9 on a 45 set speed: one SET- step to 44 (fine tuning from the
+  # record), never lower
+  tr = _fine_road()
+  res = drive(_rec_mem(tr, 45.0, 44.0), tr, 44.9, 110, set_mph=45)
+  ceil = [p.ceil for _, s, p in res if p.ceil is not None and s <= 1800]
+  assert ceil, "a record-backed 1 mph shortfall must be acted on"
+  assert min(ceil) == 44 and all(p.corner_mph == 44 for _, _, p in res if p.kind == "corner")
+  # and the same from 45.0 (the cruise at its set speed)
+  res = drive(_rec_mem(tr, 45.0, 44.0), tr, 45.0, 110, set_mph=45)
+  assert min(p.ceil for _, s, p in res if p.ceil is not None and s <= 1800) == 44
+
+
+def test_table_only_bend_one_mph_under_does_nothing():
+  # the same 1 mph shortfall resting on the table alone (corpus median: a single pass scatters a couple of mph around it): noise, ignored
+  k = 0.0062                                              # table 44, no record
+  tr = _fine_road(k)
+  assert float(np.min(P.Planner(_rec_mem(tr)).need_hi)) == 44
+  for v in (44.9, 45.0):
+    res = drive(_rec_mem(tr), tr, v, 110, set_mph=45)
+    assert all(p.ceil is None for _, _, p in res), v
+  # a record that does NOT lower the table (troubled above it, clean at it) leaves it table-only: still nothing
+  pl = P.Planner(_rec_mem(tr, 45.6, 44.2))
+  assert not pl.rec_hi.any()
+  res = drive(_rec_mem(tr, 45.6, 44.2), tr, 45.0, 110, set_mph=45)
+  assert all(p.ceil is None for _, _, p in res)
+  # (a table-only bend at most LATE_SHED_MPH under is stage 2's, from the forecast: unchanged; from further above stage 1 acts as before)
+  res = drive(_rec_mem(tr), tr, 52.0, 110, set_mph=52)
+  assert any(p.ceil is not None and p.kind == "corner" for _, _, p in res)
+
+
+def test_fine_slowdown_does_not_chatter():
+  # closed loop from 45 on a 45 set speed: the set speed asked for walks down to 44 once and is never raised again before the bend's
+  # end (no lower / raise / lower), and never below 44
+  tr = _fine_road()
+  end = 1500 + 300
+  res = drive(_rec_mem(tr, 45.0, 44.0), tr, 45.0, 120, set_mph=45, closed=True)
+  goal = [45 if p.ceil is None else min(45, p.ceil) for t, s, p, v in res if s <= end]
+  assert min(goal) == 44
+  first = goal.index(44)
+  assert all(g == 44 for g in goal[first:]), goal[first:]
+  # the speed answers: at most about one mph off, no dip toward a push depth
+  assert min(v for t, s, p, v in res if s <= end) >= 43.4
+
+
+def test_fine_steps_never_act_below_19_mph():
+  # nothing acts below the engage floor (~19 mph, RULES): a car at 19.5-21 with a record-backed bend 1 mph under its speed gets no
+  # ceiling at all, and no ceiling anywhere goes under the car's lowest set speed
+  ks = np.linspace(0.006, 0.05, 400)
+  k = float(ks[np.argmax(D.need_mph(ks) <= 22)])            # the gentlest bend the table puts at 22 or less
+  tr = _fine_road(k)
+  t_need = float(np.min(P.Planner(_rec_mem(tr)).need_hi))
+  mem = _rec_mem(tr, t_need, t_need - 3.0)
+  pl = P.Planner(mem)
+  assert pl.rec_hi.any() or pl.rec_lo.any()
+  for v in (19.5, 20.0, 21.0):
+    res = drive(mem, tr, v, 200, set_mph=int(round(v)))
+    assert all(p.ceil is None for _, _, p in res), v
