@@ -288,6 +288,7 @@ class Curve:
     self.cap_straight_f = None        # frame the road last became straight
     self.cap_held = False             # a SET+ was held back by the cap (logged once per cap)
     self.cap_gap = False
+    self.cap_on_straight = False
     self.cap_armed = False            # the plan stream had a gap (plan missing or older than PLAN_STALE_S) since the cap was set
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
@@ -966,7 +967,7 @@ class Curve:
 
   def _cap_clear(self):
     self.cap_lo = self.cap_end = self.cap_seen_f = self.cap_straight_f = None
-    self.cap_held = self.cap_armed = self.cap_gap = False
+    self.cap_held = self.cap_armed = self.cap_gap = self.cap_on_straight = False
 
   def _cap_track(self, frame, inp):
     """Forget the remembered lowest ceiling when its end conditions hold (see CAP_STALE_S)."""
@@ -983,6 +984,7 @@ class Curve:
       self.cap_straight_f = None
     past_end = self.cap_end is None or self.odo >= self.cap_end
     straight = self.cap_straight_f is not None and (frame - self.cap_straight_f) * DT >= BEND_OUT_S - 1e-9
+    self.cap_on_straight = straight       # on a straight (the bend test's own release) a returned plan is obeyed like a continuous one
     if (straight and past_end) or (self.cap_end is not None and self.odo >= self.cap_end + TRUST_HOLD_M) or        (frame - self.cap_seen_f) * DT >= CAP_STALE_S:
       self._cap_clear()
 
@@ -997,7 +999,7 @@ class Curve:
 
   def _cap_blocks(self, frame, inp, button, exempt):
     """True: a SET+ above the lowest ceiling acted on in this slowdown (the push net and the safe exit are exempt)."""
-    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or inp.set_mph is None or        inp.set_mph + 1 <= self.cap_lo:
+    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or self.cap_on_straight or inp.set_mph is None or \n       inp.set_mph + 1 <= self.cap_lo:
       return False
     if not self.cap_held:
       self.cap_held = True

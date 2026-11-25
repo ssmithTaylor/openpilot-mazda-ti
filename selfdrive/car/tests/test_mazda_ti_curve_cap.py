@@ -70,3 +70,13 @@ def test_cap_without_a_published_end_is_not_released_by_the_corner_start():
   car, cv = T.Car(55.0, 55), C.Curve()
   T.run(cv, car, 3000, lambda f, c: T.plan(40, dist=20.0), **STRAIGHT)       # "dist" only: the corner's START, no end
   assert cv.cap_lo == 40 and cv.cap_end is None
+
+
+def test_short_plan_gap_on_a_straight_then_no_corner_is_obeyed_at_once():
+  # slowed to 40 from 55, the corner's end 450 m ahead, a 1.5 s plan gap on a straight, then a trusted plan with no corner
+  car, cv = T.Car(55.0, 55), C.Curve()
+  T.run(cv, car, 3000, lambda f, c: dict(T.plan(40, dist=450.0), end=450.0), **STRAIGHT)
+  assert car.set == 40 and cv.cap_lo == 40
+  after = T.run(cv, car, 150, lambda f, c: None, start=3000, **STRAIGHT)         # the gap
+  T.run(cv, car, int((C.BEND_OUT_S + 1.0) / C.DT), lambda f, c: T.plan(None), start=3150, **STRAIGHT)
+  assert car.set > 40, car.set
