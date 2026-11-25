@@ -10,6 +10,7 @@ import math
 CAR_HALF_WIDTH = 0.92        # m
 DRIFT_CLEARANCE = 0.30       # m: car's side within this of a visible line (or over it) counts as drifting
 MIN_LINE_PROB = 0.5
+KEEP_LINE_PROB = 0.3         # a line that was confident (> MIN_LINE_PROB) stays so down to this while its position is consistent (gate only)
 # Review I2 (2026-11-24): in a turn the evidence is taken on the OUTSIDE of the turn (the side the car runs wide toward), from the
 # outside lane line OR the outside road edge, and fails OPEN when neither is seen with confidence, whatever the inside line shows.
 # Turn direction: the sign of openpilot's desired curvature, RIGHT positive in this fork's convention (as the lane-line y: the
@@ -99,7 +100,9 @@ def _evidence(model, curvature, lane_width):
       return out_edge < TURN_CLEARANCE or (inside is not None and inside <= 0.0), True
     if inside is not None:
       width = lane_width if lane_width else DEFAULT_LANE_WIDTH
-      return inside > width - 2 * CAR_HALF_WIDTH - DRIFT_CLEARANCE, True      # inside is the car side's distance to the inside line
+      # inside is the car side's distance to the inside line; <= 0: the car straddles / is over it (the crossed line, re-indexed
+      # inside, with the far line unseen -- review I2)
+      return inside > width - 2 * CAR_HALF_WIDTH - DRIFT_CLEARANCE or inside <= 0.0, True
     return True, False
   seen = [c for c in (left, right) if c is not None]
   if not seen:
@@ -127,6 +130,18 @@ def outside_clearance(model, curvature, lane_width=None):
   if inside is not None:
     return (lane_width or DEFAULT_LANE_WIDTH) - 2 * CAR_HALF_WIDTH - inside
   return None
+
+
+def _with_line_probs(model, probs12):
+  """A view of the model whose laneLineProbs[1] / [2] are replaced (the hysteresis); everything else read through."""
+  class _View:
+    def __getattr__(self, name):
+      return getattr(model, name)
+  v = _View()
+  p = list(model.laneLineProbs)
+  p[1], p[2] = probs12
+  v.laneLineProbs = p
+  return v
 
 
 def lane_width_seen(model):
@@ -165,10 +180,12 @@ class LaneDriftGate:
     self.prev_ys = None
     self.t = 0.0
     self.samples = []            # (time, outside clearance) per model frame, newest last
+    self.conf = [False, False]   # lane lines [1], [2] confident (with hysteresis)
 
   def reset(self):
     self.latch_left, self.clear_s, self.prev_ys = 0.0, 0.0, None
     self.samples = []
+    self.conf = [False, False]
 
   def closing_rate(self, model, curvature, reindex):
     """Low-passed closing rate (m/s, positive = approaching the outside line) or None: a least-squares slope over RATE_WINDOW_S of
@@ -205,6 +222,19 @@ class LaneDriftGate:
     reindex = False
     if ys is not None and self.prev_ys is not None:
       reindex = any(abs(a - b) > REINDEX_JUMP_FRAC * (self.width or DEFAULT_LANE_WIDTH) for a, b in zip(ys, self.prev_ys))
+    # Probability hysteresis: a line seen above MIN_LINE_PROB stays confident down to KEEP_LINE_PROB while its position is consistent
+    # with the previous frame (a jump of REINDEX_JUMP_FRAC of a lane width is a re-index, not the same line), so a line fading
+    # mid-crossing stays evidence. A line never above MIN_LINE_PROB is not.
+    try:
+      probs = [float(model.laneLineProbs[1]), float(model.laneLineProbs[2])]
+    except (AttributeError, IndexError, TypeError, ValueError):
+      probs = None
+    if probs is not None and ys is not None:
+      jump = REINDEX_JUMP_FRAC * (self.width or DEFAULT_LANE_WIDTH)
+      for i in (0, 1):
+        same = self.prev_ys is not None and abs(ys[i] - self.prev_ys[i]) <= jump
+        self.conf[i] = probs[i] > MIN_LINE_PROB or (self.conf[i] and same and probs[i] >= KEEP_LINE_PROB)
+      model = _with_line_probs(model, [max(probs[i], MIN_LINE_PROB + 1e-3) if self.conf[i] else probs[i] for i in (0, 1)])
     self.prev_ys = ys
     self.t += self.dt
     now, referenced = _evidence(model, curvature, self.width)
