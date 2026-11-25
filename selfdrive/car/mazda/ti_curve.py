@@ -999,7 +999,8 @@ class Curve:
 
   def _cap_blocks(self, frame, inp, button, exempt):
     """True: a SET+ above the lowest ceiling acted on in this slowdown (the push net and the safe exit are exempt)."""
-    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or self.cap_on_straight or inp.set_mph is None or \n       inp.set_mph + 1 <= self.cap_lo:
+    if button != "SET_PLUS" or exempt or self.cap_lo is None or not self.cap_armed or self.cap_on_straight or inp.set_mph is None or \
+       inp.set_mph + 1 <= self.cap_lo:
       return False
     if not self.cap_held:
       self.cap_held = True
