@@ -237,6 +237,39 @@ PROF_DD_M = 10.0                 # ... or this far was driven (or the set speed 
 PROF_MAX_S = 1.0                 # ... or this long has passed; else its last result
 
 
+_RAISE_THR = {}
+RAISE_THR_SPAN_MPH = 20.0         # the raise threshold is looked for between the set speed and this far above the target
+RAISE_THR_ITER = 34               # bisection steps (span / 2^34 ~ 1e-9 mph)
+RAISE_THR_CHECK = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0)   # monotonicity spot checks around the threshold (mph)
+
+
+def _raise_due_at(mph, set_mph, T):
+  return CM.raise_due(CM.Cruise(mph, set_mph, RAISE_SIM_DT_S), set_mph, T, hold=CM.HOLD)
+
+
+def _raise_threshold(set_mph, T):
+  """Cost (review 2): CM.raise_due for a car settled at speed m on dash `set_mph` depends only on (m, set, T) and is true below one
+  speed: the highest m at which it is true, found once per (set, T) by bisection, so a tick compares instead of simulating. None
+  (the full model each time) when the answer is not a single threshold (checked at the span's ends and around the threshold)."""
+  key = (set_mph, T, CM.HOLD)
+  if key in _RAISE_THR:
+    return _RAISE_THR[key]
+  lo, hi = float(set_mph), float(T) + RAISE_THR_SPAN_MPH
+  thr = None
+  if _raise_due_at(lo, set_mph, T) and not _raise_due_at(hi, set_mph, T):
+    for _ in range(RAISE_THR_ITER):
+      mid = 0.5 * (lo + hi)
+      if _raise_due_at(mid, set_mph, T):
+        lo = mid
+      else:
+        hi = mid
+    ok = all(_raise_due_at(lo - d, set_mph, T) for d in RAISE_THR_CHECK if lo - d >= set_mph) and \
+      not any(_raise_due_at(hi + d, set_mph, T) for d in RAISE_THR_CHECK if hi + d <= float(T) + RAISE_THR_SPAN_MPH)
+    thr = lo if ok else None
+  _RAISE_THR[key] = thr
+  return thr
+
+
 def slow_distance_m(from_mph, to_mph, floor_mph=CAR_MIN_MPH):
   """Metres before the corner at which slowing from `from_mph` to `to_mph` must start (approach + buffer + ENTRY_M)."""
   if from_mph - to_mph <= 0:
@@ -1304,6 +1337,9 @@ class Planner:
     """Switch a corner to its target: with the dash pushed below T, when the model says the car raised now bottoms out at T
     (CM.raise_due from the car settled on its current gap); otherwise within RAISE_AT_MPH of T."""
     if set_mph is not None and set_mph < T:
+      thr = _raise_threshold(float(set_mph), int(T))
+      if thr is not None:
+        return mph <= thr
       return CM.raise_due(CM.Cruise(mph, float(set_mph), RAISE_SIM_DT_S), float(set_mph), T, hold=CM.HOLD)
     return mph <= T + RAISE_AT_MPH
 
