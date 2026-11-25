@@ -4,7 +4,7 @@ import random
 from openpilot.common.conversions import Conversions as CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import TurnDirection
-from openpilot.selfdrive.controls.lib.lane_drift import lane_drift_evidence
+from openpilot.selfdrive.controls.lib.lane_drift import LaneDriftGate, lane_change_active
 from openpilot.selfdrive.controls.lib.events import ET, EVENT_NAME, FROGPILOT_EVENT_NAME, EventName, FrogPilotEventName, Events
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
@@ -35,6 +35,7 @@ class FrogPilotEvents:
     self.ti_was_active = False
     self.ti_dropout_hold = 0
     self.runwide_frames = 0
+    self.lane_drift_gate = LaneDriftGate(DT_MDL)
     self.runwide_display_hold = 0
     self.latch_display_hold = 0
 
@@ -254,10 +255,13 @@ class FrogPilotEvents:
     des_la = abs(sm["controlsState"].desiredCurvature) * v_ego ** 2
     act_la = abs(sm["controlsState"].curvature) * v_ego ** 2
     at_ceil = abs(sm["carControl"].actuators.steer) >= steer_authority.RUNWIDE_CEIL
-    runwide_now = (lat_active and ti_now and at_ceil
-                   and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
-                   and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT
-                   and lane_drift_evidence(sm["modelV2"], sm["controlsState"].desiredCurvature))   # at the limit alone is normal on held bends: needs a line close or crossed
+    runwide_base = (lat_active and ti_now and at_ceil
+                    and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
+                    and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT)
+    # at the limit alone is normal on held bends: needs a line close or crossed (stateful gate: latch through the re-index, none in a lane change)
+    drift_open = self.lane_drift_gate.update(sm["modelV2"], sm["controlsState"].desiredCurvature, bool(runwide_base),
+                                             lane_change_active(sm["modelV2"], sm["carState"].leftBlinker, sm["carState"].rightBlinker))
+    runwide_now = runwide_base and drift_open
     self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
     if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
         and getattr(frogpilot_toggles, "steer_authority_advisory", True)):
