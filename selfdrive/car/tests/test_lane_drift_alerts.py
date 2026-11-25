@@ -216,7 +216,7 @@ def test_unseen_outside_line_is_not_evidence_and_failing_open_does_not_arm_the_l
   gate = LaneDriftGate(0.01)
   nothing = tick_model((0, -1.8, 1.8, .1, .1))
   assert gate.update(nothing, RIGHT_TURN, True) is True        # nothing gives a position: fail open as before
-  hug = tick_model((0, -1.8, 0.7, .1, .9))                     # right turn, outside (left) unseen, inside hugged at 0.7 m
+  hug = tick_model((0, -1.8, 1.6, .1, .9))                     # right turn, outside (left) unseen, inside hugged: 0.68 m from the car's side (centre 1.6 m; review I2: a centre 0.7 m is OVER the line)
   assert gate.update(hug, RIGHT_TURN, True) is False           # no latch from the fail-open tick
   # the inside line far (car wide) with the outside unseen: open (lane width default)
   assert lane_drift_evidence(tick_model((0, -3.0, 2.3, .1, .9)), RIGHT_TURN) is True
@@ -303,3 +303,35 @@ def test_frame_noise_alone_does_not_predict():
   rnd = random.Random(5)
   frames = [(-1.72 + rnd.gauss(0, 0.05), 1.9, 0.9, 0.9) for _ in range(600)]      # 0.8 m clearance, sd 0.05 m noise, 30 s
   assert run_frames(frames, 0.0)[0] is None
+
+
+# ---- review I2 (2026-11-25): crossed line faint, then confident on the inside with the far line unseen; probability hysteresis ----
+def test_inside_line_straddled_opens_when_outside_unseen_both_directions():
+  # reviewer's probe B: after the re-index the crossed line (now inside) is confident, the far line unseen; the car is still over it
+  approach = [(-1.4 + 0.02 * i, 1.8 + 0.02 * i, .9, .9) for i in range(20)]
+  crossing = [(-0.9 + 0.02 * i, 2.3 + 0.02 * i, .3, .9) for i in range(20)]
+  after = [(-3.6, 0.3, .3, .9)] * 60
+  for mirror, k in ((False, RIGHT_TURN), (True, LEFT_TURN)):
+    gate = LaneDriftGate(0.01)
+    opens = []
+    for l1, l2, p1, p2 in approach + crossing + after:
+      m = tick_model((0, l1, l2, p1, p2), mirror)
+      opens += [gate.update(m, k, True) for _ in range(5)]
+    assert all(opens[len(approach + crossing) * 5:]), "gate closed while the car is still over the crossed line"
+  # not-at-limit, no latch: the rule itself
+  assert lane_drift_evidence(tick_model((0, -3.6, 0.3, .1, .9)), RIGHT_TURN) is True
+  assert lane_drift_evidence(tick_model((0, -0.3, 3.6, .9, .1)), LEFT_TURN) is True
+
+
+def test_line_probability_hysteresis_keeps_a_fading_line_but_not_one_never_confident():
+  for mirror, k in ((False, RIGHT_TURN), (True, LEFT_TURN)):
+    gate = LaneDriftGate(0.05)
+    out = []
+    # outside (left, right turn) line 0.2 m from the car's side and closing, fading in probability; inside line 1.28 m clear (closed alone)
+    for n, p in enumerate((0.8, 0.6, 0.4, 0.35, 0.2)):
+      m = tick_model((0, -1.12 - 0.002 * n, 3.0 if n < 2 else 2.2, p, .9), mirror)    # width 4.12 m learned while both lines are confident
+      out.append(gate.update(m, k, False))
+    assert out == [True, True, True, True, False]
+    gate = LaneDriftGate(0.05)
+    for n in range(4):                       # never above 0.5: not evidence at 0.4 (outside unseen, inside near: closed)
+      assert gate.update(tick_model((0, -1.12 - 0.002 * n, 1.9, 0.4, .9), mirror), k, False) is False
