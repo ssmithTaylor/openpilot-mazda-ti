@@ -29,7 +29,9 @@ Output (`Plan`): ceiling in whole mph (None: no ceiling), confidence, trusted, k
 model's own preview (largest predicted lateral acceleration in the next MODEL_LOOK_S), which the car side needs before it restores.
 No position ever leaves this module: logs carry trace / point indices, distances and curvatures only.
 """
+import hashlib
 import math
+import os
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -176,6 +178,54 @@ def decel_mph_s(gap):
 
 
 _APPROACH = {}
+# Cost (review 2, 2026-11-24): a cold approach_m is one cruise-model manoeuvre with its own raise checks (~1.2 ms on the PC, ~20 ms on
+# the device), and the cold fills were 99 % of the slowest 1 % of planner ticks. The common keys (every whole-mph speed above every
+# target, the target's own push depth, the dash at the speed) are precomputed by tools/dev/build_approach_table.py with this same
+# function into APPROACH_TABLE, keyed to the exact cruise-model and planner sources it was built from (APPROACH_SRC_HASH); a table
+# built from other sources is not loaded (every key is then computed when first needed, as before). Same values, so the same plans.
+APPROACH_TABLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ti_curve_approach.npz")
+APPROACH_DT = 0.05
+
+
+def approach_src_hash():
+  """The sources an approach_m value depends on: the cruise model, its tap timing, and this module's approach settings."""
+  h = hashlib.sha256()
+  here = os.path.dirname(os.path.abspath(__file__))
+  for f in ("ti_cruise_model.py", "ti_cruise_taps.py"):
+    with open(os.path.join(here, f), "rb") as fh:
+      h.update(fh.read().replace(b"\r\n", b"\n"))
+  h.update(repr((ARRIVED_MPH, TAP_S, CM.HOLD, APPROACH_DT)).encode())
+  return h.hexdigest()
+
+
+APPROACH_TABLE_SHED_MPH = 15       # = MAX_SHED_MPH: a run's lowest target is at most this below any of its points' targets
+
+
+def approach_table_keys():
+  """The keys the table holds: speed u above target T (19..89), the dash at u, every push depth a corner can give a point of it:
+  the push for the corner's lowest target (T down to T - APPROACH_TABLE_SHED_MPH) - DRIVE_GAP_MPH, never below the push floor."""
+  out = []
+  pf = CM.push_floor(CAR_MIN_MPH, DRIVE_GAP_MPH)
+  for T in range(CAR_MIN_MPH, MAX_MPH):
+    s1s = sorted({max(pf, T - d - DRIVE_GAP_MPH) for d in range(APPROACH_TABLE_SHED_MPH + 1)}, reverse=True)
+    for S1 in s1s:
+      for u in range(T + 1, MAX_MPH + 1):
+        out.append((u, T, S1, u))
+  return out
+
+
+def load_approach_table(path=APPROACH_TABLE):
+  """Fill the approach cache from the precomputed table if it was built from the current sources. -> keys loaded."""
+  try:
+    z = np.load(path, allow_pickle=False)
+    if str(z["src"]) != approach_src_hash():
+      return 0
+    keys, dist = z["keys"], z["dist"]
+  except (OSError, KeyError, ValueError):
+    return 0
+  for k, d in zip(keys.tolist(), dist.tolist()):
+    _APPROACH.setdefault(tuple(int(x) for x in k), float(d))
+  return len(dist)
 
 
 def approach_m(u, T, S1, dt=0.05, set0=None):
@@ -493,6 +543,9 @@ class Planner:
   ABS_FLOOR_MPH = 25              # mirrors ti_curve.ABS_FLOOR_MPH
 
   def __init__(self, memory):
+    if not getattr(Planner, "_table_tried", False):
+      Planner._table_tried = True
+      Planner.table_keys = load_approach_table()   # once per process (cost only: the same values as computed)
     self.mem = memory
     self.need = None
     self.need_hi = None
