@@ -116,6 +116,7 @@ OBS_WINDOW_S = 2.0              # the cruise's OBSERVED deceleration over this, 
 OBS_MIN_EXPECT = 0.5            # ... judged only while it should be slowing at least this much (mph/s)
 OBS_PRE_S = 1.5                 # ... the model is run from this long before the window (dead time + lag: 0.5 + 2 x 0.5 s)
 OBS_SIM_DT_S = 0.05             # ... in steps of this
+OBS_SKIP_SAFETY = 1.5           # ... skipped (cost only) when even 1.5 x the most it could predict is below OBS_MIN_EXPECT
 OBS_KEEP_S = 10.0               # ... and the last judgement kept this long (to the corner) once the gap closes
 RAISE_SLACK_MPH = 0.5           # a warning starts only above need + ALERT_MARGIN_MPH + this (speed noise at the margin); ends at the margin
 SETTLE_MPH = 0.3                # within this of its set speed the cruise is taken to be at it
@@ -1359,6 +1360,12 @@ class Planner:
     if not old or set_mph is None or any(h[2] is None for h in self.hist):
       return
     t0, m0, _ = old[-1]
+    s0 = self.hist[0][2]
+    if all(h[2] == s0 for h in self.hist) and CM.decel_mph_s(max(0.0, self.hist[0][1] - s0)) * OBS_SKIP_SAFETY < OBS_MIN_EXPECT:
+      # cost (review 2): with one set speed over the whole window the model car only closes the gap it starts with, so its
+      # slowing never exceeds the settled deceleration for that gap; below OBS_MIN_EXPECT (with margin for the step rounding)
+      # the run below could only return here (the same result, without the run)
+      return
     car = CM.Cruise(self.hist[0][1], self.hist[0][2], OBS_SIM_DT_S)
     v_t0 = car.v
     for (ta, _, sa), (tb, _, _) in zip(self.hist, self.hist[1:]):
