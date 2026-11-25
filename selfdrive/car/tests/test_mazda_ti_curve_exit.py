@@ -1,6 +1,6 @@
 """Review C2 (2026-11-24): the SAFE EXIT. Any stop of curve slowing while the dash is pushed below the 15-mph line (other than the
-driver's own cruise button or the cruise going off) raises the dash back to the line, independent of the intervention's state
-machine: after a raise tap not read back, the switch going off, the cruise check, an unexpected set-speed change, an internal error
+driver's own cruise button, the cruise going off or an unexpected set-speed change, which is left to the driver) raises the dash back to the line, independent of the intervention's state
+machine: after a raise tap not read back, the switch going off, the cruise check, an internal error
 (the Curve object gone) and a controls restart (state lost, the persisted marker found). Closed loop with the ONE cruise model, both
 braking tables: the car's actual speed never goes more than 0.5 mph below the line after the stop; no tap after a driver button;
 nothing ever above the driver's set speed."""
@@ -97,7 +97,7 @@ def test_every_stop_reason_raises_back_to_the_line(monkeypatch, event, depth, va
   car, cv, ex, st, lo, hi, fl, _ = _drive(event, depth, variant)
   if event == "changed" and st["hit"] is not None:
     # the doubt case (an unflagged drop may be the driver's own press): the exit does NOT arm and sends nothing; the set speed
-    # stays where it went, the on-road alert says so (rewritten from "raises back to the line", owner-reviewed fault 1, 2026-11-24)
+    # stays where it went, the on-road alert says so (rewritten from "raises back to the line", pending the owner's ruling (asked 2026-11-24))
     assert not ex.active and ex.result is None and car.set == st["set_at_hit"] - 1 and hi <= 55
     assert C.set_left(cv, ex, car.set) == (car.set, 55)
     return
