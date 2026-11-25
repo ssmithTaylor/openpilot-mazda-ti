@@ -599,6 +599,7 @@ class Planner:
     self.need_hi = None
     self.hi = True                      # R14: this tick plans on D.need_hi (the car at or above STEP_MPH, or a bend started there)
     self.mem_stage = False
+    self.rec_lo = self.rec_hi = None    # points whose allowed speed the bend's own record lowers below the table (None: no record)
     if memory is not None:
       # plan from the MEDIAN pass only (plan T4: never the sharpest-pass kap); the same figure serves the road-change check
       self.kmed = np.asarray(getattr(memory, "kap_med", memory.kap), np.float64)
@@ -611,6 +612,9 @@ class Planner:
       if RECORD and self.mem_stage and getattr(memory, "has_record", False) and np.any(np.isfinite(memory.v_trb)):
         b = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need, hi=False, n_trb=memory.n_trb)
         bh = record_bound(memory.v_trb, memory.v_ok, self.kmed, self.need_hi, hi=True, n_trb=memory.n_trb)
+        # winding fix class 1: which points the RECORD lowers below the table (kept whatever stage would handle the bend)
+        self.rec_lo = np.isfinite(b) & (b < self.need)
+        self.rec_hi = np.isfinite(bh) & (bh < self.need_hi)
         self.need = np.where(np.isfinite(b), np.minimum(self.need, b), self.need)
         self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
@@ -1048,11 +1052,12 @@ class Planner:
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
                              self.active, grade_of=None if grade is None else self._grade_fn(grade, idx, dist),
                              npass=self.mem.npass[idx], trb=getattr(self.mem, "v_trb", None)[idx]
-                             if getattr(self.mem, "v_trb", None) is not None else None)
+                             if getattr(self.mem, "v_trb", None) is not None else None,
+                             rec=self._rec_mask(idx))
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
     cap, need_true, cend, behind, stage = r["cap"], r["need"], r["end"], r["behind"], r["stage"]
-    corners = self._corners(idx, dist, need, mph)
+    corners = self._corners(idx, dist, need, mph, rec=self._rec_mask(idx))
     # latch every corner within reach of the warning horizon (plus LATCH_EXTRA_S of driving) while the road is trusted, and keep it,
     # by the odometer, until the car is LATCH_PAST_M past its end: also through a wrong re-match (a trusted position that no longer
     # shows it). A corner seen now replaces its latched copy.
@@ -1135,8 +1140,13 @@ class Planner:
       return GRADE_BUFFER_S_PER_DEG * (-g - GRADE_STEEP_DEG)
     return 0.0
 
+  def _rec_mask(self, idx):
+    """Per look-ahead point: True where the bend's own record lowers the allowed speed below the table (None: no record)."""
+    m = self.rec_hi if self.hi else self.rec_lo
+    return None if m is None else m[idx]
+
   def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None,
-                  trb=None):
+                  trb=None, rec=None):
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
@@ -1163,8 +1173,10 @@ class Planner:
           continue
       else:
         ok = np.ones(len(run), bool)
-      if key not in active and u_ref - float(shed_to[run[ok]].min()) <= LATE_SHED_MPH:
-        continue                                   # plan T6 / A6: a bend needing at most LATE_SHED_MPH off is stage 2's
+      if key not in active and u_ref - float(shed_to[run[ok]].min()) <= LATE_SHED_MPH and not (rec is not None and rec[run].any()):
+        continue                                   # plan T6 / A6: a bend needing at most LATE_SHED_MPH off is stage 2's, unless its
+        #                                            bound comes from the bend's own RECORD (rec): stage 2 sees only the forecast's
+        #                                            table need, never the record, so such a bend stays stage 1's (winding fix class 1)
       lowest = run[ok][int(np.argmin(need[run[ok]]))]
       # The WHOLE corner is the constraint (2026-11-24 late drive: the first target was the entry's 49, the tightest point's 44 took
       # over only inside the bend). Every point of the tight run ahead is a constraint at its own allowed speed and distance; the
@@ -1511,7 +1523,7 @@ class Planner:
     vt = need * MPH
     return v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
 
-  def _corners(self, idx, dist, need_true, mph):
+  def _corners(self, idx, dist, need_true, mph, rec=None):
     """The corners ahead the car is too fast for now: runs of points (at most 2 spacings apart) whose TRUE need (demand against capacity;
     speed; never the floor) is below mph - ALERT_MARGIN_MPH, up to HOLD_AFTER_M behind. Each: key (its last point, or the model's
     point), need (whole mph, the run's lowest), entry / low / end on the odometer."""
@@ -1533,7 +1545,8 @@ class Planner:
       lo = run[int(np.argmin(need_true[run]))]
       key = int(idx[run[-1]]) if idx[run[-1]] >= 0 else ("model", round(self.odo + float(dist[run[-1]]), -1))
       out.append({"key": key, "need": int(need_true[lo]), "entry": self.odo + float(dist[run[0]]),
-                  "low": self.odo + float(dist[lo]), "end": self.odo + float(dist[run[-1]])})
+                  "low": self.odo + float(dist[lo]), "end": self.odo + float(dist[run[-1]]),
+                  "rec": bool(rec is not None and rec[run].any())})
     return out
 
   def _observe(self, t, mph, set_mph):
@@ -1642,7 +1655,7 @@ class Planner:
         continue
       if not set_mph:
         arrive = mph                              # no cruise: nothing changes the speed
-      elif acting and lowering and u_ref - max(need, int(floor)) <= LATE_SHED_MPH and self.fc is not None:
+      elif acting and lowering and u_ref - max(need, int(floor)) <= LATE_SHED_MPH and self.fc is not None and not c.get("rec"):
         # a bend stage 1 leaves to stage 2 (plan T6): nothing changes until the preview's window reaches it, then a straight walk
         # to at most LATE_SHED_MPH below (stage 2 does not push)
         # confirmed on the 2nd planner tick (5 Hz), then the car side reads the plan and sends the first tap (S2_TAP_LAG_S)
@@ -1650,7 +1663,7 @@ class Planner:
         d1 = max(0.0, d_low - win * v)
         T2 = float(max(need, int(round(u_ref)) - LATE_SHED_MPH, int(floor)))
         arrive = self._arrive(v, d_low - d1, float(set_mph), min(float(set_mph), T2), True)
-      elif acting and lowering and u_ref - max(need, int(floor)) > LATE_SHED_MPH:
+      elif acting and lowering and (u_ref - max(need, int(floor)) > LATE_SHED_MPH or c.get("rec")):
         T = max(need, int(floor))
         arrive = self._arrive(v, d_low, float(set_mph), float(max(CM.push_floor(floor, DRIVE_GAP_MPH), T - DRIVE_GAP_MPH)), True, T=T)
       else:

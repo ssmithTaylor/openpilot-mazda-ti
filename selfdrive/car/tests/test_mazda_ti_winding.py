@@ -61,7 +61,7 @@ def test_dump():
 
 
 # ---- the fixed repro subset (run by pc_test.py --curve) ---------------------------------------------------------------------------
-REPRO = (("F1", 61), ("F6", 18), ("F2", 0), ("F1", 3), ("F5", 16))
+REPRO = (("F1", 61), ("F1", 18), ("F2", 0), ("F1", 3), ("F5", 16))
 _RES = {}
 
 
@@ -77,3 +77,32 @@ def test_repro_runs(fam, seed):
   r = _run(fam, seed)
   assert r.get("exc") is None, r["exc"]
   assert r["finished"]
+
+
+def _bend_min_mph(r, b):
+  a, e = r["bl"][b["i"]][0], r["bl"][b["i"]][1]
+  return min(row[3] for row in r["rows"] if a <= row[1] <= e)
+
+
+def _from_cruise(r, b, before_m=250.0):
+  """the car was at the driver's set speed somewhere in the before_m before the bend (it arrives from cruise, not from a bend)"""
+  a = r["bl"][b["i"]][0]
+  return any(row[3] >= r["set"] - 0.5 for row in r["rows"] if a - before_m <= row[1] < a)
+
+
+@pytest.mark.parametrize("fam,seed", (("F1", 61), ("F1", 18)))
+def test_class1_record_bound_kept_for_small_drops(fam, seed):
+  """CLASS 1: a remembered bend whose RECORD allows a speed only a few mph (<= LATE_SHED_MPH) under the set speed keeps that bound
+  whichever stage would handle it (F1/61: set 35, record bends allowed 32 were all driven at 35; F1/18: set 45, the set speed
+  walked up to 43 inside a record bend allowed 40). Every such bend: no SET+ inside it above its allowed speed; one reached from
+  cruise: arrival at or under allowed + 1 mph and graded (the car is not taken more than 1.5 mph under the allowed speed)."""
+  r = _run(fam, seed)
+  small = [b for b in r["bends"] if not b["drv"] and b["needed"] and r["set"] - b["allowed"] <= 5 and b["allowed"] >= b["floor"]]
+  assert small, "the case must contain small-drop record bends"
+  for b in small:
+    assert b["bad_up"] == 0, b
+    if _from_cruise(r, b):
+      assert b["peak"] <= b["allowed"] + 1.0, b
+      nxt = [(a2, al2) for (a2, *_x), al2 in zip(r["bl"], r["allowed"]) if 0 < a2 - r["bl"][b["i"]][1] <= 150.0]
+      if not any(al2 < b["allowed"] for _a, al2 in nxt):       # graded, unless a lower bend follows at once
+        assert _bend_min_mph(r, b) >= b["allowed"] - 1.5, (b, _bend_min_mph(r, b))
