@@ -54,6 +54,8 @@ CURVE_TESTS = (
   "selfdrive/car/tests/test_mazda_ti_curve_carside.py",
   "selfdrive/car/tests/test_mazda_ti_curve_record.py",
   "selfdrive/car/tests/test_mazda_ti_winding.py",
+  "selfdrive/car/tests/test_no_per_frame_leaks.py",       # per-frame leaks / cost growth of every per-frame entry point (gc off)
+  "selfdrive/car/tests/test_lint_per_frame.py",
   "tools/curve_slowing/test_early_dwell.py",
   "tools/curve_slowing/test_build_memory.py",
 )
@@ -61,6 +63,9 @@ CURVE_TESTS = (
 ALL_GLOBS = (
   "selfdrive/car/tests/test_mazda_ti*.py",
   "selfdrive/car/tests/test_lane_drift_alerts.py",
+  "selfdrive/car/tests/test_no_per_frame_leaks.py",
+  "selfdrive/car/tests/test_lint_per_frame.py",
+  "tools/dev/test_drive_memory_report.py",
   "tools/curve_slowing/test_*.py",
   "selfdrive/controls/lib/tests/test_*.py",
   "selfdrive/controls/tests/test_alerts.py",
