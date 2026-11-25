@@ -281,6 +281,7 @@ class Curve:
     self.bend_low_f = None            # frame the lateral acceleration first fell under the exit level
     self.bend_lo = None               # the highest a SET+ may bring the dash while in this bend (None: no limit known)
     self.bend_held = False            # a SET+ was held back by the bend rule (logged once per bend)
+    self.restore_failed = None        # the ref a restore failed to ("set speed did not respond"): not tried again by itself
     self.cap_lo = None                # the lowest corner speed acted on in this slowdown: no SET+ above it (see CAP_STALE_S)
     self.cap_end = None               # odometer where the planner last said that corner ends
     self.cap_seen_f = None            # frame of the last plan at or under the cap
@@ -317,6 +318,8 @@ class Curve:
   def _stop(self, frame, inp, why):
     self._cut_tap()
     self._cap_clear()
+    if why == "set speed did not respond" and self.state == "restoring" and self.ref is not None:
+      self.restore_failed = self.ref      # held for the driver: SET+ / SET- (a new ref) or the set speed back at ref ends it
     lowered = self.ref is not None and inp.set_mph is not None and inp.set_mph < self.ref and self.intervening()
     self.stop_lowered = lowered
     if lowered:
@@ -393,6 +396,7 @@ class Curve:
         self.chose_note = f"Your set speed is now {set_mph} (was {self.ref})"
       self.ref = set_mph
       self.left_at, self.own_press, self.left_doubt, self.lowered_from = None, False, False, None
+      self.restore_failed = None
       self.after_brake = False
     elif set_mph != self.left_at:
       self.left_doubt = True              # neither ours nor a RES to the stored value: leave it alone, keep the message
@@ -469,6 +473,7 @@ class Curve:
           self.own_press = False
         if inp.driver_set:
           self.own_press = True
+          self.restore_failed = None          # SET+ / SET-: answered (RES is not)
           self.press_plus = bool(inp.driver_set_plus)
           self.chose_note = ""
         if self.intervening() or self.state in ("ready", "stopped", "waiting"):
@@ -578,6 +583,8 @@ class Curve:
       self.ref = inp.set_mph
     if self.left_at is not None and inp.set_mph is not None and self.ref is not None and inp.set_mph >= self.ref:
       self.left_at, self.own_press, self.left_doubt = None, False, False     # back at the driver's own set speed
+    if self.restore_failed is not None and (self.restore_failed != self.ref or (inp.set_mph is not None and inp.set_mph >= self.ref)):
+      self.restore_failed = None
 
     if self.left_doubt:
       self._cut_tap()
@@ -703,6 +710,7 @@ class Curve:
         self.lowered_from = self.ref
         self.restore_wait_since = None
         self.trust_past = False
+        self.restore_failed = None            # a new slowdown: the failed restore is history
         self._ev("start", frame, ceil=ceil, corner=plan.get("corner"), floor=self.floor, limit=lim, mph=round(inp.mph, 1),
                  set_mph=inp.set_mph, ref=self.ref, dist=plan.get("dist"), lead=inp.lead)
       # the set speed the planner asks for now (the push below the corner speed, then the corner speed), within the floor and
@@ -767,6 +775,12 @@ class Curve:
         self._to(frame, "holding", "next corner close")
         self.line1 = f"HOLDING FOR THE NEXT CORNER: {inp.set_mph} mph"
         self.line2 = f"back to {self.ref} mph after it"
+        return None
+      if self.restore_failed is not None:
+        self.target = self.shown = inp.set_mph
+        self._to(frame, "holding", "restore failed: left to you")
+        self.line1 = f"ON: set speed {inp.set_mph} mph"
+        self.line2 = self._left_text(inp.set_mph)
         return None
       self.target = self.shown = cap
       if self.left_doubt:
@@ -1549,6 +1563,8 @@ def set_left(cv, ex, set_mph):
   ref = cv.ref if cv is not None else (ex.ref if ex is not None else None)
   if set_mph is None or ref is None or int(set_mph) >= int(ref):
     return None
+  if cv is not None and cv.restore_failed is not None and cv.restore_failed == cv.ref and int(set_mph) < int(cv.ref):
+    return int(set_mph), int(cv.ref)       # a restore failed: held for the driver, one steady alert until SET+ / SET-
   if cv is None:
     return None if ex is not None and ex.left_cleared else (int(set_mph), int(ref))
   if cv.state == "stopped" and not cv.after_brake:
