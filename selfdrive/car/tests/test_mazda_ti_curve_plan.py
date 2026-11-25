@@ -1437,3 +1437,52 @@ def test_rm_returning_to_the_trace_restores_trust():
   assert t2 + P.RM_STEADY_S - DT <= t_back <= t2 + P.RM_STEADY_S + 4.0, t_back - t2
   assert all(p.trusted for t, s, p in res if t >= t_back)
   assert pl.locked
+
+
+# ---- the forecast calibration per driving model (FC_RATIO per model name, 2026-11-25) ----
+def _realised_bend(k_r, lead_s=6.0):
+  return np.where(np.abs(_FC_T - lead_s) <= 0.25, k_r, 0.0)
+
+
+def test_fc_ratio_per_model_defaults_and_fallback():
+  nd, known = D.fc_ratio_for("north-dakota")
+  assert known and tuple(nd) == tuple(D.FC_RATIO)
+  ds, known = D.fc_ratio_for("dark-souls")
+  assert known and ds != nd
+  i6 = D.FC_LEAD_S.index(6.0)
+  assert ds[i6] < nd[i6]                                    # dark-souls under-reads the 6 s bend more than north-dakota
+  assert D.fc_ratio_for("some-other-model") == (nd, False)
+  assert D.fc_ratio_for("") == (nd, False)
+  # the replay / tests default: north-dakota, nothing logged
+  pl = P.Planner(None)
+  assert tuple(pl.fc_ratio) == tuple(D.FC_RATIO) and not [e for e in pl.events if e["kind"] == "model_unknown"]
+  pl = P.Planner(None, model="north-dakota")
+  assert tuple(pl.fc_ratio) == tuple(D.FC_RATIO) and not pl.events
+  pl = P.Planner(None, model="some-other-model")
+  assert tuple(pl.fc_ratio) == tuple(D.FC_RATIO)
+  ev = [e for e in pl.events if e["kind"] == "model_unknown"]
+  assert len(ev) == 1 and ev[0]["mdl"] == "some-other-model" and ev[0]["used"] == D.DEFAULT_FC_MODEL
+
+
+def test_calibration_cancels_the_driving_model_difference():
+  # the same realised bend, previewed by each model at its own measured under-reading: the calibrated need and the release decision
+  # are the same under each model's own name; north-dakota's calibration applied to dark-souls' preview reads the bend absent
+  v, T = 50 * MPH, 40
+  cap = D.capacity(T, D.RIGHT)
+  k_r = -(P.CONFIRM_SHARE + 0.02) * cap / (T * MPH) ** 2      # a right bend asking just over the release share at T (present)
+  real = _realised_bend(k_r)
+  out = {}
+  for name in ("north-dakota", "dark-souls"):
+    ratio, _ = D.fc_ratio_for(name)
+    fc = real * np.interp(_FC_T, D.FC_LEAD_S, ratio)          # what this model's preview shows of the realised bend
+    pl = P.Planner(None, model=name)
+    pl.fc = (_FC_T, fc)
+    need = D.forecast_need(_FC_T, fc, v, P.FC_LO_S, P.CONFIRM_LEAD_S, hi=True, ratio=pl.fc_ratio)
+    out[name] = (need[0], round(need[2], 6), pl._release_check(v, T, cap, 6.0))
+  assert out["dark-souls"] == out["north-dakota"]
+  assert out["north-dakota"][2] is False                      # present: kept
+  # without the per-model table (north-dakota's ratio on dark-souls' preview) the same bend reads absent
+  ds, _ = D.fc_ratio_for("dark-souls")
+  pl = P.Planner(None, model="north-dakota")
+  pl.fc = (_FC_T, real * np.interp(_FC_T, D.FC_LEAD_S, ds))
+  assert pl._release_check(v, T, cap, 6.0) is True

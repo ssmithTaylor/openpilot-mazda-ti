@@ -309,7 +309,7 @@ def fc_summary(planner):
   import numpy as np
   from openpilot.selfdrive.car.mazda import ti_curve_demand as CD
   ts = np.asarray(fc[0], np.float64)
-  la = CD.calibrate(ts, max(float(v), 1.0) ** 2 * np.asarray(fc[1], np.float64))
+  la = CD.calibrate(ts, max(float(v), 1.0) ** 2 * np.asarray(fc[1], np.float64), getattr(planner, "fc_ratio", None))
   return [round(float(x), 2) for x in np.interp(TICK_FC_LEADS, ts, la, right=float("nan"))]
 
 
@@ -456,9 +456,12 @@ def main():
     cloudlog.exception("ti_curve_plan memory")
   cloudlog.event("ti_curve_plan", kind="memory", loaded=mem is not None, why=why_none, seconds=round(time.monotonic() - t0, 2),
                  traces=getattr(mem, "n_traces", 0), points=getattr(mem, "n", 0))
-  planner = P.Planner(mem)
-  mdl = model_name(Params())          # the driving model (logs are split by it); read once
-  cloudlog.event("ti_curve_plan", kind="model", mdl=mdl)
+  mdl = model_name(Params())          # the driving model (logs are split by it; it selects the forecast calibration); read once
+  planner = P.Planner(mem, model=mdl)
+  fc_known = mdl in P.D.FC_RATIO_BY_MODEL
+  cloudlog.event("ti_curve_plan", kind="model", mdl=mdl, fc=mdl if fc_known else P.D.DEFAULT_FC_MODEL + " (fallback)")
+  if not fc_known:
+    cloudlog.warning(f"ti_curve_plan: no forecast calibration for driving model {mdl!r}: using {P.D.DEFAULT_FC_MODEL}'s")
   # cost (perf 2026-11-25): everything loaded so far (the road memory, the approach table's ~23k entries) lives for the whole process;
   # a full garbage collection walking it took 54 ms on the comma. Frozen, the collector skips it (no output depends on collection).
   gc.freeze()

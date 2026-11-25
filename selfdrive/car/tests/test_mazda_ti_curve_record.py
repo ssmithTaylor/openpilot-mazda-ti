@@ -336,3 +336,34 @@ def test_load_comparable_map(tmp_path):
   import json
   json.dump({"x-0": [True, "comparable"], "x-1": [False, "test toggle"]}, open(f, "w"))
   assert B.load_comparable(f) == {"x-0": True, "x-1": False}
+
+
+def _stage2_with_clean_history(model):
+  """Stage 2 ticks at 50 mph on a forecast bend ~4 s ahead needing a few mph off, where the memory holds the bend with clean history at
+  52 mph (n_clean >= 3 at or above the car's speed). -> the planner's stage-2 state after 3 s."""
+  pl = P.Planner(None, model=model)
+  mph = 50.0
+  v = mph * MPH
+  ts = np.arange(0.0, 8.01, 0.25)
+  k_r = (D.capacity(45, D.RIGHT) * 1.0) / (46 * MPH) ** 2          # needs about 45-46 mph: a 4-5 mph late drop
+  ratio, _ = D.fc_ratio_for(model)
+  k = -np.where(np.abs(ts - 4.0) <= 0.5, k_r, 0.0) * np.interp(ts, D.FC_LEAD_S, ratio)
+  pl.fc = (ts, k)
+  dist = np.arange(0, 400, 5.0)
+  need = np.where(np.abs(dist - 4.0 * v) <= 30.0, 45.0, 90.0)
+  vc = np.full(len(dist), 52.0)
+  vt = np.full(len(dist), np.nan)
+  for i in range(60):
+    pl._stage2(i * 0.05, v, mph, mph, 35, (need, dist, mph, vc, vt))
+  return pl.s2
+
+
+def test_stage2_clean_history_skip_only_under_the_evidence_model():
+  # I3 (owner: evidence only from passes comparable to the current setup; the driving model is part of it): the clean passes were
+  # all driven with north-dakota steering; under another model stage 2 acts as it would without that history
+  assert P.EVIDENCE_MODEL == "north-dakota"
+  assert _stage2_with_clean_history("north-dakota") is None          # the evidence applies: quiet
+  assert _stage2_with_clean_history(None) is None                    # replays / tests: north-dakota
+  s2 = _stage2_with_clean_history("dark-souls")
+  assert s2 is not None and s2["T"] < 50                              # not the evidence's model: acts
+  assert _stage2_with_clean_history("some-other-model") is not None

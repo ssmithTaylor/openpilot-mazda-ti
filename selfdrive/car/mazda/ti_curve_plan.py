@@ -88,7 +88,8 @@ CONFIRM_SHARE = 0.6
 #  * no reading counts while the car is in a bend itself or left one less than REL_AFTER_BEND_S ago (the same in-bend test as the car
 #    side's BEND_*: |lateral acceleration| from the yaw sensor >= ENTRY_LA on, < ENTRY_LA - REL_BEND_HYST_LA for REL_BEND_OUT_S off);
 #    the drive's under-reading lasted ~1.5 s after the exit, so 2.0 s;
-#  * a bend whose points carry a trouble record (finite v_trb) or REL_STRONG_PASSES or more passes is never released by the forecast:
+#  * a bend whose points carry an ATTESTED trouble record (record_attested: REC_ATTESTED+ troubled passes and a clean pass below; I1:
+#    one or two troubled passes do not count) or REL_STRONG_PASSES or more passes is never released by the forecast:
 #    the memory is the stronger witness there (whether the car is ON that road is road matching's job: off the trace no stage-1 bend
 #    starts and RM keeps working as before; the release only ever answered "is this remembered bend really there");
 #  * a start already inside the decision window (a late start, as on the drive) is not released on the readings of its own tick and
@@ -538,6 +539,15 @@ def scatter_speed_ratio(mph, side):
 REC_ATTESTED = 3
 
 
+def record_attested(v_trb, v_ok, n_trb):
+  """Per point: the trouble record is ATTESTED (REC_ATTESTED or more troubled passes at the limit, and a clean pass proven below
+  them), the one test the bound (record_bound) and the release (the "strong" bend, I1) share. n_trb None: never attested."""
+  vt = np.asarray(v_trb, np.float64)
+  if n_trb is None:
+    return np.zeros(len(vt), bool)
+  return np.isfinite(vt) & (np.asarray(n_trb) >= REC_ATTESTED) & np.isfinite(np.asarray(v_ok, np.float64))
+
+
 def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   """whole mph the record allows at each point (nan where it has no trouble), given the table's need there (`table`: need_hi when
   hi, else need); n_trb: troubled passes per point (None: all below REC_ATTESTED)."""
@@ -550,7 +560,7 @@ def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   if not sel.any():
     return out
   vt_, vo_, tab_, sd_ = vt[sel], vo[sel], tab[sel], side[sel]
-  att = (np.zeros(len(vt), bool) if n_trb is None else np.asarray(n_trb) >= REC_ATTESTED)[sel] & np.isfinite(vo_)
+  att = record_attested(v_trb, v_ok, n_trb)[sel]
   q = 0.05                                                 # the file's float16 speeds are good to about 0.04 mph
   top = np.ceil(vt_ - q) - 1.0                             # at least 1 mph under the troubled speed
   b = np.where(np.isfinite(vo_), np.floor(vo_ + q), np.floor(vt_ * scatter_speed_ratio(vt_, sd_) + q))
@@ -562,6 +572,14 @@ def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
     b = np.where(tab_ >= D.STEP_MPH, np.maximum(b, float(D.STEP_MPH)), b)
   out[sel] = np.minimum(b, tab_)                           # never raises
   return out
+
+
+# I3 (owner, 2026-11-24: outcome evidence only from passes comparable to the current setup; the driving model is part of it): the
+# clean-history skip rests on passes driven with this model steering. The memory file does not record the model; every admitted drive
+# ran north-dakota. The memory builder should record the driving model in the file's metadata (and keep evidence per model); until
+# then the skip applies only while the running model is EVIDENCE_MODEL. The record's BOUND is not gated: it only lowers speed, and
+# the steering's limit at the point is the hardware's, the same under any driving model.
+EVIDENCE_MODEL = "north-dakota"
 
 
 def s2_history_clean(v_clean_mph, v_trb, dist, lead_m, mph):
@@ -626,11 +644,17 @@ class Planner:
   MAX_SHED_MPH = 15               # mirrors ti_curve.MAX_SHED_MPH, only to flag in the log when a corner needs more
   ABS_FLOOR_MPH = 25              # mirrors ti_curve.ABS_FLOOR_MPH
 
-  def __init__(self, memory):
+  def __init__(self, memory, model=None):
+    """model: the driving model's name (the `Model` param, read once by the planner process); None (replays, tests): north-dakota,
+    the model every recorded drive ran. It selects the forecast's calibration (ti_curve_demand.fc_ratio_for)."""
     if not getattr(Planner, "_table_tried", False):
       Planner._table_tried = True
       Planner.table_keys = load_approach_table()   # once per process (cost only: the same values as computed)
     self.mem = memory
+    # I1: the points whose trouble record is attested (the release's "strong" bend; the bound uses the same test)
+    vt = getattr(memory, "v_trb", None)
+    self._attested = (None if vt is None else
+                      record_attested(vt, getattr(memory, "v_ok", np.full(len(vt), np.nan)), getattr(memory, "n_trb", None)))
     self.need = None
     self.need_hi = None
     self.hi = True                      # R14: this tick plans on D.need_hi (the car at or above STEP_MPH, or a bend started there)
@@ -655,7 +679,11 @@ class Planner:
         self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
     self.limit = None
+    self.model = D.DEFAULT_FC_MODEL if model is None else model
+    self.fc_ratio, fc_known = D.fc_ratio_for(self.model)
     self.reset()
+    if not fc_known:                    # logged once (the planner process drains events into the log)
+      self.events.append({"kind": "model_unknown", "mdl": str(self.model)[:24], "used": D.DEFAULT_FC_MODEL})
 
   def reset(self):
     self.t = None
@@ -1042,9 +1070,9 @@ class Planner:
         self.model_k = float(kk[j])
         self.fc = (ts, MODEL_K_SIGN * ks)
         self.fc_v = v
-        _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S)
+        _, _, la3, _ = D.forecast_need(ts, self.fc[1], v, 0.0, AHEAD_S, ratio=self.fc_ratio)
         self.ahead_la = None if la3 is None else round(la3, 2)
-        la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1])
+        la_all = D.calibrate(ts, max(v, 1.0) ** 2 * self.fc[1], self.fc_ratio)
         self.ask = tuple(round(float(x), 2) for x in np.interp(ASK_LEADS, ts, la_all))
     mph = v / MPH
     # R14: plan on the capacity above the step (D.need_hi) while the car is at or above D.STEP_MPH, or while a bend (stage 1, map or
@@ -1126,8 +1154,7 @@ class Planner:
     sign = np.sign(self.kmed[idx])
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
                              self.active, grade_of=None if grade is None else self._grade_fn(grade, idx, dist),
-                             npass=self.mem.npass[idx], trb=getattr(self.mem, "v_trb", None)[idx]
-                             if getattr(self.mem, "v_trb", None) is not None else None,
+                             npass=self.mem.npass[idx], trb=self._attested[idx] if self._attested is not None else None,
                              rec=self._rec_mask(idx))
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
@@ -1222,6 +1249,7 @@ class Planner:
 
   def _bend_cands(self, key_of, dist, need, kab, sign, shed_to, u_ref, mph, set_mph, floor, active, grade_of=None, npass=None,
                   trb=None, rec=None):
+    # trb: per look-ahead point, True where the trouble record is attested (record_attested), or None
     """Stage 1's bends ahead (plan T6): runs of consecutive points needing at least MIN_DROP_MPH below u_ref; a run whose lowest
     target is not MORE than LATE_SHED_MPH below u_ref is stage 2's (not started here; kept while already started). key_of(run) -> the
     bend's key, or None (a map bend not yet persisted). Per bend its binding constraint: {T, need, va (v_allow), D, due, at, entry,
@@ -1299,8 +1327,11 @@ class Planner:
                     "at": self.odo + float(dist[run[-1]]), "entry": self.odo + float(dist[run[0]]),
                     "aim_at": self.odo + float(dist[aim]), "low_m": float(dist[lowest]), "prof": prof, "S1": S1, "buf": buf,
                     "cap": D.capacity(Tmin, side), "side": side,
-                    # REL_*: the memory is the stronger witness (never released by the forecast)
-                    "strong": ("record" if trb is not None and np.any(np.isfinite(trb[run])) else
+                    # REL_*: the memory is the stronger witness (never released by the forecast) only where its record is
+                    # ATTESTED (I1, the owner's fluke rule, 2026-11-25): one or two troubled passes (132 of 142 record points in
+                    # memory v12, 53 of them on roads with 23-28 passes) must not change a bend's treatment beyond the bound;
+                    # such a bend is released by the ordinary rules (REL_TICKS valid readings etc.)
+                    "strong": ("record" if trb is not None and np.any(trb[run]) else
                                "passes" if npass is not None and np.any(npass[run] >= REL_STRONG_PASSES) else "")}
     return cands
 
@@ -1351,7 +1382,7 @@ class Planner:
     or one that does not reach the entry (never released then)."""
     if self.fc is None or float(np.max(self.fc[0])) < lead_s - 1e-6:
       return None
-    _, _, la, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, MODEL_LOOK_S)
+    _, _, la, _ = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, MODEL_LOOK_S, ratio=self.fc_ratio)
     if la is None:
       return None
     la_T = abs(la) * (T * MPH) ** 2 / max(v, 1.0) ** 2
@@ -1578,10 +1609,12 @@ class Planner:
     quiet = (self.fc is None or mph < S2_MIN_MPH or t - self.blink_t < BLINKER_HOLD_S)
     need, lead, side = None, None, D.UNKNOWN
     if not quiet:
-      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi)
+      need, lead, _, side = D.forecast_need(self.fc[0], self.fc[1], v, FC_LO_S, CONFIRM_LEAD_S, hi=self.hi,
+                                         ratio=self.fc_ratio)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
-    if hit and RECORD and mem_ahead is not None and len(mem_ahead) >= 5 and         s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):
+    if hit and RECORD and self.model == EVIDENCE_MODEL and mem_ahead is not None and len(mem_ahead) >= 5 and \
+        s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):
       hit = False                                        # this place has repeatedly been driven cleanly at this speed
     if hit:
       if self.s2_run == 0:
