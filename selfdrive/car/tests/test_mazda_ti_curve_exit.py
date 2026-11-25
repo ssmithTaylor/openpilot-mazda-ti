@@ -374,3 +374,22 @@ def test_fault2_driver_button_clears_the_record_after_an_internal_error():
     C.run_frame(None, ex, 10 * i, C.Inputs(on=True, engaged=True, cruise_on=True, set_mph=34, mph=45.0, driver_button=True, counter=3, **kw))
     assert C.set_left(None, ex, 34) is None                     # SET-, SET+, RES / CANCEL: any cruise button
     assert C.set_left(None, ex, 30) is None                     # and it stays cleared when the driver then picks a lower speed
+
+
+# ---- fault B (2026-11-24): the switched-off path rewrites TiSetSpeedLeft at 0.5 s, from the LIVE set speed --------------------------
+def test_switched_off_path_rewrites_the_left_record_every_half_second_from_the_live_set_speed(monkeypatch):
+  import json
+  cc, mem, CC, CS, clock = _cc({}, monkeypatch)
+  cv = cc.curve
+  cv.state, cv.ref, cv.off_note = "off", 55, "Set speed 34 mph (was 55): set it yourself"
+  cc.curve_exit.ref = 55
+  cc.curve_inp_last = C.Inputs(set_mph=50)                  # stale: the last frame the on path ran
+  CS.out.cruiseState.speed = 34 * 0.44704
+  writes = []
+  real = mem.put
+  mem.put = lambda k, v, *a, **kw: (writes.append((clock["k"], k, v)), real(k, v, *a, **kw))[1]
+  _frames(cc, CC, CS, clock, 600, set_mph=[34])
+  left = [(k, json.loads(v)) for k, key, v in writes if key == C.PARAM_LEFT]
+  assert left and all(d["now"] == 34 and d["was"] == 55 for _, d in left), left[:3]
+  gaps = [b[0] - a[0] for a, b in zip(left, left[1:])]
+  assert gaps and max(gaps) <= 50, gaps                     # the planner drops a record 1.0 s old: every 0.5 s
