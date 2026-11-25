@@ -196,15 +196,28 @@ def map_persist_s(mph):
   return MAP_PERSIST_S * min(1.0, max(0.0, (mph - MAP_PERSIST_LO_MPH) / (MAP_PERSIST_HI_MPH - MAP_PERSIST_LO_MPH)))
 
 
-def v_allow(D, T, S1, buf_s):
+def v_allow(D, T, S1, buf_s, hint=None):
   """The highest speed (mph, fractional) from which the car can still be at T by distance D with the push approach and buf_s of
-  margin at that speed; T when even T + 1 cannot."""
+  margin at that speed; T when even T + 1 cannot. `hint` (the speed now): the search starts in a bracket around it (the manoeuvres
+  near the speed now are the cached ones); the need is monotonic in the speed, so the answer is the same as the full search."""
+  memo = {}
+
   def need(u):
-    return approach_m(u, T, S1) + buf_s * u * MPH
+    r = memo.get(u)
+    if r is None:
+      r = memo[u] = approach_m(u, T, S1) + buf_s * u * MPH
+    return r
   lo = int(T)
   if need(lo + 1) > D:
     return float(T)
   hi = MAX_MPH
+  if hint is not None:
+    b_lo = max(lo + 1, int(hint) - V_ALLOW_BRACKET_MPH)
+    b_hi = min(MAX_MPH, int(hint) + V_ALLOW_BRACKET_MPH)
+    if b_hi > b_lo and need(b_lo) <= D:
+      lo = b_lo
+      if need(b_hi) > D:
+        hi = b_hi
   if need(hi) <= D:
     return float(hi)
   while hi - lo > 1:
@@ -215,6 +228,12 @@ def v_allow(D, T, S1, buf_s):
       hi = mid
   a, b = need(lo), need(hi)
   return lo + (0.0 if b <= a else min(1.0, max(0.0, (D - a) / (b - a))))
+
+
+V_ALLOW_BRACKET_MPH = 4          # v_allow's first bracket around the speed now (+-this); cost only (review 2, 2026-11-24)
+PROF_DV_MPH = 0.5                # the profile check is re-run when the speed moved this much,
+PROF_DD_M = 10.0                 # ... or this far was driven (or the set speed / push / target / point list changed),
+PROF_MAX_S = 1.0                 # ... or this long has passed; else its last result
 
 
 def slow_distance_m(from_mph, to_mph, floor_mph=CAR_MIN_MPH):
@@ -508,6 +527,7 @@ class Planner:
     # one is alive the published ceiling is never above its cap (_guard_apply)
     self.guard = {}
     self.s2_seq = 0
+    self._prof_cache = {}                 # corner key -> the last profile check and its inputs (_profile_cached)
 
   # ---- localisation ----------------------------------------------------------------------------------------------------------------
   def _candidates(self, fix):
@@ -889,7 +909,7 @@ class Planner:
     u_ref = max(u, self.int_base or 0.0)
     sign = np.sign(self.kmed[idx])
     cands = self._bend_cands(lambda run: int(idx[run[-1]]), dist, need, self.kabs[idx], sign, shed_to, u_ref, mph, set_mph, floor,
-                             self.active, grade_of=None if grade is None else (lambda j: self._grade(grade, idx, dist, j)),
+                             self.active, grade_of=None if grade is None else self._grade_fn(grade, idx, dist),
                              npass=self.mem.npass[idx])
     r = self._ramp(t, v, mph, set_mph, floor, cands, self.active, u_ref)
     ceil, cdist, cpt, kind, corner = r["ceil"], r["dist"], r["point"], r["kind"], r["corner"]
@@ -948,6 +968,25 @@ class Planner:
                      kind=r["kind"], past=r["kind"] == "hold", stage=r["stage"], src="map", gkey=r["key"], guntil=r["until"])
 
   @staticmethod
+  def _grade_fn(grade, idx, dist):
+    """`_grade` for every look-ahead point at once (cost, review 2): the mean grade from here to point j by running sums over the
+    look-ahead (distances ascending), the same figure as `_grade`'s nanmean of that stretch. -> j -> buffer seconds."""
+    ok = (dist >= 0) & (idx >= 0)
+    g = np.where(ok, grade[np.where(idx >= 0, idx, 0)], np.nan)
+    fin = ok & np.isfinite(g)
+    csum = np.cumsum(np.where(fin, g, 0.0))
+    ccnt = np.cumsum(fin)
+
+    def f(j):
+      if dist[j] <= 0 or ccnt[j] == 0:
+        return 0.0
+      m = float(np.degrees(csum[j] / ccnt[j]))
+      if math.isfinite(m) and m < -GRADE_STEEP_DEG:
+        return GRADE_BUFFER_S_PER_DEG * (-m - GRADE_STEEP_DEG)
+      return 0.0
+    return f
+
+  @staticmethod
   def _grade(grade, idx, dist, j):
     """Extra start-early buffer (s) for a remembered approach steeper downhill than GRADE_STEEP_DEG up to look-ahead point j."""
     if dist[j] <= 0:
@@ -1002,6 +1041,7 @@ class Planner:
       S1 = max(CM.push_floor(floor, DRIVE_GAP_MPH), Tmin - DRIVE_GAP_MPH)
       prof = []
       best = None
+      va_near = {}                                 # (speed, buffer) -> va of its nearest point ahead
       for j in run[ok]:
         j = int(j)
         T = int(shed_to[j])
@@ -1010,13 +1050,20 @@ class Planner:
         if T >= u_ref - 0.5 or D_ < 0.0:
           continue                                 # a point the car is already at or under (or passed): no start of its own
         buf = BUFFER_S + (grade_of(j) if grade_of is not None else 0.0)
-        va = v_allow(D_, T, S1, buf)
         # A8-R3: the set speed above the car's speed (a lead holds it there): the taps from the REAL set speed come first, so the
         # start is due when the model's manoeuvre from (speed, set speed) needs the remaining distance
         # (the car is never faster than its set speed, so the manoeuvre from (set, set) bounds it: the exact one only within that)
         due = bool(set_mph and set_mph > mph + SETTLE_MPH and
                    approach_m(math.ceil(set_mph), T, S1) + buf * mph * MPH >= D_ and
                    approach_m(math.ceil(mph), T, S1, set0=set_mph) + buf * mph * MPH >= D_)
+        # cost (review 2): v_allow is non-decreasing in the distance, so a farther point with the same speed and buffer has at least
+        # the nearer one's va; it is computed only where it could still change the choice below (the same result, exactly)
+        lb = va_near.get((T, buf))
+        if lb is not None and best is not None and not (lb < best[0] or (due and not best[3])):
+          continue
+        va = v_allow(D_, T, S1, buf, hint=mph)
+        if lb is None:
+          va_near[(T, buf)] = va
         if best is None or va < best[0] or (due and not best[3]):
           best = (va, D_, T, due, buf)
       if best is None:
@@ -1074,7 +1121,7 @@ class Planner:
         # mid-approach the dash is already below the speed and the car is answering it: v_allow (a FRESH start from here) would call
         # an on-plan car behind. Judge with the same model instead: where it will be at EVERY point of the corner still ahead with
         # the taps it is getting, with the SAME push-and-raise manoeuvre as the warning (R8, plan A12); the worst point decides
-        over = self._profile_over(v, c.get("prof") or [(max(0.0, c["D"]), T)], float(set_mph), float(S1), T)
+        over = self._profile_cached(key, v, mph, c.get("prof") or [(max(0.0, c["D"]), T)], float(set_mph), float(S1), T, t)
         late, on_plan = over > ARRIVED_MPH + BEHIND_MPH, over <= ARRIVED_MPH
       d_aim = a_["aim_at"] - self.odo
       early = (not a_.get("decided") and a_.get("cap_c") is not None and self.fc is not None and
@@ -1333,6 +1380,17 @@ class Planner:
     it is shown to help: without it the weak-cruise scenario test_f_behind_plan_warns_early warns 3.9 s ahead instead of 5). With T
     (above s1): the planner's own manoeuvre, a push to s1 and the model-timed raise back to T (plan A11)."""
     return CM.speed_at(v / MPH, d, set0, s1, lowering, dt=SIM_DT_S, scale=self.resp, T=T, hold=CM.HOLD)
+
+  def _profile_cached(self, key, v, mph, prof, set0, s1, T, t):
+    """`_profile_over`, re-run only when its inputs moved materially (speed by PROF_DV_MPH, the set speed, the push or target, the
+    number of points, PROF_DD_M driven) or PROF_MAX_S has passed; otherwise the last result (cost: review 2, 2026-11-24)."""
+    c = self._prof_cache.get(key)
+    if (c is not None and abs(c["mph"] - mph) < PROF_DV_MPH and c["set"] == set0 and c["s1"] == s1 and c["T"] == T and
+            c["n"] == len(prof) and self.odo - c["odo"] < PROF_DD_M and t - c["t"] < PROF_MAX_S):
+      return c["over"]
+    over = self._profile_over(v, prof, set0, s1, T)
+    self._prof_cache[key] = {"mph": mph, "set": set0, "s1": s1, "T": T, "n": len(prof), "odo": self.odo, "t": t, "over": over}
+    return over
 
   def _profile_over(self, v, prof, set0, s1, T):
     """The worst excess (mph) over the corner's points ahead: prof = [(metres ahead, allowed mph)], the car answering the planner's
