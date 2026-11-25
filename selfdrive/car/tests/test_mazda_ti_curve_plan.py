@@ -1279,7 +1279,7 @@ def _beside_ticks(res):
 def test_rm_constants_are_the_measured_ones():
   # from the noise floor on raw fixes (2026-11-24); a change here must be measured again
   assert (P.RM_TAU_S, P.RM_DIV_M, P.RM_PRED_M, P.RM_LEAD_S, P.RM_STEADY_S, P.RM_STEADY_M, P.RM_STEADY_DEG, P.RM_ABS_M) == \
-    (1.0, 4.5, 5.5, 1.0, 4.0, 1.0, 1.5, 7.0)
+    (1.0, 4.5, 5.5, 1.0, 4.0, 1.0, 1.5, 8.0)
   assert P.RM_ON
 
 
@@ -1321,13 +1321,13 @@ def test_rm_ramp_departure_trips_within_4_s():
     assert pl.locked                                             # the lock keeps tracking (it is lost only when the fixes leave it)
 
 
-def test_rm_steady_offset_beyond_7_m_trips_and_starts_nothing():
-  # a steady 7.5 m offset (more than two lanes: another road beside the remembered one): beside from the lock, no memory slowdown for
+def test_rm_steady_offset_beyond_8_m_trips_and_starts_nothing():
+  # a steady 8.5 m offset (more than two lanes: another road beside the remembered one): beside from the lock, no memory slowdown for
   # the remembered corner ahead; the tick log says why
   tr = road((1500, 0.0), (150, CORNER_K), (800, 0.0))
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
-  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (7.5, 0.0)))
+  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (8.5, 0.0)))
   assert pl.locked and _rm_events(pl) and _rm_events(pl)[0]["why"] == "far"
   assert all(p.ceil is None and not p.trusted for t, s, p in res)
   assert not any(e["kind"] == "start" for e in pl.events)
@@ -1338,10 +1338,20 @@ def test_rm_steady_offset_beyond_7_m_trips_and_starts_nothing():
   res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (3.0, 0.0)))
   assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res)
   assert not any("rm" in (p.diag or {}) for t, s, p in res)
-  # ... and one below the limit (6.5 m) too
+  # ... and ones below the limit (6.5 m, and 7.5 m: not beside, the old limit's reject) too
+  for off in (6.5, 7.5):
+    pl = P.Planner(mem)
+    res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s, off=off: (off, 0.0)))
+    assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res) and not _beside_ticks(res), off
+
+
+def test_rm_two_lane_offset_of_7_4_m_held_60_s_keeps_trust():
+  tr = road((4000, 0.0))
+  mem = M.synthetic([tr])
   pl = P.Planner(mem)
-  res = drive(mem, tr, 55, 50, planner=pl, fix_fn=_beside(lambda t, s: (6.5, 0.0)))
-  assert not _rm_events(pl) and any(p.ceil is not None for t, s, p in res)
+  res = drive(mem, tr, 55, 60, planner=pl, fix_fn=_beside(lambda t, s: (7.4, 0.0)))
+  assert not _rm_events(pl) and not _beside_ticks(res)
+  assert all(p.trusted for t, s, p in res if t >= P.STABLE_S + 0.5)
 
 
 def test_rm_jump_of_11_m_at_a_trace_link_trips_at_once():

@@ -259,7 +259,9 @@ RM_LEAD_S = 1.0
 RM_STEADY_S = 4.0               # steady this long: the offset is the car's lane on this road (re-seeds the reference)
 RM_STEADY_M = 1.0               # steady: within this of the 3 s average (the 3 s change p95 is 1.07 m) ...
 RM_STEADY_DEG = 1.5             # ... and the heading difference within this (its 1 s mean p95 is 1.39 deg)
-RM_ABS_M = 7.0                  # a steady offset beyond this is another road (per-visit median p95 5.5 m, p99 7.6 m; two lanes 7.4 m)
+# 8.0 m: above the measured per-visit p99 offset of real passes (7.6 m); at 7.0 an outer lane lost its slowdowns; cost: one known
+# phantom returns at 1.6 mph / 5 mph-s (road-match-build sensitivity run); the builder fix (lane-scale absorption) is the cure
+RM_ABS_M = 8.0
 RM_REF_TAU_S = 20.0             # while on and not yet steady the reference follows the offset this slowly
 TRACK_WINDOW_M = 40.0          # while locked, a fix must land within this of the predicted along-road position
 FIX_GAIN = 0.3                  # how far a fix pulls the dead-reckoned position
