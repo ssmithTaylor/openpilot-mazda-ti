@@ -450,3 +450,15 @@ def test_item5_dash_reaching_the_reference_by_any_means_clears_it(monkeypatch):
   CS.out.cruiseState.speed = 55 * 0.44704                       # no button seen at all
   _frames(cc, CC, CS, clock, 200, k0=3000, set_mph=[55])
   assert json.loads(mem.d[C.PARAM_LEFT])["now"] is None
+
+
+@pytest.mark.parametrize("press_frame", [3001, 3003, 3007, 3012])
+def test_item5_one_frame_driver_set_minus_to_a_lower_speed_is_latched_and_clears_it(monkeypatch, press_frame):
+  cc, mem, CC, CS, clock, log, json = _off_at_light(monkeypatch)
+  _frames(cc, CC, CS, clock, 3000, set_mph=[54])
+  for k in range(3000, 3400):
+    CS.crz_btns_set = k == press_frame
+    if k > press_frame:
+      CS.out.cruiseState.speed = 40 * 0.44704                   # the driver's own lower choice: still below the stored 55
+    _frames(cc, CC, CS, clock, 1, k0=k, set_mph=[40 if k > press_frame else 54])
+  assert json.loads(mem.d[C.PARAM_LEFT])["now"] is None
