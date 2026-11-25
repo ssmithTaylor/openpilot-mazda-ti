@@ -212,7 +212,8 @@ def header_ok(src):
 def check_headers(root=REPO):
   return [{"path": m, "line": 1, "code": "PF6", "msg": "missing '# RUNTIME: runs in <process> at <rate>; gc ...' header under the "
            "docstring", "waived": False, "text": ""} for m in PER_FRAME_MODULES
-          if (root / m).exists() and not header_ok((root / m).read_text(encoding="utf-8"))]
+          if m not in INVENTORY.get("header_exempt", {}) and (root / m).exists() and
+          not header_ok((root / m).read_text(encoding="utf-8"))]
 
 
 def _imported_files(path, root=REPO):

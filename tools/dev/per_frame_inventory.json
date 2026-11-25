@@ -1,21 +1,83 @@
 {
   "_doc": "Machine-readable per-frame inventory (read by tools/dev/lint_per_frame.py; human view: tools/dev/PER_FRAME_INVENTORY.md). per_frame: code this fork added that runs every frame / tick, with its process, rate and collector state. not_per_frame: modules imported by a per-frame module or entry point that are upstream, start-up only or offline tools, with the reason. A ti_*.py or selfdrive/controls/lib/*.py imported by a per-frame entry point must be in one of the two lists.",
   "processes": {
-    "controlsd": {"rate_hz": 100, "gc": "disabled", "where": "selfdrive/controls/controlsd.py:1181 config_realtime_process -> common/realtime.py:41 gc.disable()"},
-    "card": {"rate_hz": 100, "gc": "disabled", "where": "selfdrive/car/card.py:260 config_realtime_process -> common/realtime.py:41 gc.disable()"},
-    "ti_curve_plannerd": {"rate_hz": 5, "gc": "frozen", "where": "selfdrive/car/mazda/ti_curve_plannerd.py:469 gc.freeze() after load; collector on"}
+    "controlsd": {
+      "rate_hz": 100,
+      "gc": "disabled",
+      "where": "selfdrive/controls/controlsd.py:1181 config_realtime_process -> common/realtime.py:41 gc.disable()"
+    },
+    "card": {
+      "rate_hz": 100,
+      "gc": "disabled",
+      "where": "selfdrive/car/card.py:260 config_realtime_process -> common/realtime.py:41 gc.disable()"
+    },
+    "ti_curve_plannerd": {
+      "rate_hz": 5,
+      "gc": "frozen",
+      "where": "selfdrive/car/mazda/ti_curve_plannerd.py:469 gc.freeze() after load; collector on"
+    }
   },
   "entry_points": [
-    {"process": "controlsd", "call": "LaneDriftGate.update / lane_change_active / reset", "at": "selfdrive/controls/controlsd.py:850,864", "test": "lane_drift"},
-    {"process": "controlsd", "call": "TiAbRunner.step (via Controls.ab_step)", "at": "selfdrive/controls/controlsd.py:269", "test": "ab_runner"},
-    {"process": "controlsd", "call": "LatControlTorque.update_model_context / update (TI plant)", "at": "selfdrive/controls/controlsd.py:804-814", "test": "lateral"},
-    {"process": "controlsd", "call": "lateral_diagnostics.record_inputs", "at": "selfdrive/controls/controlsd.py:817", "test": "lateral"},
-    {"process": "card", "call": "CarController.update (tests, plan, ident, dither, stuck guard, lag guard, stats, flag / clear taps)", "at": "selfdrive/car/card.py:221 CI.apply", "test": "card_tests"},
-    {"process": "card", "call": "CarController.curve_step / _curve_monitor (ti_curve, ti_curve_monitor, ti_curve_demand)", "at": "selfdrive/car/mazda/carcontroller.py:922,961", "test": "card_curve"},
-    {"process": "card", "call": "CarController.button_tests_step / cruise_check_step", "at": "selfdrive/car/mazda/carcontroller.py:783,862", "test": "card_buttons"},
-    {"process": "card", "call": "card sets CC.ti_lag_ctl from controlsState", "at": "selfdrive/car/card.py:217-220", "test": "card_tests"},
-    {"process": "card", "call": "CarState.update_gen1 TI fields (CAN parser, compiled)", "at": "selfdrive/car/mazda/carstate.py:64", "test": null},
-    {"process": "ti_curve_plannerd", "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log", "at": "selfdrive/car/mazda/ti_curve_plannerd.py:480-", "test": "planner"}
+    {
+      "process": "controlsd",
+      "call": "LaneDriftGate.update / lane_change_active / reset",
+      "at": "selfdrive/controls/controlsd.py:850,864",
+      "test": "lane_drift"
+    },
+    {
+      "process": "controlsd",
+      "call": "TiAbRunner.step (via Controls.ab_step)",
+      "at": "selfdrive/controls/controlsd.py:269",
+      "test": "ab_runner"
+    },
+    {
+      "process": "controlsd",
+      "call": "LatControlTorque.update_model_context / update (TI plant)",
+      "at": "selfdrive/controls/controlsd.py:804-814",
+      "test": "lateral"
+    },
+    {
+      "process": "controlsd",
+      "call": "lateral_diagnostics.record_inputs",
+      "at": "selfdrive/controls/controlsd.py:817",
+      "test": "lateral"
+    },
+    {
+      "process": "card",
+      "call": "CarController.update (tests, plan, ident, dither, stuck guard, lag guard, stats, flag / clear taps)",
+      "at": "selfdrive/car/card.py:221 CI.apply",
+      "test": "card_tests"
+    },
+    {
+      "process": "card",
+      "call": "CarController.curve_step / _curve_monitor (ti_curve, ti_curve_monitor, ti_curve_demand)",
+      "at": "selfdrive/car/mazda/carcontroller.py:922,961",
+      "test": "card_curve"
+    },
+    {
+      "process": "card",
+      "call": "CarController.button_tests_step / cruise_check_step",
+      "at": "selfdrive/car/mazda/carcontroller.py:783,862",
+      "test": "card_buttons"
+    },
+    {
+      "process": "card",
+      "call": "card sets CC.ti_lag_ctl from controlsState",
+      "at": "selfdrive/car/card.py:217-220",
+      "test": "card_tests"
+    },
+    {
+      "process": "card",
+      "call": "CarState.update_gen1 TI fields (CAN parser, compiled)",
+      "at": "selfdrive/car/mazda/carstate.py:64",
+      "test": null
+    },
+    {
+      "process": "ti_curve_plannerd",
+      "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log",
+      "at": "selfdrive/car/mazda/ti_curve_plannerd.py:480-",
+      "test": "planner"
+    }
   ],
   "per_frame": {
     "selfdrive/controls/lib/lane_drift.py": "controlsd",
@@ -64,5 +126,9 @@
     "selfdrive/controls/lib/pid.py": "upstream",
     "selfdrive/controls/lib/vehicle_model.py": "upstream",
     "selfdrive/controls/lib/__init__.py": "package marker"
+  },
+  "header_exempt": {
+    "selfdrive/car/mazda/ti_cruise_model.py": "its bytes are hashed by ti_curve_plan.approach_src_hash (ti_curve_plan.py:237-245): any edit, a comment included, makes ti_curve_approach.npz stale and the planner stops loading it",
+    "selfdrive/car/mazda/ti_cruise_taps.py": "hashed by approach_src_hash like ti_cruise_model.py"
   }
 }

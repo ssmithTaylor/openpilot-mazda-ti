@@ -11,6 +11,7 @@ NEEDED=(
   tools/dev/pc_test.py
   tools/dev/comma_checks.sh
   selfdrive/car/mazda/ti_cost_check.py
+  selfdrive/car/mazda/ti_mem_check.py
   frogpilot/tools/check_params_sync.py
   selfdrive/controls/lib/tests/scalar_np_evidence.py
   selfdrive/car/mazda/ti_curve_dryrun.py

@@ -65,6 +65,8 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
   (`ti_curve_plan.py:237-245`: ti_cruise_model.py, ti_cruise_taps.py, ARRIVED_MPH, TAP_S, HOLD, APPROACH_DT). Stale -> not loaded
   (`ti_curve_plan.py` load_approach_table returns 0) and every approach is simulated on the device. Guarded by
   `test_mazda_ti_curve_approach_table.py:8`.
+  Any edit to ti_cruise_model.py or ti_cruise_taps.py, a comment included, changes the hash: rebuild the table in the same change
+  (both files are exempt from the RUNTIME header for this reason: `per_frame_inventory.json` header_exempt).
 - `ti_ident.py:251,264` TABLE_HASH / SIGNAL_HASH: computed at import from the tables (identify a test version in logs; changing a
   table changes the hash).
 

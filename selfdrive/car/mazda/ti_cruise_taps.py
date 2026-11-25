@@ -6,8 +6,6 @@ the previous one's last pressed frame, enforced on frames AND on real time) and 
 frame, then pressed frames FRAME_SPACING apart, each with the car's last counter + 1). The only addition: PressGuard(min_gap_s) may
 ask for a LONGER gap than MIN_TAP_GAP_S (never a shorter one); the default is exactly the reviewed one.
 """
-# RUNTIME: runs in card at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
-# Per frame: create no class or closure, keep no container without a bound; params / JSON at most 10 Hz.
 
 DT = 0.01                       # the car controller's frame
 FRAME_SPACING = 5               # control frames between pressed frames: 50 ms (the module itself sends at 10 Hz)

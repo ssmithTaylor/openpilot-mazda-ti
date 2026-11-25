@@ -18,8 +18,6 @@ Measured on this car (137 drives; E:/openpilot-mazda-ti-data/cruise-gap-20261124
   `hold_landing` allows it (5 mph or more to go, no landing past the goal, the press capped at ti_cruise_taps.HOLD_MAX_S) and
   finishes with taps. Whether the car reads OUR held frames as a hold is not yet shown: ti_cruise_taps.HOLD_ENABLED (off).
 """
-# RUNTIME: runs in card at 100 Hz (gc disabled) and ti_curve_plannerd at 5 Hz (gc frozen) (see docs/RUNTIME_CONSTRAINTS.md).
-# Per call: create no class or closure, keep no container without a bound; never a position in a log or param.
 import math
 from collections import deque
 

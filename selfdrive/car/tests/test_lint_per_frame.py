@@ -85,3 +85,10 @@ def test_the_inventory_page_lists_every_per_frame_module():
   page = (_P.parent / "PER_FRAME_INVENTORY.md").read_text(encoding="utf-8")
   missing = [m for m in L.PER_FRAME_MODULES if m.split("/")[-1] not in page]
   assert not missing, missing
+
+
+def test_header_exempt_modules_stay_untouched_because_their_bytes_are_hashed():
+  """ti_cruise_model.py / ti_cruise_taps.py are hashed into the approach table's key: a header there makes the table stale."""
+  root = _P.parents[2]
+  for m in L.INVENTORY.get("header_exempt", {}):
+    assert "# RUNTIME:" not in (root / m).read_text(encoding="utf-8"), m
