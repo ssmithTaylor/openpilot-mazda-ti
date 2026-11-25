@@ -538,6 +538,14 @@ def record_bound(v_trb, v_ok, k, table, hi=True, n_trb=None):
   return out
 
 
+# I3 (owner, 2026-11-24: outcome evidence only from passes comparable to the current setup; the driving model is part of it): the
+# clean-history skip rests on passes driven with this model steering. The memory file does not record the model; every admitted drive
+# ran north-dakota. The memory builder should record the driving model in the file's metadata (and keep evidence per model); until
+# then the skip applies only while the running model is EVIDENCE_MODEL. The record's BOUND is not gated: it only lowers speed, and
+# the steering's limit at the point is the hardware's, the same under any driving model.
+EVIDENCE_MODEL = "north-dakota"
+
+
 def s2_history_clean(v_clean_mph, v_trb, dist, lead_m, mph):
   """Stage 2's history check (second drive 2026-11-24): True when every remembered point of the forecast's bend (within FORK_NEAR_M
   of lead_m ahead) has been driven cleanly at least REC_ATTESTED times at or above the car's speed now (Memory.v_clean: the
@@ -1473,7 +1481,8 @@ class Planner:
                                          ratio=self.fc_ratio)
     base = self.s2["u0"] if self.s2 is not None else u
     hit = need is not None and need <= base - MIN_DROP_MPH
-    if hit and RECORD and mem_ahead is not None and len(mem_ahead) >= 5 and         s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):
+    if hit and RECORD and self.model == EVIDENCE_MODEL and mem_ahead is not None and len(mem_ahead) >= 5 and \
+        s2_history_clean(mem_ahead[3], mem_ahead[4], mem_ahead[1], lead * v, mph):
       hit = False                                        # this place has repeatedly been driven cleanly at this speed
     if hit:
       if self.s2_run == 0:
