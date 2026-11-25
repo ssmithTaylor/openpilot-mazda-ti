@@ -85,6 +85,30 @@ MAP_HDG_DEG = 45.0              # ... on a piece pointing within this of the car
 EARTH_R = 6371000.0
 
 
+_MAP_PARSED = [None, None]      # cost (perf 2026-11-25): (raw text, its parsed points) of the last list read
+
+
+def _map_points(raw):
+  """The map list's (latitudes, longitudes, |curvatures|), or None when unreadable, shorter than 2 or not finite. Cached on the raw
+  text: the map service writes ~1 Hz and the planner reads at 5 Hz, and the parse (JSON + checks) was ~1.5 ms a tick on the comma
+  for a 150-node list. Same text, same values."""
+  if _MAP_PARSED[0] is not None and _MAP_PARSED[0] == raw:
+    return _MAP_PARSED[1]
+  try:
+    pts = json.loads(raw)
+    out = None
+    if isinstance(pts, list) and len(pts) >= 2:
+      la = [float(p["latitude"]) for p in pts]
+      lo = [float(p["longitude"]) for p in pts]
+      ks = [abs(float(p["curvature"])) for p in pts]
+      if all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
+        out = (la, lo, ks)
+  except Exception:
+    out = None
+  _MAP_PARSED[0], _MAP_PARSED[1] = raw, out
+  return out
+
+
 def map_profile(raw, age_s, lat, lon, bearing_deg):
   """The map service's curvature list as (metres along the road from the car, |curvature|), for the planner; None (no map opinion) when
   missing, older than MAP_STALE_S, unreadable, or not matched to the car (no polyline piece within MAP_MATCH_M pointing its way).
@@ -92,14 +116,10 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
   try:
     if raw is None or age_s is None or not (0.0 <= age_s <= MAP_STALE_S):
       return None
-    pts = json.loads(raw)
-    if not isinstance(pts, list) or len(pts) < 2:
+    parsed = _map_points(raw)
+    if parsed is None:
       return None
-    la = [float(p["latitude"]) for p in pts]
-    lo = [float(p["longitude"]) for p in pts]
-    ks = [abs(float(p["curvature"])) for p in pts]
-    if not all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
-      return None
+    la, lo, ks = parsed
     cl = math.cos(math.radians(lat))
     xs = [math.radians(b - lon) * cl * EARTH_R for b in lo]
     ys = [math.radians(a - lat) * EARTH_R for a in la]
@@ -108,10 +128,11 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
     for i in range(len(xs) - 1):
       cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
     best = None
+    hdg_cos = math.cos(math.radians(MAP_HDG_DEG))     # once per call, not per piece (same value)
     for i in range(len(xs) - 1):
       dx, dy = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
       L = math.hypot(dx, dy)
-      if L < 0.1 or (dx * hx + dy * hy) / L < math.cos(math.radians(MAP_HDG_DEG)):
+      if L < 0.1 or (dx * hx + dy * hy) / L < hdg_cos:
         continue
       tt = max(0.0, min(1.0, -(xs[i] * dx + ys[i] * dy) / (L * L)))
       lat_m = math.hypot(xs[i] + tt * dx, ys[i] + tt * dy)
