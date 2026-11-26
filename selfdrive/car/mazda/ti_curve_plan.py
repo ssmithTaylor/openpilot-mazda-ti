@@ -516,6 +516,46 @@ DR_WIN_M = 60.0
 DR_SHIFT_M = 15.0
 DR_K_TOL = 0.0012
 DR_BAD_M = 40.0
+# YAW TRUST (I1, gorge-fix 2026-11-25): in a gorge the fix is usually PRESENT but 10-30 m off. A position offset is evidence of another
+# road only if the car's motion says so too. While locked, the car's yaw curvature is compared with the remembered curvature along the
+# trace over the last YT_WIN_M (the DR_* agreement: at some shift within -(DR_SHIFT_M + filter lag) .. +DR_SHIFT_M, the mean
+# |live - remembered| point by point within DR_K_TOL + CHANGE_LEVEL_SHARE x the remembered mean level; a correlation test was tried and
+# dropped: with the variation only entering at the window's edge it disagrees on the true road). A window is INFORMATIVE only
+# when the remembered curvature in it spans at least YT_INFO_K = 3 x DR_K_TOL (a bend of 280 m radius or tighter entered or left inside
+# it: a straight, or a gentle highway-like trace, tells nothing, and there the positional rule stands unchanged: ramps, steady offsets,
+# link jumps). An informative agreeing window grants yaw trust; it lapses YT_LAPSE_M after the last one (a straight after the gorge
+# returns to the positional rule; 300 m: the sweep's winding roads show a bend at least every 300 m), and an informative DISAGREEING
+# window ends it at once (another winding road: its first bend that differs, within YT_WIN_M). While yaw-trusted: the "beside the
+# trace" verdict does not untrust the memory; fixes up to YT_RADIUS_M off the dead-reckoned point are not misses (gorge multipath
+# 10-30 m, plus the 8 m lane / scatter allowance of RM_ABS_M, rounded: 40 m); and while beside, the along-road position is the distance
+# travelled since the last fix ON the trace (the anchor; an offset fix is not pulled from), at most DR_MAX_M, with the start margin
+# widened by DR_DRIFT x that distance (2 %: 12 m after 600 m, 30 m at the cap). One switch: False = cand4 + I2 exactly.
+# Review fixes (2026-11-25, the highway / ramp phantom with the switch on):
+#  (A) informative needs the LIVE curvature to span YT_INFO_K too: the car itself turned (a straight-driving car "agreed" with a
+#      ramp's gentle divergence curves by the level test);
+#  (B) beside the trace, only an agreement established from motion AFTER the departure counts: yt_ok_odo >= the onset + YT_WIN_M / 2
+#      (else an S-curve before a split kept trust 500 m past it); the window is then needed only while beside, so it is judged only
+#      then (F), once per YT_EVAL_M driven, on a ring buffer sampled every YT_STEP_M (nothing accumulated beforehand is needed);
+#  (C) beyond the match radius a fix counts as near only with the heading within MATCH_HEADING_DEG, as the normal match;
+#  (D) the along-road position is re-anchored from the offset fix's ALONG-road projection where the remembered curvature within
+#      YT_ANCHOR_SPAN_M is at most YT_ANCHOR_K (R >= 830 m: a 30 m sideways error moves the projection < 0.6 m there; never in a
+#      bend), which resets the odometer distance; past DR_MAX_M without one, trust lapses until the next anchor and a new agreeing
+#      window;
+#  (E) the position error (DR_DRIFT x the distance since the anchor, also under dead reckoning while beside) widens the warning's
+#      calm-braking horizon as it widens the start margin.
+# Follow-up (not tonight): tighten the agreement tolerance (reviewer: chance agreement of DIFFERENT real roads 40 % per window, 15 %
+# with (A); the true road 96 %).
+RM_YAW_TRUST = True
+YT_WIN_M = 200.0
+YT_INFO_K = 3 * DR_K_TOL
+YT_LAPSE_M = 300.0
+YT_RADIUS_M = 40.0
+YT_STEP_M = 5.0
+YT_N = int(YT_WIN_M / YT_STEP_M)
+YT_EVAL_M = 10.0
+YT_ANCHOR_K = DR_K_TOL
+YT_ANCHOR_SPAN_M = 20.0
+YT_LOG_MAX_M = 99999                # the tick log's "yt" distances are capped here (bounded record)
 
 # ---- the road may have changed (study's change detection, kept simple) -----------------------------------------------------------
 CHANGE_WINDOW_M = 300.0
@@ -776,6 +816,8 @@ class Planner:
     self.rm_n = 0
     self.view = None                    # (point indices, metres ahead, needs) of this tick's trusted look-ahead, for the screen
     self.fix_age = 1e9
+    self._yt_reset()                      # yaw trust (YT_*)
+    self.rm_onset = -1e9                  # odometer where the car last went "beside the trace"
     self.dr_m, self.dr_bad_m, self.dr_hist = 0.0, 0.0, []   # dead reckoning (DR_*): metres since the last fix, in disagreement; (odo,
     #                                                         live k, pos)
     self.odo = 0.0
@@ -845,6 +887,7 @@ class Planner:
     self.trace = -1
     self.alts, self.off_s = [], 0.0
     self.rm, self.rm_off, self.rm_why = None, False, ""
+    self._yt_reset()
     self.cmp = []
     if not keep_active:
       self.active = {}
@@ -868,10 +911,98 @@ class Planner:
       self.pos = mem.trace_start[nxt] + max(0.0, over)
       end = mem.trace_end(nxt) - 1
 
+  def _yt_reset(self):
+    """YT_*: the window (a ring buffer of live k and trace position every YT_STEP_M), the last agreement, the along-road anchor."""
+    self.yt_k, self.yt_p = np.zeros(YT_N), np.zeros(YT_N)
+    self.yt_n, self.yt_i, self.yt_next, self.yt_eval = 0, 0, -1e9, -1e9
+    self.yt_ok_odo, self.yt_anchor = -1e9, None
+
+  def _yt_trusted(self):
+    """YT_*: the car's yaw has agreed with the remembered curvature over an informative window within the last YT_LAPSE_M, and,
+    beside the trace, that agreement came from motion after the departure began (B)."""
+    if not (RM_YAW_TRUST and self.locked and self.odo - self.yt_ok_odo <= YT_LAPSE_M):
+      return False
+    return not self.rm_off or self.yt_ok_odo >= self.rm_onset + 0.5 * YT_WIN_M
+
+  def _yt_log(self):
+    """YT_* for the tick log (replayability): [trusted 0/1, why, m since the last agreeing window, m since the along-road anchor,
+    m since the departure began] (-1 = none; whole metres, capped at YT_LOG_MAX_M), while beside the trace or while a trust is live;
+    None otherwise (and always with RM_YAW_TRUST off). why: "ok" trusted; "pre" the agreement predates the departure (B); "lapsed"
+    no agreement within YT_LAPSE_M; "none" no agreement (never, or ended: the yt_off event says why). No position."""
+    if not (RM_YAW_TRUST and self.locked):
+      return None
+    has_ok = self.yt_ok_odo > -1e8
+    live = has_ok and self.odo - self.yt_ok_odo <= YT_LAPSE_M
+    if not (self.rm_off or live):
+      return None
+    trusted = self._yt_trusted()
+    why = "ok" if trusted else ("pre" if live else "lapsed" if has_ok else "none")
+
+    def m(x):
+      return -1 if x is None or x < -1e8 else int(min(YT_LOG_MAX_M, max(0.0, self.odo - x)))
+    return [int(trusted), why, m(self.yt_ok_odo), m(self.yt_anchor), m(self.rm_onset) if self.rm_off else -1]
+
+  def _pos_err_m(self):
+    """YT_* (E): the along-road position error (m): DR_DRIFT x the distance dead-reckoned, or since the last anchor while beside."""
+    e = self.dr_m if self.dr_active() else 0.0
+    if self.rm_off and self.yt_anchor is not None:
+      e = max(e, self.odo - self.yt_anchor)
+    return DR_DRIFT * e
+
+  def _yt_update(self, v):
+    """YT_*: sample the window (every YT_STEP_M), keep the anchor, and while beside the trace judge it (every YT_EVAL_M)."""
+    if self.odo >= self.yt_next:
+      self.yt_k[self.yt_i], self.yt_p[self.yt_i] = self.live_k, self.pos
+      self.yt_i, self.yt_n = (self.yt_i + 1) % YT_N, min(YT_N, self.yt_n + 1)
+      self.yt_next = self.odo + YT_STEP_M
+    if self._fix_on_trace():
+      self.yt_anchor = self.odo                    # a fix on the trace: the along-road anchor
+    if not self.rm_off or self.odo < self.yt_eval:
+      return                                       # (F) needed only beside the trace; once per YT_EVAL_M
+    self.yt_eval = self.odo + YT_EVAL_M
+    if self.yt_anchor is None or self.odo - self.yt_anchor > DR_MAX_M:
+      if self.yt_ok_odo > -1e8:
+        self.events.append({"kind": "yt_off", "why": "odometer limit", "trace": self.trace})   # (D) no anchor within the cap
+      self.yt_ok_odo = -1e9
+      return
+    if self.yt_n < YT_N // 2:
+      return
+    live, pos = self.yt_k[:self.yt_n], self.yt_p[:self.yt_n]
+    if float(live.max() - live.min()) < YT_INFO_K:
+      return                                       # (A) the car did not turn in the window: it tells nothing
+    sp = self.mem.spacing
+    shifts = np.arange(-(DR_SHIFT_M + v * LIVE_K_TAU_S), DR_SHIFT_M + 1e-6, sp)
+    rem = self.kmed[np.clip(np.round(pos[None, :] + shifts[:, None] / sp).astype(int), 0, self.mem.n - 1)]
+    inf = (rem.max(axis=1) - rem.min(axis=1)) >= YT_INFO_K
+    if not inf.any():
+      return
+    ok = np.mean(np.abs(live[None, :] - rem), axis=1) <= DR_K_TOL + CHANGE_LEVEL_SHARE * np.mean(np.abs(rem), axis=1)
+    if np.any(ok & inf):
+      self.yt_ok_odo = self.odo
+    elif self.yt_ok_odo > -1e8:
+      self.events.append({"kind": "yt_off", "why": "yaw disagrees", "trace": self.trace, "odo": round(self.odo)})
+      self.yt_ok_odo = -1e9
+
+  def _yt_reanchor(self, fix):
+    """YT_* (D): where the remembered road is near-straight, take the along-road position from the offset fix's projection (pulled
+    by FIX_GAIN) and reset the odometer distance since the anchor."""
+    mem = self.mem
+    i = min(max(int(round(self.pos)), int(mem.trace_start[self.trace])), int(mem.trace_end(self.trace)) - 1)
+    w = int(YT_ANCHOR_SPAN_M / mem.spacing)
+    lo, hi = max(int(mem.trace_start[self.trace]), i - w), min(int(mem.trace_end(self.trace)), i + w + 1)
+    if float(np.max(self.kabs[lo:hi])) > YT_ANCHOR_K:
+      return
+    along, _ = mem.project(i, fix.x, fix.y)
+    if abs(along) <= TRACK_WINDOW_M:
+      self.pos += FIX_GAIN * along / mem.spacing
+      self.yt_anchor = self.odo
+
   def _localise(self, dt, fix, v):
     mem = self.mem
     if self.locked:
       self._advance(v * dt)
+    if self.locked and RM_YAW_TRUST:
+      self._yt_update(v)
     if self.cand is not None:
       self.cand = (self.cand[0], self.cand[1] + v * dt / mem.spacing)
     if fix.valid:
@@ -887,8 +1018,10 @@ class Planner:
             break
         if best is not None:
           self.miss_s = 0.0
-          if best[1] == self.trace:
+          if best[1] == self.trace and not (RM_YAW_TRUST and not self._fix_on_trace() and self._yt_trusted()):
             self.pos += FIX_GAIN * best[3]
+          elif best[1] == self.trace and RM_YAW_TRUST:
+            self._yt_reanchor(fix)                 # (D) beside and yaw-trusted: the along-road projection on a near-straight only
           if RM_ON:
             self._rm_update(dt, fix, v, best[1], int(round(best[2])))
           # the other remembered roads here (not this trace nor its continuation): as near sideways, or nearer
@@ -906,6 +1039,17 @@ class Planner:
               self._lose("a nearer remembered road")
           else:
             self.off_s = 0.0
+        elif RM_YAW_TRUST and self._yt_near(fix) and (
+            not self.rm_off or self._yt_trusted() or self.odo - self.rm_onset <= 0.5 * YT_WIN_M + 2 * YT_EVAL_M):
+          # YT_*: a fix off the trace within YT_RADIUS_M (heading agreeing): beside the trace (untrusted) while the window decides
+          # (half a window after the onset, (B)); then kept only while the yaw agrees; otherwise a miss as before
+          self.miss_s = 0.0
+          if not self.rm_off:
+            self.rm_off, self.rm_why, self.rm_onset = True, "far", self.odo
+            self.rm_n += 1
+            self.events.append({"kind": "rm_off", "why": "far", "trace": self.trace, "lat": None, "dh": None})
+          if self._yt_trusted():
+            self._yt_reanchor(fix)
         else:
           self.miss_s += dt
           if self.miss_s >= MISS_S:
@@ -938,6 +1082,17 @@ class Planner:
         self._dead_reckon_check(dt, v)
       elif self.locked and self.fix_age >= FIX_LOST_S:
         self._lose("no position fix")
+
+  def _fix_on_trace(self):
+    """YT_*: the latest fix put the car on the locked trace (not beside, or its raw offset back within RM_DIV_M)."""
+    return not self.rm_off or (self.rm is not None and abs(self.rm["raw"]) <= RM_DIV_M)
+
+  def _yt_near(self, fix):
+    """YT_*: the fix is within YT_RADIUS_M of the dead-reckoned point on the locked trace."""
+    i = min(max(int(round(self.pos)), int(self.mem.trace_start[self.trace])), int(self.mem.trace_end(self.trace)) - 1)
+    dh = abs(M.wrap(fix.hdg - float(self.mem.hdg[i])))
+    return (math.hypot(fix.x - float(self.mem.x[i]), fix.y - float(self.mem.y[i])) <= YT_RADIUS_M and
+            dh <= math.radians(MATCH_HEADING_DEG))     # (C) the heading as the normal match
 
   def dr_active(self):
     """Dead reckoning (DR_*) in force: locked, the fix gone for more than FIX_STALE_S, and its checks still passing."""
@@ -1020,6 +1175,8 @@ class Planner:
       elif not off:
         st["ref"] += (0.0 if dt <= 0 else min(1.0, dt / RM_REF_TAU_S)) * dev
     if off != self.rm_off:
+      if off:
+        self.rm_onset = self.odo                  # YT_* (B): where the departure began
       self.rm_off, self.rm_why = off, (why if off else "")
       if off:
         self.rm_n += 1
@@ -1198,7 +1355,7 @@ class Planner:
       untrusted = (conf, known, "matching the remembered road" if self.cand is not None else "road not known here")
     elif conf < MIN_TRUST_CONF:
       untrusted = (conf, True, "position uncertain")
-    elif RM_ON and self.rm_off:
+    elif RM_ON and self.rm_off and not self._yt_trusted():
       untrusted = (conf, True, "beside the remembered road")     # the lock tracks on; nothing new starts on this trace
     if untrusted is not None:
       # a corner latched while the road was trusted is still warned for, by the odometer, until it is passed: a GPS gap or a matcher
@@ -1429,6 +1586,8 @@ class Planner:
 
   def _dr_buf_s(self, mph):
     """DR_*: the extra start margin (s) for the odometer's drift over the distance dead-reckoned (0 with a fix)."""
+    if RM_YAW_TRUST:
+      return self._pos_err_m() / max(mph * MPH, 1.0)          # (E) also under dead reckoning while beside
     return DR_DRIFT * self.dr_m / max(mph * MPH, 1.0) if self.dr_active() else 0.0
 
   def _push_floor(self, floor):
@@ -1774,11 +1933,11 @@ class Planner:
     base_ = ref_mph if ref_mph else (set_mph if set_mph else round(mph))
     return max(self.ABS_FLOOR_MPH, int(round(base_)) - self.MAX_SHED_MPH, (self.limit - self.MAX_SHED_MPH) if self.limit else 0)
 
-  @staticmethod
-  def _horizon(v, need):
-    """The calm-braking horizon (m): ALERT_LEAD_S at this speed plus the distance to brake to the need at CALM_BRAKE_MS2."""
+  def _horizon(self, v, need):
+    """The calm-braking horizon (m): ALERT_LEAD_S at this speed plus the distance to brake to the need at CALM_BRAKE_MS2 (YT_* (E):
+    plus the along-road position error)."""
     vt = need * MPH
-    return v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2))
+    return v * ALERT_LEAD_S + max(0.0, (v * v - vt * vt) / (2.0 * CALM_BRAKE_MS2)) + (self._pos_err_m() if RM_YAW_TRUST else 0.0)
 
   def _corners(self, idx, dist, need_true, mph, rec=None):
     """The corners ahead the car is too fast for now: runs of points (at most 2 spacings apart) whose TRUE need (demand against capacity;
@@ -2016,6 +2175,9 @@ class Planner:
     diag["nc"] = int(COLD[0] - getattr(self, "_cold0", COLD[0]))   # cold cruise-model simulations this tick (cost)
     if getattr(self, "rm_off", False):
       diag["rm"] = self.rm_why                    # beside the remembered road: why ("far" / "dev" / "lead" / "link")
+    yt = self._yt_log() if RM_YAW_TRUST else None
+    if yt is not None:
+      diag["yt"] = yt                             # yaw trust (YT_*): trusted or not, why, and its distances (_yt_log)
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
                 self.limit, self.model_k, kind, end, behind, alert, need if isinstance(need, (int, np.integer)) else None, self.trace,
                 point, stage, src, ahead, cap, bool(getattr(self, "released", None)), diag, getattr(self, "ask", None))

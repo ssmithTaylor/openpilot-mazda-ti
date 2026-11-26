@@ -115,6 +115,10 @@ def gen(family, seed):
     o["gps_at"] = float(rng.uniform(0.15, 0.6))                         # share of the bend section where the fault starts
     o["gps_off_m"] = float(rng.uniform(5, 15)) * float(rng.choice([-1, 1]))
     o["gps_len_s"] = float(rng.choice([30, 60, 90]))
+    if seed >= 60:                # gorge cases (2026-11-25): fixes present but 10-30 m sideways for 60 s on the winding road
+      o["gps"] = "offset"
+      o["gps_off_m"] = float(rng.uniform(10, 30)) * float(rng.choice([-1, 1]))
+      o["gps_len_s"] = 60.0
   if family == "F6":
     o["lead_under"] = float(rng.integers(5, 16))
     o["lead_leaves"] = int(rng.integers(1, len(bends)))                # leaves before this bend (mid-sequence)

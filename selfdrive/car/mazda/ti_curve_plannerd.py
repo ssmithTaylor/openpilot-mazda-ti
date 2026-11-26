@@ -327,7 +327,7 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "nc", "wall_us", "scr")
+             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "nc", "wall_us", "scr", "yt")
 TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carries (REPLAY above), and the plan's "ask" (stage 3's
                                           # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
 TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
@@ -484,6 +484,10 @@ def tick_log(plan, extras):
            rel=(plan.diag or {}).get("rel", int(bool(plan.released))))
   if (plan.diag or {}).get("rm"):
     d["rm"] = plan.diag["rm"]       # beside the remembered road (road matching): why, "far" / "dev" / "lead" / "link"
+  yt = (plan.diag or {}).get("yt")
+  if isinstance(yt, list) and len(yt) == 5:
+    # yaw trust (ti_curve_plan YT_*, RM_YAW_TRUST): [trusted 0/1, why, m since agreement, m since anchor, m since departure]
+    d["yt"] = [int(yt[0]), str(yt[1])[:8]] + [int(x) for x in yt[2:]]
   if isinstance((plan.diag or {}).get("nc"), int):
     d["nc"] = plan.diag["nc"]       # cold cruise-model simulations in this tick's step (cost; perf 2026-11-26)
   for k, nd in (("v", 1), ("gap", 1), ("a", 2), ("dec", 2), ("lay", 2), ("lacc", 2), ("des", 2), ("rate", 1)):
@@ -569,12 +573,15 @@ PLANNER_STATE = {
   "_cold0": "a cost cache's counter (COLD) at the tick's start: the tick record's nc is its growth over the tick",
   "_prof_cache": "a cost cache of _profile_over keyed by its inputs (same inputs, same answer)",
   "view": _RP + "; what the screen showed from it is the tick's scr",
+  # yaw trust (YT_*, RM_YAW_TRUST): the decision and its distances are the tick's yt (beside the trace or while a trust is live);
+  # the window itself (yt_k / yt_p ring buffer and its schedule) is rebuilt by the replay
+  "yt_ok_odo": "yt", "yt_anchor": "yt", "rm_onset": "yt",
 }
 for _a in ("alerted", "alerting", "alts", "bend_left_t", "bend_low_t", "bend_on", "blink_t", "cand", "change_strikes", "cmp", "cmp_next",
            "distrust_until", "distrust_why", "dr_bad_m", "dr_hist", "dr_m", "dr_why", "end_m", "fix_age", "guard", "hist", "hold_latch",
            "int_base", "int_floor", "latch", "limit", "live_k", "locked", "map_bends", "map_seq", "mem_stage", "miss_s", "model_k",
            "odo", "off_s", "pos", "resp", "resp_t", "rm", "rm_n", "rm_off", "s2_run", "s2_seq", "s2_t0", "stable_s", "t", "trace",
-           "_gb", "cap_out", "need_out", "ref_now", "chain", "int_passed"):
+           "_gb", "cap_out", "need_out", "ref_now", "chain", "int_passed", "yt_k", "yt_p", "yt_n", "yt_i", "yt_next", "yt_eval"):
   PLANNER_STATE.setdefault(_a, _RP)
 
 
