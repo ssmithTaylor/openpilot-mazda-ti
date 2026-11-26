@@ -109,3 +109,18 @@ def test_updater_onroad_manual_request_still_runs(tmp_path):
   """A request from the settings screen ("check for update") is honoured whatever the state, as before."""
   calls = _run_updated(tmp_path, onroad=True, manual=True)
   assert "init_overlay" in calls
+
+
+# ---- system/manager/manager.py ----------------------------------------------------------------------------------------------------
+def test_manager_logs_the_running_list_on_change_only():
+  """manager logged its whole running-process list (ANSI colours, ~1.7 kB a line) at 2 Hz, 200 kB a minute into the rlog, where
+  managerState already carries every process's state each cycle. Now: when the list changes, and once a minute."""
+  logged = []
+  env = _load("system/manager/manager.py", ["log_running"], {"cloudlog": NS(debug=lambda s: logged.append(s))})
+  log_running = env["log_running"]
+  state = [None, 0.0]
+  for i in range(240):                                # 2 minutes at 2 Hz, one process dies at 30 s
+    running = "\u001b[32ma\u001b[0m \u001b[32mb\u001b[0m" if i < 60 else "\u001b[32ma\u001b[0m \u001b[31mb\u001b[0m"
+    log_running(running, i * 0.5, state)
+  assert len(logged) <= 4, logged                     # the start, the change, at most the minute heartbeats
+  assert logged[0].endswith("b\u001b[0m") and any("\u001b[31mb" in s for s in logged)

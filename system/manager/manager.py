@@ -3,6 +3,7 @@ import datetime
 import os
 import signal
 import sys
+import time
 import traceback
 
 from cereal import log
@@ -140,6 +141,15 @@ def manager_cleanup() -> None:
   cloudlog.info("everything is dead")
 
 
+def log_running(running: str, now: float, state: list, every_s: float = 60.0) -> None:
+  """The running-process list into the log when it changes, and once a minute (state: [last logged, its time]). It was logged at
+  every 2 Hz loop, ~1.7 kB a line, 200 kB of log text a minute into the rlog, where managerState already carries every process's
+  state each cycle (owner, 2026-11-26: quieten FrogPilot's background activity)."""
+  if running != state[0] or now - state[1] >= every_s:
+    cloudlog.debug(running)
+    state[0], state[1] = running, now
+
+
 def manager_thread() -> None:
   cloudlog.bind(daemon="manager")
   cloudlog.info("manager start")
@@ -165,6 +175,7 @@ def manager_thread() -> None:
   )
 
   started_prev = False
+  running_logged = [None, 0.0]
 
   # FrogPilot variables
   frogpilot_toggles = get_frogpilot_toggles()
@@ -206,7 +217,7 @@ def manager_thread() -> None:
     running = ' '.join("{}{}\u001b[0m".format("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
                        for p in managed_processes.values() if p.proc)
     print(running)
-    cloudlog.debug(running)
+    log_running(running, time.monotonic(), running_logged)
 
     # send managerState
     msg = messaging.new_message('managerState', valid=True)
