@@ -13,6 +13,11 @@ The same flag also stops FrogPilot's phone-home (integ3 review T1-I2): the stats
 last GPS position, device registration, error reports, the weather lookup and theme submissions to FrogPilot's API.
 Those call sites ask remote_access_blocked(<name>) and skip the request when it returns True. Downloads of models,
 themes and map data and the update check are not gated (they send no identity beyond the request itself).
+Registration (re-review R2-I1): with the flag, no Konik registration (boot path and boot thread) and no comma registration
+(manager's register(allow_network=False)); an unregistered device still drives.
+When the flag is read (re-review R2-M8): each gate reads it when its call is about to go out, except FrogPilot's "register"
+thread and the boot-path Konik try, which read it once per boot: creating the flag stops a registration thread already
+waiting for FrogPilot's API only after a reboot. athenad likewise (manager start).
 RUNTIME of remote_access_blocked: one stat() per call, at boot or on a user action, or once per weather check
 (minutes); the skip is logged once per call name per process (bounded).
 """
