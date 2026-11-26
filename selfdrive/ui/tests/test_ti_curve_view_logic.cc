@@ -101,6 +101,31 @@ static void chipTiming() {
 
 static Rect AREA;   // the default fit's area (the stock screen's ribbon rectangle less INK, screen coordinates)
 
+// the chip's mark (owner, 2026-11-26): "?" for a bend known from the map only, else the arrow (direction known) or "!"
+static void marks() {
+  Payload p;
+  parse(sample(), p);
+  CHECK(p.src == SRC_RECORD);                                             // no "src" key: the remembered road
+  Chip c = chipFor(p, 1.5);
+  CHECK(c.cls == RED && chipMark(p, c) == MARK_ARROW);
+  c.dir = 0;
+  CHECK(chipMark(p, c) == MARK_BANG);                                     // a recorded bend without a direction keeps "!"
+  const std::string map_only = "{\"v\":1,\"m\":1,\"seq\":1,\"on\":1,\"mph\":450,\"fl\":30,\"r\":[],\"re\":0,"
+                               "\"b\":[[150,150,200,0,24,30,2,150,230,135]],\"src\":1}";
+  CHECK(parse(map_only, p) && p.src == SRC_MAP && p.n == 0);
+  c = chipFor(p, 0.0);
+  CHECK(c.cls == RED && chipMark(p, c) == MARK_QUESTION);
+  c.dir = 1;
+  CHECK(chipMark(p, c) == MARK_QUESTION);                                 // map only: "?" whatever the direction
+  std::string other = map_only;
+  other.replace(other.find("\"src\":1"), 7, "\"src\":2");
+  CHECK(parse(other, p) && p.src == SRC_OTHER);
+  c = chipFor(p, 0.0);
+  CHECK(chipMark(p, c) == MARK_BANG);                                     // the forecast's corner without a side: "!" as before
+  other.replace(other.find("\"src\":2"), 7, "\"src\":9");
+  CHECK(parse(other, p) && p.src == SRC_RECORD);                          // an unknown source: as before
+}
+
 static bool allInside(const double *px, const double *py, int n) {
   for (int i = 0; i < n; i++) {
     if (px[i] < AREA.x0 - 2 || px[i] > AREA.x1 + 2 || py[i] < AREA.y0 - 2 || py[i] > AREA.y1 + 2) return false;
@@ -325,6 +350,7 @@ int main() {
   fitRule();
   colours();
   layoutRules();
+  marks();
   if (failures) {
     std::printf("%d failure(s)\n", failures);
     return 1;

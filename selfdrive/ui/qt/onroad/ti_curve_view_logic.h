@@ -75,6 +75,8 @@ constexpr int BAND_TEXT_PX = 66;       // HANDS ON / HELP STEER: cap height abou
 constexpr int SECS_PX = 64;
 
 enum Cls { NEUTRAL = 0, YELLOW = 1, RED = 2 };
+// where the published bends come from (ti_curve_view.py SRC_*): the remembered road (with the ribbon), the map only, other
+enum Src { SRC_RECORD = 0, SRC_MAP = 1, SRC_OTHER = 2 };
 
 constexpr int MAX_PTS = 128;
 constexpr int MAX_BENDS = 8;
@@ -86,6 +88,7 @@ struct Bend {
 struct Payload {
   bool ok = false;
   int v = 0, seq = 0, on = 0, mph10 = 0, floor = 0, ends = 0;
+  int src = SRC_RECORD;   // optional key "src" (absent in payloads written before it: the remembered road)
   double m = -1e9;
   int n = 0;
   int d[MAX_PTS] = {};
@@ -159,6 +162,8 @@ inline bool parse(const std::string &text, Payload &p) {
   const int nb = detail::rows(s, "b", 10, bbuf, MAX_BENDS);
   if (n < 0 || nb < 0) return false;
   p.v = (int)v; p.m = m; p.seq = (int)seq; p.on = (int)on; p.mph10 = (int)mph10; p.floor = (int)fl; p.ends = (int)re;
+  double src;
+  p.src = detail::key_num(s, "src", src) && (int)src >= SRC_RECORD && (int)src <= SRC_OTHER ? (int)src : SRC_RECORD;
   p.n = n;
   for (int i = 0; i < n; i++) { p.d[i] = rbuf[2 * i]; p.k[i] = rbuf[2 * i + 1]; }
   p.nb = nb;
@@ -191,6 +196,14 @@ struct Chip {
   int secs = 0;        // whole seconds to the bend
   int dir = 0;         // +1 left, -1 right, 0 unknown
 };
+
+// the mark inside the chip's curve sign (owner, 2026-11-26): a bend known from the map only (no remembered record, no ribbon) shows
+// "?"; any other bend keeps its mark: the curve arrow when its direction is known, else "!"
+enum Mark { MARK_ARROW = 0, MARK_BANG = 1, MARK_QUESTION = 2 };
+inline Mark chipMark(const Payload &p, const Chip &c) {
+  if (p.src == SRC_MAP) return MARK_QUESTION;
+  return c.dir != 0 ? MARK_ARROW : MARK_BANG;
+}
 
 inline double secondsTo(const Payload &p, const Bend &b, double age) {
   return std::max(0.0, b.start / p.v_ms() - std::max(0.0, age));

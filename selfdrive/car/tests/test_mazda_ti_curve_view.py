@@ -207,8 +207,24 @@ def test_without_trusted_memory_the_plans_corner_is_one_bend_without_a_ribbon():
 
   class _Pl:
     view, odo = None, 0.0
-  p, _, _ = V.View().step(_Pl(), plan, 1.0, 1, True, 45.0, 45, 30, 0)
+  p, _, log = V.View().step(_Pl(), plan, 1.0, 1, True, 45.0, 45, 30, 0)
   assert p["r"] == [] and len(p["b"]) == 1 and p["b"][0][3] == 0
+  assert p["src"] == V.SRC_MAP and log[3] & 3 == V.SRC_MAP          # map only: the chip shows "?" (owner, 2026-11-26); logged
+
+
+def test_the_bends_source_is_published_and_logged():
+  out, _ = _drive()
+  _, _, p, _, log = out[30]
+  assert p["src"] == V.SRC_RECORD and log[3] & 3 == V.SRC_RECORD     # the remembered road (ribbon): the chip keeps its mark
+  fc = P.Plan(40, 1.0, True, False, "", 150.0, 40, False, None, False, None, None, "corner", 200.0, False, None, 24, -1, -1, 2, "fc",
+              None, None, False, {}, None)
+
+  class _Pl:
+    view, odo = None, 0.0
+  p, _, log = V.View().step(_Pl(), fc, 1.0, 1, True, 45.0, 45, 30, -1)
+  assert p["src"] == V.SRC_OTHER and log[3] & 3 == V.SRC_OTHER and p["b"][0][3] == -1
+  p, _, _ = V.View().step(_Pl(), fc, 1.0, 1, False, 45.0, 45, 30, -1)
+  assert p["src"] == V.SRC_RECORD and p["b"] == []                   # off: nothing published
 
 
 # ---- stale handling and the ding reader (frogpilot_planner) --------------------------------------------------------------------------

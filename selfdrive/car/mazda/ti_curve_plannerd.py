@@ -332,7 +332,8 @@ TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carrie
                                           # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
 TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
 # the driving screen's curve element (ti_curve_view.py, while curve slowing is on): [dings so far, chip shown (0 / 1 yellow / 2 red),
-# bends, microseconds to build it, then for the 3 nearest bends: start m, end m, dir, need, target, class]; ints only, never dropped by
+# bends, microseconds to build it, flags (bits 0-1: the bends' source, ti_curve_view.SRC_*: 1 = map only, the chip's "?"), then for the
+# 3 nearest bends: start m, end m, dir, need, target, class]; ints only, never dropped by
 # the trim (what the driver saw is replayable: the ribbon itself is rebuilt by replaying the planner over the same road memory)
 TICK_SCR_MAX_B = 160
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32

@@ -7,11 +7,14 @@ Published to the tmpfs param PARAM_VIEW (compact JSON, written by ti_curve_plann
   {"v": 1, "m": tick time (monotonic s), "seq": tick, "on": curve slowing switched on (0 / 1), "mph": speed x10, "fl": floor mph,
    "r": [[metres along the path, signed curvature x1e5 (left +)], ...] (<= VIEW_PTS points, the next VIEW_LOOK_S s; [] where no trusted
    road memory: no ribbon), "re": 1 when the remembered road ends inside the window (the ribbon fades out),
-   "b": [[start, tightest, end, dir, need, target, cls, approach, resume, lead x10], ...]}
+   "b": [[start, tightest, end, dir, need, target, cls, approach, resume, lead x10], ...], "src": where the bends come from}
 Bends (<= MAX_BENDS, nearest first): start / tightest / end / approach / resume in whole metres along the path from the car; dir +1 left,
 -1 right, 0 unknown (a map bend: the map's curvature is unsigned); need = the bend's needed speed, target = what the car slows to
 (max(need, floor)); cls 1 yellow (the car will slow here), 2 red (need below the floor: the feature cannot reach it); approach = where
 the approach tint starts; resume = where the car speeds back up (end + HOLD_AFTER_M); lead = the chip's lead time (s x10).
+src: SRC_RECORD 0 (the remembered road: the ribbon), SRC_MAP 1 (the map only: no remembered record, no ribbon; the chip's sign shows
+"?" instead of "!", owner 2026-11-26), SRC_OTHER 2 (no record, from the forecast or a dead-reckoned corner). The UI treats a missing
+"src" as 0 (payloads written before it).
 Never a position: distances along the path, speeds and curvatures only (test_mazda_ti_curve_view.py scans the schema).
 
 The ding (PARAM_DING, written only at the onset): ONE per red bend, when its chip first appears (seconds to the bend <= its lead) while
@@ -45,7 +48,8 @@ DING_FORGET_M = 300.0             # ... and remembered until the car is this far
 DING_KEEP = 16
 DING_FRESH_S = 1.0                # frogpilot_planner acts on an onset only this fresh
 CLS_NEUTRAL, CLS_YELLOW, CLS_RED = 0, 1, 2
-VIEW_KEYS = ("v", "m", "seq", "on", "mph", "fl", "r", "re", "b")
+SRC_RECORD, SRC_MAP, SRC_OTHER = 0, 1, 2   # where the published bends come from (the chip's "?" for SRC_MAP)
+VIEW_KEYS = ("v", "m", "seq", "on", "mph", "fl", "r", "re", "b", "src")
 BEND_FIELDS = ("start", "low", "end", "dir", "need", "target", "cls", "approach", "resume", "lead")
 
 
@@ -147,12 +151,21 @@ def chip(bl, mph):
   return CLS_NEUTRAL, -1
 
 
-def payload(t_mono, seq, on, mph, floor, rib, ends, bl):
+def bend_source(view, plan):
+  """Where the published bends come from: SRC_RECORD with the planner's look-ahead over trusted road memory (view), else SRC_MAP when
+  the plan's limiting corner comes from the map (plan.src "map"), else SRC_OTHER."""
+  if view is not None:
+    return SRC_RECORD
+  return SRC_MAP if str(getattr(plan, "src", "") or "") == "map" else SRC_OTHER
+
+
+def payload(t_mono, seq, on, mph, floor, rib, ends, bl, src=SRC_RECORD):
   """The PARAM_VIEW dict (VIEW_KEYS only; ints except the tick time)."""
   return {"v": VIEW_VERSION, "m": round(float(t_mono), 2), "seq": int(seq), "on": int(bool(on)), "mph": int(round(float(mph) * 10)),
           "fl": int(floor), "r": rib, "re": int(bool(ends)),
           "b": [[int(round(b["start"])), int(round(b["low"])), int(round(b["end"])), int(b["dir"]), int(b["need"]), int(b["target"]),
-                 int(b["cls"]), int(round(b["approach"])), int(round(b["resume"])), int(round(b["lead"] * 10))] for b in bl]}
+                 int(b["cls"]), int(round(b["approach"])), int(round(b["resume"])), int(round(b["lead"] * 10))] for b in bl],
+          "src": int(src)}
 
 
 class View:
@@ -164,7 +177,8 @@ class View:
     self.last = None                  # the last onset {"m", "n", "need"} (PARAM_DING)
 
   def step(self, planner, plan, t_mono, seq, on, mph, set_mph, floor, side):
-    """One tick after Planner.step. -> (payload dict, ding dict or None, log list of ints)."""
+    """One tick after Planner.step. -> (payload dict, ding dict or None, log list of ints: [dings so far, chip class, bends, flags
+    (bits 0-1: the bends' source SRC_*), then for the 3 nearest bends: start, end, dir, need, target, class])."""
     view = getattr(planner, "view", None) if on else None
     bl, rib, ends = [], [], False
     if on:
@@ -178,7 +192,8 @@ class View:
         bl = [b] if b is not None else []
     odo = float(getattr(planner, "odo", 0.0))
     self.dinged = [e for e in self.dinged if odo <= e + DING_FORGET_M]
-    p = payload(t_mono, seq, on, mph, floor, rib, ends, bl)
+    src = bend_source(view, plan) if on else SRC_RECORD
+    p = payload(t_mono, seq, on, mph, floor, rib, ends, bl, src)
     # the chip on the numbers as published (whole metres, 0.1 s, 0.1 mph): exactly what the UI decides at age 0
     ck, ci = chip([{"cls": q[6], "start": q[0], "lead": q[9] / 10.0} for q in p["b"]], p["mph"] / 10.0) if bl else (CLS_NEUTRAL, -1)
     ding = None
@@ -189,7 +204,7 @@ class View:
         del self.dinged[:-DING_KEEP]
         self.n += 1
         ding = self.last = {"m": round(float(t_mono), 2), "n": self.n, "need": int(bl[ci]["need"])}
-    log = [self.n, int(ck), len(bl)]
+    log = [self.n, int(ck), len(bl), int(src)]
     for b in p["b"][:3]:
       log += [b[0], b[2], b[3], b[4], b[5], b[6]]
     return p, ding, log
