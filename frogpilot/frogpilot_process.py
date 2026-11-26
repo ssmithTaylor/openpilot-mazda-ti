@@ -10,8 +10,9 @@ from openpilot.common.time import system_time_valid
 from openpilot.frogpilot.assets.model_manager import MODEL_DOWNLOAD_ALL_PARAM, MODEL_DOWNLOAD_PARAM, ModelManager
 from openpilot.frogpilot.assets.theme_manager import THEME_COMPONENT_PARAMS, ThemeManager
 from openpilot.frogpilot.common.frogpilot_functions import backup_toggles
-from openpilot.frogpilot.common.frogpilot_utilities import capture_report, flash_panda, is_url_pingable, lock_doors, run_thread_with_lock, update_maps
-from openpilot.frogpilot.common.frogpilot_variables import ERROR_LOGS_PATH, FrogPilotVariables, get_frogpilot_toggles, params_cache, params_memory
+from openpilot.frogpilot.common.frogpilot_utilities import capture_report, flash_panda, lock_doors, run_thread_with_lock, update_maps
+from openpilot.frogpilot.common.frogpilot_variables import ERROR_LOGS_PATH, FrogPilotVariables, get_frogpilot_toggles, params, params_cache, params_memory
+from openpilot.frogpilot.common.update_gate import wait_for_network_parked
 from openpilot.frogpilot.controls.frogpilot_planner import FrogPilotPlanner
 from openpilot.frogpilot.system.frogpilot_tracking import FrogPilotTracking
 
@@ -41,8 +42,10 @@ def assets_checks(model_manager, theme_manager, frogpilot_toggles):
       run_thread_with_lock("download_theme", theme_manager.download_theme, (asset_type, asset_to_download, asset_param, frogpilot_toggles))
 
 def update_checks(model_manager, now, theme_manager, frogpilot_toggles, boot_run=False):
-  while not (is_url_pingable("https://github.com") or is_url_pingable("https://gitlab.com")):
-    time.sleep(60)
+  # Re-review R2-I2: never on-road (ends at once; the next off-road transition starts it again); parked without a network the
+  # probe backs off up to hours instead of pinging every 60 s for ever; the probe leaves no garbage in this gc-off process.
+  if not wait_for_network_parked(lambda: params.get_bool("IsOnroad")):
+    return
 
   model_manager.update_models(boot_run)
   theme_manager.update_themes(frogpilot_toggles, boot_run)
@@ -54,8 +57,9 @@ def update_checks(model_manager, now, theme_manager, frogpilot_toggles, boot_run
 def update_checks_now(pending, started, time_validated, manual=False):
   """Run the model / theme / map checks (github.com, api.github.com, raw.githubusercontent.com) now? Only parked: a check due
   on-road (the hourly timer, the clock first becoming valid) waits for the drive to end (owner, 2026-11-26: quieten FrogPilot's
-  background activity while driving); the offroad transition runs one anyway. A manual request (settings screen) runs as before."""
-  return bool(pending and time_validated and (manual or not started))
+  background activity while driving); the offroad transition runs one anyway. A manual request (settings screen) made on-road
+  is held until parked as well (re-review R2-I2: no connectivity pings or update checks on-road, ever); parked it runs at once."""
+  return bool(pending and time_validated and not started)
 
 def frogpilot_thread():
   rate_keeper = Ratekeeper(1 / DT_MDL, None)

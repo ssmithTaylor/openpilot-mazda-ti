@@ -136,7 +136,9 @@ def test_frogpilot_network_checks_wait_for_the_drive_to_end():
   assert not now(True, started=True, time_validated=True)
   assert not now(True, started=False, time_validated=False)
   assert not now(False, started=False, time_validated=True)
-  assert now(True, started=True, time_validated=True, manual=True)          # a manual request, as before
+  # a manual request on-road is held too (re-review R2-I2: no update checks on-road, ever); parked it runs at once
+  assert not now(True, started=True, time_validated=True, manual=True)
+  assert now(True, started=False, time_validated=True, manual=True)
 
 
 def test_frogpilot_process_loop_uses_the_gate():

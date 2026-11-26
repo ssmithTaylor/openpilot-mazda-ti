@@ -73,6 +73,7 @@ ALL_GLOBS = (
   "frogpilot/system/tests/test_boot_jobs_offroad.py",
   "frogpilot/system/tests/test_phone_home_gate.py",
   "frogpilot/system/tests/test_konik_register_gate.py",
+  "frogpilot/system/tests/test_update_checks_offline.py",
   "frogpilot/system/ti_mcp/tests/test_ti_mcp_server.py",
   "selfdrive/car/tests/test_no_per_frame_leaks.py",
   "selfdrive/car/tests/test_lint_per_frame.py",
