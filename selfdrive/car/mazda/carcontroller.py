@@ -1058,6 +1058,9 @@ class CarController(CarControllerBase):
       age = None
       if self.curve_plan is not None and self.curve_plan_read is not None:
         age = self.curve_plan_age + (now - self.curve_plan_read)
+        tc = getattr(self, "ti_cost", None)
+        if tc is not None:
+          tc.gauge_max(0, age)
       inp = self._curve_inputs(CC, CS, now, age, mon)
       self.curve_inp_last = inp
       button = mod.run_frame(cv, ex, self.frame, inp)
@@ -1349,6 +1352,8 @@ class CarController(CarControllerBase):
       # Cruise set-speed check: SET_M / SET_P only, never CANCEL or RESUME, and nothing on a frame where openpilot asks for either
       # (checked again inside). After the existing cancel / resume logic, which it never changes.
       if self.flag_ti:
+        tc = getattr(self, "ti_cost", None)          # card's per-hook timers (ti_cost_timers.py); None elsewhere
+        tb = time.perf_counter_ns() if tc is not None else 0
         cruise_msg = self.cruise_check_step(CC, CS, ti_apply_steer)
         if cruise_msg is not None:
           can_sends.append(cruise_msg)
@@ -1362,8 +1367,13 @@ class CarController(CarControllerBase):
             can_sends.append(button_msg)
           else:
             button_msg = None
+        if tc is not None:
+          tc.add(3, time.perf_counter_ns() - tb)
+          tb = time.perf_counter_ns()
         # Curve slowing: SET_M / SET_P only, never on a frame the cruise check or a button test sends (one button frame per frame)
         curve_msg = self.curve_step(CC, CS, ti_apply_steer)
+        if tc is not None:
+          tc.add(2, time.perf_counter_ns() - tb)
         if curve_msg is not None and cruise_msg is None and button_msg is None:
           can_sends.append(curve_msg)
 

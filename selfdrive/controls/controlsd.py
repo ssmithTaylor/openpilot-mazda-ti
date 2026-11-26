@@ -32,6 +32,11 @@ from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, S
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.car.mazda.lateral_diagnostics import record_inputs
 try:
+  # per-cycle cost of this fork's hooks, summarised every 10 s (selfdrive/car/mazda/ti_cost_timers.py); optional
+  from openpilot.selfdrive.car.mazda.ti_cost_timers import HookTimers, cloudlog_cost
+except Exception:
+  HookTimers = None
+try:
   # On-car A/B alternation of one tuning setting (selfdrive/car/mazda/ti_ab.py): optional; without the module, or with the
   # mode off, the lateral controller is handed the owner's own toggles object, exactly as before.
   from openpilot.selfdrive.car.mazda.ti_ab import TiAbRunner
@@ -175,6 +180,9 @@ class Controls:
     self.last_steering_pressed_frame = 0
     self.sat_alert_frames = 0
     self.lane_drift_gate = LaneDriftGate(DT_CTRL)
+    # hooks: step (the whole cycle, upstream + ours), lat (model context + LaC.update), ab (the A/B / plan step), diag (record_inputs),
+    # drift (the lane drift gate); event "ti_cost" every 10 s
+    self.ti_cost = HookTimers("controlsd", ("step", "lat", "ab", "diag", "drift"), log=cloudlog_cost) if HookTimers is not None else None
     self.distance_traveled = 0
     self.last_functional_fan_frame = 0
     self.events_prev = []
@@ -800,10 +808,14 @@ class Controls:
       # frogpilotCarState carries the car's lateral actuator state (Mazda TI: LKAS_BLOCK, LKAS_EFFECTIVE,
       # TI RUN). Pass it only while it is alive and valid; the controllers treat None as "unknown".
       fp_car_state = self.sm['frogpilotCarState'] if self.sm.all_checks(['frogpilotCarState']) else None
+      tc = self.ti_cost
+      t0 = time.perf_counter_ns() if tc is not None else 0
       if isinstance(self.LaC, LatControlTorque):
         self.LaC.update_model_context(model_v2, self.sm.logMonoTime['modelV2'],
                                       self.sm.all_checks(['modelV2']), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+      t1 = time.perf_counter_ns() if tc is not None else 0
       self.ab_toggles = self.ab_step(CS, CC, model_v2, fp_car_state)
+      t2 = time.perf_counter_ns() if tc is not None else 0
       steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                          self.steer_limited_by_safety, self.desired_curvature,
                                                          curvature_limited, lat_delay,
@@ -811,10 +823,16 @@ class Controls:
                                                          self.sm['modelV2'],
                                                          self.ab_toggles,
                                                          fp_car_state)
+      t3 = time.perf_counter_ns() if tc is not None else 0
       self.ab_last_steer = float(steer)
       self.ab_last_saturated = bool(getattr(lac_log, "saturated", False))
       if isinstance(self.LaC, LatControlTorque) and self.LaC.plant is not None:
         record_inputs(lac_log.mazdaDiagnostics, self.sm, self.car_state_event, self.car_state_updated)
+        if getattr(self, "ti_cost", None) is not None:
+          self.ti_cost.add(3, time.perf_counter_ns() - t3)
+      if tc is not None:
+        tc.add(1, (t1 - t0) + (t3 - t2))
+        tc.add(2, t2 - t1)
       actuators.steer = float(steer)
       actuators.steeringAngleDeg = float(steeringAngleDeg)
 
@@ -861,8 +879,11 @@ class Controls:
       # owner, 2026-11-23: at the limit on a bend the car holds is normal; the alert also needs a lane line close to or under the car's side
       at_limit = bool(lac_log.saturated and undershooting and turning)
       # the gate is stateful (remembered lane width, latch through the model's re-index of the lines, none in a lane change)
+      td = time.perf_counter_ns() if self.ti_cost is not None else 0
       drift = self.lane_drift_gate.update(model_v2, model_v2.action.desiredCurvature, at_limit,
                                           lane_change_active(model_v2, CS.leftBlinker, CS.rightBlinker))
+      if self.ti_cost is not None:
+        self.ti_cost.add(4, time.perf_counter_ns() - td)
       held = at_limit and drift
       self.sat_alert_frames = self.sat_alert_frames + 1 if held else 0
       if held and self.sat_alert_frames * DT_CTRL >= TAKE_CONTROL_HOLD_S:
@@ -1170,7 +1191,12 @@ class Controls:
     try:
       t.start()
       while True:
+        tc = self.ti_cost
+        t0 = time.perf_counter_ns() if tc is not None else 0
         self.step()
+        if tc is not None:
+          tc.add(0, time.perf_counter_ns() - t0)
+          tc.tick()
         self.rk.monitor_time()
     except SystemExit:
       e.set()

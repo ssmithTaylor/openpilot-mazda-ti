@@ -349,6 +349,10 @@ def setup_lateral():
   return step, lambda: None
 
 
+def _no_log(event):
+  return None
+
+
 def _card(curve_on_fn=None):
   from openpilot.selfdrive.car.mazda import carcontroller as ccm
   from openpilot.selfdrive.car.mazda import ti_cost_check as K
@@ -359,6 +363,9 @@ def _card(curve_on_fn=None):
   seen = {}
   ccm.ti_curve_log = lambda ev: _count(seen, "curve:" + str(ev.get("kind")))
   cc, mem = K.make_controller()
+  # card's per-hook timers as card.py attaches them (ti_cost_timers.py): add / gauge_max every frame, the 10 s summary and reset
+  from openpilot.selfdrive.car.mazda.ti_cost_timers import HookTimers
+  cc.ti_cost = HookTimers("card", ("step", "cc", "curve", "buttons"), gauges=("plan_age_s",), log=_no_log)
   disk = ccm.Params()
 
   def restore():
@@ -405,6 +412,7 @@ def setup_card_tests():
     lag[0] += 2.0 if (ph // 1500) % 4 == 2 else 0.0      # cumLagMs: controlsd 2 ms late per cycle for 15 s, then on time
     cc.ti_lag_ctl = (i * 0.01, lag[0])
     cc.update(CC, CS, i * 10_000_000, tog[(ph // 1000) % 3])
+    cc.ti_cost.tick()
     _count(seen, "ident running" if cc.ti_ident is not None and cc.ti_ident.running else "ident idle")
     _count(seen, "plan " + str(mode))
     _count(seen, "lag held" if cc.ti_lag_held else "lag ok")
@@ -459,6 +467,7 @@ def setup_card_curve():
     cs.enabled = not (9850 <= ph < 10000)
     CC.actuators.steer = 1.0 if (ph // 400) % 3 == 0 else 0.3
     cc.update(CC, CS, i * 10_000_000, tog)
+    cc.ti_cost.tick()
     _count(seen, "state:" + str(cc.curve.state if cc.curve is not None else None))
     _drain(seen, cc.ti_ident)
   step.seen = seen
@@ -506,6 +515,7 @@ def setup_card_buttons():
     CS.out.vEgo = 45.0 * 0.44704
     n0 = len(sent)
     cc.update(CC, CS, i * 10_000_000, tog)
+    cc.ti_cost.tick()
     for kk, d in sent[n0:]:
       if d and (st["last"] is None or (st["last"] - 3) // 10 != (kk - 3) // 10):
         st["pending"].append((kk + 4, d))
