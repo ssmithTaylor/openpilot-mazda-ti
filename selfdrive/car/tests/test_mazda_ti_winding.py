@@ -430,3 +430,51 @@ def test_yt_decision_in_the_tick_record_bounded_and_position_free(monkeypatch):
   _, off = _yt_drive(WIND_SEGS, _offset(1000.0, b, 25.0), switch=False, monkeypatch=monkeypatch)
   assert not any("yt" in (p.diag or {}) for s, p, q in off)
   assert not any("yt" in D.tick_log(p, {"seq": 1}) for s, p, q in off)
+
+
+# ---- integ3 review T2-C1: the phantom through a curve shared with a parallel remembered road ---------------------------------------
+def _parallel_phantom(switch, monkeypatch, mph=45.0, d=10.0, dk=0.00204, R=150.0, g=50.0):
+  """Reviewer's probe (integ3 review, probe_yt.py, synthetic roads): the car stays on the main road H; the memory holds only a slip
+  road M that leaves sideways by d m, runs concentric with H through a shared curve (radius R, 300 m), then M alone has a tight bend
+  (R 50 m) g m later while H is straight. -> (ceilings after the split, alerts after the split) for the switch given."""
+  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P
+  import numpy as np
+  monkeypatch.setattr(P, "RM_YAW_TRUST", switch)
+  pre = [(800.0, 0.0)]
+  H = pre + [(140.0, 0.0), (300.0, 1.0 / R), (1200.0, 0.0)]
+  Mseg = pre + [(70.0, -dk), (70.0, dk), (300.0 * (R + d) / R, 1.0 / (R + d)), (g, 0.0), (80.0, -0.02), (600.0, 0.0)]
+  tr_h, tr_m = M.synthetic_trace(H), M.synthetic_trace(Mseg)
+  pl = P.Planner(M.synthetic([tr_m]))
+  s_road = np.arange(len(tr_h["x"])) * M.SPACING_M
+  v, t, ceil, alert = mph * P.MPH, 0.0, [], []
+  end = 800.0 + 140.0 + 300.0 + g + 300.0
+  while v * t < end:
+    s = v * t
+    i = min(int(s // M.SPACING_M), len(s_road) - 1)
+    f = P.Fix(True, float(np.interp(s, s_road, tr_h["x"])), float(np.interp(s, s_road, tr_h["y"])), float(tr_h["hdg"][i]))
+    p = pl.step(t, f, v, set_mph=mph, yaw_k=float(tr_h["kap"][i]), ref_mph=mph)
+    if s >= 800.0:
+      if p.ceil is not None:
+        ceil.append(p.ceil)
+      if p.alert_mph is not None:
+        alert.append(p.alert_mph)
+    t += 0.2
+  return ceil, alert
+
+
+def test_yaw_trust_is_off_by_default_and_the_parallel_road_phantom_is_absent(monkeypatch):
+  """integ3 review T2-C1 (Critical): with yaw trust on, a car on the main road beside a remembered slip road slows from 45 to 25 mph
+  for a bend on the slip road. The shipped default must be off, and the default planner must neither slow nor warn there."""
+  from openpilot.selfdrive.car.mazda import ti_curve_plan as P
+  assert P.RM_YAW_TRUST is False
+  ceil, alert = _parallel_phantom(P.RM_YAW_TRUST, monkeypatch)
+  assert not ceil and not alert, (min(ceil) if ceil else None, alert[:1])
+
+
+@pytest.mark.xfail(raises=AssertionError, strict=True,
+                   reason="integ3 review T2-C1: yaw trust re-trusts a parallel remembered road after a seen departure; redesign pending")
+def test_yaw_trust_on_parallel_road_phantom_pinned(monkeypatch):
+  """Pinned defect for the yaw-trust redesign: with the switch FORCED ON the same scenario must not slow or warn either. Today it does
+  (strict xfail: when the redesign closes it, this passes and the xfail marker must be removed)."""
+  ceil, alert = _parallel_phantom(True, monkeypatch)
+  assert not ceil and not alert, (min(ceil) if ceil else None, alert[:1])

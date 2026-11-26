@@ -545,7 +545,7 @@ DR_BAD_M = 40.0
 #      calm-braking horizon as it widens the start margin.
 # Follow-up (not tonight): tighten the agreement tolerance (reviewer: chance agreement of DIFFERENT real roads 40 % per window, 15 %
 # with (A); the true road 96 %).
-RM_YAW_TRUST = True
+RM_YAW_TRUST = False  # integ3 review T2-C1 (Critical): re-trusts a parallel remembered road after a seen departure; off until redesigned
 YT_WIN_M = 200.0
 YT_INFO_K = 3 * DR_K_TOL
 YT_LAPSE_M = 300.0
