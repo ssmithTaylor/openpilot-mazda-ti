@@ -58,13 +58,19 @@ def set_time(new_time):
     cloudlog.debug(f"Time diff too small: {diff}")
     return
 
+  # re-review R2-M5: a `date -s` that fails 3 times (not permitted, or the string refused) will not start working; stop
+  # trying until the next start instead of an exception record every 10 s for the whole drive.
+  failures = getattr(set_time, "failures", 0)
+  if failures >= 3:
+    return
   stamp = new_time.strftime("%Y-%m-%d %H:%M:%S.%f")
   cloudlog.debug(f"Setting time to {stamp} UTC")
   try:
     subprocess.run(f"TZ=UTC date -s '{stamp}'", shell=True, check=True)
   except subprocess.CalledProcessError:
+    set_time.failures = failures + 1
     cloudlog.exception("timed.failed_setting_time")
-    cloudlog.event("timed.set_time", ok=False, offset_before_s=round(diff.total_seconds(), 3))
+    cloudlog.event("timed.set_time", ok=False, offset_before_s=round(diff.total_seconds(), 3), failures=failures + 1)
     return
   # Replayability: system clock minus GPS time before and after the correction (seconds only, no position).
   after = datetime.datetime.now(datetime.timezone.utc) - new_time

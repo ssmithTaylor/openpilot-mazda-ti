@@ -72,7 +72,16 @@ def test_failed_set_is_logged_with_offset():
   set_time, calls, events = _load_set_time(GPS - real_datetime.timedelta(days=1100), date_s_fails=True)
   set_time(GPS)
   assert len(calls) == 1
-  assert events == [("timed.set_time", {"ok": False, "offset_before_s": -1100 * 86400.0})]
+  assert events == [("timed.set_time", {"ok": False, "offset_before_s": -1100 * 86400.0, "failures": 1})]
+
+
+def test_failing_date_is_tried_three_times_then_left_alone():
+  """re-review R2-M5: not an exception record every 10 s for the whole drive."""
+  set_time, calls, events = _load_set_time(GPS - real_datetime.timedelta(days=1100), date_s_fails=True)
+  for _ in range(10):
+    set_time(GPS)
+  assert len(calls) == 3
+  assert [e[1]["failures"] for e in events] == [1, 2, 3]
 
 
 @pytest.mark.parametrize("gps", [
