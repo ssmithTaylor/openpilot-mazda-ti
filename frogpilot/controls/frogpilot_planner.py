@@ -157,13 +157,9 @@ class FrogPilotPlanner:
     # Latched: the rack has stopped while the command is at its clip and the column is loaded near
     # the ceiling. The driver already reacts to this about a second later by feel; saying it out loud
     # is the point. Debounced, because the wheel crosses zero rate on every direction reversal.
-    column_torque = abs(sm["frogpilotCarState"].columnTorque)
-    at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
-    stopped = abs(sm["carState"].steeringRateDeg) < 2.0
-    loaded = column_torque > steer_authority.CEILING_COUNTS - 25.0
-    self.latch_bits = (1 if at_clip else 0) | (2 if stopped else 0) | (4 if loaded else 0)
-    self.latch_frames = self.latch_frames + 1 if self.latch_bits == 7 else 0
-    self.steer_latched = bool(advisory_on and self.latch_frames >= steer_authority.LATCH_DEBOUNCE_FRAMES)
+    # (steer_authority.update_latch: at the clip 0.99, wheel under 2 deg/s, column over CEILING_COUNTS - 25, LATCH_DEBOUNCE_FRAMES)
+    steer_authority.update_latch(self, sm["carControl"].actuators.steer, sm["carState"].steeringRateDeg,
+                                 sm["frogpilotCarState"].columnTorque, advisory_on)
 
     self.road_curvature_detected = (1 / abs(self.road_curvature))**0.5 < v_ego > CRUISING_SPEED and not (sm["carState"].leftBlinker or sm["carState"].rightBlinker)
 

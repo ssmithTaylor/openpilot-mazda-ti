@@ -298,4 +298,4 @@ class FrogPilotEvents:
       steer_authority.authority_key(lat_active, ti_now, runwide_base, drift_open, rw_shown, False, planner.steer_latched, lt_shown,
                                     dd_shown, advisory_on),     # (latch_cond: added from planner.latch_bits inside, where it cannot raise)
       self, planner, v_ego, des_la, act_la, sm["carControl"].actuators.steer, sm["carState"].steeringRateDeg,
-      sm["frogpilotCarState"].columnTorque)
+      sm["frogpilotCarState"].columnTorque, sm["carState"].steeringPressed, sm["carState"].steeringTorque)

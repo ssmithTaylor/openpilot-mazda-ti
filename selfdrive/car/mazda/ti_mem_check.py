@@ -755,7 +755,7 @@ def setup_frogpilot_events():
                wheel_image="stock", is_metric=False)
   fe = FE.FrogPilotEvents(planner, NS(is_file=lambda: False), NS(update_wheel_image=lambda *a, **k: None))
   trig = SA.AdvisoryTrigger()
-  st = {"latch": 0, "tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
+  st = {"tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
   names = {FEN.steerRunningWide: "running wide", FEN.tiDropout: "ti dropout", FEN.steerAuthorityAdvisory: "advisory",
            FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning"}
 
@@ -784,11 +784,8 @@ def setup_frogpilot_events():
     if st["code"][0] and now - st["code"][1] < 1.0:
       planner.steer_advisory_speed = st["code"][0]
       _count(seen, "curve code")
-    loaded = abs(sm["frogpilotCarState"].columnTorque) > SA.CEILING_COUNTS - 25.0
-    at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
-    planner.latch_bits = (1 if at_clip else 0) | (2 if abs(sm["carState"].steeringRateDeg) < 2.0 else 0) | (4 if loaded else 0)
-    st["latch"] = planner.latch_frames = st["latch"] + 1 if planner.latch_bits == 7 else 0
-    planner.steer_latched = st["latch"] >= SA.LATCH_DEBOUNCE_FRAMES
+    # the planner's latch: the real code (steer_authority.update_latch, as FrogPilotPlanner.update calls it)
+    SA.update_latch(planner, sm["carControl"].actuators.steer, sm["carState"].steeringRateDeg, sm["frogpilotCarState"].columnTorque, True)
     fe.update(100.0 * 0.2778, sm, toggles)
     for n in fe.events.names:
       if n in names:

@@ -101,6 +101,13 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Car side: `ti_curve` kind "cs" (`Curve.diag`, 5 Hz while on or active), `drv_btn` (every driver cruise-button press, on or off),
   `deliver_phase` (stage 3 phase, timers, stock-assist flags acting or not, on change, checked at 10 Hz: not on every torque count), `left` (TiSetSpeedLeft on change). Schema:
   `ti_curve.DIAG_STATE`, `DIAG_EXEMPT`, `DIAG_INPUTS`, `INPUTS_IN_RLOG`.
+- Steering alerts (2026-11-26): `lane_gate` (lane_drift.log_lane_gate, from controlsd "p":"c" and frogpilot_process "p":"f"),
+  `ti_authority` (steer_authority.log_authority, frogpilot_process: Running Wide / Mid-Corner / Dropped counters, thresholds, driver
+  flags), both on a change of a boolean bit field only (lane_drift.OnChange: at most 5 records a second, "sup" = held back; never
+  raise); `ti_stuck_guard` carries run / held_s. Schema: `LANE_GATE_BITS` / `LANE_GATE_LOGGED` / `LANE_GATE_EXEMPT`,
+  `AUTHORITY_BITS` / `AUTHORITY_*_STATE` / `_EXEMPT`, `ti_stuck_guard.STUCK_LOGGED` / `STUCK_EXEMPT`; guarded by
+  `selfdrive/car/tests/test_mazda_ti_alert_replayable.py`. The Mid-Corner latch is `steer_authority.update_latch` (planner and
+  the frogpilot_events memory scenario call the same code).
 - Guarded by `selfdrive/car/tests/test_mazda_ti_curve_replayable.py`: a new Planner / Curve attribute or input that is neither
   logged nor exempt with a reason fails it.
 - No positions, place names or VIN in any log (distances along a path, speeds, curvatures, flags only); every record bounded

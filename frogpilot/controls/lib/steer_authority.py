@@ -308,6 +308,11 @@ def advisory_speed_margin(demand_la, v_kph, allowed_drift=ALLOWED_DRIFT_M,
 # command (st, of max) and whether it was at the ceiling, wheel rate (sr, deg/s) and column load (col, counts) the latch used, asked
 # and delivered lateral acceleration (des / act, m/s^2: delivering what was asked is not losing the bend), speed (v, m/s) and the car
 # side's clearance to the outside line (oc, m, from the frogpilot_process lane gate).
+# Thresholds (several modules call "saturated" different fractions): "st" is the command fraction itself; "ceil" = st >= RUNWIDE_CEIL
+# (0.96, Running Wide); lb bit 1 = st >= LATCH_CLIP (0.99, Mid-Corner); controlsd's Take Control uses 0.9 (lane_gate "al", p "c").
+# Dropout (frogpilot_events: tiActive true -> false, which also covers a driver override and the interceptor's ramp-down, unlike
+# ti_curve_monitor's definition): "sp" (carState.steeringPressed) and "dt" (driver torque) at the change; the interceptor's own
+# STATE (DRIVER_OVER / OFF / RUN) and RAMP_DOWN at that moment are TI_FEEDBACK (0x24A) in the rlog's can.
 AUTHORITY_BITS = ("lat_active", "ti_active", "runwide_base", "drift_open", "runwide_shown", "latch_cond", "latched", "latch_shown",
                   "dropout_shown", "advisory_on")
 AUTHORITY_MAX_B = 260        # bytes of the record as JSON (about 200 in practice)
@@ -329,6 +334,22 @@ AUTHORITY_PLANNER_EXEMPT = {
 }
 
 
+LATCH_CLIP = 0.99            # of max command: "at the clip" for the Mid-Corner latch (lb bit 1); Running Wide uses RUNWIDE_CEIL (0.96, "ceil")
+LATCH_STOPPED_DEG_S = 2.0    # wheel rate under this: "stopped" (lb bit 2)
+
+
+def update_latch(planner, steer, steer_rate_deg, column, advisory_on):
+  """The Mid-Corner latch, one frogpilot_process frame (called by FrogPilotPlanner.update, and by the memory guard's scenario, so the
+  guard runs this code, not a copy): sets planner.latch_bits (1 at the clip, 2 wheel stopped, 4 column loaded), latch_frames and
+  steer_latched. Scalars only."""
+  at_clip = abs(steer) >= LATCH_CLIP
+  stopped = abs(steer_rate_deg) < LATCH_STOPPED_DEG_S
+  loaded = abs(column) > CEILING_COUNTS - 25.0
+  planner.latch_bits = (1 if at_clip else 0) | (2 if stopped else 0) | (4 if loaded else 0)
+  planner.latch_frames = planner.latch_frames + 1 if planner.latch_bits == 7 else 0
+  planner.steer_latched = bool(advisory_on and planner.latch_frames >= LATCH_DEBOUNCE_FRAMES)
+
+
 def authority_key(lat_active, ti_now, base, drift, rw_shown, latch_cond, latched, lt_shown, dd_shown, adv_on):
   """The alerts' discrete state as an int (AUTHORITY_BITS): booleans only."""
   return ((1 if lat_active else 0) | (2 if ti_now else 0) | (4 if base else 0) | (8 if drift else 0) | (16 if rw_shown else 0)
@@ -341,7 +362,7 @@ def authority_bits(s):
   return {n: bool(s >> i & 1) for i, n in enumerate(AUTHORITY_BITS)}
 
 
-def log_authority(log, key, events, planner, v_ego, des_la, act_la, steer, steer_rate, column):
+def log_authority(log, key, events, planner, v_ego, des_la, act_la, steer, steer_rate, column, steering_pressed=False, driver_torque=0.0):
   """Once per frogpilot_process frame, after the alerts' blocks: one ti_authority record when `key` changed (its latch_cond bit is
   set here from planner.latch_bits). Never raises; after an error, off for this process."""
   if log.dead:
@@ -356,6 +377,7 @@ def log_authority(log, key, events, planner, v_ego, des_la, act_la, steer, steer
         "ltf": planner.latch_frames, "lb": planner.latch_bits, "ltd": events.latch_display_hold, "dd": events.ti_dropout_hold,
         "ceil": 1 if abs(steer) >= RUNWIDE_CEIL else 0, "v": round(float(v_ego), 2), "des": round(float(des_la), 2),
         "act": round(float(act_la), 2), "st": round(float(steer), 3), "sr": round(float(steer_rate), 1),
-        "col": round(float(column), 1), "oc": None if oc is None else round(float(oc), 2), "sup": log.take_sup()})
+        "col": round(float(column), 1), "oc": None if oc is None else round(float(oc), 2), "sp": 1 if steering_pressed else 0,
+        "dt": round(float(driver_torque), 1), "sup": log.take_sup()})
   except Exception:
     log.dead = True

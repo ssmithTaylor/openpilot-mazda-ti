@@ -135,7 +135,7 @@ def test_authority_record_says_why_mid_corner_fired(records):
   pl.latch_bits, pl.latch_frames = 7, SA.LATCH_DEBOUNCE_FRAMES
   SA.log_authority(log, _key(latch_cond=True, latched=True, lt_shown=True), fe, pl, 24.6, 2.31, 2.28, 1.0, 0.4, 203.0)
   rec = records[-1][1]
-  for k in ("st", "sr", "col", "des", "act", "oc", "v", "lb", "ltf", "ltd", "rwf", "rwd", "dd"):
+  for k in ("st", "ceil", "sr", "col", "des", "act", "oc", "v", "lb", "ltf", "ltd", "rwf", "rwd", "dd", "sp", "dt"):
     assert k in rec, k
   assert abs(rec["oc"] - (1.3 - LD.CAR_HALF_WIDTH)) < 0.01 and rec["des"] == 2.31 and rec["act"] == 2.28
   text = json.dumps(rec)
@@ -190,3 +190,29 @@ def test_controller_stuck_event_carries_run_and_held_s(monkeypatch):
     cc.update(CC, CS, k * 10_000_000, toggles)
   assert events and all("run" in e and "held_s" in e for e in events)
   assert len(json.dumps(events[0])) <= 160
+
+
+def test_authority_dropout_record_tells_a_driver_override_from_a_dropout(records):
+  """frogpilot_events' dropout is tiActive true -> false, which a driver override also gives (ti_curve_monitor excludes it; the
+  owner's decision on the definition is pending): the record at the change carries the driver's steering flag and torque."""
+  fe, pl = _fe()
+  log = LD.OnChange(20, 5)
+  SA.log_authority(log, _key(), fe, pl, 25.0, 1.0, 1.0, 0.5, 1.0, 100.0)
+  fe.ti_dropout_hold = SA.TI_DROPOUT_HOLD_FRAMES
+  SA.log_authority(log, _key(ti_now=False, dd_shown=True), fe, pl, 25.0, 1.0, 1.0, 0.5, 1.0, 100.0, True, -2.4)
+  rec = records[-1][1]
+  assert SA.authority_bits(rec["s"])["dropout_shown"] and rec["sp"] == 1 and rec["dt"] == -2.4 and rec["dd"] == SA.TI_DROPOUT_HOLD_FRAMES
+
+
+def test_update_latch_is_the_planners_latch():
+  pl = NS(latch_frames=0, latch_bits=0, steer_latched=False)
+  for _ in range(SA.LATCH_DEBOUNCE_FRAMES - 1):
+    SA.update_latch(pl, -1.0, 0.5, -SA.CEILING_COUNTS, True)
+  assert pl.latch_bits == 7 and not pl.steer_latched
+  SA.update_latch(pl, -1.0, 0.5, -SA.CEILING_COUNTS, True)
+  assert pl.steer_latched and pl.latch_frames == SA.LATCH_DEBOUNCE_FRAMES
+  SA.update_latch(pl, 0.98, 0.5, 300.0, True)             # under the 0.99 clip: released
+  assert pl.latch_bits == 6 and pl.latch_frames == 0 and not pl.steer_latched
+  for _ in range(10):
+    SA.update_latch(pl, 1.0, 0.0, 300.0, False)           # advisory toggle off: counts, never latched
+  assert pl.latch_frames == 10 and not pl.steer_latched
