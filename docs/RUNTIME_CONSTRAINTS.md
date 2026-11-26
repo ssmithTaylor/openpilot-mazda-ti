@@ -64,6 +64,9 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 
 ## UI (C++ Qt: `selfdrive/ui/qt/ti_pages_logic.h`, `selfdrive/ui/qt/sidebar.cc`, `frogpilot/ui/qt/offroad/lateral_settings.cc`)
 - Reads our params (TiCurveStatus, TiTuningStats). Rate and memory behaviour NOT verified here; the Python guards do not cover it.
+- Curve element (`selfdrive/ui/qt/onroad/ti_curve_view.{h,cc}`, rules in `ti_curve_view_logic.h`): AnnotatedCameraWidget reads tmpfs
+  TiCurveView every 2nd updateState (10 Hz), parses only a changed text into fixed arrays, draws every frame on one preallocated
+  layer. Offscreen in Docker (x86 raster, 2160x1080): mean 1.2 ms, p99 2.0 ms per frame while shown; nothing when hidden.
 
 ## Python version
 - Device: `.python-version` = 3.11.4 (used by `tools/install_python_dependencies.sh:44`), `pyproject.toml:47` mypy 3.11,
