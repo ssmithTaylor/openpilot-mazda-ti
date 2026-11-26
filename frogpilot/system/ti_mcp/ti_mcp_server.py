@@ -1905,7 +1905,19 @@ def publish_address(bind_host, port):
     time.sleep(5)
 
 
+def off_control_core():
+  """Cores 0-3 only, before any thread starts (the threads inherit it): never core 4, where controlsd and card run real-time
+  (core-4 budget, 2026-11-26: seen there in the drive logs). Never raises; a host without sched_setaffinity keeps its cores."""
+  try:
+    cores = [c for c in os.sched_getaffinity(0) if c in (0, 1, 2, 3)]
+    if cores:
+      os.sched_setaffinity(0, cores)
+  except Exception:
+    pass
+
+
 def main():
+  off_control_core()
   host = os.getenv("TI_MCP_HOST", "0.0.0.0")
   port = int(os.getenv("TI_MCP_PORT", "8756"))
   threading.Thread(target=snapshot.run, daemon=True).start()
