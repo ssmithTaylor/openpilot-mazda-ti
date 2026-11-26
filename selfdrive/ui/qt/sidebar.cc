@@ -1980,28 +1980,41 @@ void TestsWindow::drawTitle(QPainter &p, const QRect &r, const QString &text, in
 void TestsWindow::drawHome(QPainter &p) {
   using namespace ti_pages;
   const QColor white(0xff, 0xff, 0xff);
-  const QColor grey(0x33, 0x33, 0x33);
+  // restyle (owner, 2026-11-26: the round-2 before/after sheet): dark cards with a hairline edge, the state as an accent bar and a
+  // dot with the words in white, quieter navigation; the same content and every control in its own rectangle (ctlRect)
+  const QColor panel(26, 26, 30), hair(255, 255, 255, 40), dim(170, 170, 176), amber(218, 202, 37), go(0x17, 0x86, 0x44);
+  auto card = [&](const QRect &r, int radius, const QColor &fill, const QColor &edge, int w) {
+    p.setPen(Qt::NoPen);
+    p.setBrush(fill);
+    p.drawRoundedRect(r, radius, radius);
+    if (w > 0) {
+      p.setBrush(Qt::NoBrush);
+      p.setPen(QPen(edge, w));
+      p.drawRoundedRect(QRectF(r).adjusted(w / 2.0, w / 2.0, -w / 2.0, -w / 2.0), radius - w / 2.0, radius - w / 2.0);
+    }
+  };
   TiHomeStrings keep;
   const HomeState hs = homeState(keep);
   const HomeLines lines = home(hs);
 
-  // The status band: its colour is the state (the same colours on every page), its words say the same
-  const ToneColor tc = toneColor(lines.primary.tone);
-  const QColor ink = tc.light ? QColor(0, 0, 0) : white;
+  // The status card: the state's colour (the same colours on every page) as an accent bar and a dot; its words say the same
   const QRect band(HOME_PRIMARY.x, HOME_PRIMARY.y, HOME_PRIMARY.w, HOME_SECOND.bottom() - HOME_PRIMARY.y);
+  card(band, 32, panel, hair, 3);
   p.setPen(Qt::NoPen);
   p.setBrush(toneQColor(lines.primary.tone));
-  p.drawRoundedRect(band, 24, 24);
-  p.setPen(ink);
-  p.setFont(InterFont(PRIMARY_PX, QFont::Bold));
-  p.drawText(qr(HOME_PRIMARY).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.primary.text));
-  p.setFont(InterFont(SECOND_PX, QFont::DemiBold));
-  p.drawText(qr(HOME_SECOND).adjusted(24, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.second));
+  p.drawRoundedRect(QRect(band.x(), band.y(), 24, band.height()), 12, 12);
+  p.drawEllipse(QRect(band.x() + 60, HOME_PRIMARY.y + 52, 44, 44));
+  p.setPen(white);
+  p.setFont(InterFont(PRIMARY_PX - 4, QFont::Bold));
+  p.drawText(qr(HOME_PRIMARY).adjusted(130, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.primary.text));
+  p.setPen(QColor(220, 220, 224));
+  p.setFont(InterFont(SECOND_PX - 10, QFont::DemiBold));
+  p.drawText(qr(HOME_SECOND).adjusted(64, 0, -24, 0), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(lines.second));
 
   // What will run, in plain words
   const std::string other_mode = (carRunning(hs) && otherModeOn(hs)) ? otherModeLine(hs) : std::string();
-  p.setPen((plan_ok && other_mode.empty()) ? white : QColor(218, 202, 37));
-  p.setFont(InterFont(CHOSEN_PX, QFont::DemiBold));
+  p.setPen((plan_ok && other_mode.empty()) ? dim : amber);
+  p.setFont(InterFont(CHOSEN_PX - 12, QFont::Medium));
   p.drawText(qr(HOME_EXPERIMENT).adjusted(24, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter,
              !other_mode.empty() ? QString::fromStdString(other_mode) :
              QString::fromStdString(planLine(plan_ok, plan_problem_text.toStdString(), plan.has_alt, plan.has_alt ? plan.setting.c_str() : "", !(plan.optional_win[0] && plan.optional_win[1] && plan.optional_win[2] && plan.optional_win[3]))));
@@ -2030,27 +2043,47 @@ void TestsWindow::drawHome(QPainter &p) {
     p.drawText(QRect(area.x(), area.y() + 180, area.width(), 56), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[2]));
     p.drawText(QRect(area.x(), area.y() + 236, area.width(), 56), Qt::AlignLeft | Qt::AlignVCenter, QString::fromStdString(msg[3]));
   }
-  if (show_bands) {
+  if (show_bands && n_bands > 0) {
+    // the bands as cards side by side inside START's rectangle: the speed large, what is left, its range; green outline and NOW:
+    // time is counting in this band; amber outline: the car is in it but nothing counts yet; DONE: dimmed, a full bar
     const QRect area = ctlRect(CTL_START);
+    const int gap = 26, cw = (area.width() - (n_bands - 1) * gap) / n_bands;
     for (int i = 0; i < n_bands; i++) {
-      const QRect row(area.x(), area.y() + i * 70, area.width(), 66);
+      const QRect r(area.x() + i * (cw + gap), area.y(), cw, area.height());
       const bool inside = bandIndexAt(bands, n_bands, hs.mph) == i && hs.have_speed;
-      p.setPen(Qt::NoPen);
-      // green: time is counting in this band now; amber: the car is in it but nothing counts yet; dim green: done
-      p.setBrush(i == counting ? QColor(0x17, 0x86, 0x44) : (inside ? QColor(0x6b, 0x5e, 0x10) : (bands[i].done ? QColor(0x1f, 0x3a, 0x2a) : QColor(0x22, 0x22, 0x22))));
-      p.drawRoundedRect(row, 18, 18);
+      const bool now = i == counting;
+      card(r, 32, now ? QColor(32, 48, 38) : panel, now ? go : (inside ? amber : hair), (now || inside) ? 6 : 3);
+      const QRect top_line = r.adjusted(32, 16, -30, -(r.height() - 60));
+      p.setFont(InterFont(30, QFont::DemiBold));
+      p.setPen(now || bands[i].done ? QColor(128, 216, 166) : (inside ? amber : dim));
+      p.drawText(top_line, Qt::AlignLeft | Qt::AlignVCenter, now ? "NOW" : (bands[i].done ? "DONE" : "NEEDED"));
+      p.setFont(InterFont(28));
+      p.setPen(dim);
+      p.drawText(top_line, Qt::AlignRight | Qt::AlignVCenter, QString::fromStdString(bandRange(bands[i], is_metric)));
+      // "34 mph  6 min" / "24 mph  done" (bandText): the number large, the unit small, the rest on its own line
+      const QStringList parts = QString::fromStdString(bandText(bands[i], is_metric)).split("  ");
+      const QStringList head = parts.value(0).split(" ");
+      const QRect num = r.adjusted(32, 56, -32, -(r.height() - 176));
+      p.setFont(InterFont(110, QFont::Bold));
+      p.setPen(bands[i].done ? QColor(150, 150, 155) : white);
+      p.drawText(num, Qt::AlignLeft | Qt::AlignVCenter, head.value(0));
+      const int nw = p.fontMetrics().horizontalAdvance(head.value(0));
+      p.setFont(InterFont(40));
+      p.setPen(dim);
+      p.drawText(num.adjusted(nw + 14, 30, 0, 0), Qt::AlignLeft | Qt::AlignVCenter, head.value(1));
+      p.setFont(InterFont(46, QFont::DemiBold));
       p.setPen(white);
-      p.setFont(InterFont(BAND_PX, QFont::Bold));
-      p.drawText(row.adjusted(24, 0, -420, 0), Qt::AlignLeft | Qt::AlignVCenter,
-                 (bands[i].done ? QString("✓ ") : QString()) + QString::fromStdString(bandText(bands[i], is_metric)));
-      p.setPen(QColor(0xc9, 0xc9, 0xc9));
-      p.setFont(InterFont(DETAIL_PX));
-      p.drawText(row.adjusted(0, 0, -24, 0), Qt::AlignRight | Qt::AlignVCenter, QString::fromStdString(bandRange(bands[i], is_metric)));
+      p.drawText(r.adjusted(32, 176, -32, -(r.height() - 232)), Qt::AlignLeft | Qt::AlignVCenter,
+                 bands[i].done ? QString::fromUtf8("\u2713 done") : parts.value(1) + " left");
+      const QRect bar = r.adjusted(32, r.height() - 42, -32, -30);
+      p.setPen(Qt::NoPen);
+      p.setBrush(bands[i].done ? go : QColor(255, 255, 255, 30));
+      p.drawRoundedRect(bar, 6, 6);
     }
-    p.setPen(QColor(0xc9, 0xc9, 0xc9));
-    p.setFont(InterFont(DETAIL_PX));
+    p.setPen(dim);
+    p.setFont(InterFont(DETAIL_PX, QFont::Medium));
     if (bandsTotalMinutes(bands, n_bands) > 0) {
-      p.drawText(QRect(area.x(), area.y() + n_bands * 70 + 4, area.width(), 44), Qt::AlignLeft | Qt::AlignVCenter,
+      p.drawText(area.adjusted(0, area.height() + 8, 0, 52), Qt::AlignLeft | Qt::AlignVCenter,
                  QString::fromStdString(std::string("About ") + std::to_string((int)bandsTotalMinutes(bands, n_bands)) + " min of driving left in all"));
     }
   }
@@ -2064,11 +2097,40 @@ void TestsWindow::drawHome(QPainter &p) {
   drawBox2(p, ctlRect(CTL_STOP), any ? QColor(201, 34, 49) : QColor(0x6b, 0x1d, 0x25), any ? white : QColor(0xc9, 0xc9, 0xc9),
            QString("STOP"), STOP_PX, QString("stops every test and the A/B relay"), START_SUB_PX);
 
-  // Navigation at the screen edge
-  drawBox(p, ctlRect(CTL_BACK), locked ? QColor(0x1a, 0x1a, 0x1a) : grey, locked ? QColor(0x55, 0x55, 0x55) : white, QString("< EXIT"), NAV_PX);
-  drawBox(p, ctlRect(CTL_NAV_SETUP), grey, white, QString("PLAN\nDETAILS >"), NAV_PX);
-  drawBox(p, ctlRect(CTL_NAV_PROGRESS), grey, white, QString("PROGRESS >"), NAV_PX);
-  drawEngagedBadge(p, qr(HOME_BADGE));
+  // Navigation at the screen edge: quieter cards, the label at the left, a chevron at the right; the same targets
+  const struct { int id; const char *label; bool back; } nav[] = {{CTL_BACK, "Exit", true}, {CTL_NAV_SETUP, "Plan details", false},
+                                                                  {CTL_NAV_PROGRESS, "Progress", false}};
+  for (const auto &nv : nav) {
+    const QRect r = ctlRect(nv.id);
+    const bool off = nv.back && locked;
+    card(r, 32, off ? QColor(0x14, 0x14, 0x16) : panel, hair, 3);
+    p.setPen(off ? QColor(0x55, 0x55, 0x55) : white);
+    p.setFont(InterFont(NAV_PX + 2, QFont::DemiBold));
+    p.drawText(r.adjusted(nv.back ? 40 : 36, 0, -20, 0), Qt::AlignLeft | Qt::AlignVCenter,
+               nv.back ? QString::fromUtf8("\u2039  ") + nv.label : QString(nv.label));
+    if (!nv.back) {
+      p.setPen(dim);
+      p.setFont(InterFont(64));
+      p.drawText(r.adjusted(0, 0, -36, 0), Qt::AlignRight | Qt::AlignVCenter, QString::fromUtf8("\u203a"));
+    }
+  }
+  // the engaged badge: a pill in the road view's status colour, a dot and the word
+  {
+    const UIStatus st = uiState()->status;
+    const bool engaged = st != STATUS_DISENGAGED && st != STATUS_OVERRIDE;
+    const QColor c = engaged ? go : (st == STATUS_OVERRIDE ? amber : QColor(0x54, 0x54, 0x54));
+    const QRect pill = qr(HOME_BADGE);
+    QColor fill = c;
+    fill.setAlpha(60);
+    card(pill, pill.height() / 2, fill, c, 3);
+    p.setPen(Qt::NoPen);
+    p.setBrush(c);
+    p.drawEllipse(QRect(pill.x() + 28, pill.center().y() - 12, 24, 24));
+    p.setPen(white);
+    p.setFont(InterFont(38, QFont::DemiBold));
+    p.drawText(pill.adjusted(70, 0, -10, 0), Qt::AlignLeft | Qt::AlignVCenter,
+               engaged ? QString("Engaged") : st == STATUS_OVERRIDE ? QString("Override") : QString("Not engaged"));
+  }
 
   // Detail (not needed while driving). Line 1: what this drive has added since START. Line 2: why the tests are held, or the
   // alternation's minutes against its target.
@@ -2087,11 +2149,11 @@ void TestsWindow::drawHome(QPainter &p) {
     abDisplay(a_s, b_s, known, target);
     detail1 = QString::fromStdString(thisDriveLine(win, std::max(0.0, a_s - drive_base_a), std::max(0.0, b_s - drive_base_b), ab_configured, is_metric));
   }
-  p.setPen(QColor(0xc9, 0xc9, 0xc9));
-  p.setFont(InterFont(DETAIL_PX));
+  p.setPen(dim);
+  p.setFont(InterFont(DETAIL_PX - 2, QFont::Medium));
   p.drawText(qr(HOME_DETAIL), Qt::AlignLeft | Qt::AlignVCenter, detail1);
   QString detail2;
-  QColor detail_color(0xc9, 0xc9, 0xc9);
+  QColor detail_color = dim;
   if (!ab_hold_why.isEmpty() && ti_ab::holdText(ab_hold_why.toStdString().c_str())[0] != 0) {
     detail2 = QString(ti_ab::holdText(ab_hold_why.toStdString().c_str()));
     detail_color = QColor(218, 202, 37);
