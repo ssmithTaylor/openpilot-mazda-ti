@@ -95,6 +95,14 @@ void AnnotatedCameraWidget::updateState(const UIState &s, const FrogPilotUIState
   hideBottomIcons |= (frogpilot_nvg->signalStyle == "traditional" || frogpilot_nvg->signalStyle == "traditional_gif") && (car_state.getLeftBlinker() || car_state.getRightBlinker());
   status = s.status;
 
+  // curve slowing's screen element: the planner's output at 10 Hz (a tmpfs read; parsed only when it changed); engaged and the
+  // speed for its visibility rule (ti_curve_view_logic.h)
+  if (curve_read_tick++ % 2 == 0) {
+    curve_view.setPayload(curve_params.get(ti_view::PARAM_KEY));
+  }
+  curve_engaged = s.status == STATUS_ENGAGED || s.status == STATUS_OVERRIDE;
+  curve_mph = cs_alive ? std::max<float>(0.0, car_state.getVEgo()) * MS_TO_MPH : 0.0;
+
   // update engageability/experimental mode button
   experimental_btn->updateState(s, fs, frogpilot_toggles);
 
@@ -595,6 +603,14 @@ void AnnotatedCameraWidget::paintEvent(QPaintEvent *event) {
   }
 
   drawHud(painter, frogpilotPlan, *fs, frogpilot_toggles);
+
+  // curve slowing: the road-ahead ribbon and, on approach, the chip beside the MAX box (nothing when off / stale / not engaged / slow)
+  {
+    const double now_mono = TiCurveView::monotonicNow();
+    const double dt = curve_draw_t > 0 ? now_mono - curve_draw_t : 1.0 / UI_FREQ;
+    curve_draw_t = now_mono;
+    curve_view.draw(painter, now_mono, curve_engaged, curve_mph, frogpilot_nvg->setSpeedRect, QPoint(UI_BORDER_SIZE, UI_BORDER_SIZE), dt);
+  }
 
   double cur_draw_t = millis_since_boot();
   double dt = cur_draw_t - prev_draw_t;

@@ -3,7 +3,9 @@
 #include <QVBoxLayout>
 #include <memory>
 
+#include "common/params.h"
 #include "selfdrive/ui/qt/onroad/buttons.h"
+#include "selfdrive/ui/qt/onroad/ti_curve_view.h"
 #include "selfdrive/ui/qt/widgets/cameraview.h"
 
 #include "frogpilot/ui/qt/onroad/frogpilot_annotated_camera.h"
@@ -49,6 +51,14 @@ private:
 
   int skip_frame_count = 0;
   bool wide_cam_requested = false;
+
+  // curve slowing's driving-screen element (ti_curve_view.h): the planner's tmpfs TiCurveView read at 10 Hz, drawn every frame
+  TiCurveView curve_view;
+  Params curve_params{"/dev/shm/params"};
+  int curve_read_tick = 0;
+  bool curve_engaged = false;
+  double curve_mph = 0.0;
+  double curve_draw_t = 0.0;
 
   // FrogPilot variables
   void paintEvent(QPaintEvent *event) override;
