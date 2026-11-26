@@ -327,7 +327,7 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "fk", "nc", "wall_us", "scr")
+             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "nc", "wall_us", "scr")
 TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carries (REPLAY above), and the plan's "ask" (stage 3's
                                           # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
 TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
@@ -486,10 +486,6 @@ def tick_log(plan, extras):
     d["rm"] = plan.diag["rm"]       # beside the remembered road (road matching): why, "far" / "dev" / "lead" / "link"
   if isinstance((plan.diag or {}).get("nc"), int):
     d["nc"] = plan.diag["nc"]       # cold cruise-model simulations in this tick's step (cost; perf 2026-11-26)
-  if (plan.diag or {}).get("fk"):
-    # forks (ti_curve_plan FORK_*): the first fork ahead [why: 1 link / 2 straighter road / 3 turn signal, continuations, chosen
-    # (0 = the link), whole metres to it]; indices only, never a position or a name
-    d["fk"] = [int(x) for x in plan.diag["fk"]][:4]
   for k, nd in (("v", 1), ("gap", 1), ("a", 2), ("dec", 2), ("lay", 2), ("lacc", 2), ("des", 2), ("rate", 1)):
     if k in d:
       d[k] = _r(d[k], nd)
@@ -564,15 +560,13 @@ PLANNER_STEP_INPUTS = {
   "v": "carState.vEgo (rlog)", "set_mph": "carState.cruiseState (rlog); tick set", "yaw_k": "can 0x075 / liveLocationKalman (rlog)",
   "model_k": "modelV2 (rlog; fresh_model's age / drops: tick fcx)", "limit_mph": "frogpilotPlan.slcMapSpeedLimit (rlog)",
   "ref_mph": "tick cs[0]", "floor_mph": "tick cs[1]", "acting": "tick cs[2]", "map_k": "tick mpr + map_list (logged_inputs)",
-  "blinker": "carState.leftBlinker / rightBlinker (rlog)",
-  "blink_side": "carState.leftBlinker / rightBlinker (rlog; also tick drv bits DRV_LBLINK / DRV_RBLINK)"}
+  "blinker": "carState.leftBlinker / rightBlinker (rlog)"}
 PLANNER_STATE = {
   "active": "s1", "map_active": "s1", "s2": "s2", "fc": "fc", "ahead_la": "ahead", "alert": "alert", "behind": "beh",
   "released": "rel", "rm_why": "rm", "ask": "ask", "events": "the planner events (ti_curve_plan channel), drained every tick",
   "mem": _FX, "need": _FX, "need_hi": _FX, "kabs": _FX, "kmed": _FX, "rec_hi": _FX, "rec_lo": _FX, "_attested": _FX, "model": _FX,
-  "fc_ratio": _FX, "hi": _FX, "fk": "fk",
+  "fc_ratio": _FX, "hi": _FX,
   "_cold0": "a cost cache's counter (COLD) at the tick's start: the tick record's nc is its growth over the tick",
-  "_fork_cache": "a cost cache of the continuations of each trace (a pure function of the road memory)",
   "_prof_cache": "a cost cache of _profile_over keyed by its inputs (same inputs, same answer)",
   "view": _RP + "; what the screen showed from it is the tick's scr",
 }
@@ -580,7 +574,7 @@ for _a in ("alerted", "alerting", "alts", "bend_left_t", "bend_low_t", "bend_on"
            "distrust_until", "distrust_why", "dr_bad_m", "dr_hist", "dr_m", "dr_why", "end_m", "fix_age", "guard", "hist", "hold_latch",
            "int_base", "int_floor", "latch", "limit", "live_k", "locked", "map_bends", "map_seq", "mem_stage", "miss_s", "model_k",
            "odo", "off_s", "pos", "resp", "resp_t", "rm", "rm_n", "rm_off", "s2_run", "s2_seq", "s2_t0", "stable_s", "t", "trace",
-           "_gb", "cap_out", "need_out", "ref_now", "chain", "int_passed", "fork", "blink_l_t", "blink_r_t"):
+           "_gb", "cap_out", "need_out", "ref_now", "chain", "int_passed"):
   PLANNER_STATE.setdefault(_a, _RP)
 
 
@@ -689,8 +683,7 @@ def main():
       s0 = time.perf_counter()
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=mk_, limit_mph=limit,
                           ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k,     # = logged_inputs(tick, lists)
-                          blinker=bool(cs.leftBlinker or cs.rightBlinker),     # stage 2 is off with a blinker (plan T5)
-                          blink_side=int(bool(cs.leftBlinker)) - int(bool(cs.rightBlinker)))   # forks: toward a branch
+                          blinker=bool(cs.leftBlinker or cs.rightBlinker))     # stage 2 is off with a blinker (plan T5)
       step_us = int(round(1e6 * (time.perf_counter() - s0)))
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")

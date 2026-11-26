@@ -488,32 +488,6 @@ RM_STEADY_DEG = 1.5             # ... and the heading difference within this (it
 # phantom returns at 1.6 mph / 5 mph-s (road-match-build sensitivity run); the builder fix (lane-scale absorption) is the cure
 RM_ABS_M = 8.0
 RM_REF_TAU_S = 20.0             # while on and not yet steady the reference follows the offset this slowly
-# Beside the record (a lane change, a GPS offset, a matcher miss) NEVER drops a slowdown, its ceiling, guard, latched warning or hold,
-# and never delays a warning: the slowdown in progress runs on by dead reckoning to the bend's end (independent review of
-# integ-20261126, finding 1: a broad drop on "beside" lost the ceiling and the warning 73 m before a bend after two lane changes). Only
-# a POSITIVE match on the other road past a fork drops what was planned on the road not taken (`_fork_switch` -> `_drop_for_switch`),
-# unless the car is cornering itself (its yaw-sensor in-bend state, REL_*; review C1).
-# FORKS (owner, 2026-11-25: "assume that the driver is going to continue on the same road until they don't"). At the end of a trace
-# with a continuation link, the planner's look-ahead AND its lock follow the SAME ROAD: among the link and the other remembered roads
-# starting or passing within FORK_R_M of the trace's last point (ahead of it by at least -FORK_BACK_M, within FORK_LAT_M sideways and
-# FORK_HDG_DEG of its heading), the straightest over FORK_LOOK_M (the largest heading change from the trace's end heading); the link
-# is kept unless another is straighter by more than FORK_MARGIN_DEG. The memory carries no road identity (name / ref) per trace, so
-# the map's road name cannot pick a trace on the device; the straightest continuation is the rule (the map service's own path past a
-# junction also follows the same name / ref first). Exception: the driver's turn signal (on within FORK_BLINK_S) toward a branch that
-# turns that way by more than FORK_MARGIN_DEG beyond the straightest makes it the plan (the one turning most that way). A branch not
-# planned on is planned as soon as the car is matched on it: within FORK_KEEP_M past the fork, a fix that matches one of the other
-# continuations better (SWITCH_MARGIN_M for SWITCH_S, or the only match) moves the lock onto it at once (no new STABLE_S match) and
-# drops what was planned on the road not taken. A trace end with no link is unchanged (the look-ahead and the lock stop there).
-FORK_ON = True
-FORK_R_M = 60.0
-FORK_BACK_M = 10.0
-FORK_LAT_M = 15.0
-FORK_HDG_DEG = 30.0
-FORK_LOOK_M = 100.0
-FORK_MARGIN_DEG = 5.0
-FORK_BLINK_S = 3.0
-FORK_KEEP_M = 300.0
-FORK_NONE, FORK_LINK, FORK_STRAIGHT, FORK_SIGNAL = 0, 1, 2, 3     # the tick record's "fk" code (why the plan took that continuation)
 TRACK_WINDOW_M = 40.0          # while locked, a fix must land within this of the predicted along-road position
 FIX_GAIN = 0.3                  # how far a fix pulls the dead-reckoned position
 STABLE_S = 3.0                  # a new match must stay consistent this long before it is trusted
@@ -784,7 +758,6 @@ class Planner:
         self.need_hi = np.where(np.isfinite(bh), np.minimum(self.need_hi, bh), self.need_hi)
       self.kabs = np.abs(self.kmed)
     self.limit = None
-    self._fork_cache = {}                 # FORK_*: trace -> its continuations (a cost cache: a pure function of the memory)
     self.model = D.DEFAULT_FC_MODEL if model is None else model
     self.fc_ratio, fc_known = D.fc_ratio_for(self.model)
     self.reset()
@@ -801,10 +774,7 @@ class Planner:
     self.alts, self.off_s = [], 0.0     # other remembered roads as near as the locked one; seconds one has been nearer
     self.rm, self.rm_off, self.rm_why = None, False, ""   # road matching (RM_*): offset state; beside the trace; why (for the log)
     self.rm_n = 0
-    self.fork = None                    # FORK_*: the fork the lock last crossed: {from, end, p_in, along, alts [(trace, point)], until}
-    self.fk = None                      # FORK_*: this tick's first fork ahead [code, continuations, chosen (0 = the link), metres]
     self.view = None                    # (point indices, metres ahead, needs) of this tick's trusted look-ahead, for the screen
-    self.blink_l_t, self.blink_r_t = -1e9, -1e9   # the last tick with the left / right signal on (FORK_BLINK_S)
     self.fix_age = 1e9
     self.dr_m, self.dr_bad_m, self.dr_hist = 0.0, 0.0, []   # dead reckoning (DR_*): metres since the last fix, in disagreement; (odo,
     #                                                         live k, pos)
@@ -875,7 +845,6 @@ class Planner:
     self.trace = -1
     self.alts, self.off_s = [], 0.0
     self.rm, self.rm_off, self.rm_why = None, False, ""
-    self.fork = None
     self.cmp = []
     if not keep_active:
       self.active = {}
@@ -887,13 +856,6 @@ class Planner:
   def _advance(self, dist):
     """Move along the trace by `dist` metres; follows the continuation link at the end, or loses the lock."""
     mem = self.mem
-    fk = self.fork
-    if fk is not None and fk["hold_m"] > 0.0:
-      # FORK_*: crossing the gap between the trace's last point and a continuation that starts further on: the place is held at
-      # the continuation's first point until the car reaches it
-      use = min(dist, fk["hold_m"])
-      fk["hold_m"] -= use
-      dist -= use
     self.pos += dist / mem.spacing
     end = mem.trace_end(self.trace) - 1
     while self.pos > end:
@@ -902,27 +864,12 @@ class Planner:
         self._lose("remembered road ends")
         return
       over = self.pos - end - 1
-      pick = self._fork_pick(self.trace)          # FORK_*: the same road (the link unless another continuation is straighter)
-      hold = 0.0
-      if pick is None or pick[0] == 0:
-        k, u, p = 0, nxt, int(mem.trace_start[nxt])
-        pos = mem.trace_start[nxt] + max(0.0, over)
-      else:
-        k, (u, p, along, _) = pick[0], self._fork_cands(self.trace)[pick[0]]
-        past_m = (over + 1.0) * mem.spacing - along      # metres the car is past the continuation's first point
-        pos, hold = p + max(0.0, past_m) / mem.spacing, max(0.0, -past_m)
-      if FORK_ON and pick is not None and pick[2] > 1:
-        c = self._fork_cands(self.trace)
-        self.fork = {"from": self.trace, "end": end, "p_in": p, "along": float(c[k][2]), "hold_m": hold,
-                     "alts": [(c[j][0], c[j][1]) for j in range(len(c)) if j != k], "until": self.odo + FORK_KEEP_M}
-        self.events.append({"kind": "fork", "trace": self.trace, "to": int(u), "why": pick[1], "n": pick[2], "k": k})
-      self.trace, self.pos = int(u), float(pos)
-      end = mem.trace_end(self.trace) - 1
+      self.trace = nxt
+      self.pos = mem.trace_start[nxt] + max(0.0, over)
+      end = mem.trace_end(nxt) - 1
 
   def _localise(self, dt, fix, v):
     mem = self.mem
-    if self.fork is not None and self.odo > self.fork["until"]:
-      self.fork = None
     if self.locked:
       self._advance(v * dt)
     if self.cand is not None:
@@ -956,22 +903,13 @@ class Planner:
           if alts and alts[0][0] + SWITCH_MARGIN_M < best[0]:
             self.off_s += dt
             if self.off_s >= SWITCH_S:
-              if self._fork_alt(alts[0][1]):
-                self._fork_switch(alts[0][1], alts[0][2], fix, v, "nearer")   # FORK_*: matched on the road not planned
-              else:
-                self._lose("a nearer remembered road")
+              self._lose("a nearer remembered road")
           else:
             self.off_s = 0.0
         else:
-          fa = next(((tr, p) for lat, tr, p in cands if self._fork_alt(tr)), None)
-          if self.fork is not None and self.fork["hold_m"] > 0.0:
-            pass                                       # FORK_*: in the gap before the planned continuation starts: no verdict yet
-          elif fa is not None:
-            self._fork_switch(fa[0], fa[1], fix, v, "only")             # FORK_*: the only match is the other continuation
-          else:
-            self.miss_s += dt
-            if self.miss_s >= MISS_S:
-              self._lose("fixes left the remembered road")
+          self.miss_s += dt
+          if self.miss_s >= MISS_S:
+            self._lose("fixes left the remembered road")
       if not self.locked:
         if not cands:
           self.cand, self.stable_s = None, 0.0
@@ -1088,7 +1026,7 @@ class Planner:
       # relative figures only (metres across, degrees): never a position
       self.events.append({"kind": "rm_off" if off else "rm_on", "why": why if off else "", "trace": self.trace,
                           "lat": round(lat_f, 1), "dh": round(math.degrees(dh_f), 1)})
-      if off and self.active:                      # beside is not a fork: runs on, dead reckoned (see RM_* above)
+      if off and self.active:
         self.dr_why = "beside the remembered road"
         self.events.append({"kind": "dead_reckon", "why": self.dr_why, "n": len(self.active),
                             "T": int(min(a_["T"] for a_ in self.active.values()))})
@@ -1125,157 +1063,7 @@ class Planner:
     for prev in range(mem.n_traces):
       if mem.trace_next[prev] == self.trace and tr == prev:
         return -((self.pos - mem.trace_start[self.trace]) + (mem.trace_end(prev) - p))
-    fk = self.fork
-    if fk is not None and tr == fk["from"]:
-      # FORK_*: the trace the lock came from through a fork (its continuation may be a road it does not link to)
-      return -((self.pos - fk["p_in"]) + (fk["end"] - p) + fk["along"] / mem.spacing)
     return None
-
-  # ---- forks (FORK_*) --------------------------------------------------------------------------------------------------------------
-  def _fork_cands(self, t):
-    """The continuations of trace t past its last point: [(trace, first point on it, metres past t's last point, signed heading
-    change in degrees over FORK_LOOK_M from t's end heading)], the LINK first; [] without a link. Cached per trace (the memory's)."""
-    c = self._fork_cache.get(t)
-    if c is not None:
-      return c
-    mem = self.mem
-    nxt = int(mem.trace_next[t])
-    out = []
-    if nxt >= 0:
-      e = mem.trace_end(t) - 1
-      he = float(mem.hdg[e])
-      f = int(mem.trace_start[nxt])
-      out.append((nxt, f, float(mem.project(e, mem.x[f], mem.y[f])[0]), self._turn_deg(nxt, f, he)))
-      best = {}
-      for i in mem.near(float(mem.x[e]), float(mem.y[e]), FORK_R_M):
-        u = int(mem.trace_of[i])
-        if u == t or u == nxt:
-          continue
-        along, lat = mem.project(e, float(mem.x[i]), float(mem.y[i]))
-        if along < -FORK_BACK_M or abs(lat) > FORK_LAT_M or abs(math.degrees(M.wrap(float(mem.hdg[i]) - he))) > FORK_HDG_DEG:
-          continue
-        if int(i) >= mem.trace_end(u) - 1:
-          continue                                   # its last point: nothing of it lies ahead
-        if u not in best or abs(along) < abs(best[u][1]):
-          best[u] = (int(i), along)
-      for u in sorted(best, key=lambda u_: (best[u_][1], u_)):
-        i, along = best[u]
-        out.append((u, i, float(along), self._turn_deg(u, i, he)))
-    self._fork_cache[t] = out
-    return out
-
-  def _turn_deg(self, u, i, he):
-    idx, _ = self.mem.ahead(u, i, FORK_LOOK_M)
-    if not len(idx):
-      return 0.0
-    dh = (self.mem.hdg[idx] - he + math.pi) % (2.0 * math.pi) - math.pi
-    j = int(np.argmax(np.abs(dh)))
-    return round(math.degrees(float(dh[j])), 1)
-
-  def _blink_side(self):
-    """+1: the left signal on within FORK_BLINK_S (and not the right), -1 the right, 0 neither or both."""
-    t = self.t if self.t is not None else 0.0
-    lft, rgt = t - self.blink_l_t <= FORK_BLINK_S, t - self.blink_r_t <= FORK_BLINK_S
-    return 1 if lft and not rgt else -1 if rgt and not lft else 0
-
-  def _fork_pick(self, t):
-    """FORK_*: which continuation of trace t is the plan -> (index into _fork_cands(t), code, number of continuations), or None
-    without a link."""
-    c = self._fork_cands(t)
-    if not c:
-      return None
-    if len(c) == 1 or not FORK_ON:
-      return 0, FORK_LINK, len(c)
-    st = min(range(len(c)), key=lambda k: (abs(c[k][3]), k))
-    side = self._blink_side()
-    if side:
-      br = [k for k in range(len(c)) if side * c[k][3] >= side * c[st][3] + FORK_MARGIN_DEG]
-      if br:
-        return max(br, key=lambda k: (side * c[k][3], -k)), FORK_SIGNAL, len(c)
-    if abs(c[0][3]) <= abs(c[st][3]) + FORK_MARGIN_DEG:
-      return 0, FORK_LINK, len(c)
-    return st, FORK_STRAIGHT, len(c)
-
-  def _fork_alt(self, tr):
-    return self.fork is not None and any(u == tr for u, _ in self.fork["alts"])
-
-  def _fork_switch(self, tr, p, fix, v, why):
-    """FORK_*: the car is matched on a continuation the plan did not take: the lock moves onto it at once, and what was planned on
-    the road not taken is dropped (unless the car is cornering itself)."""
-    self.events.append({"kind": "fork_switch", "trace": self.trace, "to": int(tr), "why": why})
-    self.trace, self.pos = int(tr), float(p)
-    self.fork, self.off_s, self.miss_s, self.alts = None, 0.0, 0.0, []
-    self.rm, self.rm_off, self.rm_why = None, False, ""
-    self.cmp = []
-    self.cmp_next = self.odo
-    if RM_ON:
-      self._rm_update(0.0, fix, v, int(tr), int(round(p)))
-    self._drop_for_switch(int(tr), "matched on the other road at a fork")
-
-  def _drop_for_switch(self, new_tr, why):
-    """FORK_*: the plan has moved onto remembered road `new_tr` (a positive match past a fork, never a "beside the record" flag):
-    what was planned for bends NOT on it (slowdowns in progress, their guard, latched warnings, latched hold) is dropped now, and
-    logged every time anything is (rm_drop: n slowdowns, nl latched warnings, nh holds), unless the car is cornering itself (bend_on):
-    then all of it is kept and runs on by dead reckoning (logged dead_reckon). Keys that are not memory points (model, stage 2) and
-    bends on the new road are never touched."""
-    if self.bend_on:
-      if self.active:
-        self.dr_why = why
-        self.events.append({"kind": "dead_reckon", "why": why, "n": len(self.active),
-                            "T": int(min(a_["T"] for a_ in self.active.values()))})
-      return
-    drop = self._keys_off_road(self.active, new_tr)
-    nl = self._keys_off_road(self.latch, new_tr)
-    nh = self._keys_off_road(self.hold_latch, new_tr)
-    if drop or nl or nh:
-      self.events.append({"kind": "rm_drop", "why": why, "n": len(drop), "nl": len(nl), "nh": len(nh),
-                          "T": int(min(self.active[k]["T"] for k in drop)) if drop else -1})
-    for k in drop:
-      self.guard.pop(k, None)
-      self._prof_cache.pop(k, None)
-      del self.active[k]
-    for k in nl:
-      del self.latch[k]
-    for k in nh:
-      del self.hold_latch[k]
-
-  def _keys_off_road(self, d, tr):
-    """The keys of `d` that are memory points on a trace other than `tr` (model / stage-2 keys are not)."""
-    trace_of = self.mem.trace_of
-    return [k for k in d if isinstance(k, (int, np.integer)) and 0 <= k < len(trace_of) and int(trace_of[k]) != tr]
-
-  def _ahead(self, t, i, dist_m, max_traces=8):
-    """Memory.ahead with the SAME-ROAD walk at trace ends (FORK_*): -> (point indices, metres ahead of point i). Where no other
-    continuation exists, exactly Memory.ahead. Sets self.fk: the first fork with more than one continuation ahead [code, n, chosen
-    index (0 = the link), whole metres to it], or None."""
-    mem = self.mem
-    idx, dist = [], []
-    d0 = 0.0
-    seen = set()
-    cur_t, cur_i = t, i
-    self.fk = None
-    while d0 <= dist_m and cur_t >= 0 and cur_t not in seen and len(seen) < max_traces:
-      seen.add(cur_t)
-      end = mem.trace_end(cur_t)
-      k = min(end - cur_i, int(math.floor((dist_m - d0) / mem.spacing)) + 1)
-      if k <= 0:
-        break
-      idx.append(np.arange(cur_i, cur_i + k))
-      dist.append(d0 + mem.spacing * np.arange(k))
-      pick = self._fork_pick(cur_t)
-      if pick is None:
-        break
-      c = self._fork_cands(cur_t)
-      if pick[2] > 1 and self.fk is None:
-        self.fk = [int(pick[1]), int(pick[2]), int(pick[0]), int(round(d0 + mem.spacing * (end - 1 - cur_i)))]
-      if pick[0] == 0:
-        d0 += mem.spacing * (end - cur_i)             # the next trace starts about one spacing after this one's last point
-      else:
-        d0 += mem.spacing * (end - 1 - cur_i) + max(c[pick[0]][2], mem.spacing)
-      cur_t, cur_i = int(c[pick[0]][0]), int(c[pick[0]][1])
-    if not idx:
-      return np.zeros(0, np.int64), np.zeros(0)
-    return np.concatenate(idx), np.concatenate(dist)
 
   def _check_change(self):
     """Live versus remembered curvature over the last CHANGE_WINDOW_M; True on a mismatch."""
@@ -1329,13 +1117,12 @@ class Planner:
 
   # ---- one tick ------------------------------------------------------------------------------------------------------------------
   def step(self, t, fix, v, set_mph=None, yaw_k=None, model_k=None, limit_mph=None, ref_mph=None, floor_mph=None, acting=True,
-           map_k=None, blinker=False, blink_side=0):
+           map_k=None, blinker=False):
     """t: seconds (monotonic); fix: Fix; v: m/s; set_mph: the cruise set speed or None; yaw_k: live curvature (1/m, left +, from the
     car's yaw sensor) or None; model_k: (seconds ahead array, curvature array) of the driving model's preview as it publishes it (RIGHT
     positive, see MODEL_K_SIGN), or None; map_k: the map's (metres ahead, |curvature|) profile (ti_curve_plannerd.map_profile; None
     when absent or stale), used by stage 1 only where no memory is known (plan T6);
-    blinker: either turn signal on (suppresses stage 2); blink_side: +1 the left signal on, -1 the right, 0 neither (FORK_*: a signal
-    toward a branch makes it the plan). -> Plan."""
+    blinker: either turn signal on (suppresses stage 2). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
     self._cold0 = COLD[0]                 # cold simulations of this tick (the tick record's "nc")
@@ -1382,11 +1169,6 @@ class Planner:
                    or (self.s2 is not None and self.s2.get("hi")))
     if blinker:
       self.blink_t = t
-    if blink_side > 0:
-      self.blink_l_t = t
-    elif blink_side < 0:
-      self.blink_r_t = t
-    self.fk = None
     self.view = None                    # the screen's input (ti_curve_view.py): this tick's look-ahead, only on trusted memory
     self.released = {k: at for k, at in self.released.items() if self.odo <= at + HOLD_AFTER_M}
     if self.mem is None:
@@ -1442,10 +1224,8 @@ class Planner:
     u = max(mph, float(set_mph)) if set_mph else mph
     look = min(LOOKAHEAD_MAX_M, max(LOOKAHEAD_MIN_M, v * LOOKAHEAD_S))
     i0 = int(math.floor(self.pos))
-    idx, dist = self._ahead(self.trace, i0, look)        # FORK_*: the same road through forks (sets self.fk for the log)
+    idx, dist = self.mem.ahead(self.trace, i0, look)
     dist = dist - (self.pos - i0) * self.mem.spacing
-    if self.fork is not None and self.fork["hold_m"] > 0.0:
-      dist = dist + self.fork["hold_m"]                 # FORK_*: the car has not reached the continuation's first point yet
     need = self._either_road((self.need_hi if self.hi else self.need)[idx].astype(np.float64), dist, look, mph)
     self.view = (idx, dist, need)       # the screen's ribbon and bends (ti_curve_view.View.step): the very arrays planned with
     # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
@@ -2234,8 +2014,6 @@ class Planner:
             "cap": cap, "ahead": ahead, "behind": behind, "alert": alert, "src": src,
             "rel": len(getattr(self, "released", {}) or {})}
     diag["nc"] = int(COLD[0] - getattr(self, "_cold0", COLD[0]))   # cold cruise-model simulations this tick (cost)
-    if getattr(self, "fk", None):
-      diag["fk"] = self.fk                        # FORK_*: the first fork ahead [code, continuations, chosen, metres]
     if getattr(self, "rm_off", False):
       diag["rm"] = self.rm_why                    # beside the remembered road: why ("far" / "dev" / "lead" / "link")
     return Plan(ceil, round(conf, 2), trusted, known, why, None if dist is None else round(dist, 1), cmph, past, model_la, capped,
