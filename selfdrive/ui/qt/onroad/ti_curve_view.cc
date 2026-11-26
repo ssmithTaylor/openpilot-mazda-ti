@@ -179,8 +179,20 @@ int TiCurveView::draw(QPainter &p, double now, bool engaged, double ui_mph, cons
   return vis;
 }
 
-void TiCurveView::drawRibbon(QPainter &p) {
+void TiCurveView::drawRibbon(QPainter &painter) {
   const int n = ribbon_.n;
+  // one layer over the fixed area (with room for the halo and the car): strokes REPLACE its pixels, as the mock-ups' layer does,
+  // so translucent runs never darken where they meet; the layer is then blended onto the camera view once
+  const int margin = 60;
+  const QPoint lo((int)AREA_X0 - margin, (int)AREA_Y0 - margin);
+  if (layer_.isNull()) {
+    layer_ = QImage((int)(AREA_X1 - AREA_X0) + 2 * margin, (int)(AREA_Y1 - AREA_Y0) + 2 * margin, QImage::Format_ARGB32_Premultiplied);
+  }
+  layer_.fill(Qt::transparent);
+  QPainter p(&layer_);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.translate(-lo);
+  p.setCompositionMode(QPainter::CompositionMode_Source);
   // 1: the soft dark halo (legible on a bright road), two passes in place of a blur; segments of equal look drawn as one polyline
   auto strokeRuns = [&](auto widthOf, auto colourOf) {
     QPolygonF run;
@@ -208,15 +220,16 @@ void TiCurveView::drawRibbon(QPainter &p) {
   };
   p.setBrush(Qt::NoBrush);
   strokeRuns([&](int i) { return style_.width[i] + HALO_EXTRA + 8; },
-             [&](int i) { return QColor(0, 0, 0, (int)std::lround(ALPHA_HALO * 0.45 * style_.fade[i])); });
-  strokeRuns([&](int i) { return style_.width[i] + HALO_EXTRA; },
-             [&](int i) { return QColor(0, 0, 0, (int)std::lround(ALPHA_HALO * 0.75 * style_.fade[i])); });
+             [&](int i) { return QColor(0, 0, 0, (int)std::lround(ALPHA_HALO * 0.4 * style_.fade[i])); });
+  strokeRuns([&](int i) { return style_.width[i] + HALO_EXTRA - 2; },
+             [&](int i) { return QColor(0, 0, 0, (int)std::lround(ALPHA_HALO * 0.8 * style_.fade[i])); });
   // 2: the colour (neutral / yellow / red; a bend's approach narrower and translucent)
   strokeRuns([&](int i) { return strokeWidth(style_, i); },
              [&](int i) {
                const Rgb &c = style_.cls[i] == RED ? RED_RGB : (style_.cls[i] == YELLOW ? YELLOW_RGB : NEUTRAL_RGB);
                return rgb(c, alphaFor(style_, i));
              });
+  p.setCompositionMode(QPainter::CompositionMode_SourceOver);
   // 3: dark hatch across the red stretch (colour is never the only cue)
   const int nm = hatchMarks(style_, px_, py_, n, marks_, MAX_PTS);
   p.setPen(QPen(rgb(HATCH_RGB, 230), 6, Qt::SolidLine, Qt::FlatCap));
@@ -244,6 +257,8 @@ void TiCurveView::drawRibbon(QPainter &p) {
   p.setBrush(QColor(255, 255, 255));
   p.setPen(QPen(QColor(0, 0, 0, 220), 3, Qt::SolidLine, Qt::FlatCap, Qt::MiterJoin));
   p.drawPolygon(car);
+  p.end();
+  painter.drawImage(lo, layer_);
 }
 
 void TiCurveView::drawChip(QPainter &p, const Chip &c, const QRect &max_box) {

@@ -7,6 +7,7 @@
 
 #include <string>
 
+#include <QImage>
 #include <QPainter>
 #include <QRect>
 
@@ -26,7 +27,7 @@ public:
   static double monotonicNow();
 
 private:
-  void drawRibbon(QPainter &p);
+  void drawRibbon(QPainter &painter);
   void drawChip(QPainter &p, const ti_view::Chip &c, const QRect &max_box);
 
   std::string text_;
@@ -37,5 +38,6 @@ private:
   double px_[ti_view::MAX_PTS] = {};
   double py_[ti_view::MAX_PTS] = {};
   int marks_[ti_view::MAX_PTS] = {};
+  QImage layer_;            // the ribbon is painted here first (pixels replaced, not blended: no darker joins), then composited once
   bool shown_ = false;
 };
