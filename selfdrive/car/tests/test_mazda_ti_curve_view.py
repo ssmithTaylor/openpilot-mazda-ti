@@ -95,6 +95,13 @@ def test_ribbon_is_decimated_monotonic_and_keeps_the_heading_change():
   assert not ends
 
 
+def test_a_road_that_goes_on_never_fades_whatever_the_point_spacing():
+  for step in (5.0, 10.0):
+    for off in (0.0, 3.0, 7.0):
+      d = np.arange(off, 3000, step)
+      assert not V.ribbon(d, np.zeros(len(d)), 45.0)[1], (step, off)
+
+
 def test_ribbon_marks_a_remembered_road_that_ends_inside_the_window():
   d = np.arange(0, 400, 5.0)
   r, ends = V.ribbon(d, np.zeros(len(d)), 45.0)

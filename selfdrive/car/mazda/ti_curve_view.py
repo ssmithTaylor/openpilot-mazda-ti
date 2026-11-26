@@ -111,7 +111,10 @@ def ribbon(dist, k, mph):
   cnt = np.diff(np.r_[starts, n])
   km = sums / np.maximum(cnt, 1)
   pts = [[int(round(float(d[e]))), int(round(float(km[i]) * 1e5))] for i, e in enumerate(ends)]
-  return pts, bool(float(d[-1]) < look - 5.0)
+  # the memory ends inside the window only when its last point is more than two point spacings short of it (not merely the last
+  # spacing before the window's edge)
+  step = float(np.median(np.diff(d)))
+  return pts, bool(float(d[-1]) < look - max(5.0, 2.0 * step))
 
 
 def plan_bend(plan, side, floor, mph):
