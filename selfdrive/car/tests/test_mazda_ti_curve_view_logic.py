@@ -77,7 +77,8 @@ def test_drawing_takes_its_numbers_from_the_header_and_reads_the_planners_param(
   cc = (ROOT / "selfdrive/ui/qt/onroad/ti_curve_view.cc").read_text(encoding="utf-8")
   assert '#include "selfdrive/ui/qt/onroad/ti_curve_view_logic.h"' in (ROOT / "selfdrive/ui/qt/onroad/ti_curve_view.h").read_text(
     encoding="utf-8")
-  for name in ("visibility(", "chipFor(", "ribbonRaw(", "styleFor(", "resumeRings(", "hatchMarks(", "carAngle(", "chipBox("):
+  for name in ("visibility(", "chipFor(", "ribbonRaw(", "styleFor(", "resumeRings(", "hatchMarks(", "carAngle(", "chipBox(",
+               "ribbonRect(", "pointsArea(", "chipAllowed("):
     assert name in cc, name
   assert 'PARAM_KEY = "' + V.PARAM_VIEW + '"' in HEADER.read_text(encoding="utf-8")
   cam = (ROOT / "selfdrive/ui/qt/onroad/annotated_camera.cc").read_text(encoding="utf-8")

@@ -152,41 +152,47 @@ void TiCurveView::setPayload(const std::string &text) {
   parse(text_, payload_);
 }
 
-int TiCurveView::draw(QPainter &p, double now, bool engaged, double ui_mph, const QRect &max_box, const QPoint &origin, double dt) {
+int TiCurveView::draw(QPainter &p, double now, bool engaged, double ui_mph, const Screen &screen, const QPoint &origin, double dt) {
   const Hidden vis = visibility(payload_, now, engaged, ui_mph, shown_);
   shown_ = vis == SHOWN;
+  rect_ = Rect();
   if (!shown_) {
     fit_.reset();
     return vis;
   }
   p.save();
-  p.translate(-origin);                   // draw in screen coordinates (the logic's)
+  p.translate(-origin);                   // draw in screen coordinates (the logic's; the widget's moved by the onroad border)
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setRenderHint(QPainter::TextAntialiasing, true);
   ribbonRaw(payload_, ribbon_);
-  if (ribbon_.n >= 2) {
+  const Rect rr = ti_view::ribbonRect(screen);     // the right-hand side, clear of every other element; empty: no room, no ribbon
+  if (ribbon_.n >= 2 && !rr.empty()) {
+    rect_ = rr;
+    fit_.setArea(pointsArea(rr, origin.x(), origin.y()));
     fit_.step(ribbon_, dt, px_, py_);
     styleFor(payload_, ribbon_, style_);
-    drawRibbon(p);
+    drawRibbon(p, QRectF(rr.x0 + origin.x(), rr.y0 + origin.y(), rr.w(), rr.h()));
   } else {
     fit_.reset();
   }
   const Chip c = chipFor(payload_, now - payload_.m);
-  if (c.cls != NEUTRAL) {
-    drawChip(p, c, max_box.translated(origin));
+  if (c.cls != NEUTRAL && chipAllowed(screen)) {
+    const Rect &mb = screen.max_box;
+    drawChip(p, c, QRect((int)mb.x0, (int)mb.y0, (int)mb.w(), (int)mb.h()).translated(origin));
   }
   p.restore();
   return vis;
 }
 
-void TiCurveView::drawRibbon(QPainter &painter) {
+void TiCurveView::drawRibbon(QPainter &painter, const QRectF &clip) {
   const int n = ribbon_.n;
-  // one layer over the fixed area (with room for the halo and the car): strokes REPLACE its pixels, as the mock-ups' layer does,
-  // so translucent runs never darken where they meet; the layer is then blended onto the camera view once
-  const int margin = 60;
-  const QPoint lo((int)AREA_X0 - margin, (int)AREA_Y0 - margin);
-  if (layer_.isNull()) {
-    layer_ = QImage((int)(AREA_X1 - AREA_X0) + 2 * margin, (int)(AREA_Y1 - AREA_Y0) + 2 * margin, QImage::Format_ARGB32_Premultiplied);
+  // one layer over the ribbon's rectangle: strokes REPLACE its pixels, as the mock-ups' layer does, so translucent runs never
+  // darken where they meet; the layer is then blended onto the camera view once. The layer IS the rectangle: nothing is drawn
+  // outside it (the points sit INK inside it, so nothing is cut off either)
+  const QPoint lo((int)std::floor(clip.x()), (int)std::floor(clip.y()));
+  const QSize sz((int)std::ceil(clip.right()) - lo.x(), (int)std::ceil(clip.bottom()) - lo.y());
+  if (layer_.size() != sz) {
+    layer_ = QImage(sz, QImage::Format_ARGB32_Premultiplied);
   }
   layer_.fill(Qt::transparent);
   QPainter p(&layer_);
