@@ -52,7 +52,7 @@ BEND_K = 1 / 90.0
 
 def case_a():
   a = M.synthetic_trace([(800, 0.0)])
-  b = M.synthetic_trace([(100, 0.005), (250, 0.0), (150, BEND_K), (300, 0.0)], x0=a["x"][-1] + 5.0, y0=0.0, h0=0.0)
+  b = M.synthetic_trace([(60, 0.005), (100, 0.0), (150, BEND_K), (300, 0.0)], x0=a["x"][-1] + 5.0, y0=0.0, h0=0.0)
   c = M.synthetic_trace([(1500, 0.0)], x0=a["x"][-1] + 40.0, y0=0.0, h0=0.0)   # the straight road, starting past the fork, no link
   mem = M.synthetic([a, b, c], nexts=[1, -1, -1])
   return a, b, c, mem
@@ -60,7 +60,7 @@ def case_a():
 
 def test_a_straight_on_is_never_slowed_for_the_linked_branch():
   a, b, c, mem = case_a()
-  res = run(mem, M.synthetic_trace([(2300, 0.0)]), 45, 90)
+  res = run(mem, M.synthetic_trace([(2300, 0.0)]), 50, 90)
   assert not starts_on(res, mem, 1), "slowed for a bend on the branch the car did not take"
   assert all(p.ceil is None for _, _, p, _, _ in res)
   # the lock followed the same road through the fork: trusted on the straight road past it, never lost there
@@ -76,7 +76,7 @@ def test_a_without_the_rule_the_branch_is_slowed_for(monkeypatch):
   """The failure the rule fixes, reproduced: with FORK_ON off the planner slows for the branch's bend (today's behaviour)."""
   monkeypatch.setattr(P, "FORK_ON", False)
   a, b, c, mem = case_a()
-  res = run(mem, M.synthetic_trace([(2300, 0.0)]), 45, 90)
+  res = run(mem, M.synthetic_trace([(2300, 0.0)]), 50, 90)
   assert starts_on(res, mem, 1)
 
 
@@ -89,9 +89,9 @@ def test_a_taking_the_branch_unsignalled_is_still_slowed_for_its_bend():
   the car is matched on it, and the slowdown for its bend still starts before the bend."""
   a, b, c, mem = case_a()
   path = cat(a, b)
-  res = run(mem, path, 45, 90)
+  res = run(mem, path, 50, 90)
   s_first = first_ceiling_s(res)
-  bend_entry = 800 + 100 + 250
+  bend_entry = 800 + 60 + 100
   assert s_first is not None and s_first < bend_entry, s_first
   assert any(e["kind"] == "fork_switch" for _, _, _, ev, _ in res for e in ev)
 
@@ -99,14 +99,14 @@ def test_a_taking_the_branch_unsignalled_is_still_slowed_for_its_bend():
 def test_a_signal_toward_the_branch_makes_it_the_plan():
   a, b, c, mem = case_a()
   path = cat(a, b)
-  base = first_ceiling_s(run(mem, path, 45, 90))
-  sig = run(mem, path, 45, 90, blink_side_fn=lambda t, s: 1 if 500 < s < 800 else 0)    # left: the branch turns left
+  base = first_ceiling_s(run(mem, path, 50, 90))
+  sig = run(mem, path, 50, 90, blink_side_fn=lambda t, s: 1 if 500 < s < 800 else 0)    # left: the branch turns left
   s_sig = first_ceiling_s(sig)
   assert s_sig is not None and s_sig < base
   fks = [p.diag.get("fk") for t, s, p, ev, _ in sig if p.diag and p.diag.get("fk")]
   assert any(f[0] == P.FORK_SIGNAL and f[2] == 0 for f in fks)
   # a signal the OTHER way is not toward the branch: the plan stays on the straight road
-  other = run(mem, M.synthetic_trace([(2300, 0.0)]), 45, 90, blink_side_fn=lambda t, s: -1 if 500 < s < 800 else 0)
+  other = run(mem, M.synthetic_trace([(2300, 0.0)]), 50, 90, blink_side_fn=lambda t, s: -1 if 500 < s < 800 else 0)
   assert not starts_on(other, mem, 1)
 
 
@@ -116,7 +116,7 @@ RAMP_K = -1 / 120.0
 
 def case_b(with_main=True):
   h1 = M.synthetic_trace([(2000, 0.0)])
-  r = M.synthetic_trace([(100, -0.0015), (250, 0.0), (150, RAMP_K), (300, 0.0)], x0=h1["x"][-1] + 4.0, y0=0.0, h0=0.0)
+  r = M.synthetic_trace([(100, -0.0015), (100, 0.0), (150, RAMP_K), (300, 0.0)], x0=h1["x"][-1] + 4.0, y0=0.0, h0=0.0)
   trs = [h1, r]
   if with_main:
     trs.append(M.synthetic_trace([(2500, 0.0)], x0=h1["x"][-1] + 45.0, y0=0.0, h0=0.0))
