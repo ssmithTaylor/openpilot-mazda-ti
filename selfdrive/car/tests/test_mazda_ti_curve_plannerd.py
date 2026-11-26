@@ -466,9 +466,9 @@ def test_map_list_record_bounded_and_position_free():
   # the replay fields: never dropped, never trimmed away, and they add at most TICK_REPLAY_MAX_B to the bounded record
   for e0 in (_worst_extras(), dict(_worst_extras(), map=[[-99999, -99999]] * 40)):
     base = D.tick_log(_worst_plan(), e0)
-    e = dict(e0, cs=[-99, -99, 1], mpr=[9999999, 99999999])
+    e = dict(e0, cs=[-99, -99, 1], mpr=[9999999, 99999999], ask=[-9999] * 6)
     d = D.tick_log(_worst_plan(), e)
-    assert d["cs"] == [-99, -99, 1] and d["mpr"] == [9999999, 99999999]
-    assert {k: v for k, v in d.items() if k not in ("cs", "mpr")} == base     # nothing else dropped for them
+    assert d["cs"] == [-99, -99, 1] and d["mpr"] == [9999999, 99999999] and d["ask"] == [-9999] * 6
+    assert {k: v for k, v in d.items() if k not in ("cs", "mpr", "ask")} == base     # nothing else dropped for them
     assert len(json.dumps(d)) <= len(json.dumps(base)) + D.TICK_REPLAY_MAX_B
   assert D.tick_log(_worst_plan(), dict(_worst_extras(), cs=[None, None, 0]))["cs"] == [None, None, 0]

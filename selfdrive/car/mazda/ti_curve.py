@@ -163,6 +163,63 @@ class HoldRun:
     return (self.stop <= v <= self.last_v) if self.d < 0 else (self.last_v <= v <= self.stop)
 
 
+DIAG_EVERY = 20                  # the car controller logs Curve.diag every this many frames (5 Hz) while on or active
+DIAG_BLK_S = 1.0                 # a SET+ held back this recently shows as diag "blk"
+
+
+def _age(t, since, scale):
+  """Seconds from `since` (a frame number; times scale = DT) to t, rounded; None when unset."""
+  if since is None or since <= -10 ** 8:
+    return None
+  return round(t - since * scale, 1)
+
+
+# REPLAYABILITY (docs/RUNTIME_CONSTRAINTS.md): every attribute of Curve is either in the diag record (DIAG_STATE: attribute -> key)
+# or exempt with the reason (DIAG_EXEMPT); every Inputs field is in diag "in" (DIAG_INPUTS) or in an rlog message (INPUTS_IN_RLOG).
+# test_mazda_ti_curve_replayable.py fails on one in neither.
+DIAG_STATE = {"state": "st", "why": "why", "ref": "ref", "set_last": "set", "target": "tgt", "floor": "fl", "floor_now": "fln",
+              "press_floor": "pfl", "shown": "shown", "lowered_from": "low", "tap": "tap", "hold": "hold", "tap_why": "tw",
+              "tap_from": "tfr", "tap_to": "tto", "taps_down": "dn", "taps_up": "up", "holds": "holds", "blk": "blk", "blk_f": "blk",
+              "bend_lo": "blo", "cap_lo": "blo", "extent_lo": "blo", "in_bend": "bend", "cap_armed": "cap", "cap_on_straight": "cap",
+              "cap_gap": "cap", "cap_end": "cap", "odo": "cap", "corner_end_odo": "cend", "needs_more": "nm", "pause_until": "pause",
+              "gas_hold": "gas", "left_at": "left", "restore_failed": "rf", "alert_mph": "al", "left_doubt": "fl_bits",
+              "own_press": "fl_bits", "correct_down": "fl_bits", "after_brake": "fl_bits", "stop_latched": "fl_bits",
+              "stop_lowered": "fl_bits", "hold_off": "fl_bits", "net_up": "fl_bits", "settling": "fl_bits", "trust_past": "fl_bits",
+              "press_plus": "fl_bits", "tap_correcting": "fl_bits", "clear_since": "since", "trust_hold_since": "since",
+              "restore_wait_since": "since", "dead_since": "since", "set_stable_since": "since", "last_set_press": "since"}
+DIAG_EXEMPT = {
+  "events": "the event list itself: drained into the log (ti_curve events) every frame",
+  "guard": "PressGuard: frame-level press safety inside one tap (its frames are in the `tap` event)",
+  "hold_guard": "HoldGuard: as guard, for a hold (the `hold` events carry its frames)",
+  "hold_ok": "a constant for the process (HOLD_ENABLED)",
+  "line1": "the page's text: in TiCurveStatus, derived from the state", "line2": "as line1",
+  "off_note": "page text (derived)", "restart_note": "page text, set at start", "chose_note": "page text (derived)",
+  "off_seen": "page bookkeeping", "log_state": "state-event rate limit (the `state` events)",
+  "btn_was": "the previous frame's driver_button (diag `in`; every press is also a `drv_btn` event)",
+  "cruise_was_on": "the previous frame's cruise_on (carState.cruiseState.enabled, every frame in the rlog)",
+  "gas_since": "gas history: carState.gasPressed every frame in the rlog", "gas_off_at": "as gas_since",
+  "bend_low_f": "the bend test's exit timer: from the car's lateral acceleration (0x75 in the rlog's can), <= BEND_OUT_S",
+  "bend_held": "log-once flag of the `bend_hold` event", "cap_held": "log-once flag of the `cap_hold` event",
+  "cap_seen_f": "cap freshness timer (<= CAP_STALE_S), from the plans (planner ticks)",
+  "cap_straight_f": "straight-road timer from lateral acceleration (rlog can), <= BEND_OUT_S",
+  "last_plus": "pacing timer of the last SET+ (its `tap` event)", "deliver_tap_f": "pacing timer of stage 3's last SET- (`tap` event)",
+  "tap_first": "inside one tap: its first frame (the `tap` event's frames)",
+  "net_car": "the push net's cruise-model car: rebuilt from the set speed and speed (rlog) since the intervention's start",
+  "net_f": "the push net's update timer", "net_chk": "as net_f",
+  "gentle_why": "a copy of the input deliver_why while stage 3 paces (diag `in`)",
+  "bad_plan_logged": "log-once flag of `plan_invalid`", "_plan_checked": "a per-plan validity cache (same plan, same answer)",
+}
+DIAG_INPUTS = {"on": "in", "check_active": "in", "plan_age": "in", "lead": "in", "counter": "in", "driver_button": "in",
+               "driver_set": "in", "driver_set_plus": "in", "deliver": "in", "deliver_need": "in", "deliver_why": "in",
+               "plan": "in (seq; the plan itself is the planner's tick of that seq)", "set_mph": "set"}
+INPUTS_IN_RLOG = {"engaged": "carControl.enabled", "cruise_on": "carState.cruiseState.enabled",
+                  "cruise_available": "carState.cruiseState.available", "mph": "carState.vEgo", "brake": "carState.brakePressed",
+                  "gas": "carState.gasPressed", "cancel_req": "carControl.cruiseControl.cancel",
+                  "resume_req": "carControl.cruiseControl.resume", "mono": "the frame time (logMonoTime)",
+                  "standstill": "carState.standstill / cruiseState.standstill",
+                  "la_now": "can 0x75 (STEER_RELATED), as carstate.lat_accel", "desired_la": "carState.vEgo, carControl.actuators.curvature"}
+
+
 class Inputs(NamedTuple):
   on: bool = False                # the page's switch (PARAM_ON)
   engaged: bool = False
@@ -293,6 +350,8 @@ class Curve:
     self.cap_gap = False
     self.cap_on_straight = False
     self.cap_armed = False            # the plan stream had a gap (plan missing or older than PLAN_STALE_S) since the cap was set
+    self.blk, self.blk_f = "", -10 ** 9   # the last SET+ held back: by which rule ("bend" / "cap" / "extent") and when (diag "blk")
+    self.tap_why = ""                 # why the tap / hold in flight was started (diag "tw"): the state, "correct" or "exit"
 
   # ---- helpers ----------------------------------------------------------------------------------------------------------------------
   def _ev(self, kind, frame, **kw):
@@ -1057,9 +1116,13 @@ class Curve:
       return None
     if not (self._correct_ok(inp.set_mph) if correcting else self._direction_ok(button, inp.set_mph)):
       return None
-    if not correcting and (self._bend_blocks(frame, inp, button, exempt) or self._cap_blocks(frame, inp, button, exempt) or
-                            self._extent_blocks(frame, inp, button, exempt)):
-      return None
+    if not correcting:
+      blk = ("bend" if self._bend_blocks(frame, inp, button, exempt) else "cap" if self._cap_blocks(frame, inp, button, exempt) else
+             "extent" if self._extent_blocks(frame, inp, button, exempt) else "")
+      if blk:
+        self.blk, self.blk_f = blk, frame
+        return None
+    self.tap_why = "correct" if correcting else ("exit" if exempt else self.state)
     if self.in_bend and button == "SET_PLUS":
       allow_hold = False                  # in a bend a raise is tapped, one step at a time, each checked against the bend's limit
     if allow_hold and not correcting and self._start_hold(frame, inp, button):
@@ -1228,6 +1291,39 @@ class Curve:
       self.tap_from = self.tap_to = None
       if self.left_at is not None:
         self.left_at = inp.set_mph
+
+  # ---- the diagnostics record (replay) ---------------------------------------------------------------------------------------------
+  def diag(self, frame, inp):
+    """The car side's decision state and the inputs no rlog message carries, for a replay (owner, 2026-11-25: "properly logging
+    information about our features so that we can enhance them after the fact"): kind "cs", logged by the car controller every
+    DIAG_EVERY frames while curve slowing is on or active (5 Hz; card: gc off, nothing kept: one dict, sent and dropped). Keys:
+    DIAG_STATE (attribute -> key) and DIAG_INPUTS (Inputs field -> key); test_mazda_ti_curve_replayable.py keeps them complete.
+    No position: speeds, counts, flags, seconds and metres to a corner's end only."""
+    tp = self.tap.button if self.tap is not None else (self.hold.button if self.hold is not None else None)
+    t = frame * DT
+    return {"kind": "cs", "frame": int(frame), "st": self.state, "why": (self.why or "")[:40], "ref": self.ref, "set": self.set_last,
+            "tgt": self.target, "fl": self.floor, "fln": self.floor_now, "pfl": self.press_floor, "shown": self.shown,
+            "low": self.lowered_from, "tap": None if tp is None else ("up" if tp == "SET_PLUS" else "down"),
+            "hold": int(self.hold is not None), "tw": self.tap_why if tp is not None else "", "tfr": self.tap_from, "tto": self.tap_to,
+            "dn": self.taps_down, "up": self.taps_up, "holds": self.holds,
+            "blk": self.blk if (frame - self.blk_f) * DT <= DIAG_BLK_S else "",
+            "blo": [self.bend_lo, self.cap_lo, self.extent_lo], "bend": int(bool(self.in_bend)),
+            "cap": [int(bool(self.cap_armed)), int(bool(self.cap_on_straight)), int(bool(self.cap_gap)),
+                    None if self.cap_end is None else round(self.cap_end - self.odo, 1)],
+            "cend": None if self.corner_end_odo is None else round(self.corner_end_odo - self.odo, 1),
+            "nm": int(bool(self.needs_more)), "pause": None if self.pause_until is None else round(max(0.0, self.pause_until - t), 1),
+            "gas": int(bool(self.gas_hold)), "left": self.left_at, "rf": self.restore_failed, "al": self.alert_mph,
+            "fl_bits": (1 * bool(self.left_doubt) | 2 * bool(self.own_press) | 4 * bool(self.correct_down) | 8 * bool(self.after_brake) |
+                        16 * bool(self.stop_latched) | 32 * bool(self.stop_lowered) | 64 * bool(self.hold_off) | 128 * bool(self.net_up) |
+                        256 * bool(self.settling) | 512 * bool(self.trust_past) | 1024 * bool(self.press_plus) |
+                        2048 * bool(self.tap_correcting)),
+            "since": [_age(t, self.clear_since, DT), _age(t, self.trust_hold_since, DT), _age(t, self.restore_wait_since, DT),
+                      _age(t, self.dead_since, DT), _age(t, self.set_stable_since, DT), _age(t, self.last_set_press, DT)],
+            "in": [int(bool(inp.on)), int(bool(inp.check_active)), None if inp.plan_age is None else round(float(inp.plan_age), 2),
+                   None if inp.lead is None else int(bool(inp.lead)), inp.counter,
+                   int(bool(inp.driver_button)) | 2 * bool(inp.driver_set) | 4 * bool(inp.driver_set_plus),
+                   int(bool(inp.deliver)), inp.deliver_need, (inp.deliver_why or "")[:24],
+                   None if not isinstance(inp.plan, dict) else inp.plan.get("seq")]}
 
   # ---- the page -------------------------------------------------------------------------------------------------------------------
   def status(self, wall):

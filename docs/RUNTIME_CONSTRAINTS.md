@@ -91,3 +91,17 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - `selfdrive/car/tests/test_no_per_frame_leaks.py` (cyclic garbage 0, retained growth, cost growth) and
   `selfdrive/car/tests/test_lint_per_frame.py`, both in `tools/dev/pc_test.py --curve` and `--all`.
 - On the comma at install: `tools/dev/comma_checks.sh` (cost, params sync, planner dry run, memory guard `ti_mem_check.py --quick`).
+
+## Replayability (owner, 2026-11-25: "Let's make sure we're properly logging information about our features so that we can enhance them after the fact")
+- Every feature logs the inputs, the state and the decision needed to replay it from a drive log: what is in an rlog message
+  already (carState, carControl, carOutput, controlsState, modelV2, frogpilotPlan, can) need not be logged again; anything else is.
+- Curve planner: tick record (`ti_curve_plan` kind "tick", 5 Hz) incl. "cs" (car side's ref / floor / acting as given to the planner),
+  "mpr" + `map_list` records (the map list exactly as used), "ask"; replay helper `ti_curve_plannerd.logged_inputs`. Schema:
+  `PLANNER_STEP_INPUTS`, `PLANNER_STATE`.
+- Car side: `ti_curve` kind "cs" (`Curve.diag`, 5 Hz while on or active), `drv_btn` (every driver cruise-button press, on or off),
+  `deliver_phase` (stage 3 phase, timers, stock-assist flags, on change at 10 Hz), `left` (TiSetSpeedLeft on change). Schema:
+  `ti_curve.DIAG_STATE`, `DIAG_EXEMPT`, `DIAG_INPUTS`, `INPUTS_IN_RLOG`.
+- Guarded by `selfdrive/car/tests/test_mazda_ti_curve_replayable.py`: a new Planner / Curve attribute or input that is neither
+  logged nor exempt with a reason fails it.
+- No positions, place names or VIN in any log (distances along a path, speeds, curvatures, flags only); every record bounded
+  (tick <= TICK_MAX_B + TICK_REPLAY_MAX_B, map_list <= ~7 KB once per list, diag ~0.5 KB at 5 Hz).

@@ -288,9 +288,10 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us", "cs", "mpr")
-TICK_REPLAY_KEYS = ("cs", "mpr")     # the planner inputs no rlog message carries (see REPLAY above): never dropped
-TICK_REPLAY_MAX_B = 52              # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999]`
+             "fcx", "mdl", "step_us", "cs", "mpr", "ask")
+TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carries (REPLAY above), and the plan's "ask" (stage 3's
+                                          # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
+TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
 
 
@@ -459,7 +460,7 @@ def tick_log(plan, extras):
     bound = TICK_MAP_MAX_B if "map" in d else TICK_MAX_B
   for k in TICK_REPLAY_KEYS:
     x = e.get(k)
-    if isinstance(x, list) and len(x) <= 3:
+    if isinstance(x, list) and len(x) <= 6:
       d[k] = [None if y is None else int(y) for y in x]
   return d
 
@@ -495,6 +496,32 @@ def logged_inputs(tick, lists):
     ml = lists[mpr[0]]
     map_k = map_k_from(ml["s"], ml["k"], int(mpr[1]))
   return ref, floor, acting, map_k
+
+
+# REPLAYABILITY (docs/RUNTIME_CONSTRAINTS.md): every Planner.step input has a logged source (PLANNER_STEP_INPUTS), and every Planner
+# attribute is either in the tick record (its key) or rebuilt by replaying the logged ticks from plannerd's start (seq 0, at most a
+# drive: the replay runs a drive in a minute) or fixed at start. test_mazda_ti_curve_replayable.py fails on one in neither.
+_RP = "replayed: derived only from step inputs (replay the ticks from seq 0)"
+_FX = "fixed at start: the road memory file (its version) and the driving model name (tick mdl)"
+PLANNER_STEP_INPUTS = {
+  "t": "tick time (logMonoTime of the logMessage)", "fix": "liveLocationKalman (rlog), mem.to_local in the replay only",
+  "v": "carState.vEgo (rlog)", "set_mph": "carState.cruiseState (rlog); tick set", "yaw_k": "can 0x075 / liveLocationKalman (rlog)",
+  "model_k": "modelV2 (rlog; fresh_model's age / drops: tick fcx)", "limit_mph": "frogpilotPlan.slcMapSpeedLimit (rlog)",
+  "ref_mph": "tick cs[0]", "floor_mph": "tick cs[1]", "acting": "tick cs[2]", "map_k": "tick mpr + map_list (logged_inputs)",
+  "blinker": "carState.leftBlinker / rightBlinker (rlog)"}
+PLANNER_STATE = {
+  "active": "s1", "map_active": "s1", "s2": "s2", "fc": "fc", "ahead_la": "ahead", "alert": "alert", "behind": "beh",
+  "released": "rel", "rm_why": "rm", "ask": "ask", "events": "the planner events (ti_curve_plan channel), drained every tick",
+  "mem": _FX, "need": _FX, "need_hi": _FX, "kabs": _FX, "kmed": _FX, "rec_hi": _FX, "rec_lo": _FX, "_attested": _FX, "model": _FX,
+  "fc_ratio": _FX, "hi": _FX,
+  "_prof_cache": "a cost cache of _profile_over keyed by its inputs (same inputs, same answer)",
+}
+for _a in ("alerted", "alerting", "alts", "bend_left_t", "bend_low_t", "bend_on", "blink_t", "cand", "change_strikes", "cmp", "cmp_next",
+           "distrust_until", "distrust_why", "dr_bad_m", "dr_hist", "dr_m", "dr_why", "end_m", "fix_age", "guard", "hist", "hold_latch",
+           "int_base", "int_floor", "latch", "limit", "live_k", "locked", "map_bends", "map_seq", "mem_stage", "miss_s", "model_k",
+           "odo", "off_s", "pos", "resp", "resp_t", "rm", "rm_n", "rm_off", "s2_run", "s2_seq", "s2_t0", "stable_s", "t", "trace",
+           "_gb", "cap_out", "need_out", "ref_now", "chain", "int_passed"):
+  PLANNER_STATE.setdefault(_a, _RP)
 
 
 def keep_off_control_core():
@@ -657,6 +684,8 @@ def main():
           cloudlog.event("ti_curve_plan", **map_list_log(map_ref[0]))
           last_list_id = map_ref[0][0]
         extras["mpr"] = [map_ref[0][0], map_ref[1]]
+      if plan.ask is not None:
+        extras["ask"] = [int(round(float(x) * 100)) for x in plan.ask]
       cloudlog.event("ti_curve_plan", **log_payload(tick_log(plan, extras), kind="tick"))
       cpu_us = int(round(1e6 * (time.process_time() - c0)))     # logged on the next tick (this tick's own cost, log included)
       cpu.append(time.process_time() - c0)

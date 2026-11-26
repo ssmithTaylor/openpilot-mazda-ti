@@ -51,6 +51,7 @@ CURVE_TESTS = (
   "selfdrive/car/tests/test_mazda_ti_curve_aim.py",
   "selfdrive/car/tests/test_mazda_ti_curve_approach_table.py",
   "selfdrive/car/tests/test_mazda_ti_curve_release.py",
+  "selfdrive/car/tests/test_mazda_ti_curve_replayable.py",
   "selfdrive/car/tests/test_mazda_ti_curve_carside.py",
   "selfdrive/car/tests/test_mazda_ti_curve_record.py",
   "selfdrive/car/tests/test_mazda_ti_winding.py",

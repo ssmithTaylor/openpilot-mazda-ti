@@ -23,3 +23,9 @@ Every review brief asks, explicitly, for each function that runs per frame / tic
 Rule for new constraints: a constraint discovered during a task (from a drive, a review, a failure) is written into
 `docs/RUNTIME_CONSTRAINTS.md` with its file:line AND encoded as a test or a lint rule in the same change. A constraint that exists
 only in a brief, a memory file or a coordinator's head will be broken by the next builder.
+
+## Replayability (owner, 2026-11-25)
+Every brief and review for a feature's decision code asks: does the log carry every input, every piece of state and the decision,
+so the moment can be replayed from a drive log (`docs/RUNTIME_CONSTRAINTS.md` "Replayability")? A new state field or input is
+logged or added to the commented exemption list with its reason (`test_mazda_ti_curve_replayable.py` fails otherwise). No
+positions, place names or VIN in any log; every record bounded in size and rate (card / controlsd: never a new 100 Hz record).

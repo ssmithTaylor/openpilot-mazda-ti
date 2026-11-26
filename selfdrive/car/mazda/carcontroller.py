@@ -949,6 +949,17 @@ class CarController(CarControllerBase):
     for ev in mon.events:
       ti_curve_log(ev)
     mon.events.clear()
+    if self.frame % 10 == 5:
+      # replayability (2026-11-25): stage 3's phase (idle / watch / alert / cool), its timers and the stock assist flags, checked at
+      # 10 Hz and logged when they change (onset / clear also have their own events): a few scalars, at most 10 records a second
+      lk = (r.phase, getattr(CS, "lkas_blocked", None), getattr(CS, "lkas_effective", None))
+      if lk != getattr(self, "curve_mon_logged", None):
+        self.curve_mon_logged = lk
+        ti_curve_log({"kind": "deliver_phase", "frame": int(self.frame), "phase": r.phase, "sat_s": round(mon.sat_s, 2),
+                      "lim_s": round(mon.lim_s, 2), "drop_s": round(mon.drop_s, 2), "off_s": round(mon.off_s_ti, 2),
+                      "cool_m": round(mon.cool_m, 1), "onsets": mon.onsets, "was_run": bool(mon.was_run),
+                      "lkas_blocked": None if lk[1] is None else bool(lk[1]),
+                      "lkas_effective": None if lk[2] is None else round(float(lk[2]), 1)})
     alerting = r.phase == "alert" and self.curve_on
     if alerting and (self.curve_deliver is None or self.frame % 20 == 0):
       self.curve_deliver = {"m": round(time.monotonic(), 2), "need": r.need_mph, "why": r.why}
@@ -965,6 +976,16 @@ class CarController(CarControllerBase):
     does only that and the 10 Hz read. Never raises: after an error curve slowing is off for the rest of this process and says so."""
     cv = self.curve
     ex = getattr(self, "curve_exit", None)
+    drv = bool(getattr(CS, "crz_btns_driver", None))
+    if drv != getattr(self, "curve_btn_was", False):
+      # every driver cruise-button press the car shows (0x09D, gen1), the switch on or off (2026-11-25: none were in any log): two
+      # bools compared per frame, one event per press
+      self.curve_btn_was = drv
+      if drv:
+        sp = float(CS.out.cruiseState.speed or 0.0)
+        ti_curve_log({"kind": "drv_btn", "frame": int(self.frame), "set_btn": bool(getattr(CS, "crz_btns_set", False)),
+                      "plus": bool(getattr(CS, "crz_btns_set_plus", False)),
+                      "set_mph": int(round(sp * CV.MS_TO_MPH)) if sp > 0.5 else None, "curve": cv.state if cv is not None else None})
     if cv is None:
       if ex is not None and (ex.active or getattr(self, "curve_left", None) is not None):
         return self._curve_exit_only(CC, CS)   # the exit, then the set-speed-left alert until the driver acts (review I4)
@@ -1033,6 +1054,8 @@ class CarController(CarControllerBase):
         for ev in evs:
           ti_curve_log(ev)
         evs.clear()
+      if self.frame % mod.DIAG_EVERY == 5:
+        ti_curve_log(cv.diag(self.frame, inp))     # 5 Hz while on or active: the replay's car-side state (Curve.diag)
       self._curve_publish(cv)
       if button is None or inp.cancel_req or inp.resume_req:
         return None
@@ -1114,6 +1137,9 @@ class CarController(CarControllerBase):
   def _curve_left(self, cv, ex, set_mph):
     """Review I4: write / clear the generic TiSetSpeedLeft record (who, now, was) for the on-road alert; at most every 0.5 s."""
     left = curve_mod.set_left(cv, ex, set_mph)
+    if left != getattr(self, "curve_left", None):
+      ti_curve_log({"kind": "left", "frame": int(self.frame), "now": None if left is None else left[0],
+                    "was": None if left is None else left[1]})     # the set-speed-left record (TiSetSpeedLeft), on change
     if left is not None and (self.frame % 50 == 5 or getattr(self, "curve_left", None) != left):
       self.params_memory.put(curve_mod.PARAM_LEFT, json.dumps({"m": round(time.monotonic(), 2), "who": "curve slowing",
                                                                "now": left[0], "was": left[1]}))

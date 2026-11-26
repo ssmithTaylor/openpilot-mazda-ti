@@ -445,6 +445,8 @@ def setup_card_curve():
       st["set"] = int(cv.tap_to)
     if ph == 8500:
       st["set"] = 53                                   # the driver's own SET- press
+    CS.crz_btns_driver = 8497 <= ph < 8500             # ... as the car shows it (0x09D): the `drv_btn` log, 2026-11-25
+    CS.crz_btns_set, CS.crz_btns_set_plus = CS.crz_btns_driver, False
     if ph == 0:
       st["set"] = 55
     cs.speed = st["set"] * 0.44704
