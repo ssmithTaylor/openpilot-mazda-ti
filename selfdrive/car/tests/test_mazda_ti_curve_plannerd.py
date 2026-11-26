@@ -135,6 +135,7 @@ def test_car_side_floor_now_is_lead_aware():
 # ---- the map service's curvature list (synthetic coordinates near 0, 0: never a recorded position) ------------------------------
 import json  # noqa: E402
 import math  # noqa: E402
+import pytest  # noqa: E402
 
 
 def _map_json(n=40, step_m=20.0, k=0.004, north=True):
@@ -402,7 +403,7 @@ def _replay_case():
       extras["map"], last_map = mk or [], mk
     if ref is not None:
       if ref[0][0] != last_id:
-        logs.append(json.dumps(D.map_list_log(ref[0])))
+        logs.extend(json.dumps(D.log_payload(r)) for r in D.map_list_log(ref[0]))
         last_id = ref[0][0]
       extras["mpr"] = [ref[0][0], ref[1]]
     logs.append(json.dumps(D.log_payload(D.tick_log(p, extras), kind="tick")))
@@ -416,7 +417,7 @@ def _replay(logs, rlog, use_cs=True, use_list=True):
   for line in logs:
     m = json.loads(line)
     if m["kind"] == "map_list":
-      lists[m["id"]] = m
+      D.map_list_add(lists, m)
       continue
     t, v, setv = next(it)
     ref, floor, acting, map_k = D.logged_inputs(m, lists)
@@ -452,17 +453,18 @@ def test_map_list_record_bounded_and_position_free():
   lists = [r for r in recs if r["kind"] == "map_list"]
   assert 2 <= len(lists) <= 70                                     # once per list used (the case rewrites it every second), not per tick
   for r in lists:
-    assert set(r) == {"kind", "id", "n", "s", "k"} and len(r["s"]) == len(r["k"]) <= D.MAP_MAX_N
+    assert set(r) == {"kind", "id", "n", "m", "i0", "s", "k"} and len(r["s"]) == len(r["k"]) <= D.MAP_LOG_N
     assert all(isinstance(x, int) for x in r["s"] + r["k"])
-    assert r["s"][0] == 0                                           # along the path from its first node: no coordinate
+    assert r["i0"] > 0 or r["s"][0] == 0                            # along the path from its first node: no coordinate
   text = " ".join(logs)
   assert "10.37" not in text and "71.73" not in text and "lat" not in text and "lon" not in text
-  # a list longer than MAP_MAX_N nodes: the first MAP_MAX_N are used and logged
+  # a list longer than MAP_LOG_N nodes: every node is used (as before the logging) and logged in records of at most MAP_LOG_N
   deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
-  raw = json.dumps([{"latitude": 10.37 + 5.0 * j * deg, "longitude": -71.73, "curvature": 0.001} for j in range(D.MAP_MAX_N + 50)])
+  raw = json.dumps([{"latitude": 10.37 + 5.0 * j * deg, "longitude": -71.73, "curvature": 0.001} for j in range(D.MAP_LOG_N + 50)])
   mk, ref = D.map_profile_ref(raw, 0.5, 10.37 + 50.0 * deg, -71.73, 0.0)
-  assert mk is not None and ref[0][1] == D.MAP_MAX_N + 50 and len(D.map_list_log(ref[0])["s"]) == D.MAP_MAX_N
-  assert len(json.dumps(D.map_list_log(ref[0]))) <= 14 * D.MAP_MAX_N          # <= ~7 KB, once per list
+  recs = D.map_list_log(ref[0])
+  assert mk is not None and ref[0][1] == D.MAP_LOG_N + 50 and sum(len(r["s"]) for r in recs) == D.MAP_LOG_N + 50
+  assert len(mk[0]) == D.MAP_LOG_N + 50 - 4 and all(len(json.dumps(r)) <= 7500 for r in recs)     # <= 7.5 KB each, once per list
   # the replay fields: never dropped, never trimmed away, and they add at most TICK_REPLAY_MAX_B to the bounded record
   for e0 in (_worst_extras(), dict(_worst_extras(), map=[[-99999, -99999]] * 40)):
     base = D.tick_log(_worst_plan(), e0)
@@ -472,3 +474,115 @@ def test_map_list_record_bounded_and_position_free():
     assert {k: v for k, v in d.items() if k not in ("cs", "mpr", "ask")} == base     # nothing else dropped for them
     assert len(json.dumps(d)) <= len(json.dumps(base)) + D.TICK_REPLAY_MAX_B
   assert D.tick_log(_worst_plan(), dict(_worst_extras(), cs=[None, None, 0]))["cs"] == [None, None, 0]
+
+
+def _old_map_profile(raw, age_s, lat, lon, bearing_deg):
+  """map_profile as it was before the replay logging (commit 0e890a76, its _map_points inlined without the cache): the reference
+  the planner's map profile must still equal (within the logged quantisation: 0.1 m, 1e-6 1/m)."""
+  try:
+    if raw is None or age_s is None or not (0.0 <= age_s <= D.MAP_STALE_S):
+      return None
+    pts = json.loads(raw)
+    if not (isinstance(pts, list) and len(pts) >= 2):
+      return None
+    la = [float(p["latitude"]) for p in pts]
+    lo = [float(p["longitude"]) for p in pts]
+    ks = [abs(float(p["curvature"])) for p in pts]
+    if not all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
+      return None
+    cl = math.cos(math.radians(lat))
+    xs = [math.radians(b - lon) * cl * D.EARTH_R for b in lo]
+    ys = [math.radians(a - lat) * D.EARTH_R for a in la]
+    hx, hy = math.sin(math.radians(bearing_deg)), math.cos(math.radians(bearing_deg))
+    cum = [0.0]
+    for i in range(len(xs) - 1):
+      cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+    best = None
+    hdg_cos = math.cos(math.radians(D.MAP_HDG_DEG))
+    for i in range(len(xs) - 1):
+      dx, dy = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
+      L = math.hypot(dx, dy)
+      if L < 0.1 or (dx * hx + dy * hy) / L < hdg_cos:
+        continue
+      tt = max(0.0, min(1.0, -(xs[i] * dx + ys[i] * dy) / (L * L)))
+      lat_m = math.hypot(xs[i] + tt * dx, ys[i] + tt * dy)
+      if lat_m <= D.MAP_MATCH_M and (best is None or lat_m < best[0]):
+        best = (lat_m, cum[i] + tt * L)
+    if best is None:
+      return None
+    d = [c - best[1] for c in cum]
+    keep = [j for j in range(len(d)) if d[j] >= -30.0 and (j == 0 or cum[j] > cum[j - 1])]
+    if len(keep) < 2:
+      return None
+    return [d[j] for j in keep], [ks[j] for j in keep]
+  except Exception:
+    return None
+
+
+def _line_list(n, hdg_deg, spacing=10.0, seed=0):
+  """A synthetic straight list of n nodes (made-up coordinates) heading hdg_deg, random curvatures; and the node positions."""
+  import random
+  rng = random.Random(seed + n)
+  deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
+  la0, lo0 = 10.37, -71.73
+  h = math.radians(hdg_deg)
+  pts = [{"latitude": la0 + spacing * j * math.cos(h) * deg,
+          "longitude": lo0 + spacing * j * math.sin(h) * deg / math.cos(math.radians(la0)),
+          "curvature": rng.choice((0.0, rng.uniform(0.0, 0.02), rng.uniform(0.0, 0.0005)))} for j in range(n)]
+  return json.dumps(pts), pts
+
+
+def _logged_and_replayed(ref):
+  """The map_list records the planner logs for this list (through JSON, as cloudlog writes them) and the replay's map_k from them."""
+  recs = [json.loads(json.dumps(D.log_payload(r))) for r in D.map_list_log(ref[0])]
+  lists = {}
+  for r in recs:
+    D.map_list_add(lists, r)
+  return recs, D.logged_inputs({"mpr": [ref[0][0], ref[1]]}, lists)[3]
+
+
+def _close_to_old(old, new, tol_m=0.1):
+  """old and new profiles agree within the logged quantisation (0.1 m, 1e-6 1/m); a node within 0.1 m of the 30 m-behind edge may be
+  in one and not the other (the edge is applied to the quantised distance)."""
+  o = [(d, k) for d, k in zip(*old) if d >= -29.9]
+  w = [(d, k) for d, k in zip(*new) if d >= -29.9]
+  assert len(o) == len(w)
+  return max((abs(a[0] - b[0]) for a, b in zip(o, w)), default=0.0) <= tol_m and \
+    max((abs(a[1] - b[1]) for a, b in zip(o, w)), default=0.0) <= 0.51e-6
+
+
+def test_map_profile_equals_the_pre_logging_profile_for_any_list_length_and_the_log_replays_it():
+  for n in (100, 500, 700, 2000):
+    for hdg in (0.0, 90.0, 180.0, 270.0):         # along a meridian or a parallel: the reference latitude makes no difference here
+      raw, pts = _line_list(n, hdg)
+      for at in sorted({3, n // 2, 450, 600, n - 40, n - 2} & set(range(n - 1))):
+        p = pts[at]
+        old = _old_map_profile(raw, 0.5, p["latitude"], p["longitude"], hdg)
+        mk, ref = D.map_profile_ref(raw, 0.5, p["latitude"], p["longitude"], hdg)
+        assert old is not None and mk is not None, (n, hdg, at)
+        assert old[0][-1] == pytest.approx(mk[0][-1], abs=0.1), (n, hdg, at)       # the same coverage ahead: to the list's end
+        assert _close_to_old(old, mk), (n, hdg, at)
+        recs, replayed = _logged_and_replayed(ref)
+        assert replayed == mk                                                      # the planner is fed exactly what is logged
+        for r in recs:
+          assert len(r["s"]) == len(r["k"]) <= D.MAP_LOG_N and len(json.dumps(r)) <= 7500
+          assert all(isinstance(x, int) for x in r["s"] + r["k"])
+
+
+def test_map_list_record_size_bounded_for_extreme_curvatures():
+  deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
+  raw = json.dumps([{"latitude": 10.37 + 50.0 * j * deg, "longitude": -71.73, "curvature": 1e3 if j % 2 else 1e200} for j in range(700)])
+  mk, ref = D.map_profile_ref(raw, 0.5, 10.37 + 50.0 * 600 * deg, -71.73, 0.0)
+  recs, replayed = _logged_and_replayed(ref)
+  assert replayed == mk and mk is not None
+  assert all(len(json.dumps(r)) <= 7500 for r in recs)
+
+
+def test_map_nodes_closer_than_the_quantum_keep_the_larger_curvature():
+  deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
+  q = [0.0, 10.0, 20.0, 20.03, 30.0, 40.0]
+  ks = [0.0, 0.001, 0.0148, 0.05, 0.001, 0.0]
+  raw = json.dumps([{"latitude": 10.37 + s * deg, "longitude": -71.73, "curvature": k} for s, k in zip(q, ks)])
+  mk, ref = D.map_profile_ref(raw, 0.5, 10.37 + 5.0 * deg, -71.73, 0.0)
+  assert max(mk[1]) == pytest.approx(0.05)
+  assert _logged_and_replayed(ref)[1] == mk

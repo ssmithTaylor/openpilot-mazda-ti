@@ -585,7 +585,8 @@ def setup_planner():
     tick_x = {}
     if map_ref is not None:                       # 2026-11-25: the list once per id (map_list_log) and [id, s0_dm] per tick
       if map_ref[0][0] != st.get("list_id"):
-        json.dumps(D.log_payload(D.map_list_log(map_ref[0])))
+        for rec in D.map_list_log(map_ref[0]):
+          json.dumps(D.log_payload(rec))
         st["list_id"] = map_ref[0][0]
       tick_x["mpr"] = [map_ref[0][0], map_ref[1]]
     floor_binds = (lap_i // 60) % 4 == 1

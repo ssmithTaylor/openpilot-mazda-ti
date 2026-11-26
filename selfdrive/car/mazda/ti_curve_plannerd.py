@@ -13,14 +13,14 @@ the owner has driven); without it the planner publishes "no road memory on the d
 Logs (`ti_curve_plan` channel): every change of the decision (ceiling, kind, trusted, reason) and the planner's events (lock, lock lost,
 road changed, corner start with the planned and actual speed and the grade, mode changes, corner passed), a summary every 5 s, and
 (plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed), and
-one `kind="map_list"` record per map list the planner uses (map_list_log). Never a position: trace and point indices, distances,
+the `kind="map_list"` record(s) of each map list the planner uses, once (map_list_log: parts of <= 500 nodes). Never a position: trace and point indices, distances,
 speeds and curvatures only.
 
 REPLAY (what a replay must read to give the planner exactly its inputs; logged_inputs below does it): from the rlog's messages as
 before (liveLocationKalman, carState, modelV2, frogpilotPlan, can: fix, speed, set speed, yaw, forecast, limit, blinker); from this
 channel: tick "cs" = [ref_mph, floor_mph, acting] as passed to Planner.step (NOT rebuilt from ti_curve `state` events: the car side's
-floor_now is in no other record), tick "mpr" = [list id, s0_dm] (absent: map_k None) with the `map_list` record of that id (keep the
-lists by id, reset them when "seq" restarts: plannerd restarted), map_k = map_k_from(s, k, s0_dm). The tick's "map" field is a
+floor_now is in no other record), tick "mpr" = [list id, s0_dm] (absent: map_k None) with the `map_list` records of that id (map_list_add:
+a long list comes in parts; keep the lists by id, reset them when "seq" restarts: plannerd restarted), map_k = map_k_from(s, k, s0_dm). The tick's "map" field is a
 12-point summary for reading, not the planner's input.
 """
 # RUNTIME: runs in ti_curve_plannerd at 5 Hz; gc frozen after load, collector on (see docs/RUNTIME_CONSTRAINTS.md).
@@ -98,7 +98,8 @@ EARTH_R = 6371000.0
 
 _MAP_PARSED = [None, None]      # cost (perf 2026-11-25): (raw text, its parsed list) of the last list read
 _MAP_ID = [0]                   # the parsed lists' running number in this process (one int; restarts at 1 with plannerd)
-MAP_MAX_N = 500                 # nodes of one list used (and logged); a longer list: its first MAP_MAX_N (the comma's lists: ~150)
+MAP_LOG_N = 500                 # nodes per `map_list` record: a longer list is used whole (as before the logging) and logged in parts
+MAP_LOG_B = 7000                # ... and at most this many characters of s + k values per record (a record stays under 7.5 KB)
 MAP_S_Q = 10                    # path distances in whole 0.1 m (dm) ...
 MAP_K_Q = 1000000               # ... curvatures in whole 1e-6 1/m: the planner gets exactly what the log carries (replay: map_k_from)
 MAP_BEHIND_DM = -300            # nodes up to 30 m behind the car are kept (as before: d >= -30 m)
@@ -107,7 +108,10 @@ MAP_BEHIND_DM = -300            # nodes up to 30 m behind the car are kept (as b
 def _map_points(raw):
   """The parsed map list: (id, nodes in the text, xs, ys, cum, s_dm, k_u), or None when unreadable, shorter than 2 or not finite.
   xs / ys: metres east / north of the list's FIRST node (positions; never leave this module); cum: metres along the polyline from
-  it; s_dm / k_u: cum and |curvature| as whole dm / whole 1e-6 1/m (what the planner is given, and the `map_list` log record).
+  it; s_dm / k_u: cum and |curvature| as whole dm / whole 1e-6 1/m (what the planner is given, and the `map_list` log records). Every
+  node is used, as before the logging (review 2026-11-25: cutting a list to its first 500 nodes lost map coverage). A node that
+  rounds to the same dm as the node kept before it is merged into it with the larger curvature (a spike is never lost); a node at
+  exactly the same place (cum not increasing) is dropped, as before.
   Cached on the raw text: the map service writes ~1 Hz and the planner reads at 5 Hz (the parse was ~1.5 ms a tick on the comma for
   a 150-node list); a new text gets the next id. Same text, same values."""
   if _MAP_PARSED[0] is not None and _MAP_PARSED[0] == raw:
@@ -117,7 +121,6 @@ def _map_points(raw):
     out = None
     if isinstance(pts, list) and len(pts) >= 2:
       n_raw = len(pts)
-      pts = pts[:MAP_MAX_N]
       la = [float(p["latitude"]) for p in pts]
       lo = [float(p["longitude"]) for p in pts]
       ks = [abs(float(p["curvature"])) for p in pts]
@@ -129,9 +132,19 @@ def _map_points(raw):
         cum = [0.0]
         for i in range(len(xs) - 1):
           cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+        s_dm, k_u = [int(round(cum[0] * MAP_S_Q))], [int(round(ks[0] * MAP_K_Q))]
+        for j in range(1, len(cum)):
+          if not cum[j] > cum[j - 1]:
+            continue                      # the same place again: dropped (as before)
+          sj, kj = int(round(cum[j] * MAP_S_Q)), int(round(ks[j] * MAP_K_Q))
+          if sj == s_dm[-1]:
+            if kj > k_u[-1]:
+              k_u[-1] = kj                # closer than 0.1 m to the node before: one node with the larger curvature
+          else:
+            s_dm.append(sj)
+            k_u.append(kj)
         _MAP_ID[0] += 1
-        out = (_MAP_ID[0], n_raw, (la0, lo0, cl), xs, ys, cum, [int(round(c * MAP_S_Q)) for c in cum],
-               [int(round(k * MAP_K_Q)) for k in ks])
+        out = (_MAP_ID[0], n_raw, (la0, lo0, cl), xs, ys, cum, s_dm, k_u)
   except Exception:
     out = None
   _MAP_PARSED[0], _MAP_PARSED[1] = raw, out
@@ -196,10 +209,36 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
 
 
 def map_list_log(parsed):
-  """The `map_list` log record of one parsed list (once per list, the first tick the planner uses it): id, nodes in the text (n; more
-  than MAP_MAX_N: only the first MAP_MAX_N were used), s (whole dm along the path from its first node), k (whole 1e-6 1/m). No
-  position: distances along the path and curvatures only. <= MAP_MAX_N x 14 bytes (~7 KB), once per list."""
-  return {"kind": "map_list", "id": int(parsed[0]), "n": int(parsed[1]), "s": list(parsed[6]), "k": list(parsed[7])}
+  """The `map_list` log records of one parsed list (logged once per list, the first tick the planner uses it): consecutive parts of
+  at most MAP_LOG_N nodes and MAP_LOG_B characters of values, each {id, n: nodes in the text, m: nodes the planner uses (all parts
+  together), i0: index of the part's first node, s: whole dm along the path from the list's first node, k: whole 1e-6 1/m}. No
+  position: distances along the path and curvatures only. Under 7.5 KB each; the comma's lists (~150 nodes) are one record."""
+  lid, n, s_dm, k_u = int(parsed[0]), int(parsed[1]), parsed[6], parsed[7]
+  m = len(s_dm)
+  out, i0 = [], 0
+  while i0 < m:
+    j, b = i0, 0
+    while j < m and j - i0 < MAP_LOG_N:
+      b += len(str(s_dm[j])) + len(str(k_u[j])) + 4
+      if b > MAP_LOG_B and j > i0:
+        break
+      j += 1
+    out.append({"kind": "map_list", "id": lid, "n": n, "m": m, "i0": i0, "s": list(s_dm[i0:j]), "k": list(k_u[i0:j])})
+    i0 = j
+  return out
+
+
+def map_list_add(lists, rec):
+  """REPLAY: add one `map_list` record to `lists` ({id: {"s", "k", "m"}}); a list is complete (logged_inputs uses it) when all m nodes
+  are in. A record without "m" (logged before the parts) is a whole list."""
+  m = rec.get("m")
+  if m is None or rec.get("i0", 0) == 0:
+    lists[rec["id"]] = {"s": list(rec["s"]), "k": list(rec["k"]), "m": len(rec["s"]) if m is None else int(m)}
+    return
+  ml = lists.get(rec["id"])
+  if ml is not None and len(ml["s"]) == rec["i0"]:
+    ml["s"].extend(rec["s"])
+    ml["k"].extend(rec["k"])
 
 
 def map_age_s(path=MAP_FILE, now=None):
@@ -486,7 +525,7 @@ def side_status(params_memory, now_wall, now_mono, tc):
 
 def logged_inputs(tick, lists):
   """REPLAY: (ref_mph, floor_mph, acting, map_k) the planner was given on a logged tick, from its "cs" and "mpr" fields and the
-  `map_list` records kept by id in `lists` ({id: record}). (None, None, None, ...) without "cs" (a log from before these fields).
+  `map_list` records kept by id in `lists` (built with map_list_add). (None, None, None, ...) without "cs" (a log from before these fields).
   map_k is None without "mpr" and when the list of that id was not seen (a log cut before it)."""
   cs = tick.get("cs")
   ref, floor, acting = (cs[0], cs[1], bool(cs[2])) if isinstance(cs, list) and len(cs) == 3 else (None, None, None)
@@ -494,7 +533,8 @@ def logged_inputs(tick, lists):
   mpr = tick.get("mpr")
   if isinstance(mpr, list) and len(mpr) == 2 and mpr[0] in lists:
     ml = lists[mpr[0]]
-    map_k = map_k_from(ml["s"], ml["k"], int(mpr[1]))
+    if len(ml["s"]) == ml.get("m", len(ml["s"])):     # every part seen (map_list_add)
+      map_k = map_k_from(ml["s"], ml["k"], int(mpr[1]))
   return ref, floor, acting, map_k
 
 
@@ -681,7 +721,8 @@ def main():
       extras["cs"] = [ref_mph, floor_mph, int(bool(acting))]
       if map_ref is not None:
         if map_ref[0][0] != last_list_id:
-          cloudlog.event("ti_curve_plan", **map_list_log(map_ref[0]))
+          for rec in map_list_log(map_ref[0]):
+            cloudlog.event("ti_curve_plan", **rec)
           last_list_id = map_ref[0][0]
         extras["mpr"] = [map_ref[0][0], map_ref[1]]
       if plan.ask is not None:

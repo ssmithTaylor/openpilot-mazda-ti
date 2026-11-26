@@ -104,4 +104,4 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Guarded by `selfdrive/car/tests/test_mazda_ti_curve_replayable.py`: a new Planner / Curve attribute or input that is neither
   logged nor exempt with a reason fails it.
 - No positions, place names or VIN in any log (distances along a path, speeds, curvatures, flags only); every record bounded
-  (tick <= TICK_MAX_B + TICK_REPLAY_MAX_B, map_list <= ~7 KB once per list, diag ~0.5 KB at 5 Hz).
+  (tick <= TICK_MAX_B + TICK_REPLAY_MAX_B, map_list: the whole list the planner uses, once per list, in parts of <= 500 nodes / 7.5 KB, diag ~0.5 KB at 5 Hz).
