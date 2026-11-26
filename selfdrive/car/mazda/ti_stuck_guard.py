@@ -51,6 +51,22 @@ def toward_zero(value):
   return min(value + STUCK_NUDGE, 0)
 
 
+# Replayability (owner, 2026-11-26 item 6). The ti_stuck_guard event stays at most one per TI_STUCK_LOG_EVERY_FRAMES (carcontroller.py):
+# lifting that limit would log every burst (one per 0.82 s through a long held command, ~11 kB/min and a log call on the control core
+# each time); two fields cost nothing per frame (two numbers kept on a burst frame only). The count of every burst is the cumulative
+# `bursts`; every value sent, nudges included, is in the rlog's sendcan (0x249) with latActive in carControl, from which the guard's
+# run is replayed. StuckGuard attributes: logged (event key) or exempt (why). Guarded by test_mazda_ti_alert_replayable.py.
+STUCK_LOGGED = {"bursts": "bursts", "fired_run": "run", "fired_s": "held_s", "held": "value"}
+STUCK_EXEMPT = {
+  "last_out": "the previous value sent: sendcan (0x249) in the rlog",
+  "run": "frames last_out has been sent: counted from sendcan",
+  "since": "when last_out was first sent: sendcan's log time",
+  "nudge_left": "nudge frames still to send: follows from sendcan and STUCK_NUDGE_FRAMES",
+  "nudged": "this frame's value is a nudge: sendcan",
+  "burst_started": "a burst began this frame: the event itself",
+}
+
+
 class StuckGuard:
   """One per car controller. update() returns the value to send; `nudged` says whether this frame's value is a nudge and
   `burst_started` whether a new nudge burst began on this frame; `bursts` counts them since start."""
@@ -64,6 +80,8 @@ class StuckGuard:
     self.nudged = False
     self.burst_started = False
     self.bursts = 0
+    self.fired_run = 0         # frames the value had been sent unchanged when the latest burst fired (logged as "run")
+    self.fired_s = None        # ... and by the clock, s (None without a clock; logged as "held_s")
 
   def reset(self):
     self.last_out, self.run, self.held, self.nudge_left, self.since = None, 0, None, 0, None
@@ -90,6 +108,7 @@ class StuckGuard:
         out = toward_zero(cmd)
         self.nudged = self.burst_started = True
         self.bursts += 1
+        self.fired_run, self.fired_s = self.run, (now - self.since) if (now is not None and self.since is not None) else None
     if out == self.last_out:
       self.run += 1
     else:

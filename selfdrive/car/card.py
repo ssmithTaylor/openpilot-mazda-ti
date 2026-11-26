@@ -19,6 +19,11 @@ from openpilot.selfdrive.controls.lib.events import Events
 
 from openpilot.frogpilot.common.frogpilot_variables import get_frogpilot_toggles, update_frogpilot_toggles
 from openpilot.frogpilot.controls.frogpilot_card import FrogPilotCard
+try:
+  # per-cycle cost of this fork's hooks, summarised every 10 s (selfdrive/car/mazda/ti_cost_timers.py); optional
+  from openpilot.selfdrive.car.mazda.ti_cost_timers import HookTimers, cloudlog_cost
+except Exception:
+  HookTimers = None
 
 REPLAY = "REPLAY" in os.environ
 
@@ -105,6 +110,13 @@ class Car:
 
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
+    # hooks: step (the whole cycle, upstream + ours), cc (CI.apply: the car controller), curve (curve_step), buttons (cruise check +
+    # button tests); gauge plan_age_s (the oldest planner output the car side acted on); event "ti_cost" every 10 s
+    self.ti_cost = HookTimers("card", ("step", "cc", "curve", "buttons"), gauges=("plan_age_s",), log=cloudlog_cost) \
+      if HookTimers is not None else None
+    ti_cc = getattr(self.CI, "CC", None)
+    if ti_cc is not None and self.ti_cost is not None:
+      ti_cc.ti_cost = self.ti_cost
 
     # FrogPilot variables
     self.frogpilot_card = FrogPilotCard(self)
@@ -218,7 +230,11 @@ class Car:
       ti_cc = getattr(self.CI, "CC", None)
       if ti_cc is not None and hasattr(ti_cc, "ti_lag_ctl"):
         ti_cc.ti_lag_ctl = (self.sm.logMonoTime['controlsState'] * 1e-9, self.sm['controlsState'].cumLagMs)
+      tc = getattr(self, "ti_cost", None)
+      t0 = time.perf_counter_ns() if tc is not None else 0
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, self.frogpilot_toggles)
+      if tc is not None:
+        tc.add(1, time.perf_counter_ns() - t0)
       self.last_applied_car_control_mono = self.sm.logMonoTime['carControl']
       self.last_apply_mono = now_nanos
       self.apply_sequence += 1
@@ -245,7 +261,12 @@ class Car:
 
   def card_thread(self):
     while True:
+      tc = getattr(self, "ti_cost", None)
+      t0 = time.perf_counter_ns() if tc is not None else 0
       self.step()
+      if tc is not None:
+        tc.add(0, time.perf_counter_ns() - t0)
+        tc.tick()
       self.rk.monitor_time()
 
       # Update FrogPilot variables: on the rising and the falling edge of togglesUpdated and once a second while it stays on (a stuck

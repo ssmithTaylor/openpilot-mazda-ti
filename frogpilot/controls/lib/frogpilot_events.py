@@ -6,7 +6,7 @@ import random
 from openpilot.common.conversions import Conversions as CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import TurnDirection
-from openpilot.selfdrive.controls.lib.lane_drift import LaneDriftGate, lane_change_active
+from openpilot.selfdrive.controls.lib.lane_drift import LaneDriftGate, OnChange, lane_change_active, log_lane_gate
 from openpilot.selfdrive.controls.lib.events import ET, EVENT_NAME, FROGPILOT_EVENT_NAME, EventName, FrogPilotEventName, Events
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
@@ -38,6 +38,8 @@ class FrogPilotEvents:
     self.ti_dropout_hold = 0
     self.runwide_frames = 0
     self.lane_drift_gate = LaneDriftGate(DT_MDL)
+    self.authority_log = OnChange(1 / DT_MDL, 5)    # ti_authority record on a change of the steering alerts' state, at most 5 a second
+    self.lane_gate_log = OnChange(1 / DT_MDL, 5)    # lane_gate record ("p": "f") on a change of the gate's state, at most 5 a second
     self.runwide_display_hold = 0
     self.latch_display_hold = 0
 
@@ -251,7 +253,8 @@ class FrogPilotEvents:
     if lat_active and self.ti_was_active and not ti_now:
       self.ti_dropout_hold = steer_authority.TI_DROPOUT_HOLD_FRAMES
     self.ti_was_active = ti_now
-    if self.ti_dropout_hold > 0:
+    dd_shown = self.ti_dropout_hold > 0
+    if dd_shown:
       self.ti_dropout_hold -= 1
       self.events.add(FrogPilotEventName.tiDropout)
 
@@ -266,14 +269,16 @@ class FrogPilotEvents:
                     and v_ego * CV.MS_TO_KPH > steer_authority.RUNWIDE_MIN_KPH
                     and (des_la - act_la) > steer_authority.RUNWIDE_DEFICIT)
     # at the limit alone is normal on held bends: needs a line close or crossed (stateful gate: latch through the re-index, none in a lane change)
-    drift_open = self.lane_drift_gate.update(sm["modelV2"], sm["controlsState"].desiredCurvature, bool(runwide_base),
-                                             lane_change_active(sm["modelV2"], sm["carState"].leftBlinker, sm["carState"].rightBlinker))
+    lane_change = lane_change_active(sm["modelV2"], sm["carState"].leftBlinker, sm["carState"].rightBlinker)
+    drift_open = self.lane_drift_gate.update(sm["modelV2"], sm["controlsState"].desiredCurvature, bool(runwide_base), lane_change)
+    log_lane_gate(self.lane_drift_gate, self.lane_gate_log, "f", drift_open, runwide_base, lane_change)   # never raises
     runwide_now = runwide_base and drift_open
     self.runwide_frames = self.runwide_frames + 1 if runwide_now else 0
-    if (self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES
-        and getattr(frogpilot_toggles, "steer_authority_advisory", True)):
+    advisory_on = getattr(frogpilot_toggles, "steer_authority_advisory", True)
+    if self.runwide_frames >= steer_authority.RUNWIDE_HOLD_FRAMES and advisory_on:
       self.runwide_display_hold = steer_authority.RUNWIDE_DISPLAY_HOLD_FRAMES
-    if self.runwide_display_hold > 0:
+    rw_shown = self.runwide_display_hold > 0
+    if rw_shown:
       self.runwide_display_hold -= 1
       self.events.add(FrogPilotEventName.steerRunningWide)
 
@@ -283,7 +288,19 @@ class FrogPilotEvents:
     # wide carries the actionable message; the latch only speaks when running wide is not.
     if self.frogpilot_planner.steer_latched:
       self.latch_display_hold = steer_authority.LATCH_DISPLAY_HOLD_FRAMES
+    lt_shown = False
     if self.latch_display_hold > 0:
       self.latch_display_hold -= 1
       if self.runwide_display_hold == 0:
+        lt_shown = True
         self.events.add(FrogPilotEventName.steerLatchedWarning)
+
+    # replayability (2026-11-26): the counters and decisions above, one ti_authority record per change of their discrete state
+    # (steer_authority.log_authority; never raises)
+    planner = self.frogpilot_planner
+    steer_authority.log_authority(
+      self.authority_log,
+      steer_authority.authority_key(lat_active, ti_now, runwide_base, drift_open, rw_shown, False, planner.steer_latched, lt_shown,
+                                    dd_shown, advisory_on),     # (latch_cond: added from planner.latch_bits inside, where it cannot raise)
+      self, planner, v_ego, des_la, act_la, sm["carControl"].actuators.steer, sm["carState"].steeringRateDeg,
+      sm["frogpilotCarState"].columnTorque, sm["carState"].steeringPressed, sm["carState"].steeringTorque)

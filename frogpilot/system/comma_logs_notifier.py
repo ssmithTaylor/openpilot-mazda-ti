@@ -175,7 +175,19 @@ def idle_forever():
     time.sleep(3600)  # once per off-road period; the manager stops this process when a drive starts
 
 
+def off_control_core():
+  """Cores 0-3 only, before any thread starts (the threads inherit it): never core 4, where controlsd and card run real-time
+  (core-4 budget, 2026-11-26: seen there in the drive logs). Never raises; a host without sched_setaffinity keeps its cores."""
+  try:
+    cores = [c for c in os.sched_getaffinity(0) if c in (0, 1, 2, 3)]
+    if cores:
+      os.sched_setaffinity(0, cores)
+  except Exception:
+    pass
+
+
 def main():
+  off_control_core()
   from cereal import log, messaging
   from openpilot.common.params import Params
   from openpilot.common.swaglog import cloudlog

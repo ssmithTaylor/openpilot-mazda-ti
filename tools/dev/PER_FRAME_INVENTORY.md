@@ -26,6 +26,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 | card | CarController.update: ti_tests, ti_plan, ti_ident, ti_dither, ti_stuck_guard, ti_lag, stats, Flag This Moment, Start A New Measurement | `card.py:221` CI.apply | card_tests |
 | card | curve_step / _curve_monitor: ti_curve, ti_curve_monitor, ti_curve_demand, ti_cruise_model, ti_cruise_taps | `carcontroller.py:922,961` | card_curve |
 | card | button_tests_step / cruise_check_step: ti_button_tests, ti_cruise_check | `carcontroller.py:783,862` | card_buttons |
+| controlsd, card | HookTimers.add / gauge_max / tick (ti_cost_timers) | `controlsd.py` state_control, controlsd_thread; `card.py` controls_update, card_thread; `carcontroller.py` update, curve_step | card_tests, card_curve, card_buttons |
 | card | CC.ti_lag_ctl set from controlsState | `card.py:217-220` | card_tests |
 | card | CarState.update_gen1 TI fields (needs the compiled CAN parser) | `carstate.py:64` | none (gap) |
 | controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314` | none (gap) |
@@ -36,7 +37,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 ## Modules
 
 controlsd: lane_drift.py, latcontrol_torque.py, scalar_np.py, lateral_plant.py, lateral_reference.py, lateral_diagnostics.py,
-friction_release.py, ti_ab.py. controlsd and card: ti_plan.py, ti_tests.py. card: carcontroller.py, carstate.py, interface.py,
+friction_release.py, ti_ab.py. controlsd and card: ti_plan.py, ti_tests.py, ti_cost_timers.py (per-hook cost, summary event `ti_cost` every 10 s). card: carcontroller.py, carstate.py, interface.py,
 ti_dither.py, ti_stuck_guard.py, ti_ident.py, ti_lag.py, ti_cruise_check.py, ti_cruise_taps.py, ti_button_tests.py,
 ti_curve_monitor.py. card and ti_curve_plannerd: ti_curve.py, ti_curve_demand.py, ti_cruise_model.py. ti_curve_plannerd:
 ti_curve_plan.py, ti_curve_plannerd.py, ti_curve_memory.py, ti_curve_view.py (also frogpilot_process: curve_ding_due). controlsd (NNFF toggle): neural_network_feedforward.py.

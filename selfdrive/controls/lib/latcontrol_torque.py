@@ -206,6 +206,75 @@ class CommitFilter:
     self.x = float(_clip(self.x, -lim, lim))
     return self.x
 
+def _usable_table(xp, fp):
+  """scalar_np.Interp's domain: at least two strictly increasing breakpoints, as many values (else np.interp is kept)."""
+  n = len(xp)
+  return n >= 2 and n == len(fp) and all(xp[i] < xp[i + 1] for i in range(n - 1))
+
+
+class PlantPID(PIDController):
+  """The TI plant branch's PID: PIDController with its scalar np.interp gains and np.clip limits in plain Python (scalar_np, bit for bit
+  numpy 1.26's values; wrapped back into np.float64 so every result has the type it had). Cost (core 4, 2026-11-26): six np.interp and
+  two np.clip on one number per cycle were ~190 us of the comma's 10 ms cycle (measured on a little core). A gain table is turned into
+  an Interp (one breakpoint: its value) once per change of its values (controlsd assigns a new list every cycle with the same values); any
+  other table outside Interp's domain keeps np.interp. Checked against PIDController in selfdrive/controls/lib/tests/test_plant_pid_scalar.py."""
+
+  def __init__(self, *a, **k):
+    self._gain_fns = [None, None, None]                 # per gain: [breakpoints, values, Interp or None]
+    super().__init__(*a, **k)
+
+  def _gain(self, slot, table):
+    xp, fp = table[0], table[1]
+    if not (type(xp) in (list, tuple) and type(fp) in (list, tuple)):
+      return np.interp(self.speed, xp, fp)            # an array table: as PIDController (never on this car)
+    c = self._gain_fns[slot]
+    if c is None or not (c[0] == xp and c[1] == fp):  # compared by value, no allocation (a new list with the same values: no change)
+      if len(xp) == 1 and len(fp) == 1:
+        fn = np.float64(fp[0])                        # np.interp on one breakpoint: that value for every x, NaN included
+      else:
+        fn = Interp(xp, fp) if _usable_table(xp, fp) else None
+      c = self._gain_fns[slot] = [type(xp)(xp), type(fp)(fp), fn]
+    fn = c[2]
+    if fn is None:
+      return np.interp(self.speed, xp, fp)
+    return fn if type(fn) is np.float64 else np.float64(fn(self.speed))
+
+  @property
+  def k_p(self):
+    return self._gain(0, self._k_p)
+
+  @property
+  def k_i(self):
+    return self._gain(1, self._k_i)
+
+  @property
+  def k_d(self):
+    return self._gain(2, self._k_d)
+
+  def update(self, error, error_rate=0.0, speed=0.0, feedforward=0., freeze_integrator=False):
+    # PIDController.update with np.clip -> np.float64(scalar_np.clip): the same steps in the same order
+    self.speed = speed
+    self.p = self.k_p * float(error)
+    self.d = self.k_d * error_rate
+    self.f = self.k_f * feedforward
+
+    i_candidate = self.i if freeze_integrator else self.i + self.k_i * self.i_dt * error
+    u = self.p + i_candidate + self.d + self.f
+    u_sat = np.float64(_clip(u, self.neg_limit, self.pos_limit))
+
+    if u == u_sat:
+      self.i = i_candidate
+    else:
+      if u > self.pos_limit and error < 0:
+        self.i = i_candidate
+      elif u < self.neg_limit and error > 0:
+        self.i = i_candidate
+
+    control = self.p + self.i + self.d + self.f
+    self.control = np.float64(_clip(control, self.neg_limit, self.pos_limit))
+    return self.control
+
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -215,8 +284,8 @@ class LatControlTorque(LatControl):
     # The plant lookup happens before the PID so the damping gain can be plant-branch-only: the
     # stock path keeps k_d = 0 and its error_rate input stays inert, exactly as upstream.
     self.plant = getattr(CI, "lateral_plant", None)
-    self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
-                             k_d=(DAMP_KD if self.plant is not None else 0.), rate=1/self.dt)
+    self.pid = (PlantPID if self.plant is not None else PIDController)(self.torque_params.kp, self.torque_params.ki,
+                                                                       k_d=(DAMP_KD if self.plant is not None else 0.), rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES = int(1 / self.dt)
@@ -248,6 +317,16 @@ class LatControlTorque(LatControl):
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
     self.out_filter = FirstOrderFilter(0.0, OUT_FILTER_TAU, self.dt)
     self.out_filter_on = 0.0     # blend weight, ramped, so both directions are continuous
+
+  def _check_saturation(self, saturated, CS, steer_limited_by_safety, curvature_limited, expected_to_recover=False):
+    # LatControl._check_saturation with np.clip -> np.float64(scalar_np.clip) (cost, 2026-11-26: ~38 us a cycle on the comma);
+    # the same values and type (test_plant_pid_scalar.py)
+    if (saturated or curvature_limited) and CS.vEgo > self.sat_check_min_speed and not steer_limited_by_safety and not CS.steeringPressed and not expected_to_recover:
+      self.sat_time += self.dt
+    else:
+      self.sat_time -= self.dt
+    self.sat_time = np.float64(_clip(self.sat_time, 0.0, self.sat_limit))
+    return self.sat_time > (self.sat_limit - 1e-3)
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     if self.plant is not None:
@@ -297,13 +376,19 @@ class LatControlTorque(LatControl):
                          curvature_limited, lat_delay, frogpilot_toggles, fp_car_state):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 2
+    # cost (core 4, 2026-11-26): each capnp field read is ~6 us on the comma; the inputs are read once per cycle into locals
+    # (the same values: nothing writes them during the cycle)
+    v_ego = CS.vEgo
+    steering_rate_deg = CS.steeringRateDeg
+    steering_pressed = CS.steeringPressed
+    roll = params.roll
 
     # The request is filtered and buffered even while we are not steering, so that engaging mid-corner
     # starts from the truth rather than from a second-old buffer (controlsd feeds the current
     # curvature while latActive is false).
-    future_lateral_accel = self.ff_filter.update(desired_curvature * CS.vEgo ** 2)
+    future_lateral_accel = self.ff_filter.update(desired_curvature * v_ego ** 2)
     self.requested_lateral_accel_buffer.append(future_lateral_accel)
-    roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
+    roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
 
     # Committed reference, see COMMIT_TAU_DEEPEN above. Both ratchets, the gate and the blend run
     # while inactive too (same rationale as the request filter above: engaging mid-corner must
@@ -324,7 +409,7 @@ class LatControlTorque(LatControl):
     diag = pid_log.init('mazdaDiagnostics')
     diag.version = 1
     diag.frictionReleaseVersion = 1
-    diag.rawRequest = float(desired_curvature * CS.vEgo ** 2)
+    diag.rawRequest = float(desired_curvature * v_ego ** 2)
     diag.filteredRequest = float(future_lateral_accel)
     diag.delayedRequest = float(setpoint)
     diag.committedFeedforward = float(ff_lat_accel)
@@ -355,8 +440,8 @@ class LatControlTorque(LatControl):
 
     # Keep the damping observer warm during disengagement. Otherwise the first
     # active update divides all intervening vehicle motion by one control tick.
-    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    measurement = measured_curvature * CS.vEgo ** 2
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), v_ego, roll)
+    measurement = measured_curvature * v_ego ** 2
     rate = (measurement - self.previous_measurement) / self.dt if self._plant_measurement_initialized else 0.0
     measurement_rate = self.measurement_rate_filter.update(rate)
     self.previous_measurement = measurement
@@ -375,19 +460,19 @@ class LatControlTorque(LatControl):
     # support unwinding. The PID continues to integrate the resulting tracking error.
     ff_lat_accel, tracked_setpoint = self.lane_release.update(
       future_lateral_accel, setpoint, ff_lat_accel, tracked_setpoint, measurement, commit_on, self.dt,
-      self._release_context, CS.vEgo, CS.steeringRateDeg, desired_curvature * CS.vEgo ** 2)
+      self._release_context, v_ego, steering_rate_deg, desired_curvature * v_ego ** 2)
 
     # Wind the integrator against the authority this car actually has in its current state -- at
     # low speed, or with the stock LKAS path blocked, that is a fraction of what it has on the
     # highway, and winding past it only delays the recovery.
-    la_max = self.plant.la_max(CS.vEgo)
+    la_max = self.plant.la_max(v_ego)
     self.pid.set_limits(la_max, -la_max)
 
     # The error tracks the delay-aligned request (the one the car has had time to answer, as
     # upstream does) -- committed in corners, raw otherwise; both computed above.
     lat_accel_offset = self.torque_params.latAccelOffset
     error = tracked_setpoint - measurement
-    low_speed_factor = (np.float64(_LOW_SPEED(CS.vEgo)) / max(CS.vEgo, MIN_SPEED)) ** 2
+    low_speed_factor = (np.float64(_LOW_SPEED(v_ego)) / max(v_ego, MIN_SPEED)) ** 2
     error_lsf = error + low_speed_factor / self.torque_params.kp * error
 
     # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts
@@ -403,16 +488,16 @@ class LatControlTorque(LatControl):
     if damp_w is not None:
       damp_rate *= damp_w            # A/B blend: the term fades in or out instead of stepping
 
-    freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+    freeze_integrator = steer_limited_by_safety or steering_pressed or v_ego < 5
     integral_before = self.pid.i
     output_lataccel = self.pid.update(error_lsf,
                                       -damp_rate,
                                       feedforward=ff,
-                                      speed=CS.vEgo,
+                                      speed=v_ego,
                                       freeze_integrator=freeze_integrator)
 
     u_max = self.plant.ti_steer_max
-    command = self.plant.inverse(output_lataccel, CS.vEgo)
+    command = self.plant.inverse(output_lataccel, v_ego)
     inverse_command = command
 
     # Friction compensation, see FRIC_COMP_BASE above. Proactive (demand-direction), unlike the
@@ -428,8 +513,8 @@ class LatControlTorque(LatControl):
       over = max(abs(gate_la) - FRIC_COMP_LA_DEAD, 0.0)
       fric_comp = comp_mag * math.tanh(over / FRIC_COMP_LA_SOFT) * (1.0 if gate_la >= 0 else -1.0)
       fric_comp = self.friction_release.update(
-        fric_comp, future_lateral_accel, desired_curvature * CS.vEgo ** 2, measurement,
-        self.lane_release.permitted, self.lane_release.elapsed[0], CS.steeringRateDeg, self.dt)
+        fric_comp, future_lateral_accel, desired_curvature * v_ego ** 2, measurement,
+        self.lane_release.permitted, self.lane_release.elapsed[0], steering_rate_deg, self.dt)
       if fric_w is not None:
         fric_comp *= fric_w              # A/B blend
       command = float(_clip(command + fric_comp, -u_max, u_max))
@@ -464,9 +549,9 @@ class LatControlTorque(LatControl):
     # reaches feedforward before the delayed target. Suppress additional breakaway help only when
     # its command direction opposes BOTH effective references. Existing boost still withdraws at
     # the bounded rate below; the guard neither reverses it nor changes the holding command.
-    wheel_rate = abs(float(CS.steeringRateDeg))
+    wheel_rate = abs(float(steering_rate_deg))
     stuck = (abs(error) > BREAK_ERR and wheel_rate < BREAK_STICK_RATE
-             and not CS.steeringPressed and not steer_limited_by_safety
+             and not steering_pressed and not steer_limited_by_safety
              and (command * error >= 0.0 or command * (ff_lat_accel - measurement) >= 0.0)
              and not at_authority_latch)
     self.break_frames = self.break_frames + 1 if stuck else 0
@@ -542,7 +627,7 @@ class LatControlTorque(LatControl):
     diag.measurementRate = float(measurement_rate)
     diag.integralBefore = float(integral_before)
     diag.integralAfter = float(self.pid.i)
-    diag.freezeReasons = int(bool(steer_limited_by_safety)) | (int(CS.steeringPressed) << 1) | (int(CS.vEgo < 5) << 2)
+    diag.freezeReasons = int(bool(steer_limited_by_safety)) | (int(steering_pressed) << 1) | (int(v_ego < 5) << 2)
     diag.pidOutput = float(output_lataccel)
     diag.plantLimit = float(la_max)
     diag.inverseCommand = float(inverse_command)

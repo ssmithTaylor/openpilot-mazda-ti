@@ -449,6 +449,15 @@ def main() -> None:
       manual_update_requested = params_memory.get_bool("ManualUpdateInitiated")
       params_memory.remove("ManualUpdateInitiated")
 
+      # Quiet while driving (owner, 2026-11-26): no overlay rebuild, git, params or network on-road; the pass runs once parked.
+      # On the road the clock is not valid (no network; the 2026-11-25 drive ran ~3 years behind), so each 60 s pass below took
+      # the "time not valid" branch after init_overlay(): .overlay_init, touched with that clock, is older than every .git file,
+      # so the overlay was rebuilt (umount, rm -rf, mount) and its whole git diff written to the GitDiff param and the log, every
+      # minute (~400 kB of log text a minute). A request from the settings screen is still honoured on-road, as before.
+      if params.get_bool("IsOnroad") and not manual_update_requested:
+        wait_helper.sleep(60)
+        continue
+
       # Attempt an update
       exception = None
       try:

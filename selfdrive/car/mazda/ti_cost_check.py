@@ -133,7 +133,7 @@ def run_mode(name, plan_mode, mph, curvature, cycles):
           "max_us": round(times[-1], 1), "test_running_share": round(ran / len(times), 3)}
 
 
-def run_curve(name, mode, cycles, count=False, warm=300):
+def run_curve(name, mode, cycles, count=False, warm=300, plan_mode=None):
   """Curve slowing (ti_curve.py) in the car controller, plan off: "off" (the switch off: the 10 Hz read only), "on, no corner" (on, the
   planner says no corner ahead), "on, working" (on, a corner ceiling 15 mph below the set speed that is lifted and given again every
   10 s, so taps are sent and read back all along). The planner's output is written to the in-memory store as the planner would (5 Hz).
@@ -153,6 +153,10 @@ def run_curve(name, mode, cycles, count=False, warm=300):
   times, py, c = [], 0, 0
   for k in range(cycles + warm):
     clock["k"] = k
+    if plan_mode is not None and k % 50 == 0:         # all features on: the drive plan in its mode as well (run_mode)
+      from openpilot.selfdrive.car.mazda import ti_plan as tp
+      mem.put_bool("TiPlanOn", True)
+      mem.put("TiPlan", tp.encode_plan(tp.PlanOut(plan_mode, plan_mode == "ab", "", "", 1), time.time(), False, "costcheck", True))
     if k % 20 == 0:
       mem.put(tc.PARAM_ON, b"1" if mode != "off" else b"0")
       corner = mode == "on, working" and (k // 1000) % 2 == 0
@@ -481,6 +485,11 @@ def main():
           f"  (A/B {r['ab_state']}, plan {r['plan_mode']})")
     if r["added_mean_us"] > a.budget_us:
       bad.append(f"{r['mode']} adds {r['added_mean_us']} us per cycle (budget {a.budget_us:g})")
+  # all features on at once (report only, 2026-11-26): the card side with the plan in its tests mode AND curve slowing working, the
+  # controls side with the plan on, and the lateral controller (below): mean, p99 and max per cycle, not only the mean
+  allon = run_curve("all on: card (plan tests + curve working)", "on, working", max(a.cycles, 4000), plan_mode="tests")
+  print(f"{allon['mode']:46s} mean {allon['mean_us']:8.1f} us  p99 {allon['p99_us']:8.1f} us  max {allon['max_us']:8.1f} us"
+        f"  added {allon['mean_us'] - base:7.1f} us  taps {allon['taps']}")
   lat = []
   try:
     new, out_new = run_lateral("lateral controller (plain-Python helpers)", False, a.cycles)
@@ -490,11 +499,17 @@ def main():
       print(f"{r['mode']:46s} mean {r['mean_us']:8.1f} us  p99 {r['p99_us']:8.1f} us")
     print(f"lateral controller: saved {old['mean_us'] - new['mean_us']:.1f} us per cycle; outputs bit-identical: {same}")
     lat = [old, new, {"identical": same}]
+    ctl_on = ctl[1]
+    tot = {k: round(allon[k] + ctl_on[k] + new[k], 1) for k in ("mean_us", "p99_us", "max_us")}
+    print(f"all on, control core (card + controls A/B + lateral; p99 / max are sums of the parts' p99 / max, an upper bound)"
+          f"  mean {tot['mean_us']:8.1f} us  p99 {tot['p99_us']:8.1f} us  max {tot['max_us']:8.1f} us"
+          f"  ({100 * tot['mean_us'] / 10000:.1f} % of the 10 ms cycle, this core's speed)")
+    lat.append({"all_on_total": tot})
     if not same:
       bad.append("the lateral controller's outputs differ between the numpy and the plain-Python helpers")
   except Exception as e:                                     # the car-side numbers stand without it
     print(f"lateral controller not timed: {type(e).__name__}: {e}")
-  print(json.dumps({"results": res, "curve": cur, "buttons": but, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
+  print(json.dumps({"all_on": allon, "results": res, "curve": cur, "buttons": but, "controls": ctl, "lateral": lat, "budget_us": a.budget_us, "seconds": round(time.time() - t0, 1)}))
   if res[3]["test_running_share"] < 0.2:
     print("NOT VALID: no test signal ran in the running mode")
     return 2

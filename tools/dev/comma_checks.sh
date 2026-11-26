@@ -19,7 +19,7 @@ stage() { echo; echo "=== [comma_checks $(( $(date +%s) - T0 )) s] $*"; }
 trap 'python3 selfdrive/car/mazda/ti_mem_check.py --readiness || true' EXIT
 changed() { [ -n "$BASE" ] && git diff --name-only "$BASE" HEAD | grep -qE "$1"; }
 
-stage "1/6 cost check (budget 300 us/cycle; device timing)"
+stage "1/6 cost check (budget 300 us/cycle added, mean; also reports all features on: mean, p99, max; device timing)"
 python3 selfdrive/car/mazda/ti_cost_check.py
 
 stage "2/6 params sync (compiled params extension)"

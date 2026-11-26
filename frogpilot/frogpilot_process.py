@@ -51,6 +51,12 @@ def update_checks(model_manager, now, theme_manager, frogpilot_toggles, boot_run
 
   time.sleep(1)
 
+def update_checks_now(pending, started, time_validated, manual=False):
+  """Run the model / theme / map checks (github.com, api.github.com, raw.githubusercontent.com) now? Only parked: a check due
+  on-road (the hourly timer, the clock first becoming valid) waits for the drive to end (owner, 2026-11-26: quieten FrogPilot's
+  background activity while driving); the offroad transition runs one anyway. A manual request (settings screen) runs as before."""
+  return bool(pending and time_validated and (manual or not started))
+
 def frogpilot_thread():
   rate_keeper = Ratekeeper(1 / DT_MDL, None)
 
@@ -145,11 +151,12 @@ def frogpilot_thread():
 
     toggles_updated = (now - toggles_last_updated).total_seconds() <= 1
 
-    run_update_checks |= params_memory.get_bool("ManualUpdateInitiated")
+    manual_update = params_memory.get_bool("ManualUpdateInitiated")
+    run_update_checks |= manual_update
     run_update_checks |= now.second == 0 and (now.minute % 60 == 0 or (now.minute % 5 == 0 and frogpilot_toggles.frogs_go_moo))
     run_update_checks &= time_validated
 
-    if run_update_checks:
+    if update_checks_now(run_update_checks, started, time_validated, manual_update):
       theme_manager.update_active_theme(time_validated, frogpilot_toggles)
       run_thread_with_lock("update_checks", update_checks, (model_manager, now, theme_manager, frogpilot_toggles))
 
@@ -160,7 +167,10 @@ def frogpilot_thread():
         continue
 
       theme_manager.update_active_theme(time_validated, frogpilot_toggles)
-      run_thread_with_lock("update_checks", update_checks, (model_manager, now, theme_manager, frogpilot_toggles, True))
+      if started:
+        run_update_checks = True      # the boot run, held until parked (update_checks_now): there it is the offroad transition's run
+      else:
+        run_thread_with_lock("update_checks", update_checks, (model_manager, now, theme_manager, frogpilot_toggles, True))
 
     rate_keeper.keep_time()
 

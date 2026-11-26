@@ -100,6 +100,12 @@
       "call": "LatControlNNFF.update (only with the NNFF toggle on; this fork changed it)",
       "at": "selfdrive/controls/controlsd.py:303-314",
       "test": null
+    },
+    {
+      "process": "controlsd, card",
+      "call": "HookTimers.add / gauge_max / tick (ti_cost_timers: per-hook cost, summary every 10 s)",
+      "at": "selfdrive/controls/controlsd.py state_control / controlsd_thread; selfdrive/car/card.py controls_update / card_thread; carcontroller.py update / curve_step",
+      "test": "card_tests"
     }
   ],
   "per_frame": {
@@ -134,7 +140,8 @@
     "frogpilot/controls/lib/frogpilot_events.py": "frogpilot_process",
     "frogpilot/controls/lib/steer_authority.py": "frogpilot_process",
     "frogpilot/controls/frogpilot_planner.py": "frogpilot_process",
-    "frogpilot/controls/lib/neural_network_feedforward.py": "controlsd"
+    "frogpilot/controls/lib/neural_network_feedforward.py": "controlsd",
+    "selfdrive/car/mazda/ti_cost_timers.py": "controlsd, card"
   },
   "not_per_frame": {
     "selfdrive/car/mazda/ti_cost_check.py": "install-time cost check, run by hand / comma_checks.sh; no process imports it",

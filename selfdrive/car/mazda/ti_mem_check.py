@@ -206,8 +206,11 @@ class _ModelFeed:
 def setup_lane_drift():
   from openpilot.selfdrive.controls.lib import lane_drift as LD
   g = LD.LaneDriftGate(0.01)
+  log = LD.OnChange(100, 5)
   feed = _ModelFeed()
   seen = {}
+  saved = LD.emit_event
+  LD.emit_event = lambda name, rec: _count(seen, "rec:" + name)   # the lane_gate record (controlsd), counted, not logged
 
   def step(i):
     m, curv, lcs = feed.get(i)
@@ -217,14 +220,21 @@ def setup_lane_drift():
       return
     at_limit = 1500 <= ph < 3000 or (4200 <= ph and (i // 40) % 3 == 0)
     lc = LD.lane_change_active(m, lcs == 1, False)
-    if g.update(m, m.action.desiredCurvature, at_limit, lc):
+    out = g.update(m, m.action.desiredCurvature, at_limit, lc)
+    LD.log_lane_gate(g, log, "c", out, at_limit, lc)
+    if out:
       _count(seen, "gate open")
     if lc:
       _count(seen, "lane change")
     if g.latch_left > 0:
       _count(seen, "latched")
+    if log.sup:
+      _count(seen, "rec capped")
+
+  def teardown():
+    LD.emit_event = saved
   step.seen = seen
-  return step, lambda: None
+  return step, teardown
 
 
 def _controls_clock(mods):
@@ -349,6 +359,10 @@ def setup_lateral():
   return step, lambda: None
 
 
+def _no_log(event):
+  return None
+
+
 def _card(curve_on_fn=None):
   from openpilot.selfdrive.car.mazda import carcontroller as ccm
   from openpilot.selfdrive.car.mazda import ti_cost_check as K
@@ -359,6 +373,9 @@ def _card(curve_on_fn=None):
   seen = {}
   ccm.ti_curve_log = lambda ev: _count(seen, "curve:" + str(ev.get("kind")))
   cc, mem = K.make_controller()
+  # card's per-hook timers as card.py attaches them (ti_cost_timers.py): add / gauge_max every frame, the 10 s summary and reset
+  from openpilot.selfdrive.car.mazda.ti_cost_timers import HookTimers
+  cc.ti_cost = HookTimers("card", ("step", "cc", "curve", "buttons"), gauges=("plan_age_s",), log=_no_log)
   disk = ccm.Params()
 
   def restore():
@@ -405,6 +422,7 @@ def setup_card_tests():
     lag[0] += 2.0 if (ph // 1500) % 4 == 2 else 0.0      # cumLagMs: controlsd 2 ms late per cycle for 15 s, then on time
     cc.ti_lag_ctl = (i * 0.01, lag[0])
     cc.update(CC, CS, i * 10_000_000, tog[(ph // 1000) % 3])
+    cc.ti_cost.tick()
     _count(seen, "ident running" if cc.ti_ident is not None and cc.ti_ident.running else "ident idle")
     _count(seen, "plan " + str(mode))
     _count(seen, "lag held" if cc.ti_lag_held else "lag ok")
@@ -459,6 +477,7 @@ def setup_card_curve():
     cs.enabled = not (9850 <= ph < 10000)
     CC.actuators.steer = 1.0 if (ph // 400) % 3 == 0 else 0.3
     cc.update(CC, CS, i * 10_000_000, tog)
+    cc.ti_cost.tick()
     _count(seen, "state:" + str(cc.curve.state if cc.curve is not None else None))
     _drain(seen, cc.ti_ident)
   step.seen = seen
@@ -506,6 +525,7 @@ def setup_card_buttons():
     CS.out.vEgo = 45.0 * 0.44704
     n0 = len(sent)
     cc.update(CC, CS, i * 10_000_000, tog)
+    cc.ti_cost.tick()
     for kk, d in sent[n0:]:
       if d and (st["last"] is None or (st["last"] - 3) // 10 != (kk - 3) // 10):
         st["pending"].append((kk + 4, d))
@@ -733,22 +753,25 @@ def setup_frogpilot_events():
   from openpilot.selfdrive.car.mazda import ti_curve as TC, ti_curve_view as TV
   from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
   from openpilot.selfdrive.controls.lib.events import FrogPilotEventName as FEN
-  saved = (FE.params, FE.params_memory)
+  from openpilot.selfdrive.controls.lib import lane_drift as LD
+  saved = (FE.params, FE.params_memory, LD.emit_event)
   mem = MemParams()
   FE.params, FE.params_memory = MemParams(), mem
+  seen = {}
+  LD.emit_event = lambda name, rec: _count(seen, "rec:" + name)   # lane_gate / ti_authority records, counted, not logged
   P = 1200                                   # 60 s of model frames
   planner = NS(frogpilot_vcruise=NS(forcing_stop=False, slc=NS(speed_limit_changed_timer=0.0)), tracking_lead=False, model_stopped=False,
                cem=NS(stop_light_detected=False), lead_one=NS(dRel=10.0, vLead=0.0), lateral_acceleration=0.0, steer_advisory_speed=0.0,
-               steer_latched=False)
+               steer_latched=False, latch_frames=0, latch_bits=0)
   toggles = NS(random_events=False, green_light_alert=True, current_holiday_theme="stock", lead_departing_alert=True, nnff=False,
                speed_limit_changed_alert=True, startup_alert_top="startup", startup_alert_bottom="", steer_authority_advisory=True,
                wheel_image="stock", is_metric=False)
   fe = FE.FrogPilotEvents(planner, NS(is_file=lambda: False), NS(update_wheel_image=lambda *a, **k: None))
   trig = SA.AdvisoryTrigger()
-  st = {"latch": 0, "tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
+  st = {"tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
   names = {FEN.steerRunningWide: "running wide", FEN.tiDropout: "ti dropout", FEN.steerAuthorityAdvisory: "advisory",
            FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning", FEN.tiCurveDing: "ding"}
-  seen = {}
+
 
   def step(i):
     now = i * 0.05
@@ -779,10 +802,8 @@ def setup_frogpilot_events():
     if st["code"][0] and now - st["code"][1] < 1.0:
       planner.steer_advisory_speed = st["code"][0]
       _count(seen, "curve code")
-    loaded = abs(sm["frogpilotCarState"].columnTorque) > SA.CEILING_COUNTS - 25.0
-    at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
-    st["latch"] = st["latch"] + 1 if (at_clip and abs(sm["carState"].steeringRateDeg) < 2.0 and loaded) else 0
-    planner.steer_latched = st["latch"] >= SA.LATCH_DEBOUNCE_FRAMES
+    # the planner's latch: the real code (steer_authority.update_latch, as FrogPilotPlanner.update calls it)
+    SA.update_latch(planner, sm["carControl"].actuators.steer, sm["carState"].steeringRateDeg, sm["frogpilotCarState"].columnTorque, True)
     fe.update(100.0 * 0.2778, sm, toggles)
     for n in fe.events.names:
       if n in names:
@@ -791,7 +812,7 @@ def setup_frogpilot_events():
       _count(seen, "gate latched")
 
   def teardown():
-    FE.params, FE.params_memory = saved
+    FE.params, FE.params_memory, LD.emit_event = saved
   step.seen = seen
   return step, teardown
 
