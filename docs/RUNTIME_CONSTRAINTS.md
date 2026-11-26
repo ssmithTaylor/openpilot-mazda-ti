@@ -68,6 +68,18 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Off-road only, only with CommaLogsUrl set (`system/manager/process_config.py:62-64`, started at `:124`). One notification per
   off-road period with bounded retries, then idle. Not per frame; collector on.
 
+## qcomgpsd (`system/qcomgpsd/qcomgpsd.py`): the car's only satellite position source
+- On-road only, ordinary Python, not on the control core, collector on. The diag loop blocks on `diag.recv()` and publishes
+  gpsLocation (about 1 Hz) and qcomGnss.
+- Read-only receiver logging (`receiver_log.ReceiverLog`, 2026-11-26): hooks run only after the stock `pm.send` (or on the
+  stock skip path), each body inside a guard that catches everything, logs `gnss.log_fault` once per part per drive (no values)
+  and switches that part off. In-memory, fixed size (`fix_quality.FixQuality` <= 60 values per field; `gnss_status.GnssStatus`
+  overwritten every 5 s). The one modem command it sends, `AT+QGPSCFG="gnssconfig"` (read form), runs once per drive in a
+  daemon thread through mmcli with a 20 s subprocess timeout, never in the diag loop. It opens no port, file or socket.
+  Published messages are byte-for-byte the stock ones (`tests/test_receiver_log.py` against `tests/stock_qcomgpsd_ref.py`).
+- gpsLocation.horizontalAccuracy stays unset: locationd rejects a fix when norm(horizontal, vertical accuracy) >= 1500 m
+  (`locationd.cc` handle_gps), so filling it would change what locationd accepts. Guarded by `test_fix_quality.py`.
+
 ## UI (C++ Qt: `selfdrive/ui/qt/ti_pages_logic.h`, `selfdrive/ui/qt/sidebar.cc`, `frogpilot/ui/qt/offroad/lateral_settings.cc`)
 - Reads our params (TiCurveStatus, TiTuningStats). Rate and memory behaviour NOT verified here; the Python guards do not cover it.
 - Curve element (`selfdrive/ui/qt/onroad/ti_curve_view.{h,cc}`, rules in `ti_curve_view_logic.h`): AnnotatedCameraWidget reads tmpfs

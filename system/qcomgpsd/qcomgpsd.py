@@ -207,6 +207,20 @@ def teardown_quectel(diag):
   try_setup_logs(diag, [])
 
 
+def _receiver_log():
+  # Read-only receiver logging (receiver_log.py): never raises into this loop, sends only the gnssconfig query. If it cannot
+  # even be imported or built, qcomgpsd runs exactly as stock.
+  try:
+    from openpilot.system.qcomgpsd.receiver_log import ReceiverLog
+    return ReceiverLog()
+  except Exception:
+    try:
+      cloudlog.exception("receiver log unavailable")
+    except Exception:
+      pass
+    return None
+
+
 def wait_for_modem(cmd="AT+QGPS?"):
   cloudlog.warning("waiting for modem to come up")
   while True:
@@ -232,6 +246,7 @@ def main() -> NoReturn:
   unpack_position, _ = dict_unpacker(position_report)
 
   wait_for_modem()
+  rx_log = _receiver_log()
 
   stop_download_event = Event()
   assist_fetch_proc = Process(target=downloader_loop, args=(stop_download_event,))
@@ -259,6 +274,8 @@ def main() -> NoReturn:
   r = setup_quectel(diag)
   want_assistance = not r
   cloudlog.warning("quectel setup done")
+  if rx_log is not None:
+    rx_log.start_config_readback()
   gpio_init(GPIO.GNSS_PWR_EN, True)
   gpio_set(GPIO.GNSS_PWR_EN, True)
 
@@ -334,6 +351,8 @@ def main() -> NoReturn:
     elif log_type == LOG_GNSS_POSITION_REPORT:
       report = unpack_position(log_payload)
       if report["u_PosSource"] != 2:
+        if rx_log is not None:
+          rx_log.position(report, False)
         continue
       vNED = [report["q_FltVelEnuMps[1]"], report["q_FltVelEnuMps[0]"], -report["q_FltVelEnuMps[2]"]]
       vNEDsigma = [report["q_FltVelSigmaMps[1]"], report["q_FltVelSigmaMps[0]"], -report["q_FltVelSigmaMps[2]"]]
@@ -362,6 +381,9 @@ def main() -> NoReturn:
         want_assistance = False
         stop_download_event.set()
       pm.send('gpsLocation', msg)
+      # gpsLocation.horizontalAccuracy stays unset (locationd thresholds on it); the receiver's accuracy figures are logged.
+      if rx_log is not None:
+        rx_log.position(report, gps.hasFix)
 
     elif log_type == LOG_GNSS_OEMDRE_SVPOLY_REPORT:
       msg = messaging.new_message('qcomGnss', valid=True)
@@ -458,6 +480,8 @@ def main() -> NoReturn:
               setattr(sv, k, v)
 
       pm.send('qcomGnss', msg)
+      if rx_log is not None:
+        rx_log.measurement(log_type, log_payload)
 
 if __name__ == "__main__":
   main()
