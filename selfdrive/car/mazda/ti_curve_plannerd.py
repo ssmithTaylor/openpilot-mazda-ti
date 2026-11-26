@@ -327,7 +327,7 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "fk")
+             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "fk", "nc", "wall_us")
 TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carries (REPLAY above), and the plan's "ask" (stage 3's
                                           # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
 TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
@@ -480,6 +480,8 @@ def tick_log(plan, extras):
            rel=(plan.diag or {}).get("rel", int(bool(plan.released))))
   if (plan.diag or {}).get("rm"):
     d["rm"] = plan.diag["rm"]       # beside the remembered road (road matching): why, "far" / "dev" / "lead" / "link"
+  if isinstance((plan.diag or {}).get("nc"), int):
+    d["nc"] = plan.diag["nc"]       # cold cruise-model simulations in this tick's step (cost; perf 2026-11-26)
   if (plan.diag or {}).get("fk"):
     # forks (ti_curve_plan FORK_*): the first fork ahead [why: 1 link / 2 straighter road / 3 turn signal, continuations, chosen
     # (0 = the link), whole metres to it]; indices only, never a position or a name
@@ -559,6 +561,7 @@ PLANNER_STATE = {
   "released": "rel", "rm_why": "rm", "ask": "ask", "events": "the planner events (ti_curve_plan channel), drained every tick",
   "mem": _FX, "need": _FX, "need_hi": _FX, "kabs": _FX, "kmed": _FX, "rec_hi": _FX, "rec_lo": _FX, "_attested": _FX, "model": _FX,
   "fc_ratio": _FX, "hi": _FX, "fk": "fk",
+  "_cold0": "a cost cache's counter (COLD) at the tick's start: the tick record's nc is its growth over the tick",
   "_fork_cache": "a cost cache of the continuations of each trace (a pure function of the road memory)",
   "_prof_cache": "a cost cache of _profile_over keyed by its inputs (same inputs, same answer)",
 }
@@ -624,7 +627,7 @@ def main():
   yaw, yaw_t = None, -1e9
   lacc, lacc_t, ti_fb, ti_t = None, -1e9, None, -1e9
   vhist = []                      # (t, m/s) over the last ~1.2 s: the measured deceleration (A10)
-  last_map, cpu_us = None, None
+  last_map, cpu_us, wall_us = None, None, None
   last_list_id = None
   lim_state = {"t": None}
   cpu = []
@@ -632,6 +635,7 @@ def main():
     sm.update(0)
     t = time.monotonic()
     c0 = time.process_time()
+    w0 = time.perf_counter()
     try:
       if sm.updated["can"]:
         y, la_, tf = can_reads(sm["can"])     # = yaw_from_can, lat_accel_from_can, ti_from_can in one pass
@@ -715,6 +719,7 @@ def main():
                     drv=(DRV_PRESSED * bool(cs.steeringPressed) | DRV_BRAKE * bool(cs.brakePressed) | DRV_GAS * bool(cs.gasPressed) |
                          DRV_BUTTON * bool(len(cs.buttonEvents)) | DRV_LBLINK * bool(cs.leftBlinker) | DRV_RBLINK * bool(cs.rightBlinker)),
                     tq=int(round(float(cs.steeringTorque))), cpu=cpu_us, fcx=fcx or None, mdl=mdl, step_us=step_us,
+                    wall_us=wall_us,
                     # review (minor): the CAN frame lacc / ti were last read from may be up to 0.5 s old (only the latest can message
                     # of each update is read): their age in ms, so a tick never reports a stale value as current
                     lacc_ms=int(round((t - lacc_t) * 1000)) if t - lacc_t < 0.5 else None,
@@ -736,6 +741,7 @@ def main():
         extras["ask"] = [int(round(float(x) * 100)) for x in plan.ask]
       cloudlog.event("ti_curve_plan", **log_payload(tick_log(plan, extras), kind="tick"))
       cpu_us = int(round(1e6 * (time.process_time() - c0)))     # logged on the next tick (this tick's own cost, log included)
+      wall_us = int(round(1e6 * (time.perf_counter() - w0)))    # ... and its whole wall time (perf 2026-11-26)
       cpu.append(time.process_time() - c0)
       if t - last_summary >= SUMMARY_S:
         cpu.sort()

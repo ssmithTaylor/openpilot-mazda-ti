@@ -250,11 +250,13 @@ APPROACH_TABLE_SHED_MPH = 15       # = MAX_SHED_MPH: a run's lowest target is at
 
 def approach_table_keys():
   """The keys the table holds: speed u above target T (19..89), the dash at u, every push depth a corner can give a point of it:
-  the push for the corner's lowest target (T down to T - APPROACH_TABLE_SHED_MPH) - DRIVE_GAP_MPH, never below the push floor."""
+  the push for the corner's lowest target (T down to T - APPROACH_TABLE_SHED_MPH) - DRIVE_GAP_MPH, never below the push floor, and
+  (perf 2026-11-26, ported from ramp2 f27ce822) the same depths without the gap: the SHALLOW pushes a push floor just under the target
+  gives (T - S1 of 0 .. DRIVE_GAP_MPH - 1: 95 % of the device's slow bend ticks on 2026-11-25 were cold simulations of those)."""
   out = []
   pf = CM.push_floor(CAR_MIN_MPH, DRIVE_GAP_MPH)
   for T in range(CAR_MIN_MPH, MAX_MPH):
-    s1s = sorted({max(pf, T - d - DRIVE_GAP_MPH) for d in range(APPROACH_TABLE_SHED_MPH + 1)}, reverse=True)
+    s1s = sorted({max(pf, T - d - g) for d in range(APPROACH_TABLE_SHED_MPH + 1) for g in (DRIVE_GAP_MPH, 0)}, reverse=True)
     for S1 in s1s:
       for u in range(T + 1, MAX_MPH + 1):
         out.append((u, T, S1, u))
@@ -262,7 +264,8 @@ def approach_table_keys():
 
 
 def load_approach_table(path=APPROACH_TABLE):
-  """Fill the approach cache from the precomputed table if it was built from the current sources. -> keys loaded."""
+  """Fill the approach cache from the precomputed table if it was built from the current sources. -> keys loaded. (The raise
+  thresholds in the same file: load_raise_table.)"""
   try:
     z = np.load(path, allow_pickle=False)
     if str(z["src"]) != approach_src_hash():
@@ -271,9 +274,70 @@ def load_approach_table(path=APPROACH_TABLE):
   except (OSError, KeyError, ValueError):
     return 0
   for k, d in zip(keys.tolist(), dist.tolist()):
-    # per-frame-ok: the approach table's ~23k keys, once at start
+    # per-frame-ok: the approach table's ~34k keys, once at start
     _APPROACH.setdefault(tuple(int(x) for x in k), float(d))
   return len(dist)
+
+
+# The raise thresholds (_raise_threshold) precomputed for the set speeds this car's cruise reports (perf 2026-11-26): the planner is
+# given carState.cruiseState.speed (a float32: CRZ_SPEED in 0.01 kph steps) / MPH, so a threshold's key is that exact float; these are
+# the 74 distinct values recorded over the 132 drives (m/s, float32-exact; speeds only). Any other value is computed cold as before.
+# The same function on the same key: the same answer (test_mazda_ti_curve_perf_table.py).
+RAISE_SET_MS = (
+  8.333333015441895, 8.491666793823242, 8.938888549804688, 9.38611125946045, 9.833333015441895, 10.280555725097656,
+  10.727777481079102, 11.175000190734863, 11.619444847106934, 12.066666603088379, 12.51388931274414, 12.961111068725586,
+  13.408333778381348, 13.409722328186035, 13.855555534362793, 14.302778244018555, 14.75, 15.197221755981445, 15.644444465637207,
+  16.08888816833496, 16.53611183166504, 16.983333587646484, 17.43055534362793, 17.877777099609375, 17.879167556762695,
+  18.325000762939453, 18.7722225189209, 19.219444274902344, 19.66666603088379, 20.113889694213867, 20.115278244018555,
+  20.558332443237305, 21.005556106567383, 21.452777862548828, 21.899999618530273, 22.34722137451172, 22.34861183166504,
+  22.794445037841797, 23.241666793823242, 23.688888549804688, 23.690277099609375, 24.136110305786133, 24.580554962158203,
+  24.58333396911621, 24.5847225189209, 25.02777862548828, 25.475000381469727, 25.922222137451172, 26.369443893432617,
+  26.816667556762695, 26.818056106567383, 27.26388931274414, 27.711111068725586, 28.15833282470703, 28.60555648803711,
+  29.052778244018555, 29.497222900390625, 29.94444465637207, 30.391666412353516, 30.83888816833496, 31.28611183166504,
+  31.733333587646484, 32.18055725097656, 32.627777099609375, 33.07500076293945, 33.522220611572266, 33.96666717529297,
+  34.41388702392578, 34.86111068725586, 35.30833435058594, 35.75555419921875, 36.20277786254883, 36.650001525878906,
+  37.09722137451172
+)
+
+
+def raise_src_hash():
+  """The sources a raise threshold depends on: the cruise model, its taps, and the raise settings."""
+  h = hashlib.sha256()
+  here = os.path.dirname(os.path.abspath(__file__))
+  for f in ("ti_cruise_model.py", "ti_cruise_taps.py"):
+    with open(os.path.join(here, f), "rb") as fh:
+      h.update(fh.read().replace(b"\r\n", b"\n"))
+  h.update(repr((RAISE_SIM_DT_S, RAISE_THR_SPAN_MPH, RAISE_THR_ITER, RAISE_THR_CHECK, CM.HOLD, MPH)).encode())
+  return h.hexdigest()
+
+
+def raise_table_keys():
+  """(set mph as the planner gets it, T) for every recorded set speed and every whole-mph target above it (a raise is judged only with
+  the dash below T)."""
+  out = []
+  for v in RAISE_SET_MS:
+    sm = float(v) / MPH
+    for T in range(max(CAR_MIN_MPH, int(math.floor(sm)) + 1), MAX_MPH):
+      out.append((sm, T))
+  return out
+
+
+def load_raise_table(path=APPROACH_TABLE):
+  """Fill the raise-threshold cache from the table if it was built from the current sources. -> entries loaded."""
+  try:
+    z = np.load(path, allow_pickle=False)
+    if str(z["rsrc"]) != raise_src_hash():
+      return 0
+    sets, Ts, thr = z["rthr_set"].tolist(), z["rthr_T"].tolist(), z["rthr"].tolist()
+  except (OSError, KeyError, ValueError):
+    return 0
+  for sm, T, th in zip(sets, Ts, thr):
+    # per-frame-ok: the raise table's ~3k entries, once at start
+    _RAISE_THR.setdefault((float(sm), int(T), CM.HOLD), None if not math.isfinite(th) else float(th))
+  return len(thr)
+
+
+COLD = [0]      # cold cruise-model simulations run so far in this process (approach_m misses, raise-threshold bisections); logged per tick
 
 
 def approach_m(u, T, S1, dt=0.05, set0=None):
@@ -284,6 +348,7 @@ def approach_m(u, T, S1, dt=0.05, set0=None):
   r = _APPROACH.get(key)
   if r is not None:
     return r
+  COLD[0] += 1
   _, dist = CM.manoeuvre(float(key[0]), key[1], key[2], raise_at=None, arrived=ARRIVED_MPH, dt=dt, tap_s=TAP_S,
                          set0=float(key[3]), hold=CM.HOLD)
   # per-frame-ok: keyed by whole mph (u, T, S1, set0) in the cruise range; 2 h soak flat at 22722 entries
@@ -353,6 +418,7 @@ def _raise_threshold(set_mph, T):
   key = (set_mph, T, CM.HOLD)
   if key in _RAISE_THR:
     return _RAISE_THR[key]
+  COLD[0] += 1
   lo, hi = float(set_mph), float(T) + RAISE_THR_SPAN_MPH
   thr = None
   if _raise_due_at(lo, set_mph, T) and not _raise_due_at(hi, set_mph, T):
@@ -688,6 +754,7 @@ class Planner:
     if not getattr(Planner, "_table_tried", False):
       Planner._table_tried = True
       Planner.table_keys = load_approach_table()   # once per process (cost only: the same values as computed)
+      Planner.raise_keys = load_raise_table()
     self.mem = memory
     # I1: the points whose trouble record is attested (the release's "strong" bend; the bound uses the same test)
     vt = getattr(memory, "v_trb", None)
@@ -1257,6 +1324,7 @@ class Planner:
     toward a branch makes it the plan). -> Plan."""
     dt = 0.0 if self.t is None else max(0.0, min(1.0, t - self.t))
     self.t = t
+    self._cold0 = COLD[0]                 # cold simulations of this tick (the tick record's "nc")
     self.ref_now = int(ref_mph) if ref_mph else None
     self.limit = int(round(limit_mph)) if limit_mph and limit_mph > 0 else None
     v = max(0.0, float(v))
@@ -2149,6 +2217,7 @@ class Planner:
     diag = {"stage": stage, "ceil": ceil, "kind": kind, "need": need if isinstance(need, (int, np.integer)) else None,
             "cap": cap, "ahead": ahead, "behind": behind, "alert": alert, "src": src,
             "rel": len(getattr(self, "released", {}) or {})}
+    diag["nc"] = int(COLD[0] - getattr(self, "_cold0", COLD[0]))   # cold cruise-model simulations this tick (cost)
     if getattr(self, "fk", None):
       diag["fk"] = self.fk                        # FORK_*: the first fork ahead [code, continuations, chosen, metres]
     if getattr(self, "rm_off", False):
