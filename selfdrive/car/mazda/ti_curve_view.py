@@ -18,7 +18,8 @@ src: SRC_RECORD 0 (the remembered road: the ribbon), SRC_MAP 1 (the map only: no
 Never a position: distances along the path, speeds and curvatures only (test_mazda_ti_curve_view.py scans the schema).
 
 The ding (PARAM_DING, written only at the onset): ONE per red bend, when its chip first appears (seconds to the bend <= its lead) while
-curve slowing is on and the car is at or above MIN_MPH; never again for the same bend (known by the odometer of its end, kept until
+curve slowing is on, the car's cruise is active (the screen hides the element while cruise is cancelled, owner 2026-11-26) and the car
+is at or above MIN_MPH; never again for the same bend (known by the odometer of its end, kept until
 passed). frogpilot_planner reads it (read_curve_ding) and raises the size-none event tiCurveDing once: a sound, no banner, no loop.
 """
 # RUNTIME: runs in ti_curve_plannerd at 5 Hz (gc frozen after load, collector on); read_curve_ding in frogpilot_process at 10 Hz (gc
@@ -176,9 +177,11 @@ class View:
     self.n = 0                        # red-chip onsets (dings) so far in this process
     self.last = None                  # the last onset {"m", "n", "need"} (PARAM_DING)
 
-  def step(self, planner, plan, t_mono, seq, on, mph, set_mph, floor, side):
+  def step(self, planner, plan, t_mono, seq, on, mph, set_mph, floor, side, cruise=True):
     """One tick after Planner.step. -> (payload dict, ding dict or None, log list of ints: [dings so far, chip class, bends, flags
-    (bits 0-1: the bends' source SRC_*), then for the 3 nearest bends: start, end, dir, need, target, class])."""
+    (bits 0-1: the bends' source SRC_*; bit 2: cruise active), then for the 3 nearest bends: start, end, dir, need, target, class]).
+    cruise: the car's cruise is active (carState.cruiseState.enabled); while it is cancelled no ding (the screen shows nothing then);
+    a red bend first seen then dings when cruise is active again and its chip still shows."""
     view = getattr(planner, "view", None) if on else None
     bl, rib, ends = [], [], False
     if on:
@@ -197,14 +200,14 @@ class View:
     # the chip on the numbers as published (whole metres, 0.1 s, 0.1 mph): exactly what the UI decides at age 0
     ck, ci = chip([{"cls": q[6], "start": q[0], "lead": q[9] / 10.0} for q in p["b"]], p["mph"] / 10.0) if bl else (CLS_NEUTRAL, -1)
     ding = None
-    if on and ck == CLS_RED and float(mph) >= MIN_MPH:
+    if on and cruise and ck == CLS_RED and float(mph) >= MIN_MPH:
       key = odo + bl[ci]["end"]
       if not any(abs(key - e) <= DING_MATCH_M for e in self.dinged):
         self.dinged.append(key)
         del self.dinged[:-DING_KEEP]
         self.n += 1
         ding = self.last = {"m": round(float(t_mono), 2), "n": self.n, "need": int(bl[ci]["need"])}
-    log = [self.n, int(ck), len(bl), int(src)]
+    log = [self.n, int(ck), len(bl), int(src) | (4 if cruise else 0)]
     for b in p["b"][:3]:
       log += [b[0], b[2], b[3], b[4], b[5], b[6]]
     return p, ding, log

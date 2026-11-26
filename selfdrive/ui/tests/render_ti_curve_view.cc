@@ -78,6 +78,7 @@ int main(int argc, char **argv) {
       screen.lead_text = ti_view::Rect{cfg["lead"][0], cfg["lead"][1], cfg["lead"][2], cfg["lead"][3]};
     }
     const bool engaged = get("engaged", 1) != 0;
+    const bool cruise = get("cruise", 1) != 0;
     const bool outline = get("outline", 0) != 0;
     const QPoint widget_at(sidebar ? 300 + ti_view::BORDER : ti_view::BORDER, ti_view::BORDER);   // the camera widget on the screen
     for (const char *bg : {"dark", "bright"}) {
@@ -106,7 +107,7 @@ int main(int argc, char **argv) {
           p.translate(widget_at);                      // the camera widget's coordinates, as in AnnotatedCameraWidget::paintEvent
           QElapsedTimer t;
           t.start();
-          view.draw(p, now, engaged, ticks[i].first, screen, origin, 0.05);
+          view.draw(p, now, engaged, cruise, ticks[i].first, screen, origin, 0.05);
           times.push_back(t.nsecsElapsed() * 1e-6);
           if (final_frame && outline) {
             ti_view::Element obs[ti_view::MAX_ELEMENTS];

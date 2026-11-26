@@ -1,4 +1,4 @@
-// Reads lines "<now> <engaged 0/1> <ui mph> <was shown 0/1> <payload JSON>" and prints, per line, what the driving screen's curve
+// Reads lines "<now> <engaged 0/1> <cruise active 0/1> <ui mph> <was shown 0/1> <payload JSON>" and prints, per line, what the driving screen's curve
 // element decides (ti_curve_view_logic.h): "<visibility> <chip class> <chip mph> <chip secs> <chip dir> <chip bend> <ribbon points>".
 // Used by selfdrive/car/tests/test_mazda_ti_curve_view_logic.py to check the C++ rules against the planner's own (ti_curve_view.py).
 #include <cstdio>
@@ -14,13 +14,13 @@ int main() {
   while (std::getline(std::cin, line)) {
     std::istringstream in(line);
     double now = 0, mph = 0;
-    int engaged = 0, was = 0;
-    in >> now >> engaged >> mph >> was;
+    int engaged = 0, cruise = 0, was = 0;
+    in >> now >> engaged >> cruise >> mph >> was;
     std::string rest;
     std::getline(in, rest);
     ti_view::Payload p;
     ti_view::parse(rest, p);
-    const int vis = ti_view::visibility(p, now, engaged != 0, mph, was != 0);
+    const int vis = ti_view::visibility(p, now, engaged != 0, cruise != 0, mph, was != 0);
     const ti_view::Chip c = ti_view::chipFor(p, now - p.m);
     ti_view::Ribbon r;
     ti_view::ribbonRaw(p, r);

@@ -6,7 +6,8 @@
 // number from here.
 //   - the input: ti_curve_plannerd's tmpfs param TiCurveView (selfdrive/car/mazda/ti_curve_view.py), parsed into fixed arrays
 //     (no allocation per read);
-//   - when it is drawn (visibility): curve slowing on, openpilot engaged, at or above 19 mph (hidden again below 18.5), the planner's
+//   - when it is drawn (visibility): curve slowing on, openpilot engaged, the car's cruise active (owner 2026-11-26: hidden while
+//     cruise is cancelled and openpilot still steers), at or above 19 mph (hidden again below 18.5), the planner's
 //     tick at most 1 s old; otherwise nothing at all (the chip never shows a stale number);
 //   - the ribbon: the road ahead for 45 s, bends 30 % sharper than true, the near road enlarged (distance compressed beyond about
 //     12 s), fitted to its bounding box inside its area on the right-hand side (layout(): clear of every other element), the fit smoothed over 1 s and replaced at once by the fitting one when
@@ -176,13 +177,18 @@ inline bool parse(const std::string &text, Payload &p) {
 }
 
 // ---- when it is drawn -------------------------------------------------------------------------------------------------------------
-enum Hidden { SHOWN = 0, NO_DATA, SWITCHED_OFF, STALE, NOT_ENGAGED, TOO_SLOW };
+enum Hidden { SHOWN = 0, NO_DATA, SWITCHED_OFF, STALE, NOT_ENGAGED, TOO_SLOW, CRUISE_OFF };
 
-inline Hidden visibility(const Payload &p, double now, bool engaged, double ui_mph, bool was_shown) {
+// engaged: openpilot engaged (the UI's status ENGAGED or OVERRIDE); cruise_active: the car's cruise is on and active
+// (carState.cruiseState.enabled). With cruise cancelled nothing is drawn, whether or not openpilot still steers (FrogPilot's
+// always-on lateral): owner, 2026-11-26, "for now"; the element returns as soon as cruise is active again. Both inputs are in
+// the drive log (carState, controlsState), so this decision needs no log of its own.
+inline Hidden visibility(const Payload &p, double now, bool engaged, bool cruise_active, double ui_mph, bool was_shown) {
   if (!p.ok) return NO_DATA;
   if (!p.on) return SWITCHED_OFF;
   const double age = now - p.m;
   if (age > STALE_S || age < -FUTURE_S) return STALE;
+  if (!cruise_active) return CRUISE_OFF;
   if (!engaged) return NOT_ENGAGED;
   if (ui_mph < (was_shown ? HIDE_MPH : SHOW_MPH)) return TOO_SLOW;
   return SHOWN;

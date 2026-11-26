@@ -23,7 +23,8 @@ public:
   // screen: the camera widget's size and what else is on it, in the painter's coordinates (ti_view::Screen; the MAX box included);
   // origin: where the painter's (0, 0) is in the onroad window (the onroad border); dt: seconds since the last frame.
   // -> what was decided (ti_view::Hidden)
-  int draw(QPainter &p, double now, bool engaged, double ui_mph, const ti_view::Screen &screen, const QPoint &origin, double dt);
+  int draw(QPainter &p, double now, bool engaged, bool cruise_active, double ui_mph, const ti_view::Screen &screen,
+           const QPoint &origin, double dt);
 
   const ti_view::Payload &payload() const { return payload_; }
   const ti_view::Fit &fit() const { return fit_; }

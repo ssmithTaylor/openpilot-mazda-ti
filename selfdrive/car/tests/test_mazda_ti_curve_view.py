@@ -110,7 +110,7 @@ def test_ribbon_marks_a_remembered_road_that_ends_inside_the_window():
 
 # ---- the planner tick end to end on a synthetic road -------------------------------------------------------------------------------
 def _drive(on=True, ticks=200, v=20.0, segments=((600.0, 0.0), (120.0, 0.03), (600.0, 0.0), (150.0, -0.012), (800.0, 0.0)),
-           floor=30, x0=1.0e5, y0=-2.0e5):
+           floor=30, x0=1.0e5, y0=-2.0e5, cruise_off=()):
   tr = M.synthetic_trace(list(segments), x0=x0, y0=y0)
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
@@ -122,7 +122,7 @@ def _drive(on=True, ticks=200, v=20.0, segments=((600.0, 0.0), (120.0, 0.03), (6
     plan = pl.step(k * 0.2, P.Fix(True, float(tr["x"][j]), float(tr["y"][j]), float(tr["hdg"][j])), v, set_mph=45.0,
                    yaw_k=float(tr["kap"][j]), ref_mph=45.0, floor_mph=floor)
     s1, s2, side = D.stage_summary(pl)
-    p, ding, log = vw.step(pl, plan, k * 0.2, k, on, v / MPH, 45.0, floor, side)
+    p, ding, log = vw.step(pl, plan, k * 0.2, k, on, v / MPH, 45.0, floor, side, cruise=k not in cruise_off)
     out.append((s, plan, p, ding, log))
   return out, tr
 
@@ -183,6 +183,17 @@ def test_exactly_one_ding_per_red_bend_and_none_for_yellow():
 def test_no_ding_below_19_mph():
   out, _ = _drive(v=18.5 * MPH, ticks=400, segments=((150.0, 0.0), (120.0, 0.05), (400.0, 0.0)))
   assert all(x[3] is None for x in out)
+
+
+def test_no_ding_while_cruise_is_cancelled_and_one_when_it_is_back_before_the_bend():
+  out, _ = _drive()
+  first = next(i for i, o in enumerate(out) if o[3] is not None)      # the red chip's onset with cruise active
+  off = set(range(first, first + 3))                                   # cruise cancelled at the onset for three ticks
+  out2, _ = _drive(cruise_off=off)
+  dings = [o[3] is not None for o in out2]
+  assert not any(dings[:first + 3])                                    # none while cancelled
+  assert dings[first + 3] and sum(dings) == sum(o[3] is not None for o in out)   # then one, when it is back and the chip shows
+  assert all(o[4][3] & 4 == (0 if k in off else 4) for k, o in enumerate(out2))   # cruise is in the tick record
 
 
 def test_a_second_red_bend_dings_again():

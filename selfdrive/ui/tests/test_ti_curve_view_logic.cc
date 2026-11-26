@@ -53,18 +53,27 @@ static void parsing() {
 static void visibilityRules() {
   Payload p;
   parse(sample(100.0), p);
-  CHECK(visibility(p, 100.5, true, 45.0, false) == SHOWN);
-  CHECK(visibility(p, 101.01, true, 45.0, true) == STALE);              // older than 1 s: gone, chip included
-  CHECK(visibility(p, 99.5, true, 45.0, true) == STALE);                // from the future (another clock): never trusted
-  CHECK(visibility(p, 100.5, false, 45.0, true) == NOT_ENGAGED);
-  CHECK(visibility(p, 100.5, true, 18.9, false) == TOO_SLOW);           // appears only from 19 mph
-  CHECK(visibility(p, 100.5, true, 18.9, true) == SHOWN);               // ... and stays down to 18.5
-  CHECK(visibility(p, 100.5, true, 18.4, true) == TOO_SLOW);
+  CHECK(visibility(p, 100.5, true, true, 45.0, false) == SHOWN);
+  CHECK(visibility(p, 101.01, true, true, 45.0, true) == STALE);              // older than 1 s: gone, chip included
+  CHECK(visibility(p, 99.5, true, true, 45.0, true) == STALE);                // from the future (another clock): never trusted
+  CHECK(visibility(p, 100.5, false, true, 45.0, true) == NOT_ENGAGED);
+  CHECK(visibility(p, 100.5, true, true, 18.9, false) == TOO_SLOW);           // appears only from 19 mph
+  CHECK(visibility(p, 100.5, true, true, 18.9, true) == SHOWN);               // ... and stays down to 18.5
+  CHECK(visibility(p, 100.5, true, true, 18.4, true) == TOO_SLOW);
   Payload off;
   parse(sample(100.0, 0), off);
-  CHECK(visibility(off, 100.5, true, 45.0, true) == SWITCHED_OFF);
+  CHECK(visibility(off, 100.5, true, true, 45.0, true) == SWITCHED_OFF);
   Payload none;
-  CHECK(visibility(none, 100.5, true, 45.0, true) == NO_DATA);
+  CHECK(visibility(none, 100.5, true, true, 45.0, true) == NO_DATA);
+  // cruise cancelled while openpilot still steers (owner, 2026-11-26, "for now"): nothing at all, chip included
+  CHECK(visibility(p, 100.5, true, false, 45.0, true) == CRUISE_OFF);
+  CHECK(visibility(p, 100.5, false, false, 45.0, true) == CRUISE_OFF);
+  // ... and back as soon as cruise is active again (it was hidden: the 19 mph threshold to appear applies)
+  CHECK(visibility(p, 100.5, true, true, 45.0, false) == SHOWN);
+  CHECK(visibility(p, 100.5, true, true, 18.9, false) == TOO_SLOW);
+  // stale or switched off still say so first (what the log shows the planner published)
+  CHECK(visibility(p, 101.5, true, false, 45.0, true) == STALE);
+  CHECK(visibility(off, 100.5, true, false, 45.0, true) == SWITCHED_OFF);
 }
 
 static void chipTiming() {

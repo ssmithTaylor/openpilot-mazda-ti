@@ -153,8 +153,9 @@ void TiCurveView::setPayload(const std::string &text) {
   parse(text_, payload_);
 }
 
-int TiCurveView::draw(QPainter &p, double now, bool engaged, double ui_mph, const Screen &screen, const QPoint &origin, double dt) {
-  const Hidden vis = visibility(payload_, now, engaged, ui_mph, shown_);
+int TiCurveView::draw(QPainter &p, double now, bool engaged, bool cruise_active, double ui_mph, const Screen &screen,
+                      const QPoint &origin, double dt) {
+  const Hidden vis = visibility(payload_, now, engaged, cruise_active, ui_mph, shown_);
   shown_ = vis == SHOWN;
   rect_ = Rect();
   if (!shown_) {

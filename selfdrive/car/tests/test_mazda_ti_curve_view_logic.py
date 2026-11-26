@@ -56,7 +56,7 @@ def test_the_ui_decides_the_chip_as_the_planner_does_on_real_payloads():
   out, _ = _drive(ticks=260)
   lines, want = [], []
   for _, _, p, _, log in out:
-    lines.append(f"{p['m']:.2f} 1 {p['mph'] / 10:.1f} 1 {V.view_json(p)}")
+    lines.append(f"{p['m']:.2f} 1 1 {p['mph'] / 10:.1f} 1 {V.view_json(p)}")
     want.append(log[1])
   with tempfile.TemporaryDirectory() as d:
     exe = _build(ROOT / "selfdrive/ui/tests/curve_view_cli.cc", d)
