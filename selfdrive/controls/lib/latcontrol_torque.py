@@ -206,6 +206,75 @@ class CommitFilter:
     self.x = float(_clip(self.x, -lim, lim))
     return self.x
 
+def _usable_table(xp, fp):
+  """scalar_np.Interp's domain: at least two strictly increasing breakpoints, as many values (else np.interp is kept)."""
+  n = len(xp)
+  return n >= 2 and n == len(fp) and all(xp[i] < xp[i + 1] for i in range(n - 1))
+
+
+class PlantPID(PIDController):
+  """The TI plant branch's PID: PIDController with its scalar np.interp gains and np.clip limits in plain Python (scalar_np, bit for bit
+  numpy 1.26's values; wrapped back into np.float64 so every result has the type it had). Cost (core 4, 2026-11-26): six np.interp and
+  two np.clip on one number per cycle were ~190 us of the comma's 10 ms cycle (measured on a little core). A gain table is turned into
+  an Interp (one breakpoint: its value) once per change of its values (controlsd assigns a new list every cycle with the same values); any
+  other table outside Interp's domain keeps np.interp. Checked against PIDController in selfdrive/controls/lib/tests/test_plant_pid_scalar.py."""
+
+  def __init__(self, *a, **k):
+    self._gain_fns = [None, None, None]                 # per gain: [breakpoints, values, Interp or None]
+    super().__init__(*a, **k)
+
+  def _gain(self, slot, table):
+    xp, fp = table[0], table[1]
+    if not (type(xp) in (list, tuple) and type(fp) in (list, tuple)):
+      return np.interp(self.speed, xp, fp)            # an array table: as PIDController (never on this car)
+    c = self._gain_fns[slot]
+    if c is None or not (c[0] == xp and c[1] == fp):  # compared by value, no allocation (a new list with the same values: no change)
+      if len(xp) == 1 and len(fp) == 1:
+        fn = np.float64(fp[0])                        # np.interp on one breakpoint: that value for every x, NaN included
+      else:
+        fn = Interp(xp, fp) if _usable_table(xp, fp) else None
+      c = self._gain_fns[slot] = [type(xp)(xp), type(fp)(fp), fn]
+    fn = c[2]
+    if fn is None:
+      return np.interp(self.speed, xp, fp)
+    return fn if type(fn) is np.float64 else np.float64(fn(self.speed))
+
+  @property
+  def k_p(self):
+    return self._gain(0, self._k_p)
+
+  @property
+  def k_i(self):
+    return self._gain(1, self._k_i)
+
+  @property
+  def k_d(self):
+    return self._gain(2, self._k_d)
+
+  def update(self, error, error_rate=0.0, speed=0.0, feedforward=0., freeze_integrator=False):
+    # PIDController.update with np.clip -> np.float64(scalar_np.clip): the same steps in the same order
+    self.speed = speed
+    self.p = self.k_p * float(error)
+    self.d = self.k_d * error_rate
+    self.f = self.k_f * feedforward
+
+    i_candidate = self.i if freeze_integrator else self.i + self.k_i * self.i_dt * error
+    u = self.p + i_candidate + self.d + self.f
+    u_sat = np.float64(_clip(u, self.neg_limit, self.pos_limit))
+
+    if u == u_sat:
+      self.i = i_candidate
+    else:
+      if u > self.pos_limit and error < 0:
+        self.i = i_candidate
+      elif u < self.neg_limit and error > 0:
+        self.i = i_candidate
+
+    control = self.p + self.i + self.d + self.f
+    self.control = np.float64(_clip(control, self.neg_limit, self.pos_limit))
+    return self.control
+
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -215,8 +284,8 @@ class LatControlTorque(LatControl):
     # The plant lookup happens before the PID so the damping gain can be plant-branch-only: the
     # stock path keeps k_d = 0 and its error_rate input stays inert, exactly as upstream.
     self.plant = getattr(CI, "lateral_plant", None)
-    self.pid = PIDController(self.torque_params.kp, self.torque_params.ki,
-                             k_d=(DAMP_KD if self.plant is not None else 0.), rate=1/self.dt)
+    self.pid = (PlantPID if self.plant is not None else PIDController)(self.torque_params.kp, self.torque_params.ki,
+                                                                       k_d=(DAMP_KD if self.plant is not None else 0.), rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.LATACCEL_REQUEST_BUFFER_NUM_FRAMES = int(1 / self.dt)
@@ -248,6 +317,16 @@ class LatControlTorque(LatControl):
     self.break_boost = 0.0       # counts, ramped, signed in the command's frame
     self.out_filter = FirstOrderFilter(0.0, OUT_FILTER_TAU, self.dt)
     self.out_filter_on = 0.0     # blend weight, ramped, so both directions are continuous
+
+  def _check_saturation(self, saturated, CS, steer_limited_by_safety, curvature_limited, expected_to_recover=False):
+    # LatControl._check_saturation with np.clip -> np.float64(scalar_np.clip) (cost, 2026-11-26: ~38 us a cycle on the comma);
+    # the same values and type (test_plant_pid_scalar.py)
+    if (saturated or curvature_limited) and CS.vEgo > self.sat_check_min_speed and not steer_limited_by_safety and not CS.steeringPressed and not expected_to_recover:
+      self.sat_time += self.dt
+    else:
+      self.sat_time -= self.dt
+    self.sat_time = np.float64(_clip(self.sat_time, 0.0, self.sat_limit))
+    return self.sat_time > (self.sat_limit - 1e-3)
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     if self.plant is not None:
