@@ -45,6 +45,19 @@ def test_on_road_defers_until_off_road_polling_slowly_and_logs_once():
   assert len(lines) == 2 and lines[0].startswith("boot jobs: deferred") and lines[1] == f"boot jobs: running (deferred {waited} s)"
 
 
+def test_default_log_goes_to_the_drive_log(monkeypatch, capsys):
+  """re-review R2-M6: the decision lines reach cloudlog (the drive log), not only manager's stdout."""
+  import inspect
+  from openpilot.frogpilot.common import boot_jobs
+  events = []
+  import openpilot.common.swaglog as swaglog
+  monkeypatch.setattr(swaglog.cloudlog, "event", lambda name, **kw: events.append((name, kw)))
+  assert inspect.signature(wait_until_offroad).parameters["log"].default is boot_jobs.log_line
+  boot_jobs.log_line("boot jobs: running (deferred 0.0 s)")
+  assert events == [("boot_jobs", {"msg": "boot jobs: running (deferred 0.0 s)"})]
+  assert capsys.readouterr().out.strip() == "boot jobs: running (deferred 0.0 s)"
+
+
 def _calls_in_order(fn):
   names = []
   for node in ast.walk(fn):

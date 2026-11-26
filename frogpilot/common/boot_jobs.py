@@ -16,7 +16,17 @@ import time
 OFFROAD_POLL_S = 10.0  # one param read every 10 s while driving; the jobs are not urgent
 
 
-def wait_until_offroad(params, sleep=time.sleep, monotonic=time.monotonic, log=print, poll_s: float = OFFROAD_POLL_S) -> float:
+def log_line(line: str) -> None:
+  """manager's stdout and the drive log (re-review R2-M6: the decision must be replayable from the log, not stdout only)."""
+  print(line)
+  try:
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.event("boot_jobs", msg=line)
+  except Exception:
+    pass
+
+
+def wait_until_offroad(params, sleep=time.sleep, monotonic=time.monotonic, log=log_line, poll_s: float = OFFROAD_POLL_S) -> float:
   """Block while params says the car is on-road. Returns the seconds deferred (0.0 when it was off-road already)."""
   t0 = monotonic()
   deferred = False
