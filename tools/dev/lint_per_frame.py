@@ -12,7 +12,8 @@ Flags, inside any function (not at module or class level):
   PF5  `+=` on a `self.` attribute that is a str / list / bytes (initialised so in the class, or a str / list / bytes added).
 And over the inventory (tools/dev/per_frame_inventory.json):
   PF6  a per-frame module without the `# RUNTIME: runs in <process> ...` header right under its docstring;
-  PF7  a ti_*.py, lateral_* / friction_* or selfdrive/controls/lib/*.py module imported by controlsd, card or a per-frame module that
+  PF7  a ti_*.py, lateral_* / friction_*, selfdrive/controls/lib/*.py or frogpilot/controls/[lib/]*.py module imported by controlsd,
+       card, frogpilot_process or a per-frame module that
        is in neither `per_frame` nor `not_per_frame` (new per-frame code must be classified before it lands).
 A line (or the line just above it) carrying `# per-frame-ok: <reason>` is waived. Exit 1 when any unwaived hit remains.
 """
@@ -29,8 +30,9 @@ INVENTORY = json.loads(INVENTORY_PATH.read_text(encoding="utf-8"))
 PER_FRAME_MODULES = tuple(INVENTORY["per_frame"])
 # What a per-frame module imports from these places must be classified in the inventory (per_frame or not_per_frame).
 CLASSIFY = (re.compile(r"^selfdrive/car/mazda/ti_[^/]+\.py$"), re.compile(r"^selfdrive/controls/lib/[^/]+\.py$"),
-            re.compile(r"^selfdrive/car/mazda/(lateral|friction)_[^/]+\.py$"))
-ENTRY_FILES = ("selfdrive/controls/controlsd.py", "selfdrive/car/card.py")
+            re.compile(r"^selfdrive/car/mazda/(lateral|friction)_[^/]+\.py$"), re.compile(r"^frogpilot/controls/(lib/)?[^/]+\.py$"))
+# The processes that run our code with the collector off (frogpilot_process: 2026-11-25, the second lane_drift leak, ~1 GB/h on-road).
+ENTRY_FILES = ("selfdrive/controls/controlsd.py", "selfdrive/car/card.py", "frogpilot/frogpilot_process.py")
 HEADER = re.compile(r"^# RUNTIME: runs in \S")
 WAIVER = re.compile(r"#\s*per-frame-ok:\s*\S")
 WRITE_METHODS = {"append", "add", "update", "setdefault", "extend", "insert", "appendleft", "__setitem__"}

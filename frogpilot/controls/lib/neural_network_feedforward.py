@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Twilsonco's Lateral Neural Network Feedforward Controller
+# RUNTIME: runs in controlsd at 100 Hz when the NNFF toggle is on; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import json
 import math
 import numpy as np

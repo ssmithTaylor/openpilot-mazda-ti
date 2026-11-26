@@ -32,6 +32,8 @@ So the advisory here is the conservative one: the speed at which the car can act
 plan. Expect it to ask for more slowing than strictly needed until the margin model earns its place;
 `TARGET_MARGIN` is the knob, and the logged prediction-versus-outcome is what should move it.
 """
+# RUNTIME: runs in frogpilot_process at 20 Hz (each modelV2, on-road, engaged or not); gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 
 # NOTE (2026-11-22): the 0x75 field named STEER_TORQUE / columnTorque is NOT column torque. It is the car's own
 # lateral acceleration sensor, about 96-103 counts per m/s^2 (so 202 counts is roughly 2.1 m/s^2), and it includes road

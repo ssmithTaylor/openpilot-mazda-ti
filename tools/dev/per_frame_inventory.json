@@ -15,6 +15,11 @@
       "rate_hz": 5,
       "gc": "frozen",
       "where": "selfdrive/car/mazda/ti_curve_plannerd.py:469 gc.freeze() after load; collector on"
+    },
+    "frogpilot_process": {
+      "rate_hz": 20,
+      "gc": "disabled",
+      "where": "frogpilot/frogpilot_process.py:57 config_realtime_process -> common/realtime.py:41 gc.disable(); Ratekeeper(1 / DT_MDL) at :55; on-road branch :112-116 (every modelV2 while started, engaged or not)"
     }
   },
   "entry_points": [
@@ -77,10 +82,28 @@
       "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log",
       "at": "selfdrive/car/mazda/ti_curve_plannerd.py:480-",
       "test": "planner"
+    },
+    {
+      "process": "frogpilot_process",
+      "call": "FrogPilotEvents.update (via FrogPilotPlanner.update): LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch",
+      "at": "frogpilot/controls/lib/frogpilot_events.py:262",
+      "test": "frogpilot_events"
+    },
+    {
+      "process": "frogpilot_process",
+      "call": "FrogPilotPlanner.update TI block: steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code, latch count",
+      "at": "frogpilot/controls/frogpilot_planner.py:122-162",
+      "test": "frogpilot_events"
+    },
+    {
+      "process": "controlsd",
+      "call": "LatControlNNFF.update (only with the NNFF toggle on; this fork changed it)",
+      "at": "selfdrive/controls/controlsd.py:303-314",
+      "test": null
     }
   ],
   "per_frame": {
-    "selfdrive/controls/lib/lane_drift.py": "controlsd",
+    "selfdrive/controls/lib/lane_drift.py": "controlsd, frogpilot_process",
     "selfdrive/controls/lib/latcontrol_torque.py": "controlsd",
     "selfdrive/controls/lib/scalar_np.py": "controlsd",
     "selfdrive/car/mazda/lateral_plant.py": "controlsd",
@@ -100,13 +123,17 @@
     "selfdrive/car/mazda/ti_cruise_check.py": "card",
     "selfdrive/car/mazda/ti_cruise_taps.py": "card",
     "selfdrive/car/mazda/ti_button_tests.py": "card",
-    "selfdrive/car/mazda/ti_curve.py": "card, ti_curve_plannerd",
+    "selfdrive/car/mazda/ti_curve.py": "card, ti_curve_plannerd, frogpilot_process",
     "selfdrive/car/mazda/ti_curve_monitor.py": "card",
     "selfdrive/car/mazda/ti_curve_demand.py": "card, ti_curve_plannerd",
     "selfdrive/car/mazda/ti_cruise_model.py": "card, ti_curve_plannerd",
     "selfdrive/car/mazda/ti_curve_plan.py": "ti_curve_plannerd",
     "selfdrive/car/mazda/ti_curve_plannerd.py": "ti_curve_plannerd",
-    "selfdrive/car/mazda/ti_curve_memory.py": "ti_curve_plannerd"
+    "selfdrive/car/mazda/ti_curve_memory.py": "ti_curve_plannerd",
+    "frogpilot/controls/lib/frogpilot_events.py": "frogpilot_process",
+    "frogpilot/controls/lib/steer_authority.py": "frogpilot_process",
+    "frogpilot/controls/frogpilot_planner.py": "frogpilot_process",
+    "frogpilot/controls/lib/neural_network_feedforward.py": "controlsd"
   },
   "not_per_frame": {
     "selfdrive/car/mazda/ti_cost_check.py": "install-time cost check, run by hand / comma_checks.sh; no process imports it",
@@ -125,7 +152,13 @@
     "selfdrive/controls/lib/longitudinal_planner.py": "upstream (plannerd)",
     "selfdrive/controls/lib/pid.py": "upstream",
     "selfdrive/controls/lib/vehicle_model.py": "upstream",
-    "selfdrive/controls/lib/__init__.py": "package marker"
+    "selfdrive/controls/lib/__init__.py": "package marker",
+    "frogpilot/controls/frogpilot_card.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process",
+    "frogpilot/controls/lib/conditional_experimental_mode.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process",
+    "frogpilot/controls/lib/frogpilot_acceleration.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process",
+    "frogpilot/controls/lib/frogpilot_following.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process",
+    "frogpilot/controls/lib/frogpilot_vcruise.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process",
+    "frogpilot/controls/lib/weather_checker.py": "upstream FrogPilot (unchanged from the snapshot 5eaeed25); runs per frame in its process"
   },
   "header_exempt": {
     "selfdrive/car/mazda/ti_cruise_model.py": "its bytes are hashed by ti_curve_plan.approach_src_hash (ti_curve_plan.py:237-245): any edit, a comment included, makes ti_curve_approach.npz stale and the planner stops loading it",

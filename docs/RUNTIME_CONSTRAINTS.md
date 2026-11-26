@@ -44,6 +44,17 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Consequences for code: caches keyed by finite domains only (lint PF4 waivers name the domain); nothing created per tick that the
   frozen generation keeps; positions stay inside the process (indices, distances, speeds, curvatures out).
 
+## frogpilot_process (`frogpilot/frogpilot_process.py`)
+- Rate: 20 Hz, `frogpilot_process.py:55` `Ratekeeper(1 / DT_MDL)`; polls modelV2 (`:76`).
+- Collector: OFF. `frogpilot_process.py:57` `config_realtime_process(5, Priority.CTRL_LOW)` -> `common/realtime.py:41`.
+- On-road only (`:112-116`, `deviceState.started`), engaged or not: FrogPilotPlanner.update / publish, FrogPilotTracking.update.
+  Ours here: FrogPilotEvents.update's TI block, which runs LaneDriftGate.update every model frame (`frogpilot_events.py:262`), and
+  the planner's TI block (`frogpilot_planner.py:122-162`: steer_authority, ti_curve alert readers). Parked it runs none of this.
+- 2026-11-25 second leak: lane_drift's per-call class (fixed in cc877397) also ran here, 13.6 KB per cycle on the comma (the class
+  plus the modelV2 message it kept), ~1 GB/h on-road; the drive measured 1.0-1.4 GB/h. Scenario `frogpilot_events` in ti_mem_check.
+- Consequences for code: the controlsd list above; keep no reference to a SubMaster message past the cycle (it holds the whole
+  message buffer, about 10 KB for modelV2).
+
 ## ti_mcp (`frogpilot/system/ti_mcp/ti_mcp_server.py`)
 - On request over HTTP, not per frame; only with TiMcpEnabled (`system/manager/process_config.py:78`). Read-only by design
   (module docstring). Collector on (no config_realtime_process call).

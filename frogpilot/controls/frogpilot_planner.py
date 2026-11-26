@@ -1,5 +1,7 @@
 import time
 #!/usr/bin/env python3
+# RUNTIME: runs in frogpilot_process at 20 Hz (each modelV2, on-road, engaged or not); gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
+# Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import json
 import math
 
