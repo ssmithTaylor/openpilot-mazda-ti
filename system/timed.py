@@ -34,8 +34,10 @@ def set_timezone(timezone):
 
 
 def set_time(new_time):
+  # Correct the clock when it is off from GPS time by 10 s or more in EITHER direction. Upstream only corrected a clock
+  # that was ahead (diff >= 10 s), so a clock left far BEHIND (no internet, no NTP) was never fixed from GPS.
   diff = datetime.datetime.now() - new_time
-  if diff < datetime.timedelta(seconds=10):
+  if abs(diff) < datetime.timedelta(seconds=10):
     cloudlog.debug(f"Time diff too small: {diff}")
     return
 
@@ -44,6 +46,12 @@ def set_time(new_time):
     subprocess.run(f"TZ=UTC date -s '{new_time}'", shell=True, check=True)
   except subprocess.CalledProcessError:
     cloudlog.exception("timed.failed_setting_time")
+    cloudlog.event("timed.set_time", ok=False, offset_before_s=round(diff.total_seconds(), 3))
+    return
+  # Replayability: system clock minus GPS time before and after the correction (seconds only, no position).
+  after = datetime.datetime.now() - new_time
+  cloudlog.event("timed.set_time", ok=True, offset_before_s=round(diff.total_seconds(), 3),
+                 offset_after_s=round(after.total_seconds(), 3))
 
 
 def main() -> NoReturn:

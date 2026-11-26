@@ -79,6 +79,7 @@ ALL_GLOBS = (
   "selfdrive/controls/tests/test_alerts.py",
   "selfdrive/controls/tests/test_state_machine.py",
   "system/tests/test_onroad_quiet.py",
+  "system/tests/test_timed_clock.py",
 )
 # Tests that cannot run on a PC at all (hardware, compiled extensions, real processes). Never selected by --changed/--all.
 PC_EXCLUDED = {
