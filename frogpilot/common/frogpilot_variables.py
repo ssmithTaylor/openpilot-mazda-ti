@@ -729,8 +729,9 @@ class FrogPilotVariables:
     toggle.use_custom_steerRatio = bool(round(toggle.steerRatio, 2) != round(steerRatio, 2)) and not toggle.force_auto_tune or toggle.force_auto_tune_off
 
     # Torque Interceptor limits. Defaults match the hard-coded CarControllerParams values so an
-    # untouched install behaves identically. TiSteerMax is capped at 600 because the TI clips the
-    # LKAS request there in hardware; anything above is silently discarded by the unit.
+    # untouched install behaves identically. TiSteerMax is clipped to 100-1200 here (= values.TI_LIMIT_BOUNDS and the
+    # lateral_settings.cc range); above 600 is only for probing the clamp: the interceptor firmware's request clip is +-600
+    # (ti_stuck_guard.TI_FW_CLIP; only exactly +-600 is exempt from its stuck check) and more is not expected to give more.
     ti_tune = params.get_bool("TorqueInterceptorTune") if toggle.tuning_level >= level["TorqueInterceptorTune"] else default.get_bool("TorqueInterceptorTune")
     toggle.ti_tune = ti_tune
     # Shapes the steering command, never its size: the clips below and the car controller behind

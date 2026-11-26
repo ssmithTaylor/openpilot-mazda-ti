@@ -820,6 +820,102 @@ def setup_frogpilot_events():
 # name: (setup, rate Hz, period frames, (warm periods, window periods) full, quick stride, process). The quick run (the install check on
 # the comma) runs one period of warm-up and one per window with the input schedule strided: step(i * stride), the whole sequence in
 # 1/stride of the frames (the simulated clock jumps stride frames per call: coarser, still every state); the PC tests run it unstrided.
+def setup_nnff():
+  """controlsd (100 Hz, gc disabled), NNFF toggle on: LatControlNNFF.update (frogpilot/controls/lib/neural_network_feedforward.py,
+  changed by this fork: gain correction against the TI plant, plantState labels), as controlsd.py:820 calls it, with
+  update_live_delay / update_live_torque_params every second and reset when steering stops. Per 6000-frame period: speed 8-32 m/s
+  across the LKAS gate (TI-only below 12.5 m/s), bends both ways up to 2.5 m/s^2 (error blend, gain correction moving the command),
+  a driver press, steering inactive 200 frames, the gain correction off, nnff_lite, a driving model without orientation
+  (model_good False), frogpilotCarState missing, TI dropping out. Real capnp CarState / LiveLocationKalman / ModelDataV2 (new every 5
+  frames). The model JSON is the repo's MAZDA_CX9_2021; get_nn_model's params write goes to an in-memory store."""
+  # sentry first (circular frogpilot_variables -> car_helpers -> sentry import, see setup_frogpilot_events)
+  import openpilot.system.sentry  # noqa: F401
+  import random
+  from cereal import car, log
+  from openpilot.frogpilot.controls.lib import neural_network_feedforward as nn
+  from openpilot.selfdrive.car.mazda import lateral_plant as lp_mod
+  from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
+  from openpilot.selfdrive.controls.lib.vehicle_model import VehicleModel
+  from openpilot.selfdrive.modeld.constants import ModelConstants
+  saved = nn.Params
+  nn.Params = MemParams
+  CP = car.CarParams.new_message()
+  CP.carFingerprint = "MAZDA_CX9_2021"
+  CP.steerLimitTimer, CP.mass, CP.rotationalInertia, CP.wheelbase = 0.4, 1909.0, 2813.0, 2.7
+  CP.centerToFront, CP.steerRatio, CP.tireStiffnessFront, CP.tireStiffnessRear = 2.7 * 0.41, 15.5, 80000.0, 90000.0
+  CP.steerActuatorDelay = 0.1
+  lt = CP.lateralTuning
+  lt.init("torque")
+  lt.torque.kp, lt.torque.ki, lt.torque.friction, lt.torque.latAccelFactor = 0.8, 0.2, 0.1, 2.0
+  lt.torque.useSteeringAngle = True
+  ci = NS(lateral_plant=lp_mod.TiLateralPlant(600.0, 0.01), torque_from_lateral_accel=lambda: (lambda la, tp: la / tp.latAccelFactor))
+  ctrl = nn.LatControlNNFF(CP, ci, 0.01)
+  if not ctrl.nnff_loaded:
+    raise RuntimeError("nnff scenario: the NNFF model did not load")
+  VM = VehicleModel(CP)
+  params = log.LiveParametersData.new_message()
+  T = list(ModelConstants.T_IDXS)
+  r = random.Random(11)
+  CS = car.CarState.new_message()
+  llk = log.LiveLocationKalman.new_message()
+  llk.angularVelocityCalibrated.value = [0.0, 0.0, 0.0]
+  llk.calibratedOrientationNED.value = [0.0, 0.01, 0.0]
+  st = {"v": 20.0, "model": None, "k": None}
+  P = 6000
+  seen = {}
+
+  def model(i, la):
+    if i // 5 != st["k"]:
+      st["k"] = i // 5
+      m = log.ModelDataV2.new_message()
+      if not (2000 <= i % P < 2300):
+        m.orientation.x = [0.02 * math.sin(i * 1e-3 + t) for t in T]
+        m.orientation.y = [0.01] * len(T)
+      m.acceleration.y = [la * (1 + 0.2 * math.sin(t)) for t in T]
+      st["model"] = m
+    return st["model"]
+
+  def step(i):
+    ph = i % P
+    st["v"] = min(max(st["v"] + r.gauss(0, 0.06), 8.0), 32.0)
+    v = st["v"]
+    la = 2.5 * math.sin(2 * math.pi * ph / 1500.0)
+    curv = la / (v * v)
+    CS.vEgo, CS.aEgo = v, r.gauss(0, 0.3)
+    CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-curv * (1 + r.gauss(0, 0.05)), v, 0.0))
+    CS.steeringRateDeg = r.gauss(0, 5)
+    CS.steeringPressed = (ph // 300) % 10 == 7
+    llk.angularVelocityCalibrated.value = [0.0, 0.0, curv * v]
+    params.roll = 0.02 * math.sin(i * 3e-4)
+    active = ph < 5800
+    if ph == 5800:
+      ctrl.reset()
+    toggles = NS(nnff=not (4400 <= ph < 4700), nnff_lite=4400 <= ph < 4700, nnff_gain_correction=not (3000 <= ph < 3500),
+                 ti_steer_max=600.0 if (i // P) % 2 == 0 else 590.0)
+    fp = None if 4800 <= ph < 4900 else NS(lkasBlocked=v < 12.5, lkasEffective=r.uniform(0, 300), tiActive=not (5000 <= ph < 5100))
+    if i % 100 == 0:
+      ctrl.update_live_delay(0.2 + 0.05 * ((i // 100) % 3))
+      ctrl.update_live_torque_params(2.0 + 0.01 * ((i // 100) % 5), 0.0, 0.1)
+    m = model(i, la)
+    _, _, pid_log = ctrl.update(active, CS, VM, params, False, curv, False, 0.25, llk, m, toggles, fp)
+    _count(seen, "active" if active else "inactive")
+    if int(pid_log.plantState) & nn.NNFF_GAIN_FLAG:
+      _count(seen, "gain")
+    if active and toggles.nnff and len(m.orientation.x) >= 17:
+      _count(seen, "nnff model")
+    if toggles.nnff_lite:
+      _count(seen, "lite")
+    if fp is None:
+      _count(seen, "no fp state")
+    if active and abs(la) > 1.0:
+      _count(seen, "error blend")
+  step.seen = seen
+
+  def restore():
+    nn.Params = saved
+  return step, restore
+
+
 SCENARIOS = {
   "lane_drift": (setup_lane_drift, 100, 6000, (1, 2), 4, "controlsd"),
   "ab_runner": (setup_ab_runner, 100, 12000, (1, 1), 8, "controlsd"),
@@ -829,6 +925,8 @@ SCENARIOS = {
   "card_buttons": (setup_card_buttons, 100, 12000, (1, 1), 6, "card"),
   "planner": (setup_planner, 5, None, (1, 2), 4, "ti_curve_plannerd"),
   "frogpilot_events": (setup_frogpilot_events, 20, 1200, (1, 2), 4, "frogpilot_process"),
+  # stride 12: ~15 ms per traced frame on the comma (2026-11-26, 3.11.4), so the quick run stays near 20 s
+  "nnff": (setup_nnff, 100, 6000, (1, 1), 12, "controlsd"),
 }
 
 

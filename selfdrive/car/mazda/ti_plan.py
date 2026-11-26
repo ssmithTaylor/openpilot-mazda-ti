@@ -37,7 +37,6 @@ PARAM_HOLD = "TiTestHold"            # tmpfs, car controller: {"held", "why", "t
 # every reason `tests_gate` or the car controller can give for a hold (the screens map each to plain words)
 HOLD_WHYS = ("plan dead", "plan missing", "plan unreadable", "plan stale", "alternation not at A", "plan says ab", "plan says hold",
              "plan says off", "A/B switch on", "control loop busy")
-MODES = ("off", "hold", "ab", "tests")
 
 
 def in_range(prev, mph, ceiling=PLAN_ALT_MAX_MPH):

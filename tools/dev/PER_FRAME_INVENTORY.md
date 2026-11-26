@@ -10,7 +10,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 |---|---|---|---|
 | controlsd | 100 Hz (`controlsd.py:214` Ratekeeper(100)) | **disabled** | `controlsd.py:1181` config_realtime_process -> `common/realtime.py:41` gc.disable() |
 | card | 100 Hz (`card.py:107` Ratekeeper(100)) | **disabled** | `card.py:260` config_realtime_process -> `common/realtime.py:41` |
-| ti_curve_plannerd | 5 Hz (`ti_curve_plannerd.py:27` RATE_HZ) | on, **frozen** after load | `ti_curve_plannerd.py:469` gc.freeze(); cores 0-3 (`:423` keep_off_control_core) |
+| ti_curve_plannerd | 5 Hz (`ti_curve_plannerd.py:35` RATE_HZ) | on, **frozen** after load | `ti_curve_plannerd.py:633` gc.freeze(); cores 0-3 (`:611` keep_off_control_core) |
 | frogpilot_process | 20 Hz (`frogpilot_process.py:55` Ratekeeper(1 / DT_MDL)); on-road branch every modelV2 while started, engaged or not (`:112-116`) | **disabled** | `frogpilot_process.py:57` config_realtime_process -> `common/realtime.py:41` |
 | ti_mcp (frogpilot/system/ti_mcp) | on request (HTTP), not per frame | on | `system/manager/process_config.py:78`, only with TiMcpEnabled |
 | ui (C++ Qt: `selfdrive/ui/qt/ti_pages_logic.h`, `sidebar.cc`) | UI loop (upstream; rate not verified here) | n/a (C++) | not covered by the Python guards |
@@ -24,15 +24,15 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 | controlsd | LatControlTorque.update_model_context / update with the TI plant | `controlsd.py:804-814` | lateral |
 | controlsd | lateral_diagnostics.record_inputs | `controlsd.py:817` | lateral |
 | card | CarController.update: ti_tests, ti_plan, ti_ident, ti_dither, ti_stuck_guard, ti_lag, stats, Flag This Moment, Start A New Measurement | `card.py:221` CI.apply | card_tests |
-| card | curve_step / _curve_monitor: ti_curve, ti_curve_monitor, ti_curve_demand, ti_cruise_model, ti_cruise_taps | `carcontroller.py:922,961` | card_curve |
-| card | button_tests_step / cruise_check_step: ti_button_tests, ti_cruise_check | `carcontroller.py:783,862` | card_buttons |
+| card | curve_step / _curve_monitor: ti_curve, ti_curve_monitor, ti_curve_demand, ti_cruise_model, ti_cruise_taps | `carcontroller.py:984,930` (curve_step, _curve_monitor) | card_curve |
+| card | button_tests_step / cruise_check_step: ti_button_tests, ti_cruise_check | `carcontroller.py:791,870` (button_tests_step, cruise_check_step) | card_buttons |
 | controlsd, card | HookTimers.add / gauge_max / tick (ti_cost_timers) | `controlsd.py` state_control, controlsd_thread; `card.py` controls_update, card_thread; `carcontroller.py` update, curve_step | card_tests, card_curve, card_buttons |
 | card | CC.ti_lag_ctl set from controlsState | `card.py:217-220` | card_tests |
 | card | CarState.update_gen1 TI fields (needs the compiled CAN parser) | `carstate.py:64` | none (gap) |
-| controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314` | none (gap) |
-| frogpilot_process | FrogPilotEvents.update: LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch | `frogpilot_events.py:262` | frogpilot_events |
+| controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:312-323`, `:820` | nnff |
+| frogpilot_process | FrogPilotEvents.update: LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch | `frogpilot_events.py:273` | frogpilot_events |
 | frogpilot_process | FrogPilotPlanner.update TI block: steer_authority predicted_drift_m / AdvisoryTrigger.update, ti_curve curve_alert_mph / read_curve_code | `frogpilot_planner.py:122-162` | frogpilot_events |
-| ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, ti_curve_view.View.step / view_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |
+| ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, ti_curve_view.View.step / view_json, log_payload, tick_log | `ti_curve_plannerd.py:646-` (main loop) | planner |
 
 ## Modules
 

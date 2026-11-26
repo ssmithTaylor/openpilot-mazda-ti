@@ -173,7 +173,8 @@ def _lead40(f, car, s):
   "R16 physical limit with the realistic 8 s preview (Job 2, 2026-11-24): lead-held at 40, the unconfirmed cap holds the dash at 35 "
   "until the preview reaches the entry (~143 m), then 35 -> 25 cannot finish: 30.3 mph 50 m before the bend, 26.2 at its entry "
   "(target 25, need 24), within the warning's need + 2.5 so no warning. Passed with the old 4 s preview, which never capped. "
-  "The owner is being asked about R16 (S1_UNCONFIRMED_MAX_MPH); strict: this flips to a failure when it passes")))])
+  "R16 is OFF since the owner's decision of 2026-11-24 (ti_curve_plan.S1_UNCONFIRMED_MAX_MPH = None); this case pins the kept cap "
+  "path's limit only; strict: this flips to a failure when it passes")))])
 def test_b_lead_holds_the_car_at_40_corner_needs_24(monkeypatch, cap):
   # fourth review, item 4: the lead-held floor (min(ref, speed) - 15 = 25) is the planner's too, so the corner IS slowed for
   monkeypatch.setattr(P, "S1_UNCONFIRMED_MAX_MPH", cap)

@@ -91,7 +91,6 @@ TRUST_HOLD_MAX_S = 30.0          # ... but never longer than this: then stop, le
 RESTORE_WAIT_S = 10.0            # a restore that cannot proceed for this long says WAITING TO RESTORE and why
 LIMIT_PLAUSIBLE_MPH = 15.0       # a speed limit further than this from the car's speed is not used (stale or wrong, high or low)
 STATE_LOG_MIN_S = 1.0            # the same state with a different reason is logged at most this often
-TEXT_STALE_S = 3.0               # the page calls a status older than this stale
 
 STATES = ("off", "ready", "slowing", "holding", "restoring", "paused", "stopped", "waiting")
 

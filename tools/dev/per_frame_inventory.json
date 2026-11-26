@@ -14,7 +14,7 @@
     "ti_curve_plannerd": {
       "rate_hz": 5,
       "gc": "frozen",
-      "where": "selfdrive/car/mazda/ti_curve_plannerd.py:469 gc.freeze() after load; collector on"
+      "where": "selfdrive/car/mazda/ti_curve_plannerd.py:633 gc.freeze() after load; collector on"
     },
     "frogpilot_process": {
       "rate_hz": 20,
@@ -56,13 +56,13 @@
     {
       "process": "card",
       "call": "CarController.curve_step / _curve_monitor (ti_curve, ti_curve_monitor, ti_curve_demand)",
-      "at": "selfdrive/car/mazda/carcontroller.py:922,961",
+      "at": "selfdrive/car/mazda/carcontroller.py:984,930",
       "test": "card_curve"
     },
     {
       "process": "card",
       "call": "CarController.button_tests_step / cruise_check_step",
-      "at": "selfdrive/car/mazda/carcontroller.py:783,862",
+      "at": "selfdrive/car/mazda/carcontroller.py:791,870",
       "test": "card_buttons"
     },
     {
@@ -80,13 +80,13 @@
     {
       "process": "ti_curve_plannerd",
       "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, ti_curve_view.View.step / view_json, log_payload, tick_log",
-      "at": "selfdrive/car/mazda/ti_curve_plannerd.py:480-",
+      "at": "selfdrive/car/mazda/ti_curve_plannerd.py:646-",
       "test": "planner"
     },
     {
       "process": "frogpilot_process",
       "call": "FrogPilotEvents.update (via FrogPilotPlanner.update): LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch",
-      "at": "frogpilot/controls/lib/frogpilot_events.py:262",
+      "at": "frogpilot/controls/lib/frogpilot_events.py:273",
       "test": "frogpilot_events"
     },
     {
@@ -98,8 +98,8 @@
     {
       "process": "controlsd",
       "call": "LatControlNNFF.update (only with the NNFF toggle on; this fork changed it)",
-      "at": "selfdrive/controls/controlsd.py:303-314",
-      "test": null
+      "at": "selfdrive/controls/controlsd.py:312-323",
+      "test": "nnff"
     },
     {
       "process": "controlsd, card",

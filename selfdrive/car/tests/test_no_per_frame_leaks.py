@@ -28,6 +28,7 @@ REQUIRED = {
   "planner": ("ceiling", "ev:alert", "ev:lock_lost", "ev:lock"),
   "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code", "rec:lane_gate",
                        "rec:ti_authority"),
+  "nnff": ("active", "inactive", "gain", "nnff model", "lite", "no fp state", "error blend"),
 }
 
 
