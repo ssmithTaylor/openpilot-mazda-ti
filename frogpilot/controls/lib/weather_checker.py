@@ -9,6 +9,7 @@ from openpilot.common.params import Params
 
 from openpilot.frogpilot.common.frogpilot_utilities import calculate_distance_to_point, get_frogpilot_api_info
 from openpilot.frogpilot.common.frogpilot_variables import FROGPILOT_API
+from openpilot.system.manager.remote_access import remote_access_blocked
 
 CACHE_DISTANCE = 25
 MAX_RETRIES = 3
@@ -138,6 +139,8 @@ class WeatherChecker:
       self.update_offsets(frogpilot_toggles)
 
     def make_request():
+      if remote_access_blocked("weather"):  # owner's flag: no position + device id to FrogPilot's weather API
+        return None
       payload = {
         "api_key": self.user_api_key,
         "api_token": self.api_token,

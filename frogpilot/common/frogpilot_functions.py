@@ -19,6 +19,7 @@ from openpilot.common.params import Params
 from openpilot.common.time import system_time_valid
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.system.hardware import HARDWARE
+from openpilot.system.manager.remote_access import remote_access_blocked
 
 from openpilot.frogpilot.assets.model_manager import ModelManager
 from openpilot.frogpilot.assets.theme_manager import ThemeManager
@@ -245,6 +246,8 @@ def setup_frogpilot(build_metadata):
 
 def register_device(build_metadata):
   def register_thread():
+    if remote_access_blocked("register"):  # owner's flag: no device ids to FrogPilot's API (not even the reachability ping)
+      return
     while not is_url_pingable(FROGPILOT_API):
       time.sleep(60)
 

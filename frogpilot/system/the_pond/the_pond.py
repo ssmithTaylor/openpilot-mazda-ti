@@ -27,6 +27,7 @@ from openpilot.selfdrive.car.toyota.carcontroller import LOCK_CMD, UNLOCK_CMD
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.system.hardware.hw import Paths
 from openpilot.system.loggerd.deleter import PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE, PRESERVE_COUNT
+from openpilot.system.manager.remote_access import remote_access_blocked
 from openpilot.system.version import get_build_metadata
 from panda import Panda
 
@@ -1245,6 +1246,8 @@ def setup(app):
 
   @app.route("/api/themes/submit", methods=["POST"])
   def submit_theme():
+    if remote_access_blocked("theme_submission"):  # owner's flag: no device id + theme to FrogPilot's API / Discord
+      return jsonify({"error": "Theme submission is off on this device (no_remote_access)"}), 403
     if not is_url_pingable(FROGPILOT_API):
       return jsonify({"error": "FrogPilot API is not reachable"}), 503
 

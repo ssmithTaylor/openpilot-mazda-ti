@@ -6,6 +6,7 @@ from cereal import car, custom
 
 from openpilot.frogpilot.common.frogpilot_utilities import clean_model_name, get_frogpilot_api_info
 from openpilot.frogpilot.common.frogpilot_variables import FROGPILOT_API, get_frogpilot_toggles, params
+from openpilot.system.manager.remote_access import remote_access_blocked
 
 BASE_URL = "https://nominatim.openstreetmap.org"
 GITHUB_API_URL = "https://api.github.com/repos/FrogAi/FrogPilot/commits"
@@ -34,6 +35,8 @@ def get_branch_commits():
 
 def get_city_center(latitude, longitude):
   if latitude == 0 and longitude == 0:
+    return (0.0, 0.0, "N/A", "N/A", "N/A")
+  if remote_access_blocked("geocoder"):  # owner's flag: the position never goes to the public geocoder
     return (0.0, 0.0, "N/A", "N/A", "N/A")
 
   try:
@@ -112,6 +115,9 @@ def get_city_center(latitude, longitude):
     return float(0.0), float(0.0), "N/A", "N/A", "N/A"
 
 def send_stats():
+  # Owner's remote-access flag: no stats post, so no geocoder lookup of the last position and no GitHub query.
+  if remote_access_blocked("stats"):
+    return
   try:
     frogpilot_toggles = get_frogpilot_toggles()
 

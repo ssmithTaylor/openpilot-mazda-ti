@@ -111,6 +111,9 @@ def calculate_road_curvature(modelData, v_ego):
   return predicted_lateral_acc / max(v_ego, 1)**2, max(time_to_curve, 1)
 
 def capture_report(discord_user, report, frogpilot_toggles):
+  from openpilot.system.manager.remote_access import remote_access_blocked
+  if remote_access_blocked("discord_report"):  # owner's flag: no error report (device id, toggles, error log) to FrogPilot
+    return
   if not is_url_pingable(FROGPILOT_API):
     return
 
