@@ -53,7 +53,13 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 
 ## Python version
 - Device: `.python-version` = 3.11.4 (used by `tools/install_python_dependencies.sh:44`), `pyproject.toml:47` mypy 3.11,
-  `Dockerfile.openpilot_base:79` pyenv 3.11.4. The interpreter actually on the comma: NOT verified here.
+  `Dockerfile.openpilot_base:79` pyenv 3.11.4. On the comma (checked 2026-11-25 over ssh): Python 3.11.4, pycapnp 1.3.0,
+  numpy 1.26.4.
+- 3.11 free lists: a freed tuple (up to 2000 per size), float, list or dict is kept by the interpreter and keeps its tracemalloc
+  trace until a full collection; bounded, but it reads as per-frame growth in a short window (2026-11-25 install: card_tests and
+  planner failed on it, flat at 176,000 B after 2000 ticks for the planner's 6-tuples; the PC's 3.14 does not show it).
+  `ti_mem_check.measure` reads each window after a DEBUG_SAVEALL full collection (free lists emptied, cycles kept as growth);
+  guarded by `test_no_per_frame_leaks.py` test_guard_does_not_count_memory_a_full_collection_returns_without_finding_garbage.
 - PC tests: the venv runs Python 3.14.7. Code must run on 3.11 (no 3.12+ syntax or stdlib); gc and tracemalloc numbers differ between
   versions, so the install check re-runs the leak guard on the device (comma_checks.sh stage 6).
 
