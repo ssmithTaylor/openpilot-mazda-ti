@@ -41,9 +41,12 @@ plan. Expect it to ask for more slowing than strictly needed until the margin mo
 # rate. The names and the thresholds below are kept as tuned; read "column torque" / "column load" as lateral
 # acceleration. No motor-current or unsaturated torque signal has been found on the bus.
 
+import time
 from collections import deque
 
 import numpy as np
+
+from openpilot.selfdrive.controls.lib import lane_drift as LD
 
 # Fitted SAT slope and intercept against speed. Torque = slope * |angle_deg| + intercept.
 SAT_SPEED_KPH = [52.5, 65.0, 75.0, 87.5, 115.0]
@@ -294,3 +297,65 @@ def advisory_speed_margin(demand_la, v_kph, allowed_drift=ALLOWED_DRIFT_M,
   if v_kph - advised < MIN_MEANINGFUL_SLOWDOWN_KPH:
     return 0.0
   return advised
+
+
+# ---- the ti_authority record (replayability, owner 2026-11-26 item 6) ---------------------------------------------------------------
+# The small counters behind "Running Wide - Slow Down" (frogpilot_events.py: runwide_frames, runwide_display_hold), "Steering Has
+# Stopped Mid-Corner" (frogpilot_planner.py: latch_frames, latch_bits; frogpilot_events.py: latch_display_hold) and "Steering Assist
+# Dropped" (ti_dropout_hold), with their gate decisions, in one record per CHANGE of the discrete state "s" (AUTHORITY_BITS, bit 0
+# first), written by frogpilot_process (20 Hz) through lane_drift.OnChange: at most 5 a second, "sup" counts what the cap held back.
+# The analogue values are carried as they were at the change (never compared): enough afterwards to tell WHY an alert fired -- the
+# command (st, of max) and whether it was at the ceiling, wheel rate (sr, deg/s) and column load (col, counts) the latch used, asked
+# and delivered lateral acceleration (des / act, m/s^2: delivering what was asked is not losing the bend), speed (v, m/s) and the car
+# side's clearance to the outside line (oc, m, from the frogpilot_process lane gate).
+AUTHORITY_BITS = ("lat_active", "ti_active", "runwide_base", "drift_open", "runwide_shown", "latch_cond", "latched", "latch_shown",
+                  "dropout_shown", "advisory_on")
+AUTHORITY_MAX_B = 260        # bytes of the record as JSON (about 200 in practice)
+# FrogPilotEvents / FrogPilotPlanner state of these alerts: logged (record key) or exempt (why a replay does not need it).
+# Guarded by selfdrive/car/tests/test_mazda_ti_alert_replayable.py.
+AUTHORITY_EVENTS_STATE = {"runwide_frames": "rwf", "runwide_display_hold": "rwd", "latch_display_hold": "ltd", "ti_dropout_hold": "dd",
+                          "ti_was_active": "bit ti_active (of the previous record)", "lane_drift_gate": "the lane_gate record (p f)"}
+AUTHORITY_EVENTS_EXEMPT = {"authority_log": "the record gate itself (OnChange)", "lane_gate_log": "the lane_gate record gate (OnChange)"}
+AUTHORITY_PLANNER_STATE = {"latch_frames": "ltf", "latch_bits": "lb", "steer_latched": "bit latched"}
+AUTHORITY_PLANNER_EXEMPT = {
+  "steer_advisory_speed": "published: frogpilotPlan.steerAdvisorySpeed in the rlog",
+  "steer_predicted_drift": "published: frogpilotPlan.steerPredictedDrift in the rlog",
+  "advisory_trigger": "AdvisoryTrigger: inputs (modelV2 road curvature, speed) in the rlog, output steerAdvisorySpeed in the rlog",
+  "curve_tick": "a call counter (reads at 10 Hz)",
+  "curve_alert_mph": "read from TiCurvePlan / TiCurveDeliver, logged by the planner (tick) and the car side (deliver_phase)",
+  "curve_alert_t": "as curve_alert_mph",
+  "curve_code": "as curve_alert_mph",
+  "curve_code_t": "as curve_alert_mph",
+}
+
+
+def authority_key(lat_active, ti_now, base, drift, rw_shown, latch_cond, latched, lt_shown, dd_shown, adv_on):
+  """The alerts' discrete state as an int (AUTHORITY_BITS): booleans only."""
+  return ((1 if lat_active else 0) | (2 if ti_now else 0) | (4 if base else 0) | (8 if drift else 0) | (16 if rw_shown else 0)
+          | (32 if latch_cond else 0) | (64 if latched else 0) | (128 if lt_shown else 0) | (256 if dd_shown else 0)
+          | (512 if adv_on else 0))
+
+
+def authority_bits(s):
+  """The record's "s" as {name: bool} (for the drive review)."""
+  return {n: bool(s >> i & 1) for i, n in enumerate(AUTHORITY_BITS)}
+
+
+def log_authority(log, key, events, planner, v_ego, des_la, act_la, steer, steer_rate, column):
+  """Once per frogpilot_process frame, after the alerts' blocks: one ti_authority record when `key` changed (its latch_cond bit is
+  set here from planner.latch_bits). Never raises; after an error, off for this process."""
+  if log.dead:
+    return
+  try:
+    if planner.latch_bits == 7:
+      key |= 32                  # latch_cond: at the clip, wheel stopped and column loaded this frame
+    if log.due(key):
+      oc = events.lane_drift_gate.oc
+      LD.emit_event("ti_authority", {
+        "m": round(time.monotonic(), 3), "s": key, "rwf": events.runwide_frames, "rwd": events.runwide_display_hold,
+        "ltf": planner.latch_frames, "lb": planner.latch_bits, "ltd": events.latch_display_hold, "dd": events.ti_dropout_hold,
+        "ceil": 1 if abs(steer) >= RUNWIDE_CEIL else 0, "v": round(float(v_ego), 2), "des": round(float(des_la), 2),
+        "act": round(float(act_la), 2), "st": round(float(steer), 3), "sr": round(float(steer_rate), 1),
+        "col": round(float(column), 1), "oc": None if oc is None else round(float(oc), 2), "sup": log.take_sup()})
+  except Exception:
+    log.dead = True

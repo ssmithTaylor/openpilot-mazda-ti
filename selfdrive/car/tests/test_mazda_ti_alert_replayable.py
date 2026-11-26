@@ -46,3 +46,43 @@ def test_lane_gate_record_carries_every_logged_key():
     key = where.split(" ")[0]
     assert key == "bit" or key == "bits" or key in keys, (where, keys)
   assert len(LD.LANE_GATE_BITS) == 8 and max(r["s"] for r in seen) < 256
+
+
+# ---- Running Wide / Mid-Corner / Steering Assist Dropped (ti_authority) -------------------------------------------------------------
+# FrogPilot's own FrogPilotEvents state (upstream, not this fork's alerts): not part of the guard.
+UPSTREAM_EVENTS_STATE = {"frogpilot_planner", "theme_manager", "error_log", "events", "always_on_lateral_enabled_previously",
+                         "previous_traffic_mode", "random_event_playing", "startup_seen", "stopped_for_light", "max_acceleration",
+                         "random_event_timer", "tracked_lead_distance", "played_events"}
+
+
+def test_every_steering_alert_attribute_of_frogpilot_events_is_logged_or_exempt():
+  from openpilot.selfdrive.car.mazda import ti_mem_check as MC
+  from openpilot.frogpilot.controls.lib import steer_authority as SA
+  step, teardown = MC.setup_frogpilot_events()
+  try:
+    for i in range(1300):
+      step(i)
+    fe = step.__closure__ and next(c.cell_contents for c in step.__closure__ if type(c.cell_contents).__name__ == "FrogPilotEvents")
+    names = set(vars(fe)) - UPSTREAM_EVENTS_STATE
+  finally:
+    teardown()
+  assert step.seen.get("rec:ti_authority"), step.seen
+  missing = sorted(n for n in names if n not in SA.AUTHORITY_EVENTS_STATE and n not in SA.AUTHORITY_EVENTS_EXEMPT)
+  assert not missing, f"FrogPilotEvents alert state not in the ti_authority record nor exempt: {missing}"
+  stale = sorted(n for n in list(SA.AUTHORITY_EVENTS_STATE) + list(SA.AUTHORITY_EVENTS_EXEMPT) if n not in names)
+  assert not stale, f"listed but no longer an attribute: {stale}"
+
+
+def test_every_steering_alert_attribute_of_the_planner_is_logged_or_exempt():
+  """FrogPilotPlanner's TI attributes (named steer_* / latch_* / curve_* / advisory_*): read from the source, as the planner needs
+  the whole FrogPilot stack to construct."""
+  import re
+  from pathlib import Path
+  from openpilot.frogpilot.controls.lib import steer_authority as SA
+  src = (Path(SA.__file__).resolve().parents[1] / "frogpilot_planner.py").read_text(encoding="utf-8")
+  names = set(re.findall(r"self\.((?:steer|latch|curve|advisory)_\w+)\s*[=,)]", src))
+  names |= set(re.findall(r'getattr\(self, "((?:steer|latch|curve|advisory)_\w+)"', src))
+  assert {"latch_frames", "latch_bits", "steer_latched"} <= names, names
+  missing = sorted(n for n in names if n not in SA.AUTHORITY_PLANNER_STATE and n not in SA.AUTHORITY_PLANNER_EXEMPT)
+  assert not missing, f"FrogPilotPlanner alert state not in the ti_authority record nor exempt: {missing}"
+  assert not set(SA.AUTHORITY_PLANNER_STATE) & set(SA.AUTHORITY_PLANNER_EXEMPT)

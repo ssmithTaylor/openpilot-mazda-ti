@@ -749,7 +749,7 @@ def setup_frogpilot_events():
   P = 1200                                   # 60 s of model frames
   planner = NS(frogpilot_vcruise=NS(forcing_stop=False, slc=NS(speed_limit_changed_timer=0.0)), tracking_lead=False, model_stopped=False,
                cem=NS(stop_light_detected=False), lead_one=NS(dRel=10.0, vLead=0.0), lateral_acceleration=0.0, steer_advisory_speed=0.0,
-               steer_latched=False)
+               steer_latched=False, latch_frames=0, latch_bits=0)
   toggles = NS(random_events=False, green_light_alert=True, current_holiday_theme="stock", lead_departing_alert=True, nnff=False,
                speed_limit_changed_alert=True, startup_alert_top="startup", startup_alert_bottom="", steer_authority_advisory=True,
                wheel_image="stock", is_metric=False)
@@ -786,7 +786,8 @@ def setup_frogpilot_events():
       _count(seen, "curve code")
     loaded = abs(sm["frogpilotCarState"].columnTorque) > SA.CEILING_COUNTS - 25.0
     at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
-    st["latch"] = st["latch"] + 1 if (at_clip and abs(sm["carState"].steeringRateDeg) < 2.0 and loaded) else 0
+    planner.latch_bits = (1 if at_clip else 0) | (2 if abs(sm["carState"].steeringRateDeg) < 2.0 else 0) | (4 if loaded else 0)
+    st["latch"] = planner.latch_frames = st["latch"] + 1 if planner.latch_bits == 7 else 0
     planner.steer_latched = st["latch"] >= SA.LATCH_DEBOUNCE_FRAMES
     fe.update(100.0 * 0.2778, sm, toggles)
     for n in fe.events.names:

@@ -85,3 +85,71 @@ def test_lane_gate_logging_does_not_change_the_gate():
     rb = b.update(m, m.action.desiredCurvature, lim, False)
     LD.log_lane_gate(b, log, "c", rb, lim, False)
     assert ra == rb and a.latch_left == b.latch_left
+
+
+# ---- ti_authority: the counters behind "Running Wide - Slow Down" and "Steering Has Stopped Mid-Corner" -----------------------------
+from openpilot.frogpilot.controls.lib import steer_authority as SA  # noqa: E402
+
+
+def _fe():
+  """The parts of FrogPilotEvents / FrogPilotPlanner log_authority reads."""
+  fe = NS(runwide_frames=0, runwide_display_hold=0, latch_display_hold=0, ti_dropout_hold=0, lane_drift_gate=LD.LaneDriftGate(0.05))
+  return fe, NS(latch_frames=0, latch_bits=0)
+
+
+def _key(**kw):
+  a = dict(lat_active=True, ti_now=True, base=False, drift=False, rw_shown=False, latch_cond=False, latched=False, lt_shown=False,
+           dd_shown=False, adv_on=True)
+  a.update(kw)
+  return SA.authority_key(**a)
+
+
+def test_authority_varying_but_not_crossing_gives_one_record_and_a_crossing_one_more(records):
+  fe, pl = _fe()
+  log = LD.OnChange(20, 5)
+  # steering near but under its ceiling, speed, asks and column load moving every frame: no discrete change
+  for i in range(200):
+    SA.log_authority(log, _key(), fe, pl, 25.0 + 0.1 * math.sin(i), 2.0 + 0.2 * math.sin(i), 1.9, 0.9 + 0.03 * math.sin(i),
+                     3.0 * math.sin(i), 150.0 + 10 * math.sin(i))
+  assert len(records) == 1, records
+  assert records[0][0] == "ti_authority"
+  # the latch condition is met (at the clip, wheel stopped, column loaded): one more
+  pl.latch_bits, pl.latch_frames = 7, 1
+  for i in range(3):
+    SA.log_authority(log, _key(latch_cond=True), fe, pl, 25.0, 2.3, 2.25, 1.0, 0.5, 200.0)
+    pl.latch_frames += 1
+  assert len(records) == 2, records
+  rec = records[1][1]
+  assert SA.authority_bits(rec["s"])["latch_cond"] and rec["lb"] == 7 and rec["ltf"] == 1
+
+
+def test_authority_record_says_why_mid_corner_fired(records):
+  """A Mid-Corner record carries what is needed afterwards to tell a real stall from a false one: the command, wheel rate and
+  column load the latch used, the asked and delivered lateral acceleration (delivering what was asked = not losing the bend) and
+  the car side's clearance to the outside line."""
+  fe, pl = _fe()
+  log = LD.OnChange(20, 5)
+  m = NS(laneLines=[NS(y=[-5.0]), NS(y=[-1.3]), NS(y=[2.3]), NS(y=[6.0])], laneLineProbs=[0.1, 0.9, 0.9, 0.1],
+         roadEdges=[NS(y=[-6.0]), NS(y=[7.0])], roadEdgeStds=[9.0, 9.0], meta=NS(laneChangeState=0), action=NS(desiredCurvature=0.004))
+  fe.lane_drift_gate.update(m, 0.004, True, False)
+  pl.latch_bits, pl.latch_frames = 7, SA.LATCH_DEBOUNCE_FRAMES
+  SA.log_authority(log, _key(latch_cond=True, latched=True, lt_shown=True), fe, pl, 24.6, 2.31, 2.28, 1.0, 0.4, 203.0)
+  rec = records[-1][1]
+  for k in ("st", "sr", "col", "des", "act", "oc", "v", "lb", "ltf", "ltd", "rwf", "rwd", "dd"):
+    assert k in rec, k
+  assert abs(rec["oc"] - (1.3 - LD.CAR_HALF_WIDTH)) < 0.01 and rec["des"] == 2.31 and rec["act"] == 2.28
+  text = json.dumps(rec)
+  assert len(text) <= SA.AUTHORITY_MAX_B, (len(text), text)
+  for bad in ("lat\"", "lon", "latitude", "longitude", "vin"):
+    assert bad not in text.lower()
+
+
+def test_authority_logging_cannot_raise(monkeypatch):
+  def boom(name, rec):
+    raise RuntimeError("log down")
+  monkeypatch.setattr(LD, "emit_event", boom)
+  fe, pl = _fe()
+  log = LD.OnChange(20, 5)
+  SA.log_authority(log, _key(), fe, pl, 25.0, 2.0, 1.9, 0.9, 1.0, 100.0)
+  SA.log_authority(log, _key(), NS(), NS(), 25.0, 2.0, 1.9, 0.9, 1.0, 100.0)     # even a broken host
+  assert log.dead

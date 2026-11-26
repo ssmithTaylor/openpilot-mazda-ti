@@ -46,6 +46,7 @@ class FrogPilotPlanner:
     self.lateral_check = False
     self.steer_latched = False
     self.latch_frames = 0
+    self.latch_bits = 0           # the latch's three conditions this frame: 1 at the clip, 2 wheel stopped, 4 column loaded (ti_authority "lb")
     self.steer_advisory_speed = 0.0
     self.steer_predicted_drift = 0.0
     self.advisory_trigger = steer_authority.AdvisoryTrigger()
@@ -160,7 +161,8 @@ class FrogPilotPlanner:
     at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
     stopped = abs(sm["carState"].steeringRateDeg) < 2.0
     loaded = column_torque > steer_authority.CEILING_COUNTS - 25.0
-    self.latch_frames = self.latch_frames + 1 if (at_clip and stopped and loaded) else 0
+    self.latch_bits = (1 if at_clip else 0) | (2 if stopped else 0) | (4 if loaded else 0)
+    self.latch_frames = self.latch_frames + 1 if self.latch_bits == 7 else 0
     self.steer_latched = bool(advisory_on and self.latch_frames >= steer_authority.LATCH_DEBOUNCE_FRAMES)
 
     self.road_curvature_detected = (1 / abs(self.road_curvature))**0.5 < v_ego > CRUISING_SPEED and not (sm["carState"].leftBlinker or sm["carState"].rightBlinker)

@@ -26,7 +26,8 @@ REQUIRED = {
                  "curve:deliver_phase", "curve:cs", "curve:drv_btn", "curve:left"),
   "card_buttons": ("buttons:running", "buttons:finished", "check:running", "check:finished", "frames sent"),
   "planner": ("ceiling", "ev:alert", "ev:lock_lost", "ev:lock"),
-  "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code", "rec:lane_gate"),
+  "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code", "rec:lane_gate",
+                       "rec:ti_authority"),
 }
 
 
