@@ -331,6 +331,8 @@ AUTHORITY_PLANNER_EXEMPT = {
   "curve_alert_t": "as curve_alert_mph",
   "curve_code": "as curve_alert_mph",
   "curve_code_t": "as curve_alert_mph",
+  "curve_ding": "one-shot flag: the tiCurveDing event it raises is published in frogpilotPlan.frogpilotEvents in the rlog",
+  "curve_ding_m": "the onset time read from TiCurveDing (ti_curve_plannerd writes it; the onset count is the tick log's scr[0])",
 }
 
 
