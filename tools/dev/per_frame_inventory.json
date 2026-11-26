@@ -79,7 +79,7 @@
     },
     {
       "process": "ti_curve_plannerd",
-      "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log",
+      "call": "main loop tick: can_reads, car_side, map_input/map_profile, fresh_model, fresh_limit, Planner.step, plan_json, ti_curve_view.View.step / view_json, log_payload, tick_log",
       "at": "selfdrive/car/mazda/ti_curve_plannerd.py:480-",
       "test": "planner"
     },
@@ -91,7 +91,7 @@
     },
     {
       "process": "frogpilot_process",
-      "call": "FrogPilotPlanner.update TI block: steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code, latch count",
+      "call": "FrogPilotPlanner.update TI block: steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code, ti_curve_view.curve_ding_due, latch count",
       "at": "frogpilot/controls/frogpilot_planner.py:122-162",
       "test": "frogpilot_events"
     },
@@ -129,6 +129,7 @@
     "selfdrive/car/mazda/ti_cruise_model.py": "card, ti_curve_plannerd",
     "selfdrive/car/mazda/ti_curve_plan.py": "ti_curve_plannerd",
     "selfdrive/car/mazda/ti_curve_plannerd.py": "ti_curve_plannerd",
+    "selfdrive/car/mazda/ti_curve_view.py": "ti_curve_plannerd",
     "selfdrive/car/mazda/ti_curve_memory.py": "ti_curve_plannerd",
     "frogpilot/controls/lib/frogpilot_events.py": "frogpilot_process",
     "frogpilot/controls/lib/steer_authority.py": "frogpilot_process",

@@ -111,7 +111,7 @@ EXCLUDED_KEYS = {
   "AvailableModels", "AvailableModelNames", "CalibratedLateralAcceleration", "CalibrationProgress", "CarParamsPersistent",
   "CurvatureData", "ExperimentalLongitudinalEnabled", "KonikMinutes", "MapBoxRequests", "ModelDrivesAndScores", "ModelVersions",
   "openpilotMinutes", "OverpassRequests", "SpeedLimits", "SpeedLimitsFiltered", "UpdaterAvailableBranches",
-  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "TiAbConfig", "TiAbProgress", "TiAbOn", "TiAbPin", "TiAbStatus", "TiPlanOn", "TiPlan", "TiPlanAck", "TiTestHold", "TiCruiseCheck", "TiCruiseCheckStatus", "TiButtonTest", "TiButtonTestStatus", "TiCurveOn", "TiCurvePlan", "TiCurveStatus", "TiCurveDeliver", "TiSetSpeedLeft",
+  "TiTestProgress", "TiTestQueue", "TiTestGate", "TiTestLock", "TiAbConfig", "TiAbProgress", "TiAbOn", "TiAbPin", "TiAbStatus", "TiPlanOn", "TiPlan", "TiPlanAck", "TiTestHold", "TiCruiseCheck", "TiCruiseCheckStatus", "TiButtonTest", "TiButtonTestStatus", "TiCurveOn", "TiCurvePlan", "TiCurveStatus", "TiCurveDeliver", "TiCurveView", "TiCurveDing", "TiSetSpeedLeft",
   "MapCurvatures", "MapTargetVelocities", "CommaLogsUrl"
 }
 
@@ -506,6 +506,8 @@ frogpilot_default_params: list[tuple[str, str | bytes, int, str]] = [
   ("TiCurvePlan", "", 3, ""),
   ("TiCurveStatus", "", 3, ""),
   ("TiCurveDeliver", "", 3, ""),
+  ("TiCurveView", "", 3, ""),
+  ("TiCurveDing", "", 3, ""),
   ("TiSetSpeedLeft", "", 3, ""),
   ("MapCurvatures", "", 3, ""),
   ("MapTargetVelocities", "", 3, ""),

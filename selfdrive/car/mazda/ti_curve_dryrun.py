@@ -57,7 +57,7 @@ def budgets(walls, bend, budget_ms, budget_bend_ms, max_ms):
 def run_inputs(path, budget_ms=20.0, budget_bend_ms=100.0, max_ms=500.0, limit=None):
   """The FULL tick over the recorded real-drive inputs (module docstring). -> 0 within every budget, else 1."""
   import numpy as np
-  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P, ti_curve_plannerd as D
+  from openpilot.selfdrive.car.mazda import ti_curve_memory as M, ti_curve_plan as P, ti_curve_plannerd as D, ti_curve_view as V
   z = np.load(path, allow_pickle=False)
   meta = json.loads(str(z["meta"]))
   sp = float(meta["spacing_m"])
@@ -72,6 +72,7 @@ def run_inputs(path, budget_ms=20.0, budget_bend_ms=100.0, max_ms=500.0, limit=N
   pt, pla = z["pred_t"].astype(np.float64), z["pred_la"].astype(np.float64)
   n = len(s_) if limit is None else min(limit, len(s_))
   walls, bend, starts, cold0 = [], [], 0, P.COLD[0]
+  view, dings, vbytes = V.View(), 0, 0
   dtick = float(meta["tick_s"])
   for k in range(n):
     c0 = time.perf_counter()
@@ -87,15 +88,21 @@ def run_inputs(path, budget_ms=20.0, budget_bend_ms=100.0, max_ms=500.0, limit=N
     starts += sum(1 for ev in pl.events if ev.get("kind") == "start")
     pl.events.clear()
     s1, s2, side = D.stage_summary(pl)
+    # the driving screen's element as plannerd publishes it while curve slowing is on (ti_curve_view.py): look-ahead, bends, ding
+    vp, ding, scr = view.step(pl, p, k * dtick, k, True, v / P.MPH, set_mph, pl._floor(None, None, set_mph, v / P.MPH), side)
+    V.view_json(vp)
+    dings += ding is not None
+    vbytes = max(vbytes, len(V.view_json(vp)))
     extras = dict(seq=k, v=v / P.MPH, set=None if set_mph is None else int(round(set_mph)), mem=D.mem_summary(pl),
-                  fc=D.fc_summary(pl), s1=s1, s2=s2, side=side, step_us=1, cs=[None, None, 1])
+                  fc=D.fc_summary(pl), s1=s1, s2=s2, side=side, step_us=1, cs=[None, None, 1], scr=scr)
     json.dumps({"event": "ti_curve_plan", **D.log_payload(D.tick_log(p, extras), kind="tick")})
     walls.append(time.perf_counter() - c0)
     bend.append(bool(pl.active or pl.map_active or pl.s2 is not None))
   ok, txt = budgets(walls, bend, budget_ms, budget_bend_ms, max_ms)
   print(f"inputs: {n} ticks ({n * dtick / 60:.1f} min of a real drive), road {len(s_road) * sp / 1000:.1f} km rebuilt from its curvature; "
         f"planner start {load_s:.2f} s (approach table {P.Planner.table_keys} keys, raise thresholds {P.Planner.raise_keys}); bends "
-        f"started {starts}; cold simulations {P.COLD[0] - cold0}; total {sum(walls):.1f} s")
+        f"started {starts}; cold simulations {P.COLD[0] - cold0}; total {sum(walls):.1f} s; screen: {dings} dings, largest "
+        f"payload {vbytes} B")
   print(txt)
   print("DRY RUN OK" if ok else "OVER BUDGET")
   return 0 if ok else 1

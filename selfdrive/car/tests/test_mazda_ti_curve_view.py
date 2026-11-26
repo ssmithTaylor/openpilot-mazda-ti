@@ -135,7 +135,7 @@ def test_payload_has_the_schema_a_ribbon_and_the_bends_and_is_small():
 
 def test_left_and_right_bends_keep_their_sign_in_the_ribbon_and_the_bend_list():
   out, _ = _drive()
-  p = out[30][2]
+  p = out[110][2]                                          # 485 m along: both bends inside the 45 s window
   ks = [k for _, k in p["r"]]
   assert max(ks) > 1000 and min(ks) < -500                 # +0.03 left and -0.012 right, x1e5
   dirs = [b[3] for b in p["b"]]

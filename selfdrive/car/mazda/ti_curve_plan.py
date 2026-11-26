@@ -803,6 +803,7 @@ class Planner:
     self.rm_n = 0
     self.fork = None                    # FORK_*: the fork the lock last crossed: {from, end, p_in, along, alts [(trace, point)], until}
     self.fk = None                      # FORK_*: this tick's first fork ahead [code, continuations, chosen (0 = the link), metres]
+    self.view = None                    # (point indices, metres ahead, needs) of this tick's trusted look-ahead, for the screen
     self.blink_l_t, self.blink_r_t = -1e9, -1e9   # the last tick with the left / right signal on (FORK_BLINK_S)
     self.fix_age = 1e9
     self.dr_m, self.dr_bad_m, self.dr_hist = 0.0, 0.0, []   # dead reckoning (DR_*): metres since the last fix, in disagreement; (odo,
@@ -1373,6 +1374,7 @@ class Planner:
     elif blink_side < 0:
       self.blink_r_t = t
     self.fk = None
+    self.view = None                    # the screen's input (ti_curve_view.py): this tick's look-ahead, only on trusted memory
     self.released = {k: at for k, at in self.released.items() if self.odo <= at + HOLD_AFTER_M}
     if self.mem is None:
       floor = self._floor(floor_mph, ref_mph, set_mph, mph)
@@ -1432,6 +1434,7 @@ class Planner:
     if self.fork is not None and self.fork["hold_m"] > 0.0:
       dist = dist + self.fork["hold_m"]                 # FORK_*: the car has not reached the continuation's first point yet
     need = self._either_road((self.need_hi if self.hi else self.need)[idx].astype(np.float64), dist, look, mph)
+    self.view = (idx, dist, need)       # the screen's ribbon and bends (ti_curve_view.View.step): the very arrays planned with
     # the floor the car side keeps for an intervention (the known limit, else the speed when it starts, minus MAX_SHED_MPH)
     # (kept from the first corner of a chain until the car is back near the speed it started from, as the car side does)
     # ONE source with the car side (2026-11-23 drive: a floor kept here from an earlier 55 mph episode clamped every corner for 11 min

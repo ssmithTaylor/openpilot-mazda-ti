@@ -41,6 +41,9 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Started by the manager onroad: `system/manager/process_config.py:128`.
 - Budget: tick p99 under 20 ms of the 200 ms tick (`selfdrive/car/mazda/ti_curve_dryrun.py:38`, comma_checks.sh stage 4).
 - Never a position in a log or param: `ti_curve_plannerd.py:16`; plan JSON checked by `test_mazda_ti_curve_plan.py:452`.
+- Also publishes the driving screen's curve element (`ti_curve_view.py`, tmpfs TiCurveView ~1-1.5 KB every tick, TiCurveDing at a
+  red chip's onset only): distances along the path, signed curvature, speeds; no position (`test_mazda_ti_curve_view.py` scans it).
+  PC cost of View.step + JSON over the dry run's drive: mean 0.08 ms, p99 0.14 ms per tick.
 - Consequences for code: caches keyed by finite domains only (lint PF4 waivers name the domain); nothing created per tick that the
   frozen generation keeps; positions stay inside the process (indices, distances, speeds, curvatures out).
 
@@ -96,7 +99,8 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Every feature logs the inputs, the state and the decision needed to replay it from a drive log: what is in an rlog message
   already (carState, carControl, carOutput, controlsState, modelV2, frogpilotPlan, can) need not be logged again; anything else is.
 - Curve planner: tick record (`ti_curve_plan` kind "tick", 5 Hz) incl. "cs" (car side's ref / floor / acting as given to the planner),
-  "mpr" + `map_list` records (the map list exactly as used), "ask"; replay helper `ti_curve_plannerd.logged_inputs`. Schema:
+  "mpr" + `map_list` records (the map list exactly as used), "ask"; replay helper `ti_curve_plannerd.logged_inputs`. Screen: tick "scr"
+  (dings so far, chip shown, bends, build us, the 3 nearest bends) while curve slowing is on; the ribbon is rebuilt by the replay. Schema:
   `PLANNER_STEP_INPUTS`, `PLANNER_STATE`.
 - Car side: `ti_curve` kind "cs" (`Curve.diag`, 5 Hz while on or active), `drv_btn` (every driver cruise-button press, on or off),
   `deliver_phase` (stage 3 phase, timers, stock-assist flags acting or not, on change, checked at 10 Hz: not on every torque count), `left` (TiSetSpeedLeft on change). Schema:

@@ -31,7 +31,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 | controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314` | none (gap) |
 | frogpilot_process | FrogPilotEvents.update: LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch | `frogpilot_events.py:262` | frogpilot_events |
 | frogpilot_process | FrogPilotPlanner.update TI block: steer_authority predicted_drift_m / AdvisoryTrigger.update, ti_curve curve_alert_mph / read_curve_code | `frogpilot_planner.py:122-162` | frogpilot_events |
-| ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |
+| ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, ti_curve_view.View.step / view_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |
 
 ## Modules
 
@@ -39,7 +39,7 @@ controlsd: lane_drift.py, latcontrol_torque.py, scalar_np.py, lateral_plant.py, 
 friction_release.py, ti_ab.py. controlsd and card: ti_plan.py, ti_tests.py. card: carcontroller.py, carstate.py, interface.py,
 ti_dither.py, ti_stuck_guard.py, ti_ident.py, ti_lag.py, ti_cruise_check.py, ti_cruise_taps.py, ti_button_tests.py,
 ti_curve_monitor.py. card and ti_curve_plannerd: ti_curve.py, ti_curve_demand.py, ti_cruise_model.py. ti_curve_plannerd:
-ti_curve_plan.py, ti_curve_plannerd.py, ti_curve_memory.py. controlsd (NNFF toggle): neural_network_feedforward.py.
+ti_curve_plan.py, ti_curve_plannerd.py, ti_curve_memory.py, ti_curve_view.py (also frogpilot_process: curve_ding_due). controlsd (NNFF toggle): neural_network_feedforward.py.
 frogpilot_process: frogpilot_planner.py, frogpilot_events.py, steer_authority.py, and lane_drift.py / ti_curve.py (shared above).
 
 Not per frame (classified): ti_cost_check.py, ti_mem_check.py, ti_curve_dryrun.py (install checks), ti_button_tests_report.py,

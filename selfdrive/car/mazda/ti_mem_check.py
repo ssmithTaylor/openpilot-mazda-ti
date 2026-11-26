@@ -538,11 +538,14 @@ def setup_planner():
   every second, its `map_list` record once per list, Planner.step, plan_json, the events and the tick log through log_payload / tick_log (JSON-dumped, as cloudlog would),
   fresh_limit; over a lap whose first part is remembered and whose second part is known only from the map list, with lock lost and
   regained, the driver's set speed changing, cruise off and on, the forecast missing for a few seconds, and the car-side floor
-  binding (alerts raised and cleared). One period is one lap; the position jumps back to the start (lock lost, re-lock)."""
+  binding (alerts raised and cleared); the driving screen's element (ti_curve_view.View.step: look-ahead, bends, the ding at a red
+  chip's onset, its tick field). One period is one lap; the position jumps back to the start (lock lost, re-lock)."""
   import numpy as np
   from openpilot.selfdrive.car.mazda import ti_curve as C, ti_curve_memory as M, ti_curve_plan as P, ti_curve_plannerd as D
+  from openpilot.selfdrive.car.mazda import ti_curve_view as V
   from openpilot.selfdrive.car.mazda import ti_cruise_model as CM
   from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
+  view = V.View()
   trA, trB = _lap(4, 11), _lap(3, 12)
   mem = M.synthetic([trA])
   nA = len(trA["x"])
@@ -611,6 +614,16 @@ def setup_planner():
     pj = P.plan_json(p, t, st["seq"], "act")
     st["seq"] += 1
     store.d[C.PARAM_PLAN] = json.dumps(pj)
+    _, _, side = D.stage_summary(pl)
+    vp, ding, scr = view.step(pl, p, t, st["seq"], True, st["v"], st["set"] if cruise_on else None,
+                              pl._floor(floor, ref, st["set"] if cruise_on else None, st["v"]), side)
+    store.d[V.PARAM_VIEW] = V.view_json(vp)
+    if ding is not None:
+      store.d[V.PARAM_DING] = json.dumps(ding)
+      _count(seen, "ding")
+    if vp["r"]:
+      _count(seen, "ribbon")
+    tick_x["scr"] = scr
     if p.ceil is not None:
       _count(seen, "ceiling")
     for ev in pl.events:

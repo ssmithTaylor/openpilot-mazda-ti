@@ -327,10 +327,14 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "fk", "nc", "wall_us")
+             "fcx", "mdl", "step_us", "cs", "mpr", "ask", "fk", "nc", "wall_us", "scr")
 TICK_REPLAY_KEYS = ("cs", "mpr", "ask")   # replay inputs no rlog message carries (REPLAY above), and the plan's "ask" (stage 3's
                                           # input on the car side: the forecast demand at ASK_LEADS, x100): never dropped
 TICK_REPLAY_MAX_B = 104             # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999], "ask": [-9999 x 6]`
+# the driving screen's curve element (ti_curve_view.py, while curve slowing is on): [dings so far, chip shown (0 / 1 yellow / 2 red),
+# bends, microseconds to build it, then for the 3 nearest bends: start m, end m, dir, need, target, class]; ints only, never dropped by
+# the trim (what the driver saw is replayable: the ribbon itself is rebuilt by replaying the planner over the same road memory)
+TICK_SCR_MAX_B = 160
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
 
 
@@ -507,6 +511,12 @@ def tick_log(plan, extras):
     x = e.get(k)
     if isinstance(x, list) and len(x) <= 6:
       d[k] = [None if y is None else int(y) for y in x]
+  scr = e.get("scr")
+  if isinstance(scr, list):
+    scr = [int(y) for y in scr if isinstance(y, (int, float)) and not isinstance(y, bool)]
+    while scr and len(json.dumps(scr)) > TICK_SCR_MAX_B:
+      scr = scr[:-1]
+    d["scr"] = scr
   return d
 
 
@@ -564,6 +574,7 @@ PLANNER_STATE = {
   "_cold0": "a cost cache's counter (COLD) at the tick's start: the tick record's nc is its growth over the tick",
   "_fork_cache": "a cost cache of the continuations of each trace (a pure function of the road memory)",
   "_prof_cache": "a cost cache of _profile_over keyed by its inputs (same inputs, same answer)",
+  "view": _RP + "; what the screen showed from it is the tick's scr",
 }
 for _a in ("alerted", "alerting", "alts", "bend_left_t", "bend_low_t", "bend_on", "blink_t", "cand", "change_strikes", "cmp", "cmp_next",
            "distrust_until", "distrust_why", "dr_bad_m", "dr_hist", "dr_m", "dr_why", "end_m", "fix_age", "guard", "hist", "hold_latch",
@@ -595,7 +606,7 @@ def main():
   from openpilot.common.params import Params
   from openpilot.common.realtime import Ratekeeper
   from openpilot.common.swaglog import cloudlog
-  from openpilot.selfdrive.car.mazda import ti_curve as tc, ti_curve_memory as M, ti_curve_plan as P
+  from openpilot.selfdrive.car.mazda import ti_curve as tc, ti_curve_memory as M, ti_curve_plan as P, ti_curve_view as V
 
   keep_off_control_core()
   params_memory = Params("/dev/shm/params")
@@ -631,6 +642,7 @@ def main():
   last_list_id = None
   lim_state = {"t": None}
   cpu = []
+  view = V.View()                 # the driving screen's curve element: the published look-ahead and the one ding per red bend
   while True:
     sm.update(0)
     t = time.monotonic()
@@ -683,6 +695,15 @@ def main():
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
       d = P.plan_json(plan, t, seq, "act" if on else "shadow")
       params_memory.put(tc.PARAM_PLAN, json.dumps(d))
+      # the driving screen (ti_curve_view.py): the look-ahead and bends, every tick (the UI hides it when older than 1 s); a ding
+      # only at a red chip's onset (frogpilot_planner raises it once)
+      v0 = time.perf_counter()
+      s1, s2, side = stage_summary(planner)
+      vp, ding, scr = view.step(planner, plan, t, seq, on, v / MPH, set_mph, planner._floor(floor_mph, ref_mph, set_mph, v / MPH), side)
+      params_memory.put(V.PARAM_VIEW, V.view_json(vp))
+      if ding is not None:
+        params_memory.put(V.PARAM_DING, json.dumps(ding))
+      scr.insert(3, int(round(1e6 * (time.perf_counter() - v0))))
       seq += 1
       for ev in planner.events:
         cloudlog.event("ti_curve_plan", **log_payload(ev, feature=d["mode"]))
@@ -704,7 +725,6 @@ def main():
         if len(sel) > TICK_MAP_N:
           sel = [sel[int(round(q * (len(sel) - 1) / (TICK_MAP_N - 1)))] for q in range(TICK_MAP_N)]
         mk = [[int(round(dd[j])), int(round(kk[j] * 1e4))] for j in sel]
-      s1, s2, side = stage_summary(planner)
       car_st, mon_st = side_status(params_memory, time.time(), t, tc)
       co = sm["carOutput"]
       diag_ = co.mazdaDiagnostics if sm.alive["carOutput"] else None
@@ -739,6 +759,8 @@ def main():
         extras["mpr"] = [map_ref[0][0], map_ref[1]]
       if plan.ask is not None:
         extras["ask"] = [int(round(float(x) * 100)) for x in plan.ask]
+      if on:
+        extras["scr"] = scr
       cloudlog.event("ti_curve_plan", **log_payload(tick_log(plan, extras), kind="tick"))
       cpu_us = int(round(1e6 * (time.process_time() - c0)))     # logged on the next tick (this tick's own cost, log included)
       wall_us = int(round(1e6 * (time.perf_counter() - w0)))    # ... and its whole wall time (perf 2026-11-26)

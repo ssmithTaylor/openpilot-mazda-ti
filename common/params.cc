@@ -616,6 +616,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"TiCurveStatus", CLEAR_ON_MANAGER_START},        // tmpfs: what curve slowing is doing (car controller, on change and 1 Hz)
     {"TiSetSpeedLeft", CLEAR_ON_MANAGER_START},       // tmpfs: {m, who, now, was} a stopped feature / test left the cruise set speed below the driver's (on-road alert)
     {"TiCurveDeliver", CLEAR_ON_MANAGER_START},       // tmpfs: curve slowing stage 3 alert {m, need, why} (car controller, at onset / clear)
+    {"TiCurveView", CLEAR_ON_MANAGER_START},          // tmpfs: the driving screen's curve element, 5 Hz (ti_curve_plannerd: ti_curve_view.py), no position
+    {"TiCurveDing", CLEAR_ON_MANAGER_START},          // tmpfs: the latest red-chip onset {m, n, need} (ti_curve_plannerd), read by frogpilot_planner
     {"TinygradUpdateAvailable", PERSISTENT},
     {"TorqueInterceptorTune", PERSISTENT},
     {"TiSteerDeltaDown", PERSISTENT},
