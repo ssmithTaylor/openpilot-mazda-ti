@@ -127,6 +127,13 @@ def _finite_or_none(x):
   return x if x == x and abs(x) != float("inf") else None
 
 
+def _set_mph_or_none(speed_ms):
+  """The cruise set speed in whole mph for a log record, or None when it is not a plausible speed (absent, not a number, NaN,
+  infinite, at most 0.5 m/s or above 90 m/s): never raises (review 2026-11-25: an infinite speed raised OverflowError into card)."""
+  sp = _finite_or_none(speed_ms)
+  return int(round(sp * CV.MS_TO_MPH)) if sp is not None and 0.5 < sp < 90.0 else None
+
+
 def ti_cruise_log(event):
   """The cruise set-speed check's steps (armed, waiting, tap with its frames and counters, accepted, aborted, result) into the log."""
   try:
@@ -986,10 +993,10 @@ class CarController(CarControllerBase):
       # bools compared per frame, one event per press
       self.curve_btn_was = drv
       if drv:
-        sp = float(CS.out.cruiseState.speed or 0.0)
         ti_curve_log({"kind": "drv_btn", "frame": int(self.frame), "set_btn": bool(getattr(CS, "crz_btns_set", False)),
                       "plus": bool(getattr(CS, "crz_btns_set_plus", False)),
-                      "set_mph": int(round(sp * CV.MS_TO_MPH)) if sp > 0.5 else None, "curve": cv.state if cv is not None else None})
+                      "set_mph": _set_mph_or_none(getattr(getattr(CS.out, "cruiseState", None), "speed", None)),
+                      "curve": cv.state if cv is not None else None})
     if cv is None:
       if ex is not None and (ex.active or getattr(self, "curve_left", None) is not None):
         return self._curve_exit_only(CC, CS)   # the exit, then the set-speed-left alert until the driver acts (review I4)

@@ -418,3 +418,22 @@ def test_deliver_phase_logged_when_the_assist_turns_on_or_off_not_on_every_torqu
   recs = [e for e in _run_logged(1000, crossing) if e.get("kind") == "deliver_phase"]
   assert len(recs) == 2 and recs[1]["lkas_effective"] == 0.0, recs
 
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), None, -5.0, 1e308, "x"])
+def test_driver_button_log_never_raises_on_a_bad_cruise_speed(bad):
+  # review 2026-11-25: the drv_btn record ran outside curve_step's guard; an infinite or NaN speed raised into card (100 Hz)
+  def press(k, CS):
+    CS.crz_btns_driver = 300 <= k < 303
+    CS.crz_btns_set = CS.crz_btns_driver
+    CS.out.cruiseState.speed = bad if k >= 290 else 45 * 0.44704
+  recs = [e for e in _run_logged(400, press) if e.get("kind") == "drv_btn"]
+  assert len(recs) == 1 and recs[0]["set_mph"] is None, recs
+
+
+def test_driver_button_log_carries_a_good_cruise_speed():
+  def press(k, CS):
+    CS.crz_btns_driver = 300 <= k < 303
+    CS.crz_btns_set = CS.crz_btns_driver
+  recs = [e for e in _run_logged(400, press) if e.get("kind") == "drv_btn"]
+  assert len(recs) == 1 and recs[0]["set_mph"] == 45, recs
