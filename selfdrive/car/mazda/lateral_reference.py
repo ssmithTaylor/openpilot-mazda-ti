@@ -6,7 +6,7 @@ offset and heading here mean right, as in the torque controller's curvature fram
 """
 # RUNTIME: runs in controlsd at 100 Hz; gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
 # Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -98,7 +98,9 @@ class LaneObserver:
     if model_mono != self.model_mono:
       self.context = fit_lane_context(model, age)
       self.model_mono = model_mono
-    return replace(self.context, age=age)
+    # replace(self.context, age=age) without dataclasses.replace's field walk (~40 us a cycle on the comma): the same fields, in order
+    c = self.context
+    return LaneContext(c.valid, c.offset, c.heading10, c.heading20, age, c.reason, c.curvature10, c.curvature20)
 
 
 class LaneRelease:

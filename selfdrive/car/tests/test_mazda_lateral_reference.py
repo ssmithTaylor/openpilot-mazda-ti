@@ -124,3 +124,18 @@ class TestLaneRelease:
     self.step(release, enabled=False)
     assert release.removed == [0.0, 0.0]
     assert self.step(release) == (2.9, 2.9)
+
+
+def test_observer_keeps_every_context_field_when_it_restamps_the_age():
+  """LaneObserver.update rebuilds the held context with the new age field by field (cost, 2026-11-26): it must equal
+  dataclasses.replace(context, age=age) for every field, so a field added to LaneContext fails here until it is passed on."""
+  import dataclasses
+  from types import SimpleNamespace as NS
+  obs = LaneObserver()
+  held = LaneContext(True, 0.31, 0.012, -0.007, 0.05, 'valid', 0.0021, -0.0013)
+  obs.context, obs.model_mono = held, 5
+  model = NS(timestampEof=1_000_000_000 - 40_000_000)
+  got = obs.update(model, 5, True, 1_000_000_000, 1_000_000_000)
+  assert got == dataclasses.replace(held, age=0.04)
+  assert [f.name for f in dataclasses.fields(LaneContext)] == ['valid', 'offset', 'heading10', 'heading20', 'age', 'reason',
+                                                               'curvature10', 'curvature20']
