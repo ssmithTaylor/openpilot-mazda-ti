@@ -206,8 +206,11 @@ class _ModelFeed:
 def setup_lane_drift():
   from openpilot.selfdrive.controls.lib import lane_drift as LD
   g = LD.LaneDriftGate(0.01)
+  log = LD.OnChange(100, 5)
   feed = _ModelFeed()
   seen = {}
+  saved = LD.emit_event
+  LD.emit_event = lambda name, rec: _count(seen, "rec:" + name)   # the lane_gate record (controlsd), counted, not logged
 
   def step(i):
     m, curv, lcs = feed.get(i)
@@ -217,14 +220,21 @@ def setup_lane_drift():
       return
     at_limit = 1500 <= ph < 3000 or (4200 <= ph and (i // 40) % 3 == 0)
     lc = LD.lane_change_active(m, lcs == 1, False)
-    if g.update(m, m.action.desiredCurvature, at_limit, lc):
+    out = g.update(m, m.action.desiredCurvature, at_limit, lc)
+    LD.log_lane_gate(g, log, "c", out, at_limit, lc)
+    if out:
       _count(seen, "gate open")
     if lc:
       _count(seen, "lane change")
     if g.latch_left > 0:
       _count(seen, "latched")
+    if log.sup:
+      _count(seen, "rec capped")
+
+  def teardown():
+    LD.emit_event = saved
   step.seen = seen
-  return step, lambda: None
+  return step, teardown
 
 
 def _controls_clock(mods):
@@ -730,9 +740,12 @@ def setup_frogpilot_events():
   from openpilot.selfdrive.car.mazda import ti_curve as TC
   from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
   from openpilot.selfdrive.controls.lib.events import FrogPilotEventName as FEN
-  saved = (FE.params, FE.params_memory)
+  from openpilot.selfdrive.controls.lib import lane_drift as LD
+  saved = (FE.params, FE.params_memory, LD.emit_event)
   mem = MemParams()
   FE.params, FE.params_memory = MemParams(), mem
+  seen = {}
+  LD.emit_event = lambda name, rec: _count(seen, "rec:" + name)   # lane_gate / ti_authority records, counted, not logged
   P = 1200                                   # 60 s of model frames
   planner = NS(frogpilot_vcruise=NS(forcing_stop=False, slc=NS(speed_limit_changed_timer=0.0)), tracking_lead=False, model_stopped=False,
                cem=NS(stop_light_detected=False), lead_one=NS(dRel=10.0, vLead=0.0), lateral_acceleration=0.0, steer_advisory_speed=0.0,
@@ -745,7 +758,6 @@ def setup_frogpilot_events():
   st = {"latch": 0, "tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
   names = {FEN.steerRunningWide: "running wide", FEN.tiDropout: "ti dropout", FEN.steerAuthorityAdvisory: "advisory",
            FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning"}
-  seen = {}
 
   def step(i):
     now = i * 0.05
@@ -784,7 +796,7 @@ def setup_frogpilot_events():
       _count(seen, "gate latched")
 
   def teardown():
-    FE.params, FE.params_memory = saved
+    FE.params, FE.params_memory, LD.emit_event = saved
   step.seen = seen
   return step, teardown
 

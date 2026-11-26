@@ -27,7 +27,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import VCruiseHelper, clip_c
 from openpilot.selfdrive.controls.lib.events import Events, ET
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_CONTROL_SPEED
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
-from openpilot.selfdrive.controls.lib.lane_drift import LaneDriftGate, lane_change_active
+from openpilot.selfdrive.controls.lib.lane_drift import LaneDriftGate, OnChange, lane_change_active, log_lane_gate
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.car.mazda.lateral_diagnostics import record_inputs
@@ -180,6 +180,7 @@ class Controls:
     self.last_steering_pressed_frame = 0
     self.sat_alert_frames = 0
     self.lane_drift_gate = LaneDriftGate(DT_CTRL)
+    self.lane_gate_log = OnChange(100, 5)      # lane_gate record on a change of the gate's state, at most 5 a second
     # hooks: step (the whole cycle, upstream + ours), lat (model context + LaC.update), ab (the A/B / plan step), diag (record_inputs),
     # drift (the lane drift gate); event "ti_cost" every 10 s
     self.ti_cost = HookTimers("controlsd", ("step", "lat", "ab", "diag", "drift"), log=cloudlog_cost) if HookTimers is not None else None
@@ -880,8 +881,9 @@ class Controls:
       at_limit = bool(lac_log.saturated and undershooting and turning)
       # the gate is stateful (remembered lane width, latch through the model's re-index of the lines, none in a lane change)
       td = time.perf_counter_ns() if self.ti_cost is not None else 0
-      drift = self.lane_drift_gate.update(model_v2, model_v2.action.desiredCurvature, at_limit,
-                                          lane_change_active(model_v2, CS.leftBlinker, CS.rightBlinker))
+      lane_change = lane_change_active(model_v2, CS.leftBlinker, CS.rightBlinker)
+      drift = self.lane_drift_gate.update(model_v2, model_v2.action.desiredCurvature, at_limit, lane_change)
+      log_lane_gate(self.lane_drift_gate, self.lane_gate_log, "c", drift, at_limit, lane_change)   # never raises
       if self.ti_cost is not None:
         self.ti_cost.add(4, time.perf_counter_ns() - td)
       held = at_limit and drift

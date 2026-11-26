@@ -8,6 +8,7 @@ CAR_HALF_WIDTH nearer the line than the centre is.
 # RUNTIME: runs in controlsd at 100 Hz (while steering) and frogpilot_process at 20 Hz (every model frame on-road); gc disabled (see docs/RUNTIME_CONSTRAINTS.md).
 # Per call: create no class or closure, keep no container without a bound, nothing that grows with drive time.
 import math
+import time
 
 CAR_HALF_WIDTH = 0.92        # m
 DRIFT_CLEARANCE = 0.30       # m: car's side within this of a visible line (or over it) counts as drifting
@@ -192,6 +193,11 @@ class LaneDriftGate:
     self.t = 0.0
     self.samples = []            # (time, outside clearance) per model frame, newest last
     self.conf = [False, False]   # lane lines [1], [2] confident (with hysteresis)
+    # the last update's evidence, for the lane_gate record (read only by log_lane_gate; the answer never depends on them)
+    self.ref = False             # positive evidence (False: open only because nothing gave a position, or closed)
+    self.pred = False            # opened by the closing-rate prediction
+    self.oc = None               # the outside clearance (m) the rate was taken from, None on a straight / no reference
+    self.rate = None             # the closing rate (m/s), None when too few frames
 
   def reset(self):
     self.latch_left, self.clear_s, self.prev_ys = 0.0, 0.0, None
@@ -204,6 +210,7 @@ class LaneDriftGate:
     if reindex:
       self.samples = []
     c = outside_clearance(model, curvature, self.width)
+    self.oc = c
     if c is None:
       self.samples = []
       return None
@@ -224,6 +231,7 @@ class LaneDriftGate:
       self.width = w
     if lane_change:
       self.reset()
+      self.ref = self.pred = False
       return False
     ys = None
     try:
@@ -250,10 +258,13 @@ class LaneDriftGate:
     self.t += self.dt
     now, referenced = _evidence(model, curvature, self.width)
     rate = self.closing_rate(model, curvature, reindex)
+    self.pred = False
     if at_limit and not now and rate is not None and rate >= PREDICT_MIN_RATE:
       c = self.samples[-1][1]
       if c - rate * PREDICT_HORIZON_S <= 0.0:      # the car's side reaches the line within the horizon
         now = referenced = True
+        self.pred = True
+    self.ref, self.rate = referenced, rate
     if not at_limit:
       self.clear_s += self.dt
       if self.clear_s >= LATCH_RELEASE_S:
@@ -269,6 +280,90 @@ class LaneDriftGate:
       self.latch_left -= self.dt
       return True
     return False
+
+
+# ---- the lane_gate record (replayability, owner 2026-11-26 item 6) --------------------------------------------------------------------
+# One record per CHANGE of the gate's discrete state, from both processes that run it ("p": "c" controlsd while steering, "f"
+# frogpilot_process every model frame on-road). The state is the bit field "s" (LANE_GATE_BITS, bit 0 first); the analogue values in
+# the record (latch time left, width, outside clearance, closing rate) are carried as they were at that change, never compared.
+# At most OnChange.per_window records a second per process; "sup" counts the calls whose changed state was held back by that cap.
+# Inputs a replay needs are in the rlog already: modelV2 (lines, probabilities, edges, desired curvature, lane-change state), the
+# blinkers (carState), at_limit (controlsd: controlsState's saturation / curvatures; frogpilot_process: "base" in ti_authority).
+LANE_GATE_BITS = ("out", "latched", "conf_l", "conf_r", "width_known", "lane_change", "predicted", "referenced")
+LANE_GATE_MAX_B = 140        # bytes of the record as JSON (about 100 in practice)
+# LaneDriftGate attributes: logged (record key) or exempt (why a replay does not need it). Guarded by test_mazda_ti_alert_replayable.py.
+LANE_GATE_LOGGED = {"latch_left": "latch (and bit latched)", "conf": "bits conf_l / conf_r", "width": "w (and bit width_known)",
+                    "ref": "bit referenced", "pred": "bit predicted", "oc": "c", "rate": "r"}
+LANE_GATE_EXEMPT = {
+  "dt": "fixed at construction (0.01 controlsd, 0.05 frogpilot_process)",
+  "clear_s": "time since the steering left its limit: the at_limit sequence (rlog / ti_authority base) gives it",
+  "prev_ys": "the previous model frame's two line positions: modelV2 in the rlog",
+  "t": "the gate's own clock, calls x dt",
+  "samples": "the last 0.6 s of outside clearances: recomputed from modelV2 in the rlog; their slope is logged as r",
+}
+
+
+def emit_event(name, rec):
+  """Into the log (logMessage in the rlog); a test replaces it."""
+  from openpilot.common.swaglog import cloudlog
+  cloudlog.event(name, **rec)
+
+
+class OnChange:
+  """Decides when a record of a feature's discrete state is due: when its integer key changed, at most per_window records per
+  window of calls (calls_per_s calls: one second at the caller's rate). Preallocated, nothing grows; after an error the caller sets
+  `dead` and logs nothing more in this process."""
+  __slots__ = ("key", "calls", "win", "n", "sup", "window", "per_window", "dead")
+
+  def __init__(self, calls_per_s, max_per_s):
+    self.key, self.calls, self.win, self.n, self.sup = -1, 0, 0, 0, 0
+    self.window, self.per_window, self.dead = int(calls_per_s), int(max_per_s), False
+
+  def due(self, key):
+    self.calls += 1
+    if self.calls - self.win >= self.window:
+      self.win, self.n = self.calls, 0
+    if key == self.key:
+      return False
+    if self.n >= self.per_window:
+      self.sup += 1
+      return False
+    self.key = key
+    self.n += 1
+    return True
+
+  def take_sup(self):
+    s, self.sup = self.sup, 0
+    return s
+
+
+def lane_gate_key(gate, out, lane_change):
+  """The gate's discrete state as an int (LANE_GATE_BITS): booleans only, never a raw position or width."""
+  c = gate.conf
+  return ((1 if out else 0) | (2 if gate.latch_left > 0.0 else 0) | (4 if c[0] else 0) | (8 if c[1] else 0)
+          | (16 if gate.width is not None else 0) | (32 if lane_change else 0) | (64 if gate.pred else 0) | (128 if gate.ref else 0))
+
+
+def lane_gate_bits(s):
+  """The record's "s" as {name: bool} (for the drive review)."""
+  return {n: bool(s >> i & 1) for i, n in enumerate(LANE_GATE_BITS)}
+
+
+def _r(x, nd):
+  return None if x is None else round(float(x), nd)
+
+
+def log_lane_gate(gate, log, proc, out, at_limit, lane_change):
+  """After gate.update: one lane_gate record when the gate's state changed. Never raises; after an error, off for this process."""
+  if log.dead:
+    return
+  try:
+    if log.due(lane_gate_key(gate, out, lane_change)):
+      emit_event("lane_gate", {"p": proc, "m": round(time.monotonic(), 3), "s": log.key, "latch": round(gate.latch_left, 2),
+                               "w": _r(gate.width, 2), "al": 1 if at_limit else 0, "c": _r(gate.oc, 2), "r": _r(gate.rate, 2),
+                               "sup": log.take_sup()})
+  except Exception:
+    log.dead = True
 
 
 class HoldTimer:

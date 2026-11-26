@@ -18,7 +18,7 @@ NAMES = list(MC.SCENARIOS)
 # What each scenario must have exercised inside its measured run (else the "no growth" is about an idle path): the states that create
 # and drop state. Keys are counted by the scenario (ti_mem_check: `seen`).
 REQUIRED = {
-  "lane_drift": ("gate open", "latched", "lane change"),
+  "lane_drift": ("gate open", "latched", "lane change", "rec:lane_gate"),
   "ab_runner": ("ev:block_start", "ev:block_end", "plan:ab", "plan:tests"),
   "lateral": ("lane valid", "lane confidence", "lane lane_change", "inactive", "diagnostics"),
   "card_tests": ("ident running", "lag held", "plan tests", "ev:run", "ev:stop"),
@@ -26,7 +26,7 @@ REQUIRED = {
                  "curve:deliver_phase", "curve:cs", "curve:drv_btn", "curve:left"),
   "card_buttons": ("buttons:running", "buttons:finished", "check:running", "check:finished", "frames sent"),
   "planner": ("ceiling", "ev:alert", "ev:lock_lost", "ev:lock"),
-  "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code"),
+  "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code", "rec:lane_gate"),
 }
 
 
