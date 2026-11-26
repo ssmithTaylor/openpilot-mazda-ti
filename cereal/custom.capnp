@@ -101,6 +101,7 @@ struct FrogPilotCarEvent @0x81c2f05a394cf4af {
     steerLatchedWarning @30;
     tiDropout @31;
     steerRunningWide @32;
+    tiCurveDing @33;          # curve slowing's driving-screen element: the one ding when a red chip first appears (no banner)
   }
 }
 

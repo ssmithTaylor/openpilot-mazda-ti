@@ -723,14 +723,14 @@ def setup_frogpilot_events():
   """frogpilot_process (20 Hz, gc disabled), on-road, engaged or not: FrogPilotEvents.update (whole, the planner's state faked), which
   runs LaneDriftGate.update every model frame (the running-wide gate; 2026-11-25 second leak: lane_drift's per-call class kept every
   modelV2 message, about 13.6 KB per cycle, ~1 GB/h on-road), and the TI block FrogPilotPlanner.update adds per cycle
-  (steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code every 2nd cycle, the
-  stopped-steering latch count). Fresh capnp messages per cycle, as SubMaster gives them. The module's params / params_memory are
+  (steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code / ti_curve_view.curve_ding_due
+  every 2nd cycle (a red-chip onset now and then: the tiCurveDing event), the stopped-steering latch count). Fresh capnp messages per cycle, as SubMaster gives them. The module's params / params_memory are
   swapped for in-memory stores for the run (nothing is read from or written to the device's)."""
   # sentry first: frogpilot_variables -> car_helpers -> sentry -> frogpilot_variables is circular when frogpilot_variables is the
   # first of them imported (the comma: ImportError ERROR_LOGS_PATH); the processes import sentry first through their own imports
   import openpilot.system.sentry  # noqa: F401
   from openpilot.frogpilot.controls.lib import frogpilot_events as FE, steer_authority as SA
-  from openpilot.selfdrive.car.mazda import ti_curve as TC
+  from openpilot.selfdrive.car.mazda import ti_curve as TC, ti_curve_view as TV
   from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
   from openpilot.selfdrive.controls.lib.events import FrogPilotEventName as FEN
   saved = (FE.params, FE.params_memory)
@@ -747,7 +747,7 @@ def setup_frogpilot_events():
   trig = SA.AdvisoryTrigger()
   st = {"latch": 0, "tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
   names = {FEN.steerRunningWide: "running wide", FEN.tiDropout: "ti dropout", FEN.steerAuthorityAdvisory: "advisory",
-           FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning"}
+           FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning", FEN.tiCurveDing: "ding"}
   seen = {}
 
   def step(i):
@@ -758,6 +758,8 @@ def setup_frogpilot_events():
       mem.put(TC.PARAM_DELIVER, json.dumps({"m": now, "need": 36 if 440 <= ph < 560 else None,
                                             "why": "dropout" if 450 <= ph < 470 else "limit"}))
       mem.put(TC.PARAM_LEFT, json.dumps({"m": now, "who": "curve", "now": 40, "was": 45}) if 1100 <= ph < 1150 else "")
+      if ph in (200, 640, 1000):                   # a red chip's onset (the planner writes it once per red bend)
+        mem.put(TV.PARAM_DING, json.dumps({"m": now, "n": ph, "need": 22}))
     sm = _fp_messages(i, P)
     v_ego = sm["carState"].vEgo
     # FrogPilotPlanner.update's TI block (frogpilot_planner.py), in its order
@@ -769,6 +771,8 @@ def setup_frogpilot_events():
     if st["tick"] % 2 == 0:
       st["alert"] = TC.curve_alert_mph(mem, now)
       st["code"] = TC.read_curve_code(mem, now)
+      st["ding_m"], due = TV.curve_ding_due(mem, now, st.get("ding_m"), True)
+      planner.curve_ding = getattr(planner, "curve_ding", False) or due
     if st["alert"][0] and now - st["alert"][1] < 1.0:
       planner.steer_advisory_speed = -st["alert"][0] * 0.44704
       _count(seen, "curve alert")

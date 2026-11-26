@@ -26,6 +26,12 @@ try:
 except Exception:
   def read_curve_alert(params_memory, now):
     return None, 0.0
+try:
+  # curve slowing's driving-screen element (optional): the one ding at a red chip's onset (ti_curve_view.py)
+  from openpilot.selfdrive.car.mazda.ti_curve_view import curve_ding_due
+except Exception:
+  def curve_ding_due(params_memory, now, last_m, engaged):
+    return last_m, False
 from openpilot.frogpilot.controls.lib.frogpilot_following import FrogPilotFollowing
 from openpilot.frogpilot.controls.lib.frogpilot_vcruise import FrogPilotVCruise
 from openpilot.frogpilot.controls.lib import steer_authority
@@ -141,6 +147,10 @@ class FrogPilotPlanner:
     if self.curve_tick % 2 == 0:
       self.curve_alert_mph, self.curve_alert_t = read_curve_alert(params_memory, time.monotonic())
       self.curve_code, self.curve_code_t = read_curve_code(params_memory, time.monotonic())
+      # the screen element's ding: a new red-chip onset raises tiCurveDing once (frogpilot_events clears the flag), only while engaged
+      self.curve_ding_m, due = curve_ding_due(params_memory, time.monotonic(), getattr(self, "curve_ding_m", None),
+                                              bool(sm["controlsState"].enabled))
+      self.curve_ding = getattr(self, "curve_ding", False) or due
     if getattr(self, "curve_alert_mph", None) and time.monotonic() - self.curve_alert_t < 1.0:
       curve_ms = self.curve_alert_mph * CV.MPH_TO_MS
       if self.steer_advisory_speed <= 0 or curve_ms <= self.steer_advisory_speed:

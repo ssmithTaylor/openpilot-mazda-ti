@@ -6,7 +6,7 @@ import json
 import re
 
 from cereal import car, custom, log
-from openpilot.selfdrive.controls.lib.events import EVENTS, ET
+from openpilot.selfdrive.controls.lib.events import FROGPILOT_EVENTS as EVENTS, ET
 from openpilot.selfdrive.car.mazda import ti_curve_view as V
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parents[3]
@@ -61,7 +61,7 @@ def test_the_event_is_a_single_prompt_with_no_banner():
   assert a.alert_text_1 == "" and a.alert_text_2 == ""
   assert a.audible_alert == car.CarControl.HUDControl.AudibleAlert.prompt       # prompt: plays once (soundd), never promptRepeat
   assert a.visual_alert == car.CarControl.HUDControl.VisualAlert.none
-  assert a.duration <= 1.0
+  assert a.duration <= 100                                                      # in 10 ms frames: at most 1 s
   assert set(EVENTS[FEN.tiCurveDing]) == {ET.WARNING}                           # only while engaged; never a disable or no-entry
 
 

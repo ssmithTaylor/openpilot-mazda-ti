@@ -1195,6 +1195,16 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.warningSoft, .5),
   },
 
+  # curve slowing's driving-screen element (selfdrive/car/mazda/ti_curve_view.py): ONE ding when a bend's red chip first appears.
+  # Size none: no banner, no text (the chip on the screen says it); prompt plays once; raised for a single frogpilot frame per onset.
+  FrogPilotEventName.tiCurveDing: {
+    ET.WARNING: Alert(
+      "",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 1.),
+  },
+
   FrogPilotEventName.steerRunningWide: {
     # HIGH so it outranks the curve warning (MID) and the model advisory (LOW) when both are live: they hold for seconds around a
     # corner, and the reactive out-of-torque call must not be hidden behind them. warningSoft (was prompt, the curve warning's own

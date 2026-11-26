@@ -238,6 +238,11 @@ class FrogPilotEvents:
     if self.frogpilot_planner.steer_advisory_speed != 0:       # > 0 the corner advisory, < 0 curve slowing's warning
       self.events.add(FrogPilotEventName.steerAuthorityAdvisory)
 
+    # curve slowing's screen element: the one ding of a red chip's onset (frogpilot_planner sets the flag once per onset)
+    if getattr(self.frogpilot_planner, "curve_ding", False):
+      self.frogpilot_planner.curve_ding = False
+      self.events.add(FrogPilotEventName.tiCurveDing)
+
     # TI dropout: the interceptor left RUN while lateral was active. On the recorded 0x11 event
     # this removed most of the steering instantly (achieved la 2.6 -> 0.3) and took 32 s to
     # self-recover, all silently. Latched for a few seconds so it cannot flash unseen.
