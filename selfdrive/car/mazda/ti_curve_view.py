@@ -132,8 +132,8 @@ def plan_bend(plan, side, floor, mph):
 
 
 def chip(bl, mph):
-  """The chip the screen shows at the tick (the UI's own rule, ti_curve_view_logic.h chipFor, at age 0): the nearest red bend within its
-  lead, else the nearest yellow within YELLOW_LEAD_S. -> (cls, index in bl) or (0, -1)."""
+  """The chip the screen shows at the tick (the UI's own rule, ti_curve_view_logic.h chipFor, at age 0): the first red bend within its
+  lead, else the first yellow within its lead (YELLOW_LEAD_S). bl: dicts with cls, start (m), lead (s). -> (cls, index) or (0, -1)."""
   v = max(float(mph) * MPH, 1.0)
   for i, b in enumerate(bl):
     if b["cls"] == CLS_RED and b["start"] / v <= b["lead"]:
@@ -175,7 +175,9 @@ class View:
         bl = [b] if b is not None else []
     odo = float(getattr(planner, "odo", 0.0))
     self.dinged = [e for e in self.dinged if odo <= e + DING_FORGET_M]
-    ck, ci = chip(bl, mph) if bl else (CLS_NEUTRAL, -1)
+    p = payload(t_mono, seq, on, mph, floor, rib, ends, bl)
+    # the chip on the numbers as published (whole metres, 0.1 s, 0.1 mph): exactly what the UI decides at age 0
+    ck, ci = chip([{"cls": q[6], "start": q[0], "lead": q[9] / 10.0} for q in p["b"]], p["mph"] / 10.0) if bl else (CLS_NEUTRAL, -1)
     ding = None
     if on and ck == CLS_RED and float(mph) >= MIN_MPH:
       key = odo + bl[ci]["end"]
@@ -184,7 +186,6 @@ class View:
         del self.dinged[:-DING_KEEP]
         self.n += 1
         ding = self.last = {"m": round(float(t_mono), 2), "n": self.n, "need": int(bl[ci]["need"])}
-    p = payload(t_mono, seq, on, mph, floor, rib, ends, bl)
     log = [self.n, int(ck), len(bl)]
     for b in p["b"][:3]:
       log += [b[0], b[2], b[3], b[4], b[5], b[6]]
