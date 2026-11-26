@@ -5,7 +5,9 @@ until they don't"). SYNTHETIC roads only, built to reproduce the two measured ca
   (b) a turn-off taken once (a single-pass branch) is the link; the multi-pass road goes on straight; road matching flagged the car
       beside the branch but the slowdown stayed (dead-reckoned to the bend's end).
 The planner plans along the SAME road at a fork (the straightest continuation; the turn signal toward a branch makes it the plan), and
-a slowdown from a record the car is matched beside is dropped at once."""
+a slowdown planned on the road not taken is dropped once the car is positively matched on the other road past the fork (fork_switch).
+Being merely beside the record (a lane change, a GPS offset, a matcher miss) never drops anything (review of integ-20261126, finding 1).
+"""
 import numpy as np
 import pytest
 
@@ -140,24 +142,16 @@ def test_b_without_the_rule_the_branch_is_slowed_for(monkeypatch):
   assert starts_on(res, mem, 1)
 
 
-def test_b_beside_the_record_drops_its_slowdown_at_once():
-  """No other remembered road to follow (the same-road rule cannot help): the lock follows the branch, the car goes straight, road
-  matching says it is beside the record, and the slowdown from that record is dropped on that tick (it used to run on, dead
-  reckoned, to the bend's end)."""
+def test_b_beside_the_record_with_no_other_road_runs_on_dead_reckoned():
+  """No other remembered road to follow (the same-road rule cannot help, and no fork switch can happen): the lock follows the branch,
+  the car goes straight, road matching says it is beside the record. That flag alone is not evidence of another road (a lane change
+  or a GPS offset looks the same), so the slowdown runs on, dead reckoned, as before the fork work (it used to be dropped here)."""
   h1, r, mem = case_b(with_main=False)
   res = run(mem, M.synthetic_trace([(3400, 0.0)]), 60, 120)
   assert starts_on(res, mem, 1), "the branch's slowdown starts before the fork (the look-ahead had nothing else)"
   k_off = next(k for k, (t, s, p, ev, _) in enumerate(res) if any(e["kind"] == "rm_off" for e in ev))
-  t_off, _, p_off, ev_off, _ = res[k_off]
-  assert any(e["kind"] == "rm_drop" for e in ev_off)
-  assert all(p.ceil is None for t, s, p, ev, _ in res[k_off:])
-
-
-def test_b_beside_the_record_without_the_drop_runs_on(monkeypatch):
-  monkeypatch.setattr(P, "RM_DROP", False)
-  h1, r, mem = case_b(with_main=False)
-  res = run(mem, M.synthetic_trace([(3400, 0.0)]), 60, 120)
-  k_off = next(k for k, (t, s, p, ev, _) in enumerate(res) if any(e["kind"] == "rm_off" for e in ev))
+  assert not any(e["kind"] == "rm_drop" for _, _, _, ev, _ in res for e in ev)
+  assert any(e["kind"] == "dead_reckon" for e in res[k_off][3])
   assert any(p.ceil is not None for t, s, p, ev, _ in res[k_off + 1:])
 
 
@@ -168,18 +162,22 @@ def test_b_signal_toward_the_turn_off_keeps_it_planned():
   assert starts_on(res, mem, 1)
 
 
-def test_a_car_in_a_bend_keeps_its_slowdown_when_flagged_beside():
-  """The one exception to the drop: the car is cornering itself (its yaw-sensor in-bend state): a slowdown is never dropped inside a
-  bend the car is actually in (review C1)."""
+def test_a_car_in_a_bend_keeps_its_slowdown_on_a_road_switch():
+  """The one exception to the fork switch's drop: the car is cornering itself (its yaw-sensor in-bend state): a slowdown is never
+  dropped inside a bend the car is actually in (review C1). The slowdown is for a bend on the branch; the switch is onto the main
+  road (trace 0 here: the only other one)."""
   h1, r, mem = case_b(with_main=False)
   pl = P.Planner(mem)
-  pl.active[999] = {"T": 40, "need": 40, "Tc": 40, "at": 1e9, "entry": 0.0, "mode": "push", "since": 0.0, "start_t": 0.0, "phase": 1}
+  key = int(mem.trace_start[1]) + 20
+  pl.active[key] = {"T": 40, "need": 40, "Tc": 40, "at": 1e9, "entry": 0.0, "mode": "push", "since": 0.0, "start_t": 0.0, "phase": 1}
   pl.bend_on = True
-  pl._drop_active("beside the remembered road")
-  assert 999 in pl.active
+  pl._drop_for_switch(0, "matched on the other road at a fork")
+  assert key in pl.active
+  assert any(e["kind"] == "dead_reckon" for e in pl.events)
   pl.bend_on = False
-  pl._drop_active("beside the remembered road")
-  assert 999 not in pl.active
+  pl._drop_for_switch(0, "matched on the other road at a fork")
+  assert key not in pl.active
+  assert any(e["kind"] == "rm_drop" and e["n"] == 1 for e in pl.events)
 
 
 def test_no_alternative_no_change():
@@ -206,3 +204,139 @@ def test_fork_log_is_small_and_position_free(case):
   idx, dist = pl._ahead(0, int(mem.trace_end(0)) - 40, 600.0)
   fk = pl.fk
   assert isinstance(fk, list) and len(fk) == 4 and all(isinstance(x, int) for x in fk)
+
+
+# ---- beside the record is NOT a fork (independent review of integ-20261126, finding 1) ------------------------------------------
+# A lane change, a GPS offset or a matcher miss sets road matching's "beside the record" flag. That never drops a slowdown, its
+# ceiling, guard, latched warning or hold, and never delays a warning ("a GPS gap or a matcher miss never drops (or delays) a
+# warning", fourth review MUST 1): the plan in those drives must be EXACTLY the one before the fork work. Only a positive match on the
+# other road past a fork (fork_switch) drops what was planned on the road not taken.
+# Synthetic straight road into a 37 mph bend (1/120 m) at 1500 m, approached at 60 mph.
+PROBE_BEND_M = 1500.0
+
+
+def probe_road():
+  a = M.synthetic_trace([(1500, 0.0), (200, 1 / 120.0), (600, 0.0)])
+  return a, M.synthetic([a], nexts=[-1])
+
+
+def lane_change(s0, width=3.7, length=110.0):
+  def f(s):
+    if s < s0:
+      return 0.0, 0.0
+    if s > s0 + length:
+      return width, 0.0
+    u = (s - s0) / length
+    return width * (3 * u * u - 2 * u ** 3), float(np.arctan(width * (6 * u - 6 * u * u) / length))
+  return f
+
+
+def two_lane_changes(s1, s2):
+  l1, l2 = lane_change(s1), lane_change(s2)
+  return lambda s: (l1(s)[0] + l2(s)[0], l1(s)[1] + l2(s)[1])
+
+
+PROBES = {
+  "lane_changes_ending_10m_before_the_bend": two_lane_changes(1260, 1380),
+  "gps_jump_6m_for_40m": lambda s: ((6.0, 0.0) if 1300 <= s <= 1340 else (0.0, 0.0)),
+  "lane_changes_before_the_slowdown_starts": two_lane_changes(1000, 1150),
+}
+# Expected: the same synthetic drives run on commit 1c8a450d (the build before the fork work: 447837fb), recorded tick by tick as
+# (metres along, published ceiling, alert, slowdowns in progress, latched warnings), here as the ticks where any of them changes.
+# All three are identical to that build with RM_DROP off at 3147bb1d (the reviewer's probe).
+PRE_FORK = {
+  "lane_changes_ending_10m_before_the_bend":
+    [(0.0, None, None, 0, 0), (976.3, None, None, 0, 1), (1244.6, 50, 37, 1, 1), (1341.1, 39, 37, 1, 1), (1727.4, None, None, 0, 0)],
+  "gps_jump_6m_for_40m":
+    [(0.0, None, None, 0, 0), (976.3, None, None, 0, 1), (1244.6, 50, 37, 1, 1), (1341.1, 39, 37, 1, 1), (1727.4, None, None, 0, 0)],
+  "lane_changes_before_the_slowdown_starts":
+    [(0.0, None, None, 0, 0), (976.3, None, None, 0, 1), (1244.6, None, 37, 0, 1), (1448.4, 39, 37, 1, 1), (1727.4, None, None, 0, 0)],
+}
+
+
+def run_offset(mem, path, v_mph, seconds, lat_fn):
+  """Constant speed along `path` with the fix moved sideways by lat_fn(s) -> (metres left, heading offset rad)."""
+  pl = P.Planner(mem)
+  s_road = np.arange(len(path["x"])) * M.SPACING_M
+  rows, evs, s = [], [], 0.0
+  v = v_mph * MPH
+  for k in range(int(seconds / DT)):
+    if s > s_road[-1]:
+      break
+    j = min(int(s // M.SPACING_M), len(path["x"]) - 1)
+    h = float(path["hdg"][j])
+    d, dh = lat_fn(s)
+    x = float(np.interp(s, s_road, path["x"])) - np.sin(h) * d
+    y = float(np.interp(s, s_road, path["y"])) + np.cos(h) * d
+    p = pl.step(k * DT, P.Fix(True, x, y, h + dh), v, set_mph=v_mph, yaw_k=float(path["kap"][j]), ref_mph=v_mph)
+    rows.append((round(s, 1), p.ceil, (p.diag or {}).get("alert"), len(pl.active), len(pl.latch)))
+    evs += [(round(s, 1), e) for e in pl.events]
+    pl.events.clear()
+    s += v * DT
+  return rows, evs
+
+
+def changes(rows):
+  out, prev = [], None
+  for r in rows:
+    if r[1:] != prev:
+      out.append(r)
+      prev = r[1:]
+  return out
+
+
+@pytest.mark.parametrize("name", list(PROBES))
+def test_beside_the_record_keeps_the_plan_exactly_as_before_the_fork_work(name):
+  a, mem = probe_road()
+  rows, evs = run_offset(mem, a, 60, 120, PROBES[name])
+  assert any(e["kind"] == "rm_off" for _, e in evs), "the probe must actually put the car beside the record"
+  assert changes(rows) == PRE_FORK[name]
+  assert not any(e["kind"] == "rm_drop" for _, e in evs)
+  # the warning shows from the same distance before the bend, and a ceiling is published through the bend
+  first_alert = next(s for s, c, al, n, nl in rows if al is not None)
+  assert PROBE_BEND_M - first_alert > 250.0
+  assert all(c is not None for s, c, al, n, nl in rows if PROBE_BEND_M <= s <= PROBE_BEND_M + 150.0)
+
+
+def fork_bend_on_the_planned_road():
+  """The link b leaves at 14 deg, straight; the straight-on road c (the plan by the same-road rule) has a bend 150 m in."""
+  a = M.synthetic_trace([(800, 0.0)])
+  b = M.synthetic_trace([(500, 0.0)], x0=a["x"][-1] + 5.0, y0=0.0, h0=0.25)   # straight (not a bend the car corners in)
+  c = M.synthetic_trace([(150, 0.0), (200, 1 / 90.0), (800, 0.0)], x0=a["x"][-1] + 40.0, y0=0.0, h0=0.0)
+  return a, b, c, M.synthetic([a, b, c], nexts=[1, -1, -1])
+
+
+def test_a_road_switch_that_clears_the_old_roads_warning_logs_it():
+  """The car takes the branch the plan did not follow: the warning latched for the planned road's bend is cleared on the switch,
+  and that is logged (rm_drop with the latched-warning count), also when no slowdown is in progress."""
+  a, b, c, mem = fork_bend_on_the_planned_road()
+  res = run(mem, cat(a, b), 50, 60)
+  k_sw = next(k for k, r in enumerate(res) if any(e["kind"] == "fork_switch" for e in r[3]))
+  pl_before = res[k_sw - 1][4]
+  sw = [e for e in res[k_sw][3] if e["kind"] == "rm_drop"]
+  assert sw and sw[0]["nl"] >= 1, res[k_sw][3]
+  assert all(p.diag.get("alert") is None for _, _, p, _, _ in res[k_sw:] if p.diag)
+  del pl_before
+
+
+def test_a_cleared_latch_is_logged_with_no_slowdown_in_progress():
+  a, b, c, mem = fork_bend_on_the_planned_road()
+  pl = P.Planner(mem)
+  key = int(mem.trace_start[2]) + 20            # a bend point on the road not taken
+  pl.latch[key] = {"key": key, "need": 30, "entry": 100.0, "low": 120.0, "end": 140.0, "rec": False}
+  pl.hold_latch = {key: 40}
+  assert not pl.active
+  pl._drop_for_switch(1, "matched on the other road at a fork")
+  assert key not in pl.latch and key not in pl.hold_latch
+  ev = [e for e in pl.events if e["kind"] == "rm_drop"]
+  assert ev and ev[0]["n"] == 0 and ev[0]["nl"] == 1 and ev[0]["nh"] == 1
+
+
+def test_a_switch_keeps_warnings_for_bends_on_the_road_now_followed():
+  a, b, c, mem = fork_bend_on_the_planned_road()
+  pl = P.Planner(mem)
+  key = int(mem.trace_start[1]) + 20            # a point on the road the car is now matched on
+  pl.latch[key] = {"key": key, "need": 30, "entry": 100.0, "low": 120.0, "end": 140.0, "rec": False}
+  pl._drop_for_switch(1, "matched on the other road at a fork")
+  assert key in pl.latch
+  assert not any(e["kind"] == "rm_drop" for e in pl.events)

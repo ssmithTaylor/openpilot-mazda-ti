@@ -488,11 +488,11 @@ RM_STEADY_DEG = 1.5             # ... and the heading difference within this (it
 # phantom returns at 1.6 mph / 5 mph-s (road-match-build sensitivity run); the builder fix (lane-scale absorption) is the cure
 RM_ABS_M = 8.0
 RM_REF_TAU_S = 20.0             # while on and not yet steady the reference follows the offset this slowly
-# Beside the record = off it (owner's go-ahead on forks, 2026-11-25 night): a slowdown from a record the car is matched beside is
-# DROPPED on that tick (corners in progress, their published-ceiling guard and their latched warnings), no longer dead-reckoned to the
-# bend's end; the one exception is a car cornering itself (its yaw-sensor in-bend state, REL_*), so a set speed is never raised inside
-# a bend the car is actually in (review C1). The plan then follows the record the car is matched on next.
-RM_DROP = True
+# Beside the record (a lane change, a GPS offset, a matcher miss) NEVER drops a slowdown, its ceiling, guard, latched warning or hold,
+# and never delays a warning: the slowdown in progress runs on by dead reckoning to the bend's end (independent review of
+# integ-20261126, finding 1: a broad drop on "beside" lost the ceiling and the warning 73 m before a bend after two lane changes). Only
+# a POSITIVE match on the other road past a fork drops what was planned on the road not taken (`_fork_switch` -> `_drop_for_switch`),
+# unless the car is cornering itself (its yaw-sensor in-bend state, REL_*; review C1).
 # FORKS (owner, 2026-11-25: "assume that the driver is going to continue on the same road until they don't"). At the end of a trace
 # with a continuation link, the planner's look-ahead AND its lock follow the SAME ROAD: among the link and the other remembered roads
 # starting or passing within FORK_R_M of the trace's last point (ahead of it by at least -FORK_BACK_M, within FORK_LAT_M sideways and
@@ -1088,8 +1088,7 @@ class Planner:
       # relative figures only (metres across, degrees): never a position
       self.events.append({"kind": "rm_off" if off else "rm_on", "why": why if off else "", "trace": self.trace,
                           "lat": round(lat_f, 1), "dh": round(math.degrees(dh_f), 1)})
-      dropped = off and RM_DROP and self._drop_active("beside the remembered road")
-      if off and self.active and not dropped:
+      if off and self.active:                      # beside is not a fork: runs on, dead reckoned (see RM_* above)
         self.dr_why = "beside the remembered road"
         self.events.append({"kind": "dead_reckon", "why": self.dr_why, "n": len(self.active),
                             "T": int(min(a_["T"] for a_ in self.active.values()))})
@@ -1211,25 +1210,39 @@ class Planner:
     self.cmp_next = self.odo
     if RM_ON:
       self._rm_update(0.0, fix, v, int(tr), int(round(p)))
-    if RM_DROP and not self._drop_active("matched on the other road at a fork") and self.active:
-      self.dr_why = "matched on the other road at a fork"
-      self.events.append({"kind": "dead_reckon", "why": self.dr_why, "n": len(self.active),
-                          "T": int(min(a_["T"] for a_ in self.active.values()))})
+    self._drop_for_switch(int(tr), "matched on the other road at a fork")
 
-  def _drop_active(self, why):
-    """RM_DROP: the memory slowdowns in progress (and their guard, latched warnings and hold) are dropped now, unless the car is
-    cornering itself (bend_on). -> True when dropped (or nothing to drop), False when kept (the caller logs that)."""
+  def _drop_for_switch(self, new_tr, why):
+    """FORK_*: the plan has moved onto remembered road `new_tr` (a positive match past a fork, never a "beside the record" flag):
+    what was planned for bends NOT on it (slowdowns in progress, their guard, latched warnings, latched hold) is dropped now, and
+    logged every time anything is (rm_drop: n slowdowns, nl latched warnings, nh holds), unless the car is cornering itself (bend_on):
+    then all of it is kept and runs on by dead reckoning (logged dead_reckon). Keys that are not memory points (model, stage 2) and
+    bends on the new road are never touched."""
     if self.bend_on:
-      return False                                 # kept: the caller logs it (dead_reckon, with its reason)
-    if self.active:
-      self.events.append({"kind": "rm_drop", "why": why, "n": len(self.active), "T": int(min(a_["T"] for a_ in self.active.values()))})
-    for key in list(self.active):
-      self.guard.pop(key, None)
-      self._prof_cache.pop(key, None)
-    self.active.clear()
-    self.latch = {}
-    self.hold_latch = {}
-    return True
+      if self.active:
+        self.dr_why = why
+        self.events.append({"kind": "dead_reckon", "why": why, "n": len(self.active),
+                            "T": int(min(a_["T"] for a_ in self.active.values()))})
+      return
+    drop = self._keys_off_road(self.active, new_tr)
+    nl = self._keys_off_road(self.latch, new_tr)
+    nh = self._keys_off_road(self.hold_latch, new_tr)
+    if drop or nl or nh:
+      self.events.append({"kind": "rm_drop", "why": why, "n": len(drop), "nl": len(nl), "nh": len(nh),
+                          "T": int(min(self.active[k]["T"] for k in drop)) if drop else -1})
+    for k in drop:
+      self.guard.pop(k, None)
+      self._prof_cache.pop(k, None)
+      del self.active[k]
+    for k in nl:
+      del self.latch[k]
+    for k in nh:
+      del self.hold_latch[k]
+
+  def _keys_off_road(self, d, tr):
+    """The keys of `d` that are memory points on a trace other than `tr` (model / stage-2 keys are not)."""
+    trace_of = self.mem.trace_of
+    return [k for k in d if isinstance(k, (int, np.integer)) and 0 <= k < len(trace_of) and int(trace_of[k]) != tr]
 
   def _ahead(self, t, i, dist_m, max_traces=8):
     """Memory.ahead with the SAME-ROAD walk at trace ends (FORK_*): -> (point indices, metres ahead of point i). Where no other
