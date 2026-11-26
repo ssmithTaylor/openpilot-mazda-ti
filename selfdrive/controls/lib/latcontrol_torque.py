@@ -297,13 +297,19 @@ class LatControlTorque(LatControl):
                          curvature_limited, lat_delay, frogpilot_toggles, fp_car_state):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = 2
+    # cost (core 4, 2026-11-26): each capnp field read is ~6 us on the comma; the inputs are read once per cycle into locals
+    # (the same values: nothing writes them during the cycle)
+    v_ego = CS.vEgo
+    steering_rate_deg = CS.steeringRateDeg
+    steering_pressed = CS.steeringPressed
+    roll = params.roll
 
     # The request is filtered and buffered even while we are not steering, so that engaging mid-corner
     # starts from the truth rather than from a second-old buffer (controlsd feeds the current
     # curvature while latActive is false).
-    future_lateral_accel = self.ff_filter.update(desired_curvature * CS.vEgo ** 2)
+    future_lateral_accel = self.ff_filter.update(desired_curvature * v_ego ** 2)
     self.requested_lateral_accel_buffer.append(future_lateral_accel)
-    roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
+    roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
 
     # Committed reference, see COMMIT_TAU_DEEPEN above. Both ratchets, the gate and the blend run
     # while inactive too (same rationale as the request filter above: engaging mid-corner must
@@ -324,7 +330,7 @@ class LatControlTorque(LatControl):
     diag = pid_log.init('mazdaDiagnostics')
     diag.version = 1
     diag.frictionReleaseVersion = 1
-    diag.rawRequest = float(desired_curvature * CS.vEgo ** 2)
+    diag.rawRequest = float(desired_curvature * v_ego ** 2)
     diag.filteredRequest = float(future_lateral_accel)
     diag.delayedRequest = float(setpoint)
     diag.committedFeedforward = float(ff_lat_accel)
@@ -355,8 +361,8 @@ class LatControlTorque(LatControl):
 
     # Keep the damping observer warm during disengagement. Otherwise the first
     # active update divides all intervening vehicle motion by one control tick.
-    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    measurement = measured_curvature * CS.vEgo ** 2
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), v_ego, roll)
+    measurement = measured_curvature * v_ego ** 2
     rate = (measurement - self.previous_measurement) / self.dt if self._plant_measurement_initialized else 0.0
     measurement_rate = self.measurement_rate_filter.update(rate)
     self.previous_measurement = measurement
@@ -375,19 +381,19 @@ class LatControlTorque(LatControl):
     # support unwinding. The PID continues to integrate the resulting tracking error.
     ff_lat_accel, tracked_setpoint = self.lane_release.update(
       future_lateral_accel, setpoint, ff_lat_accel, tracked_setpoint, measurement, commit_on, self.dt,
-      self._release_context, CS.vEgo, CS.steeringRateDeg, desired_curvature * CS.vEgo ** 2)
+      self._release_context, v_ego, steering_rate_deg, desired_curvature * v_ego ** 2)
 
     # Wind the integrator against the authority this car actually has in its current state -- at
     # low speed, or with the stock LKAS path blocked, that is a fraction of what it has on the
     # highway, and winding past it only delays the recovery.
-    la_max = self.plant.la_max(CS.vEgo)
+    la_max = self.plant.la_max(v_ego)
     self.pid.set_limits(la_max, -la_max)
 
     # The error tracks the delay-aligned request (the one the car has had time to answer, as
     # upstream does) -- committed in corners, raw otherwise; both computed above.
     lat_accel_offset = self.torque_params.latAccelOffset
     error = tracked_setpoint - measurement
-    low_speed_factor = (np.float64(_LOW_SPEED(CS.vEgo)) / max(CS.vEgo, MIN_SPEED)) ** 2
+    low_speed_factor = (np.float64(_LOW_SPEED(v_ego)) / max(v_ego, MIN_SPEED)) ** 2
     error_lsf = error + low_speed_factor / self.torque_params.kp * error
 
     # Feedforward is the demand at the tire, in lateral accel; the model turns it into counts
@@ -403,16 +409,16 @@ class LatControlTorque(LatControl):
     if damp_w is not None:
       damp_rate *= damp_w            # A/B blend: the term fades in or out instead of stepping
 
-    freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+    freeze_integrator = steer_limited_by_safety or steering_pressed or v_ego < 5
     integral_before = self.pid.i
     output_lataccel = self.pid.update(error_lsf,
                                       -damp_rate,
                                       feedforward=ff,
-                                      speed=CS.vEgo,
+                                      speed=v_ego,
                                       freeze_integrator=freeze_integrator)
 
     u_max = self.plant.ti_steer_max
-    command = self.plant.inverse(output_lataccel, CS.vEgo)
+    command = self.plant.inverse(output_lataccel, v_ego)
     inverse_command = command
 
     # Friction compensation, see FRIC_COMP_BASE above. Proactive (demand-direction), unlike the
@@ -428,8 +434,8 @@ class LatControlTorque(LatControl):
       over = max(abs(gate_la) - FRIC_COMP_LA_DEAD, 0.0)
       fric_comp = comp_mag * math.tanh(over / FRIC_COMP_LA_SOFT) * (1.0 if gate_la >= 0 else -1.0)
       fric_comp = self.friction_release.update(
-        fric_comp, future_lateral_accel, desired_curvature * CS.vEgo ** 2, measurement,
-        self.lane_release.permitted, self.lane_release.elapsed[0], CS.steeringRateDeg, self.dt)
+        fric_comp, future_lateral_accel, desired_curvature * v_ego ** 2, measurement,
+        self.lane_release.permitted, self.lane_release.elapsed[0], steering_rate_deg, self.dt)
       if fric_w is not None:
         fric_comp *= fric_w              # A/B blend
       command = float(_clip(command + fric_comp, -u_max, u_max))
@@ -464,9 +470,9 @@ class LatControlTorque(LatControl):
     # reaches feedforward before the delayed target. Suppress additional breakaway help only when
     # its command direction opposes BOTH effective references. Existing boost still withdraws at
     # the bounded rate below; the guard neither reverses it nor changes the holding command.
-    wheel_rate = abs(float(CS.steeringRateDeg))
+    wheel_rate = abs(float(steering_rate_deg))
     stuck = (abs(error) > BREAK_ERR and wheel_rate < BREAK_STICK_RATE
-             and not CS.steeringPressed and not steer_limited_by_safety
+             and not steering_pressed and not steer_limited_by_safety
              and (command * error >= 0.0 or command * (ff_lat_accel - measurement) >= 0.0)
              and not at_authority_latch)
     self.break_frames = self.break_frames + 1 if stuck else 0
@@ -542,7 +548,7 @@ class LatControlTorque(LatControl):
     diag.measurementRate = float(measurement_rate)
     diag.integralBefore = float(integral_before)
     diag.integralAfter = float(self.pid.i)
-    diag.freezeReasons = int(bool(steer_limited_by_safety)) | (int(CS.steeringPressed) << 1) | (int(CS.vEgo < 5) << 2)
+    diag.freezeReasons = int(bool(steer_limited_by_safety)) | (int(steering_pressed) << 1) | (int(v_ego < 5) << 2)
     diag.pidOutput = float(output_lataccel)
     diag.plantLimit = float(la_max)
     diag.inverseCommand = float(inverse_command)
