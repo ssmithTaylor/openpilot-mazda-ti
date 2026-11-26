@@ -701,6 +701,9 @@ def setup_frogpilot_events():
   (steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code every 2nd cycle, the
   stopped-steering latch count). Fresh capnp messages per cycle, as SubMaster gives them. The module's params / params_memory are
   swapped for in-memory stores for the run (nothing is read from or written to the device's)."""
+  # sentry first: frogpilot_variables -> car_helpers -> sentry -> frogpilot_variables is circular when frogpilot_variables is the
+  # first of them imported (the comma: ImportError ERROR_LOGS_PATH); the processes import sentry first through their own imports
+  import openpilot.system.sentry  # noqa: F401
   from openpilot.frogpilot.controls.lib import frogpilot_events as FE, steer_authority as SA
   from openpilot.selfdrive.car.mazda import ti_curve as TC
   from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
@@ -775,7 +778,7 @@ SCENARIOS = {
   "card_curve": (setup_card_curve, 100, 12000, (1, 1), 6, "card"),
   "card_buttons": (setup_card_buttons, 100, 12000, (1, 1), 6, "card"),
   "planner": (setup_planner, 5, None, (1, 2), 4, "ti_curve_plannerd"),
-  "frogpilot_events": (setup_frogpilot_events, 20, 1200, (1, 2), 2, "frogpilot_process"),
+  "frogpilot_events": (setup_frogpilot_events, 20, 1200, (1, 2), 4, "frogpilot_process"),
 }
 
 
