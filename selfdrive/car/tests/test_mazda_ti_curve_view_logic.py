@@ -78,8 +78,12 @@ def test_drawing_takes_its_numbers_from_the_header_and_reads_the_planners_param(
   assert '#include "selfdrive/ui/qt/onroad/ti_curve_view_logic.h"' in (ROOT / "selfdrive/ui/qt/onroad/ti_curve_view.h").read_text(
     encoding="utf-8")
   for name in ("visibility(", "chipFor(", "ribbonRaw(", "styleFor(", "resumeRings(", "hatchMarks(", "carAngle(", "chipBox(",
-               "ribbonRect(", "pointsArea(", "chipAllowed("):
+               "place_.step(", "place_.hide(", "pointsArea(", "chipAllowed("):
     assert name in cc, name
+  # the ribbon's rectangle comes from the header's held Placement, which places it with ribbonRect (integ3 review T3-I1)
+  h = HEADER.read_text(encoding="utf-8")
+  step = h[h.index("struct Placement"):]
+  assert "rect = ribbonRect(s);" in step[:step.index("void hide(")]
   assert 'PARAM_KEY = "' + V.PARAM_VIEW + '"' in HEADER.read_text(encoding="utf-8")
   cam = (ROOT / "selfdrive/ui/qt/onroad/annotated_camera.cc").read_text(encoding="utf-8")
   assert "curve_view" in cam
