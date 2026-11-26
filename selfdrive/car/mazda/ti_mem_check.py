@@ -429,7 +429,7 @@ def setup_card_curve():
   def step(i):
     clock["k"] = i
     ph = i % P
-    on = not (10500 <= ph < 11000)
+    on = not (10500 <= ph < 11000 or 4600 <= ph < 4700)  # off: once with the set speed left lowered in a bend (the `left` log)
     if i % 20 == 0 and not (7000 <= ph < 7300):         # 3 s plan gap
       corner = (ph // 1000) % 2 == 0 and ph < 9000
       ceil = 40 + (ph // 2000) % 3 * 3
@@ -452,6 +452,9 @@ def setup_card_curve():
     cs.speed = st["set"] * 0.44704
     CS.out.vEgo = (st["set"] + 1.5 * math.sin(i * 0.01)) * 0.44704
     CS.out.gasPressed = 9500 <= ph < 9600
+    # the stock assist's torque count: changing every frame, zero for a while (review 2026-11-25: a constant hid deliver_phase
+    # logging every check)
+    CS.lkas_effective = 0.0 if 3000 <= ph < 3500 else 60.0 + 37.0 * math.sin(i * 0.37)
     CS.out.brakePressed = 9800 <= ph < 9850
     cs.enabled = not (9850 <= ph < 10000)
     CC.actuators.steer = 1.0 if (ph // 400) % 3 == 0 else 0.3

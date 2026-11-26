@@ -370,3 +370,51 @@ def test_i1_dropout_text_is_not_a_corner_speed(why, code):
     assert need == 40 and val is None
   else:
     assert need is None and val == C.alert_code_value(code)
+
+
+def _run_logged(frames, per_frame, steer=0.3):
+  """CarController.update for `frames` frames with curve slowing on and a quiet plan; per_frame(k, CS) sets the car state; the
+  ti_curve records logged."""
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  mod = _cost_mod()
+  cc, mem = mod.make_controller()
+  clock = {"k": 0}
+  saved = (ccm.time, ccm.ti_curve_log)
+  ccm.time = NS(monotonic=lambda: clock["k"] * 0.01, time=lambda: 1.0e9 + clock["k"] * 0.01, perf_counter=lambda: 0.0)
+  logged = []
+  ccm.ti_curve_log = logged.append
+  try:
+    CC, CS = mod.inputs(45.0, 0.0003, steer=steer)
+    CS.lat_accel, CS.lkas_effective, CS.lkas_blocked = 0.2, 100.0, False
+    CS.out.steeringRateDeg = 0.0
+    toggles = NS(ti_sweep=False, ti_ladder=False, ti_pulses=False, ti_ident_all=False, ti_dither=False)
+    for k in range(frames):
+      clock["k"] = k
+      if k % 20 == 0:
+        mem.put(C.PARAM_ON, b"1")
+        mem.put(C.PARAM_PLAN, json.dumps({"m": k * 0.01, "seq": k, "mode": "act", "ceil": None, "conf": 1.0, "trusted": True,
+                                          "known": True, "why": "", "dist": None, "past": True, "model_la": 0.1, "model_k": 0.0003,
+                                          "capped": False, "limit": None, "kind": "", "corner": None, "ahead": 0.2,
+                                          "ask": [0.2] * 6, "alert": None}))
+      if k % 10 == 3:
+        CS.crz_btns_counter = (CS.crz_btns_counter + 1) % 16
+      per_frame(k, CS)
+      cc.update(CC, CS, k * 10_000_000, toggles)
+  finally:
+    ccm.time, ccm.ti_curve_log = saved
+  return logged
+
+
+def test_deliver_phase_logged_when_the_assist_turns_on_or_off_not_on_every_torque_count():
+  # review 2026-11-25: lkas_effective is a torque count that changes almost every frame above the stock assist speed; compared raw,
+  # the "on change" record logged at a steady 10 Hz (~180 KB/min). Only its crossing zero (the assist acting or not) is state.
+  def varying(k, CS):
+    CS.lkas_effective = 60.0 + 37.0 * math.sin(k * 0.37)           # never zero
+  recs = [e for e in _run_logged(1000, varying) if e.get("kind") == "deliver_phase"]
+  assert len(recs) == 1 and len({r["phase"] for r in recs}) == 1, recs
+
+  def crossing(k, CS):
+    CS.lkas_effective = 0.0 if k >= 600 else 60.0 + 37.0 * math.sin(k * 0.37)
+  recs = [e for e in _run_logged(1000, crossing) if e.get("kind") == "deliver_phase"]
+  assert len(recs) == 2 and recs[1]["lkas_effective"] == 0.0, recs
+

@@ -99,7 +99,7 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
   "mpr" + `map_list` records (the map list exactly as used), "ask"; replay helper `ti_curve_plannerd.logged_inputs`. Schema:
   `PLANNER_STEP_INPUTS`, `PLANNER_STATE`.
 - Car side: `ti_curve` kind "cs" (`Curve.diag`, 5 Hz while on or active), `drv_btn` (every driver cruise-button press, on or off),
-  `deliver_phase` (stage 3 phase, timers, stock-assist flags, on change at 10 Hz), `left` (TiSetSpeedLeft on change). Schema:
+  `deliver_phase` (stage 3 phase, timers, stock-assist flags acting or not, on change, checked at 10 Hz: not on every torque count), `left` (TiSetSpeedLeft on change). Schema:
   `ti_curve.DIAG_STATE`, `DIAG_EXEMPT`, `DIAG_INPUTS`, `INPUTS_IN_RLOG`.
 - Guarded by `selfdrive/car/tests/test_mazda_ti_curve_replayable.py`: a new Planner / Curve attribute or input that is neither
   logged nor exempt with a reason fails it.

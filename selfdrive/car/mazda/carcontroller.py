@@ -951,10 +951,14 @@ class CarController(CarControllerBase):
     mon.events.clear()
     if self.frame % 10 == 5:
       # replayability (2026-11-25): stage 3's phase (idle / watch / alert / cool), its timers and the stock assist flags, checked at
-      # 10 Hz and logged when they change (onset / clear also have their own events): a few scalars, at most 10 records a second
-      lk = (r.phase, getattr(CS, "lkas_blocked", None), getattr(CS, "lkas_effective", None))
-      if lk != getattr(self, "curve_mon_logged", None):
-        self.curve_mon_logged = lk
+      # 10 Hz and logged when they change (onset / clear also have their own events): a few scalars, at most 10 records a second.
+      # The assist's torque count (lkas_effective) changes almost every frame: only whether it acts (nonzero) is state (review
+      # 2026-11-25: compared raw it logged at a steady 10 Hz, ~180 KB/min); the record carries the count as it was then.
+      blk, eff = getattr(CS, "lkas_blocked", None), getattr(CS, "lkas_effective", None)
+      key = (r.phase, None if blk is None else bool(blk), None if eff is None else eff != 0)
+      if key != getattr(self, "curve_mon_logged", None):
+        self.curve_mon_logged = key
+        lk = (r.phase, blk, eff)
         ti_curve_log({"kind": "deliver_phase", "frame": int(self.frame), "phase": r.phase, "sat_s": round(mon.sat_s, 2),
                       "lim_s": round(mon.lim_s, 2), "drop_s": round(mon.drop_s, 2), "off_s": round(mon.off_s_ti, 2),
                       "cool_m": round(mon.cool_m, 1), "onsets": mon.onsets, "was_run": bool(mon.was_run),
