@@ -625,6 +625,145 @@ def setup_planner():
   return step, lambda: None
 
 
+def _decode(b):
+  """Event bytes -> reader, as cereal.messaging.log_from_bytes does in SubMaster (a fresh buffer per message: a reader kept alive keeps
+  its whole message, so a leaked reference costs the message's size, not just the Python objects)."""
+  from cereal import log
+  r = log.Event.from_bytes(b, traversal_limit_in_words=2**63 - 1)
+  if hasattr(r, "__enter__"):
+    with r as m:
+      return m
+  return r
+
+
+def _fp_messages(i, period):
+  """frogpilot_process's inputs for model frame i, as fresh capnp readers: modelV2 from _lane_model (straight; a right bend running wide
+  over the outside line; lines fading; a lane change; a left bend with flickering lines), with the steering at its limit and short of
+  the ask in the bends (running wide), the interceptor dropping out once, a blinker, a stop, alerts raised and cleared."""
+  from cereal import log
+  ph = i % period
+  nm, curv, lcs = _lane_model(5 * ph)        # one model frame per call (_lane_model's schedule is in 100 Hz frames)
+  out = {}
+
+  def ev(svc):
+    e = log.Event.new_message()
+    e.valid = True
+    return e, e.init(svc)
+  e, m = ev("modelV2")
+  m.init("laneLines", 4)
+  for k, ln in enumerate(nm.laneLines):
+    m.laneLines[k].x, m.laneLines[k].y = ln.x, ln.y
+  m.laneLineProbs, m.laneLineStds = nm.laneLineProbs, nm.laneLineStds
+  m.init("roadEdges", 2)
+  for k, ln in enumerate(nm.roadEdges):
+    m.roadEdges[k].x, m.roadEdges[k].y = ln.x, ln.y
+  m.roadEdgeStds = nm.roadEdgeStds
+  m.position.x = [float(5 * k) for k in range(33)]
+  m.action.desiredCurvature = curv
+  m.meta.laneChangeState = "preLaneChange" if lcs else "off"
+  out["modelV2"] = e.to_bytes()
+  v = 0.0 if 900 <= ph < 960 else 25.0
+  bend = 300 <= ph < 600 or ph >= 840
+  e, c = ev("controlsState")
+  c.desiredCurvature, c.curvature = curv, curv * (0.6 if bend else 1.0)
+  c.vCruise = c.vCruiseCluster = 100.0
+  c.alertText1 = "TAKE CONTROL" if (ph // 50) % 7 == 3 else ""
+  c.alertType = "steerSaturated/warning" if c.alertText1 else ""
+  out["controlsState"] = e.to_bytes()
+  e, f = ev("frogpilotControlsState")
+  f.alertText1 = "" if ph % 400 else "startup"
+  out["frogpilotControlsState"] = e.to_bytes()
+  e, cc = ev("carControl")
+  cc.latActive = not (700 <= ph < 760)
+  cc.actuators.steer = 1.0 if bend else 0.2
+  cc.actuators.accel = 0.5
+  out["carControl"] = e.to_bytes()
+  e, cs = ev("carState")
+  cs.vEgo, cs.standstill, cs.gearShifter = v, v == 0.0, "drive"
+  cs.leftBlinker = 720 <= ph < 840
+  cs.steeringRateDeg = 0.5 if bend else 8.0
+  out["carState"] = e.to_bytes()
+  e, fc = ev("frogpilotCarState")
+  fc.tiActive = not (450 <= ph < 470)        # an interceptor dropout while steering
+  fc.columnTorque = 200.0 if bend else 30.0
+  fc.trafficModeEnabled = (ph // 600) % 2 == 1
+  out["frogpilotCarState"] = e.to_bytes()
+  e, fm = ev("frogpilotModelV2")
+  fm.turnDirection = "turnLeft" if 1000 <= ph < 1020 else "none"
+  out["frogpilotModelV2"] = e.to_bytes()
+  return {s: getattr(_decode(b), s) for s, b in out.items()}
+
+
+def setup_frogpilot_events():
+  """frogpilot_process (20 Hz, gc disabled), on-road, engaged or not: FrogPilotEvents.update (whole, the planner's state faked), which
+  runs LaneDriftGate.update every model frame (the running-wide gate; 2026-11-25 second leak: lane_drift's per-call class kept every
+  modelV2 message, about 13.6 KB per cycle, ~1 GB/h on-road), and the TI block FrogPilotPlanner.update adds per cycle
+  (steer_authority.predicted_drift_m / AdvisoryTrigger.update, ti_curve.curve_alert_mph / read_curve_code every 2nd cycle, the
+  stopped-steering latch count). Fresh capnp messages per cycle, as SubMaster gives them. The module's params / params_memory are
+  swapped for in-memory stores for the run (nothing is read from or written to the device's)."""
+  from openpilot.frogpilot.controls.lib import frogpilot_events as FE, steer_authority as SA
+  from openpilot.selfdrive.car.mazda import ti_curve as TC
+  from openpilot.selfdrive.car.mazda.ti_cost_check import MemParams
+  from openpilot.selfdrive.controls.lib.events import FrogPilotEventName as FEN
+  saved = (FE.params, FE.params_memory)
+  mem = MemParams()
+  FE.params, FE.params_memory = MemParams(), mem
+  P = 1200                                   # 60 s of model frames
+  planner = NS(frogpilot_vcruise=NS(forcing_stop=False, slc=NS(speed_limit_changed_timer=0.0)), tracking_lead=False, model_stopped=False,
+               cem=NS(stop_light_detected=False), lead_one=NS(dRel=10.0, vLead=0.0), lateral_acceleration=0.0, steer_advisory_speed=0.0,
+               steer_latched=False)
+  toggles = NS(random_events=False, green_light_alert=True, current_holiday_theme="stock", lead_departing_alert=True, nnff=False,
+               speed_limit_changed_alert=True, startup_alert_top="startup", startup_alert_bottom="", steer_authority_advisory=True,
+               wheel_image="stock", is_metric=False)
+  fe = FE.FrogPilotEvents(planner, NS(is_file=lambda: False), NS(update_wheel_image=lambda *a, **k: None))
+  trig = SA.AdvisoryTrigger()
+  st = {"latch": 0, "tick": 0, "alert": (None, 0.0), "code": (None, 0.0)}
+  names = {FEN.steerRunningWide: "running wide", FEN.tiDropout: "ti dropout", FEN.steerAuthorityAdvisory: "advisory",
+           FEN.steerLatchedWarning: "latched", FEN.trafficModeActive: "traffic mode", FEN.turningLeft: "turning"}
+  seen = {}
+
+  def step(i):
+    now = i * 0.05
+    ph = i % P
+    if i % 4 == 0:                           # the planner (5 Hz) and the car controller (stage 3, the set speed left) write these
+      mem.put(TC.PARAM_PLAN, json.dumps({"m": now, "mode": "act", "alert": 38 if 300 <= ph < 500 else None}))
+      mem.put(TC.PARAM_DELIVER, json.dumps({"m": now, "need": 36 if 440 <= ph < 560 else None,
+                                            "why": "dropout" if 450 <= ph < 470 else "limit"}))
+      mem.put(TC.PARAM_LEFT, json.dumps({"m": now, "who": "curve", "now": 40, "was": 45}) if 1100 <= ph < 1150 else "")
+    sm = _fp_messages(i, P)
+    v_ego = sm["carState"].vEgo
+    # FrogPilotPlanner.update's TI block (frogpilot_planner.py), in its order
+    forecast_la = abs(sm["modelV2"].action.desiredCurvature) * 1.6 * max(v_ego, 1.0) ** 2
+    SA.predicted_drift_m(forecast_la, v_ego * 3.6)
+    adv = trig.update(True, forecast_la, v_ego * 3.6)
+    planner.steer_advisory_speed = adv / 3.6 if adv > 0 else 0.0
+    st["tick"] += 1
+    if st["tick"] % 2 == 0:
+      st["alert"] = TC.curve_alert_mph(mem, now)
+      st["code"] = TC.read_curve_code(mem, now)
+    if st["alert"][0] and now - st["alert"][1] < 1.0:
+      planner.steer_advisory_speed = -st["alert"][0] * 0.44704
+      _count(seen, "curve alert")
+    if st["code"][0] and now - st["code"][1] < 1.0:
+      planner.steer_advisory_speed = st["code"][0]
+      _count(seen, "curve code")
+    loaded = abs(sm["frogpilotCarState"].columnTorque) > SA.CEILING_COUNTS - 25.0
+    at_clip = abs(sm["carControl"].actuators.steer) >= 0.99
+    st["latch"] = st["latch"] + 1 if (at_clip and abs(sm["carState"].steeringRateDeg) < 2.0 and loaded) else 0
+    planner.steer_latched = st["latch"] >= SA.LATCH_DEBOUNCE_FRAMES
+    fe.update(100.0 * 0.2778, sm, toggles)
+    for n in fe.events.names:
+      if n in names:
+        _count(seen, names[n])
+    if fe.lane_drift_gate.latch_left > 0:
+      _count(seen, "gate latched")
+
+  def teardown():
+    FE.params, FE.params_memory = saved
+  step.seen = seen
+  return step, teardown
+
+
 # name: (setup, rate Hz, period frames, (warm periods, window periods) full, quick stride, process). The quick run (the install check on
 # the comma) runs one period of warm-up and one per window with the input schedule strided: step(i * stride), the whole sequence in
 # 1/stride of the frames (the simulated clock jumps stride frames per call: coarser, still every state); the PC tests run it unstrided.
@@ -636,6 +775,7 @@ SCENARIOS = {
   "card_curve": (setup_card_curve, 100, 12000, (1, 1), 6, "card"),
   "card_buttons": (setup_card_buttons, 100, 12000, (1, 1), 6, "card"),
   "planner": (setup_planner, 5, None, (1, 2), 4, "ti_curve_plannerd"),
+  "frogpilot_events": (setup_frogpilot_events, 20, 1200, (1, 2), 2, "frogpilot_process"),
 }
 
 

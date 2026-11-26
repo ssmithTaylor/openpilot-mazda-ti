@@ -25,7 +25,18 @@ REQUIRED = {
   "card_curve": ("curve:tap", "curve:restored", "curve:deliver_onset", "curve:deliver_clear", "state:stopped", "curve:switched_off"),
   "card_buttons": ("buttons:running", "buttons:finished", "check:running", "check:finished", "frames sent"),
   "planner": ("ceiling", "ev:alert", "ev:lock_lost", "ev:lock"),
+  "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code"),
 }
+
+
+def test_frogpilot_process_is_guarded_and_runs_with_the_collector_off():
+  """frogpilot_process runs FrogPilotEvents.update (and through it LaneDriftGate.update) every model frame on-road, engaged or not,
+  with gc disabled: the 2026-11-25 drive's second leak (~1-1.4 GB/h, the same lane_drift class per call). Keep a scenario for it,
+  and keep the collector state it is measured under true to the process."""
+  from pathlib import Path
+  src = (Path(__file__).resolve().parents[3] / "frogpilot" / "frogpilot_process.py").read_text()
+  assert "config_realtime_process(" in src and "Ratekeeper(1 / DT_MDL" in src
+  assert MC.SCENARIOS["frogpilot_events"][1] == 20 and MC.SCENARIOS["frogpilot_events"][5] == "frogpilot_process"
 
 
 @pytest.fixture(scope="module")
