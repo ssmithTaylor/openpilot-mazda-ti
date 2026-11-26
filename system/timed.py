@@ -33,23 +33,33 @@ def set_timezone(timezone):
     cloudlog.exception(f"Error setting timezone to {timezone}")
 
 
+def gps_datetime(unix_ms):
+  """GPS time as a timezone-aware UTC datetime. Never a naive local time: the device runs in its local zone (set from GPS
+  below), and a naive local value handed to `TZ=UTC date -s` set the clock wrong by the zone offset (integ3 review T1-I1)."""
+  return datetime.datetime.fromtimestamp(unix_ms / 1000., tz=datetime.timezone.utc)
+
+
 def set_time(new_time):
   # Correct the clock when it is off from GPS time by 10 s or more in EITHER direction. Upstream only corrected a clock
   # that was ahead (diff >= 10 s), so a clock left far BEHIND (no internet, no NTP) was never fixed from GPS.
-  diff = datetime.datetime.now() - new_time
+  # UTC end to end: new_time is aware UTC (gps_datetime), the comparison is against the aware UTC now, and `date -s` is
+  # given the UTC wall time with TZ=UTC, so the device's own zone never enters.
+  new_time = new_time.astimezone(datetime.timezone.utc)
+  diff = datetime.datetime.now(datetime.timezone.utc) - new_time
   if abs(diff) < datetime.timedelta(seconds=10):
     cloudlog.debug(f"Time diff too small: {diff}")
     return
 
-  cloudlog.debug(f"Setting time to {new_time}")
+  stamp = new_time.strftime("%Y-%m-%d %H:%M:%S.%f")
+  cloudlog.debug(f"Setting time to {stamp} UTC")
   try:
-    subprocess.run(f"TZ=UTC date -s '{new_time}'", shell=True, check=True)
+    subprocess.run(f"TZ=UTC date -s '{stamp}'", shell=True, check=True)
   except subprocess.CalledProcessError:
     cloudlog.exception("timed.failed_setting_time")
     cloudlog.event("timed.set_time", ok=False, offset_before_s=round(diff.total_seconds(), 3))
     return
   # Replayability: system clock minus GPS time before and after the correction (seconds only, no position).
-  after = datetime.datetime.now() - new_time
+  after = datetime.datetime.now(datetime.timezone.utc) - new_time
   cloudlog.event("timed.set_time", ok=True, offset_before_s=round(diff.total_seconds(), 3),
                  offset_after_s=round(after.total_seconds(), 3))
 
@@ -89,7 +99,7 @@ def main() -> NoReturn:
 
     # set time
     # TODO: account for unixTimesatmpMillis being a (usually short) time in the past
-    gps_time = datetime.datetime.fromtimestamp(llk.unixTimestampMillis / 1000.)
+    gps_time = gps_datetime(llk.unixTimestampMillis)
     set_time(gps_time)
 
     # set timezone
