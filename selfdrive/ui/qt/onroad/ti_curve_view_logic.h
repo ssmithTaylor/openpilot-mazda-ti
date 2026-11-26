@@ -417,6 +417,54 @@ inline Rect pointsArea(const Rect &rr, double ox, double oy) {
 // the chip is hidden only under a full-screen alert (it sits top left, above the small and mid banners and the bottom row)
 inline bool chipAllowed(const Screen &s) { return s.alert != ALERT_FULL; }
 
+// ---- the ribbon's position is held (integ3 review T3-I1) --------------------------------------------------------------------------
+// ribbonRect() alone is recomputed every frame, so the ribbon jumped whenever lead text, a blinker image or an alert appeared anywhere
+// in its column. Placement keeps the rectangle once placed: it moves only when the held rectangle would overlap an element (LAYOUT_GAP
+// included) or leave the allowed area (both guarantees outrank the hold), and then to ribbonRect() for the screen of that frame. A
+// widget appearing elsewhere, or the old place freeing up again, never moves it. While the ribbon is hidden the place is kept for
+// RIBBON_HOLD_S; hidden longer, the next showing is placed afresh.
+// RIBBON_HOLD_S = 4 s: longer than a blinker's on-off cycle (about 0.67 s at 1.5 Hz) several times over and than a brief blink-out
+// of cruiseState.enabled, so neither re-places the ribbon; short enough that a ribbon hidden between two bends (cruise cancelled,
+// below 19 mph, stale planner output) comes back at the best place for the next one.
+constexpr double RIBBON_HOLD_S = 4.0;
+
+// the rectangle is inside the allowed area (as ribbonRect's) and LAYOUT_GAP clear of every element
+inline bool placeClear(const Screen &s, const Rect &r) {
+  if (r.empty() || !within(r, Rect{s.w / 2.0 + RIGHT_OF_SPEED, (double)UI_BORDER, s.w - (double)UI_BORDER, s.h - (double)UI_BORDER})) {
+    return false;
+  }
+  Element obs[MAX_ELEMENTS];
+  const int n = obstacles(s, obs);
+  for (int i = 0; i < n; i++) {
+    const Rect &o = obs[i].r;
+    if (overlaps(r, Rect{o.x0 - LAYOUT_GAP, o.y0 - LAYOUT_GAP, o.x1 + LAYOUT_GAP, o.y1 + LAYOUT_GAP})) return false;
+  }
+  return true;
+}
+
+struct Placement {
+  Rect rect;                 // where the ribbon is drawn (empty: not drawn)
+  bool held = false;         // a rectangle is placed and kept
+  double moved_at = -1e9;    // UI clock (s) of the last placement or move
+  double hidden_at = -1.0;   // UI clock (s) the ribbon was hidden at; < 0 while shown
+  int moves = 0;             // forced moves of a held rectangle (it would have overlapped or left the area)
+  // every frame the ribbon is shown -> its rectangle for this frame (empty: no room, not drawn)
+  Rect step(const Screen &s, double now) {
+    hidden_at = -1.0;
+    if (held && placeClear(s, rect)) return rect;
+    if (held) moves++;
+    rect = ribbonRect(s);
+    held = !rect.empty();
+    moved_at = now;
+    return rect;
+  }
+  // every frame the ribbon is hidden
+  void hide(double now) {
+    if (hidden_at < 0) hidden_at = now;
+    if (now - hidden_at >= RIBBON_HOLD_S) held = false;
+  }
+};
+
 struct Fit {
   bool init = false;
   double s = 1.0, cx = 0.0, cy = 0.0;

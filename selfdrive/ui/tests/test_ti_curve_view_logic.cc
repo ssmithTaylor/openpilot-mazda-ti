@@ -309,6 +309,131 @@ static void layoutRules() {
   std::printf("layout: %d states, ribbon drawn in %d\n", cases, drawn);
 }
 
+// the held rectangle (integ3 review T3-I1): no move for a widget elsewhere, one move for a widget on top, no ping-pong with a blinker,
+// and the never-overlap / always-on-screen guarantees over every state with history
+static bool okRect(const Screen &s, const Rect &r) { return r.empty() ? ribbonRect(s).empty() : clearOfAll(s, r) && onScreen(s, r); }
+static bool same(const Rect &a, const Rect &b) { return a.x0 == b.x0 && a.y0 == b.y0 && a.x1 == b.x1 && a.y1 == b.y1; }
+
+static void placementRules() {
+  const double dt = 0.05;   // 20 fps
+  // a widget appears elsewhere (lead text on the left half): the ribbon does not move
+  {
+    Screen s;
+    Placement pl;
+    const Rect r0 = pl.step(s, 0.0);
+    CHECK(!r0.empty() && pl.moves == 0);
+    s.lead_text = Rect{700, 420, 1400, 480};
+    bool kept = true;
+    for (int i = 1; i <= 200; i++) {
+      const Rect r = pl.step(s, i * dt);
+      kept = kept && same(r, r0);
+      CHECK(okRect(s, r));
+    }
+    CHECK(kept && pl.moves == 0);
+  }
+  // a widget appears on top of it (lead text in its column): exactly one move, clear of it; when the text goes, the ribbon stays where
+  // it moved to (the old place freeing up is no reason to move back)
+  {
+    Screen s;
+    Placement pl;
+    const Rect r0 = pl.step(s, 0.0);
+    s.lead_text = Rect{1500, 560, 2100, 620};
+    CHECK(overlaps(r0, Rect{1500 - LAYOUT_GAP, 560 - LAYOUT_GAP, 2100 + LAYOUT_GAP, 620 + LAYOUT_GAP}));
+    const Rect r1 = pl.step(s, dt);
+    CHECK(pl.moves == 1 && !r1.empty() && okRect(s, r1) && !same(r1, r0));
+    for (int i = 2; i <= 40; i++) CHECK(okRect(s, pl.step(s, i * dt)));
+    s.lead_text = Rect();
+    bool stays = true;
+    for (int i = 41; i <= 41 + (int)(3 * RIBBON_HOLD_S / dt); i++) {
+      const Rect r = pl.step(s, i * dt);
+      stays = stays && same(r, r1);
+      CHECK(okRect(s, r));
+    }
+    CHECK(stays && pl.moves == 1);
+  }
+  // a blinker flashing at 1.5 Hz (the sweep image on for a third of a second, off for a third) over the ribbon's place: one move
+  // when it first shows, none after (no ping-pong); clear of it on every frame
+  {
+    Screen s;
+    s.signal_w = 350;
+    s.signal_h = 300;
+    Placement pl;
+    pl.step(s, 0.0);
+    Rect first;
+    bool steady = true;
+    for (int i = 1; i <= 200; i++) {
+      const double t = i * dt;
+      s.signal = std::fmod(t, 2.0 / 3.0) < 1.0 / 3.0 ? SIGNAL_SWEEP : SIGNAL_OFF;
+      const Rect r = pl.step(s, t);
+      CHECK(okRect(s, r));
+      if (pl.moves == 1 && first.empty()) first = r;
+      if (!first.empty()) steady = steady && same(r, first);
+    }
+    CHECK(pl.moves == 1 && !first.empty() && steady);
+  }
+  // hidden briefly: the place is kept; hidden for RIBBON_HOLD_S or longer: placed afresh (the best place for the next bend)
+  {
+    Screen s;
+    Placement pl;
+    const Rect r0 = pl.step(s, 0.0);
+    s.lead_text = Rect{1500, 560, 2100, 620};
+    const Rect r1 = pl.step(s, dt);
+    s.lead_text = Rect();
+    pl.step(s, 2 * dt);
+    pl.hide(3 * dt);
+    pl.hide(3 * dt + RIBBON_HOLD_S - 0.5);
+    CHECK(same(pl.step(s, 3 * dt + RIBBON_HOLD_S - 0.45), r1));
+    pl.hide(10.0);
+    pl.hide(10.0 + RIBBON_HOLD_S);
+    CHECK(same(pl.step(s, 10.0 + RIBBON_HOLD_S + dt), r0) && pl.moves == 1);
+  }
+  // the layout sweep's 4,608 states, driven through ONE held placement (in sweep order, and again shuffled): on every frame the
+  // ribbon is clear of every element and fully on screen, or there is no room at all
+  static Screen all[4608];
+  int n = 0;
+  const int widths[] = {SCREEN_W - 2 * BORDER, SCREEN_W - 300 - 2 * BORDER, SCREEN_W / 2 - BORDER, SCREEN_W / 4 - BORDER};
+  const Rect boxes[] = {Rect{60, 45, 232, 249}, Rect{35, 45, 258, 447}, Rect{46, 45, 246, 437}};
+  const Rect leads[] = {Rect(), Rect{700, 420, 1400, 480}, Rect{1500, 560, 2100, 620}, Rect{1200, 300, 1900, 360}};
+  const int sig_sizes[][2] = {{0, 0}, {150, 150}, {300, 250}, {450, 400}};
+  for (int w : widths) for (const Rect &mb : boxes) for (int alert = 0; alert <= 3; alert++) for (int ped = 0; ped <= 1; ped++)
+    for (int sig = 0; sig <= 2; sig++) for (const auto &ss : sig_sizes) for (const Rect &lt : leads) {
+      Screen t;
+      t.w = w;
+      t.max_box = mb;
+      t.alert = alert;
+      t.alert_h = alert == ALERT_SMALL ? ALERT_SMALL_H - ALERT_MARGIN : alert == ALERT_MID ? ALERT_MID_H - ALERT_MARGIN :
+                  alert == ALERT_FULL ? t.h : 0;
+      t.pedals = ped != 0;
+      t.signal = sig;
+      t.signal_w = ss[0];
+      t.signal_h = ss[1];
+      t.lead_text = lt;
+      if (n < 4608) all[n] = t;
+      n++;
+    }
+  CHECK(n == 4608);
+  unsigned lcg = 12345u;
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      for (int i = n - 1; i > 0; i--) {
+        lcg = lcg * 1664525u + 1013904223u;
+        std::swap(all[i], all[lcg % (unsigned)(i + 1)]);
+      }
+    }
+    Placement pl;
+    int bad = 0, held_other = 0;
+    for (int i = 0; i < n; i++) {
+      const Rect r = pl.step(all[i], i * dt);
+      if (!okRect(all[i], r)) bad++;
+      if (!r.empty() && !same(r, ribbonRect(all[i]))) held_other++;
+    }
+    CHECK(bad == 0);
+    CHECK(held_other > 0);   // the hold really kept a rectangle other than the frame's own best somewhere
+    std::printf("placement %s: %d states with history, held elsewhere than the frame's best in %d, moves %d\n",
+                pass ? "shuffled" : "in order", n, held_other, pl.moves);
+  }
+}
+
 static void colours() {
   Payload p;
   parse(sample(), p);
@@ -359,6 +484,7 @@ int main() {
   fitRule();
   colours();
   layoutRules();
+  placementRules();
   marks();
   if (failures) {
     std::printf("%d failure(s)\n", failures);

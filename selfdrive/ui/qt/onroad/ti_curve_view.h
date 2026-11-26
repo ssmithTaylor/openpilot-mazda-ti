@@ -30,6 +30,7 @@ public:
   const ti_view::Fit &fit() const { return fit_; }
   // the ribbon's rectangle at the last draw (the painter's coordinates); empty when no ribbon was drawn
   const ti_view::Rect &lastRibbonRect() const { return rect_; }
+  const ti_view::Placement &placement() const { return place_; }
   static double monotonicNow();
 
 private:
@@ -41,6 +42,7 @@ private:
   ti_view::Ribbon ribbon_;
   ti_view::Style style_;
   ti_view::Fit fit_;
+  ti_view::Placement place_;   // the ribbon's rectangle, held while it stays clear (integ3 review T3-I1)
   double px_[ti_view::MAX_PTS] = {};
   double py_[ti_view::MAX_PTS] = {};
   int marks_[ti_view::MAX_PTS] = {};

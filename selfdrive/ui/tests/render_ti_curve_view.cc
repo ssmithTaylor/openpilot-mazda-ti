@@ -64,19 +64,29 @@ int main(int argc, char **argv) {
       while (ls >> x) cfg[key].push_back(x);
     }
     auto get = [&](const char *key, double dflt) { return cfg.count(key) && !cfg[key].empty() ? cfg[key][0] : dflt; };
-    ti_view::Screen screen;
     const bool sidebar = get("sidebar", 0) != 0;
-    screen.w = (int)get("w", sidebar ? ti_view::SCREEN_W - 300 - 2 * ti_view::BORDER : screen.w);
-    screen.h = (int)get("h", screen.h);
-    screen.alert = (int)get("alert", 0);
-    screen.alert_h = (int)get("alert_h", 0);
-    screen.pedals = get("pedals", 0) != 0;
-    screen.signal = (int)get("signal", 0);
-    screen.signal_w = (int)get("sw", 0);
-    screen.signal_h = (int)get("sh", 0);
-    if (cfg.count("lead") && cfg["lead"].size() == 4) {
-      screen.lead_text = ti_view::Rect{cfg["lead"][0], cfg["lead"][1], cfg["lead"][2], cfg["lead"][3]};
-    }
+    // the screen for the last tick from the plain keys; "pre_<key>" overrides it for every earlier tick (history: the ribbon's
+    // rectangle is held, so what was on screen before matters)
+    auto makeScreen = [&](const std::string &prefix) {
+      auto val = [&](const char *key, double dflt) {
+        const std::string pk = prefix + key;
+        return !prefix.empty() && cfg.count(pk) && !cfg[pk].empty() ? cfg[pk][0] : get(key, dflt);
+      };
+      ti_view::Screen sc;
+      sc.w = (int)val("w", sidebar ? ti_view::SCREEN_W - 300 - 2 * ti_view::BORDER : sc.w);
+      sc.h = (int)val("h", sc.h);
+      sc.alert = (int)val("alert", 0);
+      sc.alert_h = (int)val("alert_h", 0);
+      sc.pedals = val("pedals", 0) != 0;
+      sc.signal = (int)val("signal", 0);
+      sc.signal_w = (int)val("sw", 0);
+      sc.signal_h = (int)val("sh", 0);
+      const std::string lk = !prefix.empty() && cfg.count(prefix + "lead") ? prefix + "lead" : "lead";
+      if (cfg.count(lk) && cfg[lk].size() == 4) sc.lead_text = ti_view::Rect{cfg[lk][0], cfg[lk][1], cfg[lk][2], cfg[lk][3]};
+      return sc;
+    };
+    const ti_view::Screen screen = makeScreen("");
+    const ti_view::Screen screen_pre = makeScreen("pre_");
     const bool engaged = get("engaged", 1) != 0;
     const bool cruise = get("cruise", 1) != 0;
     const bool outline = get("outline", 0) != 0;
@@ -107,7 +117,7 @@ int main(int argc, char **argv) {
           p.translate(widget_at);                      // the camera widget's coordinates, as in AnnotatedCameraWidget::paintEvent
           QElapsedTimer t;
           t.start();
-          view.draw(p, now, engaged, cruise, ticks[i].first, screen, origin, 0.05);
+          view.draw(p, now, engaged, cruise, ticks[i].first, last ? screen : screen_pre, origin, 0.05);
           times.push_back(t.nsecsElapsed() * 1e-6);
           if (final_frame && outline) {
             ti_view::Element obs[ti_view::MAX_ELEMENTS];
@@ -122,7 +132,7 @@ int main(int argc, char **argv) {
               p.drawRect(QRectF(r.x0, r.y0, r.w(), r.h()));
               p.drawText(QPointF(std::max(0.0, r.x0) + 4, std::max(0.0, r.y0) + 18), QString(obs[k].name).left(44));
             }
-            const ti_view::Rect rr = ti_view::ribbonRect(screen);
+            const ti_view::Rect rr = view.lastRibbonRect();   // the held rectangle actually drawn
             if (!rr.empty()) {
               p.setPen(QPen(QColor(255, 0, 255), 3));
               p.drawRect(QRectF(rr.x0, rr.y0, rr.w(), rr.h()));

@@ -160,6 +160,7 @@ int TiCurveView::draw(QPainter &p, double now, bool engaged, bool cruise_active,
   rect_ = Rect();
   if (!shown_) {
     fit_.reset();
+    place_.hide(now);
     return vis;
   }
   p.save();
@@ -167,7 +168,13 @@ int TiCurveView::draw(QPainter &p, double now, bool engaged, bool cruise_active,
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setRenderHint(QPainter::TextAntialiasing, true);
   ribbonRaw(payload_, ribbon_);
-  const Rect rr = ti_view::ribbonRect(screen);     // the right-hand side, clear of every other element; empty: no room, no ribbon
+  // the right-hand side, clear of every other element, held in place (Placement); empty: no room, no ribbon
+  Rect rr;
+  if (ribbon_.n >= 2) {
+    rr = place_.step(screen, now);
+  } else {
+    place_.hide(now);
+  }
   if (ribbon_.n >= 2 && !rr.empty()) {
     rect_ = rr;
     fit_.setArea(pointsArea(rr, origin.x(), origin.y()));
