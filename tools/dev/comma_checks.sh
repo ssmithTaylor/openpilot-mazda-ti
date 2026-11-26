@@ -32,7 +32,9 @@ else
   echo "skipped: no change under selfdrive/controls/lib or selfdrive/car/mazda/ti_* since $BASE"
 fi
 
-stage "4/6 curve planner dry run (tick budget on the device)"
+stage "4/6 curve planner dry run (tick budgets on the device: no bend p99 20 ms, bend in play p99 100 ms, no tick over 500 ms)"
+# the FULL tick over the shipped real-drive inputs (8 bend-rich minutes, position-free; ~15 s here), then the rlogs or the synthetic profile
+python3 selfdrive/car/mazda/ti_curve_dryrun.py --inputs selfdrive/car/mazda/ti_curve_dryrun_inputs.npz
 if [ ${#RLOGS[@]} -gt 0 ]; then
   python3 selfdrive/car/mazda/ti_curve_dryrun.py --rlog "${RLOGS[@]}"
 else
