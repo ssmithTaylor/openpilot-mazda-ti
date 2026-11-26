@@ -56,7 +56,17 @@ def test_no_cyclic_garbage_and_no_retained_growth(name, results):
   if r["noisy"]:
     pytest.skip(f"{name}: memory ok; per-frame timing too noisy to judge cost growth "
                 f"(window medians {r['us1']} / {r['us2']} us, chunk spread over {MC.NOISY_SPREAD})")
-  assert not r["cost_fail"], f"{name}: per-frame cost grew {r['cost_ratio']}x ({r['us1']} -> {r['us2']} us)"
+  if r["cost_fail"]:
+    # Timing only, and only once: a real per-frame cost growth (a scan over a growing container) repeats on a second measurement;
+    # other test workers starting up on the same PC do not (2026-11-25: 1.6x on three scenarios with 8 workers, pass alone).
+    # The memory criteria above are never re-measured.
+    first = (r["cost_ratio"], r["us1"], r["us2"])
+    r = MC.run(name)
+    assert r["cyclic"] == 0 and not r["fails"], f"{name} (second measurement): {r['fails']}"
+    if r["noisy"]:
+      pytest.skip(f"{name}: memory ok; cost grew {first[0]}x on the first measurement and the second was too noisy to judge")
+    assert not r["cost_fail"], (f"{name}: per-frame cost grew twice: {first[0]}x ({first[1]} -> {first[2]} us), then "
+                                f"{r['cost_ratio']}x ({r['us1']} -> {r['us2']} us)")
 
 
 @pytest.mark.parametrize("mod,cls,cap", MC.BOUNDED_EVENT_BUFFERS)
