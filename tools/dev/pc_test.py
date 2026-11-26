@@ -64,6 +64,10 @@ CURVE_TESTS = (
 ALL_GLOBS = (
   "selfdrive/car/tests/test_mazda_ti*.py",
   "selfdrive/car/tests/test_lane_drift_alerts.py",
+  "selfdrive/car/tests/test_mazda_lateral_reference.py",
+  "selfdrive/car/tests/test_remote_access_switch.py",
+  "frogpilot/system/tests/test_comma_logs_notifier.py",
+  "frogpilot/system/ti_mcp/tests/test_ti_mcp_server.py",
   "selfdrive/car/tests/test_no_per_frame_leaks.py",
   "selfdrive/car/tests/test_lint_per_frame.py",
   "tools/dev/test_drive_memory_report.py",
