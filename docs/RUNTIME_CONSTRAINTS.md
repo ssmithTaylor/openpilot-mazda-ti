@@ -30,14 +30,14 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Budget: `ti_cost_check.py:428` 300 us per cycle added by any tests mode (comma_checks.sh stage 1).
 - Params: tmpfs (`/dev/shm/params`) for anything written while driving; flash writes put_nonblocking and at most once a minute
   (`carcontroller.py` publish_ti_stats, `frame % 6000`). A new params key must also be declared in `common/params.cc`
-  (`carcontroller.py:624`; checked by `frogpilot/tools/check_params_sync.py`, comma_checks.sh stage 2), else the device does not boot.
+  (`carcontroller.py:631` comment in publish_ti_stats; checked by `frogpilot/tools/check_params_sync.py`, comma_checks.sh stage 2), else the device does not boot.
 - Consequences for code: the controlsd list above, plus: never send a button frame or CAN message outside the existing tap
   machinery; anything optional is imported in try/except so that without it the controller runs unchanged (`carcontroller.py:14-53`).
 
 ## ti_curve_plannerd (`selfdrive/car/mazda/ti_curve_plannerd.py`)
-- Rate: 5 Hz, `ti_curve_plannerd.py:27` `RATE_HZ = 5.0`, `:471` Ratekeeper.
-- Collector: ON, everything loaded at start frozen: `:469` `gc.freeze()` (a full collection over the memory took 54 ms, `:468`).
-- Real time: none; cores 0-3, below normal priority, never core 4 (`:423` keep_off_control_core).
+- Rate: 5 Hz, `ti_curve_plannerd.py:35` `RATE_HZ = 5.0`, `:615` Ratekeeper (main).
+- Collector: ON, everything loaded at start frozen: `:613` `gc.freeze()` (a full collection over the memory took 54 ms, `:612`).
+- Real time: none; cores 0-3, below normal priority, never core 4 (keep_off_control_core, defined `:567`, called `:591`).
 - Started by the manager onroad: `system/manager/process_config.py:128`.
 - Budget: tick p99 under 20 ms of the 200 ms tick (`selfdrive/car/mazda/ti_curve_dryrun.py:38`, comma_checks.sh stage 4).
 - Never a position in a log or param: `ti_curve_plannerd.py:16`; plan JSON checked by `test_mazda_ti_curve_plan.py:452`.
@@ -48,7 +48,7 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 - Rate: 20 Hz, `frogpilot_process.py:55` `Ratekeeper(1 / DT_MDL)`; polls modelV2 (`:76`).
 - Collector: OFF. `frogpilot_process.py:57` `config_realtime_process(5, Priority.CTRL_LOW)` -> `common/realtime.py:41`.
 - On-road only (`:112-116`, `deviceState.started`), engaged or not: FrogPilotPlanner.update / publish, FrogPilotTracking.update.
-  Ours here: FrogPilotEvents.update's TI block, which runs LaneDriftGate.update every model frame (`frogpilot_events.py:262`), and
+  Ours here: FrogPilotEvents.update's TI block, which runs LaneDriftGate.update every model frame (`frogpilot_events.py:264`), and
   the planner's TI block (`frogpilot_planner.py:122-162`: steer_authority, ti_curve alert readers). Parked it runs none of this.
 - 2026-11-25 second leak: lane_drift's per-call class (fixed in cc877397) also ran here, 13.6 KB per cycle on the comma (the class
   plus the modelV2 message it kept), ~1 GB/h on-road; the drive measured 1.0-1.4 GB/h. Scenario `frogpilot_events` in ti_mem_check.
@@ -64,7 +64,7 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 
 ## Python version
 - Device: `.python-version` = 3.11.4 (used by `tools/install_python_dependencies.sh:44`), `pyproject.toml:47` mypy 3.11,
-  `Dockerfile.openpilot_base:79` pyenv 3.11.4. On the comma (checked 2026-11-25 over ssh): Python 3.11.4, pycapnp 1.3.0,
+  `Dockerfile.openpilot_base:67` `ENV PYENV_VERSION=3.11.4`. On the comma (checked 2026-11-25 over ssh): Python 3.11.4, pycapnp 1.3.0,
   numpy 1.26.4.
 - 3.11 free lists: a freed tuple (up to 2000 per size), float, list or dict is kept by the interpreter and keeps its tracemalloc
   trace until a full collection; bounded, but it reads as per-frame growth in a short window (2026-11-25 install: card_tests and
