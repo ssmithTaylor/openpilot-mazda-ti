@@ -481,3 +481,13 @@ def test_hook_cost_is_small():
     r.position(rep, True)
   per_call_ms = (time.perf_counter() - t0) / 1000 * 1e3
   assert per_call_ms < 2.0, per_call_ms
+
+
+def test_filtered_reply_never_keeps_a_coordinate_readable():
+  """re-review R2-M10: an unparsable reply that happened to hold a position-style line is not logged readable."""
+  from openpilot.system.qcomgpsd.receiver_log import filtered
+  out = filtered('+QGPSLOC: 111111.0,1234.567N,09876.543E,1.0,555.5,2,011.1,0.0,0.0,010101,08')
+  assert "1234" not in out and "09876" not in out and "111111" not in out and "555.5" not in out
+  assert not __import__("re").search(r"\d{4}", out), out
+  assert filtered('+CME ERROR: 50') == '+CME ERROR: 50'              # short codes stay readable
+  assert filtered('12.34,-56.78') == '#,-#'

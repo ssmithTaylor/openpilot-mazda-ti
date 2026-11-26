@@ -46,6 +46,7 @@ CONFIG_TIMEOUT_S = 20.0                 # hard bound on the readback subprocess 
 PARTS = ('position', 'measurement', 'summary', 'config')
 _GNSSCONFIG_RE = re.compile(r'\+QGPSCFG:\s*"gnssconfig"\s*,\s*(\d{1,3})')
 _SAFE_TEXT = re.compile(r'[^A-Za-z0-9 +:",._=\-]')
+_LONG_DIGITS = re.compile(r'\d+(?:\.\d+)+|\d{4,}')   # re-review R2-M10: no coordinate-like number passes through readable
 
 
 def _run(args, timeout):
@@ -58,8 +59,9 @@ def parse_gnssconfig(text):
 
 
 def filtered(text, n=120):
-  """Reply text cut to n characters and reduced to a fixed harmless alphabet (for an unparsable reply only)."""
-  return _SAFE_TEXT.sub('?', str(text or ''))[:n]
+  """Reply text cut to n characters and reduced to a fixed harmless alphabet (for an unparsable reply only); every decimal
+  number and every run of 4 or more digits becomes '#', so a reply that happened to hold a position is not logged readable."""
+  return _LONG_DIGITS.sub('#', _SAFE_TEXT.sub('?', str(text or '')))[:n]
 
 
 class ReceiverLog:
