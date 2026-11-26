@@ -147,6 +147,24 @@ def convert_params(params_cache):
 
   print("Param conversion completed")
 
+KONIK_LATE_REGISTER_MAX_WAIT_S = 59  # register() gives up after this (under 60 s: its give-up test needs max_wait < 60 without a spinner)
+
+
+def late_konik_registration(konik_id_needed, log=print):
+  """The boot-path quick try failed: one bounded retry, parked (after wait_until_offroad), never with the owner's
+  no_remote_access flag (re-review R2-I1). DongleId is only touched on success; on failure the identity chosen at boot
+  stays and the next boot tries again. Returns the id stored, or None."""
+  if not konik_id_needed or remote_access_blocked("konik_register"):
+    return None
+  late_id = register(show_spinner=False, register_konik=True, max_wait=KONIK_LATE_REGISTER_MAX_WAIT_S, log_each_failure=False)
+  if late_id in (None, UNREGISTERED_DONGLE_ID):
+    log(f"konik registration: gave up after {KONIK_LATE_REGISTER_MAX_WAIT_S} s; next boot tries again")
+    return None
+  params.put("KonikDongleId", late_id)
+  params.put("DongleId", late_id)
+  return late_id
+
+
 def frogpilot_boot_functions(build_metadata, params_cache):
   if params.get_bool("HasAcceptedTerms"):
     params_cache.clear_all()
@@ -169,15 +187,18 @@ def frogpilot_boot_functions(build_metadata, params_cache):
   # Now: a sentinel is "not registered". A real ID already on the device (a previous good konik
   # registration, or the stock comma one -- konik hands out the same ID for this device) stays
   # in DongleId, which makes stock register() a no-op. The boot-path attempt is one quick try
-  # (3s per request, 6s total) so an offline boot loses seconds, not minutes, and the real
-  # retry runs in boot_thread below, after system time is valid, i.e. once there is a network.
+  # (3s per request, 6s total) so an offline boot loses seconds, not minutes, and one bounded
+  # retry runs in boot_thread below, once the clock is valid and the car is parked
+  # (late_konik_registration). With the owner's no_remote_access flag neither runs.
   konik_id_needed = False
   if use_konik_server():
     konik_id = params.get("KonikDongleId", encoding="utf8")
     if konik_id == UNREGISTERED_DONGLE_ID:
       params.remove("KonikDongleId")
       konik_id = None
-    if konik_id is None:
+    if konik_id is None and remote_access_blocked("konik_register"):
+      pass  # owner's flag (re-review R2-I1): no Konik registration from this device at all, now or later in boot_thread
+    elif konik_id is None:
       attempt = register(show_spinner=True, register_konik=True, timeout=3, max_wait=6)
       if attempt not in (None, UNREGISTERED_DONGLE_ID):
         params.put("KonikDongleId", attempt)
@@ -202,17 +223,10 @@ def frogpilot_boot_functions(build_metadata, params_cache):
       print("Waiting for system time to become valid...")
       time.sleep(1)
 
-    if konik_id_needed:
-      # Time is valid, so there is a network now. Full-patience registration, off the boot path.
-      # DongleId is only touched on success; on failure the identity chosen above stays in place
-      # and the next boot tries again from the top.
-      late_id = register(show_spinner=False, register_konik=True)
-      if late_id not in (None, UNREGISTERED_DONGLE_ID):
-        params.put("KonikDongleId", late_id)
-        params.put("DongleId", late_id)
-
     # The clock can become valid mid-drive (GPS time); backups and stats load disk / CPU, so they wait until off-road.
     wait_until_offroad(params)
+
+    late_konik_registration(konik_id_needed)
 
     backup_frogpilot(build_metadata)
     backup_toggles(params_cache)

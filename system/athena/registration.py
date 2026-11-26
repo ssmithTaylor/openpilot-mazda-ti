@@ -23,10 +23,15 @@ def is_registered_device() -> bool:
   return dongle not in (None, UNREGISTERED_DONGLE_ID)
 
 
-def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60) -> str | None:
+def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60, allow_network=True,
+             log_each_failure=True) -> str | None:
   # `timeout` is the per-attempt HTTP timeout and `max_wait` the total budget before giving up
   # with UNREGISTERED_DONGLE_ID. Defaults reproduce the stock behaviour. FrogPilot's boot path
   # passes small values so a device with no network does not sit on the spinner for a minute.
+  # allow_network=False (the owner's no_remote_access flag, re-review R2-I1): no request is made; a device that
+  # would need registering gets UNREGISTERED_DONGLE_ID at once, exactly what an offline registration ends with (it
+  # still drives; manager then leaves athenad and the uploader off). log_each_failure=False logs only the first failed
+  # attempt (bounded callers), not one traceback per retry.
   params = Params()
 
   IMEI = params.get("IMEI", encoding='utf8')
@@ -39,6 +44,10 @@ def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60) 
   if not pubkey.is_file():
     dongle_id = UNREGISTERED_DONGLE_ID
     cloudlog.warning(f"missing public key: {pubkey}")
+  elif (needs_registration or register_konik) and not allow_network:
+    cloudlog.event("registration.skipped", reason="no_remote_access", konik=register_konik)
+    if register_konik or dongle_id is None:
+      dongle_id = UNREGISTERED_DONGLE_ID
   elif needs_registration or register_konik:
     if show_spinner:
       spinner = Spinner()
@@ -68,6 +77,7 @@ def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60) 
     params.put("HardwareSerial", serial)
 
     backoff = 0
+    failures = 0
     start_time = time.monotonic()
     while True:
       try:
@@ -84,7 +94,9 @@ def register(show_spinner=False, register_konik=False, timeout=15, max_wait=60) 
           dongle_id = dongleauth["dongle_id"]
         break
       except Exception:
-        cloudlog.exception("failed to authenticate")
+        failures += 1
+        if log_each_failure or failures == 1:
+          cloudlog.exception("failed to authenticate")
         backoff = min(backoff + 1, 15)
         time.sleep(backoff)
 

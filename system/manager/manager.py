@@ -15,7 +15,7 @@ from openpilot.system.hardware import HARDWARE, PC
 from openpilot.system.manager.helpers import unblock_stdout, write_onroad_params, save_bootlog
 from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
-from openpilot.system.manager.remote_access import remote_access_ignores
+from openpilot.system.manager.remote_access import remote_access_ignores, remote_access_off
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.system.version import get_build_metadata, terms_version, training_version
@@ -100,7 +100,10 @@ def manager_init() -> None:
   params.put_bool("IsReleaseBranch", build_metadata.release_channel)
 
   # set dongle id
-  reg_res = register(show_spinner=True)
+  # owner's flag: no registration request (serial, IMEIs, public key) to comma's server. A registered device is unaffected
+  # (no request either way); an unregistered one gets the same UnregisteredDevice an offline registration ends with and still
+  # drives (manager_thread then leaves athenad and the uploader off). Re-review R2-I1.
+  reg_res = register(show_spinner=True, allow_network=not remote_access_off())
   if reg_res:
     dongle_id = reg_res
   else:
