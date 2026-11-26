@@ -1200,6 +1200,12 @@ class CarController(CarControllerBase):
                       "ramp": bool(CS.ti_ramp_down), "version": int(CS.ti_version)}
 
     apply_steer = 0
+    # cost (core 4, 2026-11-26): CC is a capnp reader and CS.out a capnp builder, ~6 us a field read on the comma; the fields this
+    # method reads most often are read once (the same values: nothing writes CC or CS.out during the frame). Here, after
+    # `apply_steer = 0`, so that the steering blocks tools/mazda_ti/test_diagnostics.py executes on its own see them.
+    lat_active = CC.latActive
+    actuators = CC.actuators
+    steering_torque = CS.out.steeringTorque
     is_ti = getattr(self, "flag_ti", None)        # the cached flag (a host without it: the steering-block tests)
     if is_ti is None:
       is_ti = bool(self.CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
@@ -1211,15 +1217,15 @@ class CarController(CarControllerBase):
     ti_reported = None   # the TI command reported to controlsd when it differs from the one sent (dither on)
     stock_previous, ti_previous = self.apply_steer_last, self.ti_apply_steer_last
 
-    if CC.latActive:
+    if lat_active:
       # calculate steer and also set limits due to driver torque
-      new_steer = int(round(CC.actuators.steer * self.ccp.STEER_MAX))
+      new_steer = int(round(actuators.steer * self.ccp.STEER_MAX))
       apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last,
-                                                     CS.out.steeringTorque, self.ccp)
+                                                     steering_torque, self.ccp)
       if is_ti:
         ti_new_steer = 0
         if CS.ti_lkas_allowed:
-          ti_new_steer = int(round(CC.actuators.steer * self.ccp.TI_STEER_MAX))
+          ti_new_steer = int(round(actuators.steer * self.ccp.TI_STEER_MAX))
           # Identification dither, TI path only, added BEFORE the limiter so every existing bound still applies to
           # the total. Zero whenever the toggle is off (ti_dither.py). getattr, here and at the reset below:
           # tools/mazda_ti/test_diagnostics.py executes this block on a minimal host that has no dither, which must
@@ -1231,10 +1237,10 @@ class CarController(CarControllerBase):
             ident_now = getattr(self, "ti_ident", None)
             ti_dither = dither.update(
               self.ti_dither_enabled and not getattr(self, "ti_ab_on", False) and not (ident_now is not None and ident_now.running), self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
-              driver_torque=CS.out.steeringTorque,
+              driver_torque=steering_torque,
               blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
               base_request=ti_new_steer, ti_max=self.ccp.TI_STEER_MAX,
-              lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, room=rate_room(self.ccp))
+              lat_demand=CS.out.vEgo ** 2 * actuators.curvature, room=rate_room(self.ccp))
             ti_new_steer += ti_dither
           # Identification tests: the same place and the same rules as the dither, never both at once (armed only
           # while the dither toggle is off and the dither silent, and only one test toggle on). getattr: as above.
@@ -1262,10 +1268,10 @@ class CarController(CarControllerBase):
               self.ti_ident_armed = armed
               ti_ident = int(ident.update(
                 armed, self.frame, v_ego=CS.out.vEgo, steering_pressed=CS.out.steeringPressed,
-                driver_torque=CS.out.steeringTorque,
+                driver_torque=steering_torque,
                 blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker or CC.leftBlinker or CC.rightBlinker),
                 base_request=ti_new_steer - ti_dither, ti_max=self.ccp.TI_STEER_MAX,
-                lat_demand=CS.out.vEgo ** 2 * CC.actuators.curvature, curvature=CC.actuators.curvature,
+                lat_demand=CS.out.vEgo ** 2 * actuators.curvature, curvature=actuators.curvature,
                 lkas_blocked=getattr(CS, "lkas_blocked", None),
                 room=ti_ident_mod.rate_room(self.ccp, armed) if armed is not None else None,
                 remaining=rem_now))
@@ -1275,7 +1281,7 @@ class CarController(CarControllerBase):
               self.ti_ident_failed()
             ti_new_steer += ti_ident
           ti_apply_steer = apply_ti_steer_torque_limits(ti_new_steer, self.ti_apply_steer_last,
-                                                    CS.out.steeringTorque, self.ccp)
+                                                    steering_torque, self.ccp)
           if (dither is not None and dither.envelope > 0.0) or (ident is not None and ident.emitted):
             # What the car would be sent had there been no dither: the same pure limiter on the undithered request,
             # run on its own (undithered) history, ti_reported_last. Running it on the sent history instead would
@@ -1283,7 +1289,7 @@ class CarController(CarControllerBase):
             # compares with its requests, so its limited flag (and the integrator freeze) see the real limiting of
             # the controller's request and never the dither.
             ti_reported = apply_ti_steer_torque_limits(ti_new_steer - ti_dither - ti_ident, self.ti_reported_last,
-                                                       CS.out.steeringTorque, self.ccp)
+                                                       steering_torque, self.ccp)
             self.ti_dither_frames += ti_dither != 0
             if ti_ident != 0:
               self.ti_ident_frames[ident.emitted] = self.ti_ident_frames.get(ident.emitted, 0) + 1
@@ -1298,7 +1304,7 @@ class CarController(CarControllerBase):
       # unchanged for STUCK_HOLD_S is moved STUCK_NUDGE counts toward zero for STUCK_NUDGE_FRAMES frames, so the interceptor never
       # sees the ~1.9 s unchanged request that trips its 0x11 fault. The value sent becomes the limiter's history below, so the step
       # back up is the limiter's own.
-      ti_apply_steer = guard.update(ti_apply_steer, bool(CC.latActive and CS.ti_lkas_allowed), now=now_nanos * 1e-9)
+      ti_apply_steer = guard.update(ti_apply_steer, bool(lat_active and CS.ti_lkas_allowed), now=now_nanos * 1e-9)
       if guard.burst_started and (self.ti_stuck_logged is None or self.frame - self.ti_stuck_logged >= TI_STUCK_LOG_EVERY_FRAMES):
         self.ti_stuck_logged = self.frame
         ti_stuck_log({"kind": "nudge", "frame": self.frame, "value": int(ti_unguarded), "sent": int(ti_apply_steer),
@@ -1310,13 +1316,13 @@ class CarController(CarControllerBase):
       self.ti_reported_last = ti_apply_steer if ti_reported is None else ti_reported
       self.ti_dither_seen |= self.ti_dither_enabled
       dither = getattr(self, "ti_dither", None)   # same guard as in the steering block above
-      if dither is not None and not (CC.latActive and CS.ti_lkas_allowed):
+      if dither is not None and not (lat_active and CS.ti_lkas_allowed):
         dither.reset()   # lateral control off or TI not in RUN: zero at once, next fade-in from nothing
       ident = getattr(self, "ti_ident", None)
       if ident is not None:
         self.ti_ident_seen |= set(self.ti_ident_on) | (set(ti_ident_mod.KEYS) if self.ti_ident_all else set())
         self.ti_ident_all_seen |= self.ti_ident_all
-        if not (CC.latActive and CS.ti_lkas_allowed):
+        if not (lat_active and CS.ti_lkas_allowed):
           try:
             ident.reset(self.frame)   # the same for the identification tests
           except Exception:
@@ -1378,7 +1384,7 @@ class CarController(CarControllerBase):
           self.hold_timer.reset()
 
         if CC.longActive:
-          raw_acc_output = CC.actuators.accel * 1150
+          raw_acc_output = actuators.accel * 1150
           raw_acc_output = max(-1000, min(raw_acc_output, 1000))
 
           if self.params.get_bool("BlendedACC"):
@@ -1399,7 +1405,7 @@ class CarController(CarControllerBase):
           can_sends.extend(mazdacan.create_radar_command(self.packer, self.frame, CC.longActive, CS, hold))
 
     elif self.flag_gen2:
-      raw_acc_output = (CC.actuators.accel * 200) + 2000
+      raw_acc_output = (actuators.accel * 200) + 2000
       if CC.longActive:
         if self.params.get_bool("BlendedACC"):
           if not self.long_active_last:
@@ -1436,9 +1442,9 @@ class CarController(CarControllerBase):
         """
         if CS.out.standstill: # if we're stopped
           if not self.hold_delay.active(): # and we have been stopped for more than hold_delay duration. This prevents a hard brake if we aren't fully stopped.
-            if ((CC.cruiseControl.resume and CC.actuators.longControlState != LongCtrlState.stopping) or
+            if ((CC.cruiseControl.resume and actuators.longControlState != LongCtrlState.stopping) or
                 CC.cruiseControl.override or CS.out.gasPressed or
-                (CC.actuators.longControlState == LongCtrlState.starting) or CS.acc["RESUME"]): # if we are resuming or overriding, we want to release the brake
+                (actuators.longControlState == LongCtrlState.starting) or CS.acc["RESUME"]): # if we are resuming or overriding, we want to release the brake
               self.resume_timer.reset() # reset the resume timer so its active
             else: # otherwise we're holding
               hold = self.hold_timer.active() # hold for 6s. This allows the electric brake to hold the car.
@@ -1457,7 +1463,7 @@ class CarController(CarControllerBase):
       ti_apply_steer if self.flag_ti else None
     ))
 
-    new_actuators = CC.actuators.as_builder()
+    new_actuators = actuators.as_builder()
     if is_ti and CS.ti_lkas_allowed:
       # While the TI is in RUN it is the actuator that actually steers the car, so report its
       # command rather than the stock LKAS one. torqued fits its model to actuatorsOutput.steer,
@@ -1496,7 +1502,7 @@ class CarController(CarControllerBase):
         active = TI_DITHER_ACTIVE if ti_dither != 0 else ()
         if ident is not None and ident.emitted and ident.reason in ti_ident_mod.RUNNING_REASONS:
           active = active + (ident.emitted,)    # an identification test running clean (screen: ON · ACTIVE)
-        tests.update(frogpilot_toggles, CS.out.vEgo, CC.latActive, active,
+        tests.update(frogpilot_toggles, CS.out.vEgo, lat_active, active,
                      credit=ident.credit if ident is not None else None,
                      run_all_forced=bool(self.ti_ident_all))
 
@@ -1521,7 +1527,7 @@ class CarController(CarControllerBase):
     if is_ti:
       diag = car.CarOutput.MazdaActuatorDiagnostics.new_message()
       diag.version = 1
-      diag.latActive = CC.latActive
+      diag.latActive = lat_active
       diag.tiAllowed = bool(CS.ti_lkas_allowed)
       diag.stockRequested = int(new_steer)
       diag.stockLimited = int(apply_steer)
@@ -1529,7 +1535,7 @@ class CarController(CarControllerBase):
       diag.tiLimited = int(ti_apply_steer)
       diag.stockPrevious = int(stock_previous)
       diag.tiPrevious = int(ti_previous)
-      diag.driverTorque = float(CS.out.steeringTorque)
+      diag.driverTorque = float(steering_torque)
       diag.tiMax = float(self.ccp.TI_STEER_MAX)
       diag.tiDeltaUp = float(self.ccp.TI_STEER_DELTA_UP)
       diag.tiDeltaDown = float(self.ccp.TI_STEER_DELTA_DOWN)
