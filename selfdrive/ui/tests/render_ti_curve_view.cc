@@ -112,9 +112,9 @@ int main(int argc, char **argv) {
           if (final_frame && outline) {
             ti_view::Element obs[ti_view::MAX_ELEMENTS];
             const int n = ti_view::obstacles(screen, obs);
-            QFont f("Inter");
-            f.setPixelSize(18);
-            p.setFont(f);
+            QFont lf("Inter");
+            lf.setPixelSize(18);
+            p.setFont(lf);
             p.setBrush(Qt::NoBrush);
             for (int k = 0; k < n; k++) {
               const ti_view::Rect &r = obs[k].r;
