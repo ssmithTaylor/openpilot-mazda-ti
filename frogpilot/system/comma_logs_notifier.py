@@ -16,6 +16,8 @@ times, then exits its work: the collector pulls over SSH by itself, so there is 
 redirects refused (so the token can only go to the configured host, inside a verified TLS session). Any failure
 ends quietly. Nothing here touches steering, control or the power-down logic.
 """
+# RUNTIME: runs in its own process comma_logs_notifier, off-road only (manager, system/manager/process_config.py:124, gate
+# run_comma_logs_notifier); one notification per off-road period, then idle; not per frame; collector on (see docs/RUNTIME_CONSTRAINTS.md).
 import http.client
 import ipaddress
 import json

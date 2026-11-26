@@ -21,6 +21,9 @@ There is no authentication. Anyone who can reach the port can read driving state
 steering, engagement. That is an accepted trade for a read-only service on a trusted home network;
 on an untrusted or public network, turn the toggle off or set TI_MCP_HOST=127.0.0.1 and tunnel.
 """
+# RUNTIME: runs in its own process ti_mcp (manager, system/manager/process_config.py:78, whenever TiMcpEnabled, on- and off-road);
+# a snapshot thread polls a SubMaster every SNAPSHOT_PERIOD_S (2 Hz) and HTTP requests are served on demand, not per frame;
+# collector on (no config_realtime_process); no core pinning, so it may share the control core 4 (see docs/RUNTIME_CONSTRAINTS.md).
 import collections
 import json
 import math

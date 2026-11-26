@@ -57,7 +57,13 @@ test or lint rule in the same change (`docs/BRIEFING_CHECKLIST.md`).
 
 ## ti_mcp (`frogpilot/system/ti_mcp/ti_mcp_server.py`)
 - On request over HTTP, not per frame; only with TiMcpEnabled (`system/manager/process_config.py:78`). Read-only by design
-  (module docstring). Collector on (no config_realtime_process call).
+  (module docstring). Collector on (no config_realtime_process call). A snapshot thread polls a SubMaster every
+  SNAPSHOT_PERIOD_S = 0.5 s (`ti_mcp_server.py` Snapshot.run, started in main), on- and off-road; the gate ignores `started`
+  (`process_config.py:19-22`). No core pinning or priority change: it can be scheduled on the control core 4.
+
+## comma_logs_notifier (`frogpilot/system/comma_logs_notifier.py`)
+- Off-road only, only with CommaLogsUrl set (`system/manager/process_config.py:62-64`, started at `:124`). One notification per
+  off-road period with bounded retries, then idle. Not per frame; collector on.
 
 ## UI (C++ Qt: `selfdrive/ui/qt/ti_pages_logic.h`, `selfdrive/ui/qt/sidebar.cc`, `frogpilot/ui/qt/offroad/lateral_settings.cc`)
 - Reads our params (TiCurveStatus, TiTuningStats). Rate and memory behaviour NOT verified here; the Python guards do not cover it.
