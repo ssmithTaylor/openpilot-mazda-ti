@@ -45,7 +45,15 @@ def set_time(new_time):
   # UTC end to end: new_time is aware UTC (gps_datetime), the comparison is against the aware UTC now, and `date -s` is
   # given the UTC wall time with TZ=UTC, so the device's own zone never enters.
   new_time = new_time.astimezone(datetime.timezone.utc)
-  diff = datetime.datetime.now(datetime.timezone.utc) - new_time
+  # Sanity bound (re-review T1-M1): never set the clock to a GPS time before this build's year or more than 20 years after
+  # it. Refusals are logged once per process.
+  earliest = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+  if not (earliest <= new_time <= earliest + datetime.timedelta(days=20 * 366)):
+    if not getattr(set_time, "refusal_logged", False):
+      set_time.refusal_logged = True
+      cloudlog.event("timed.gps_time_refused", gps_year=new_time.year)
+    return
+  diff =datetime.datetime.now(datetime.timezone.utc) - new_time
   if abs(diff) < datetime.timedelta(seconds=10):
     cloudlog.debug(f"Time diff too small: {diff}")
     return

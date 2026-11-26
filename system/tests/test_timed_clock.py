@@ -75,6 +75,28 @@ def test_failed_set_is_logged_with_offset():
   assert events == [("timed.set_time", {"ok": False, "offset_before_s": -1100 * 86400.0})]
 
 
+@pytest.mark.parametrize("gps", [
+  real_datetime.datetime(1980, 1, 6, tzinfo=UTC),        # the earliest value the receiver arithmetic can give
+  real_datetime.datetime(2024, 6, 1, tzinfo=UTC),        # before this build
+  real_datetime.datetime(2025, 12, 31, 23, 59, tzinfo=UTC),
+  real_datetime.datetime(2046, 2, 1, tzinfo=UTC),        # more than 20 years after it
+  real_datetime.datetime(2099, 1, 1, tzinfo=UTC),
+])
+def test_implausible_gps_time_is_refused_and_logged_once(gps):
+  set_time, calls, events = _load_set_time(GPS - real_datetime.timedelta(days=1100))
+  for _ in range(3):
+    set_time(gps)
+  assert calls == []
+  assert events == [("timed.gps_time_refused", {"gps_year": gps.year})]
+
+
+def test_plausible_gps_time_at_the_bounds_is_accepted():
+  for gps in (real_datetime.datetime(2026, 1, 1, tzinfo=UTC), real_datetime.datetime(2045, 12, 1, tzinfo=UTC)):
+    set_time, calls, events = _load_set_time(gps - real_datetime.timedelta(days=1100))
+    set_time(gps)
+    assert len(calls) == 1, gps
+
+
 def test_log_line_carries_no_position():
   src = (REPO / "system/timed.py").read_text(encoding="utf-8")
   fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "set_time")
