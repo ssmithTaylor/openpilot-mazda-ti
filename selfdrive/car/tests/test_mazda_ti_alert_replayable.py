@@ -86,3 +86,17 @@ def test_every_steering_alert_attribute_of_the_planner_is_logged_or_exempt():
   missing = sorted(n for n in names if n not in SA.AUTHORITY_PLANNER_STATE and n not in SA.AUTHORITY_PLANNER_EXEMPT)
   assert not missing, f"FrogPilotPlanner alert state not in the ti_authority record nor exempt: {missing}"
   assert not set(SA.AUTHORITY_PLANNER_STATE) & set(SA.AUTHORITY_PLANNER_EXEMPT)
+
+
+# ---- stuck-request guard ------------------------------------------------------------------------------------------------------------
+def test_every_stuck_guard_attribute_is_logged_or_exempt():
+  from openpilot.selfdrive.car.mazda import ti_stuck_guard as SG
+  g = SG.StuckGuard()
+  for k in range(300):
+    g.update(300 if k < 250 else 0, k % 120 != 119, now=k * 0.01)
+  names = set(vars(g))
+  missing = sorted(n for n in names if n not in SG.STUCK_LOGGED and n not in SG.STUCK_EXEMPT)
+  assert not missing, f"StuckGuard state not in the ti_stuck_guard event nor exempt: {missing}"
+  stale = sorted(n for n in list(SG.STUCK_LOGGED) + list(SG.STUCK_EXEMPT) if n not in names)
+  assert not stale, f"listed but no longer an attribute: {stale}"
+  assert not set(SG.STUCK_LOGGED) & set(SG.STUCK_EXEMPT)

@@ -153,3 +153,40 @@ def test_authority_logging_cannot_raise(monkeypatch):
   SA.log_authority(log, _key(), fe, pl, 25.0, 2.0, 1.9, 0.9, 1.0, 100.0)
   SA.log_authority(log, _key(), NS(), NS(), 25.0, 2.0, 1.9, 0.9, 1.0, 100.0)     # even a broken host
   assert log.dead
+
+
+# ---- stuck-request guard: the record says how each logged nudge was triggered ----------------------------------------------------
+def test_stuck_guard_burst_records_the_run_and_the_clock_hold():
+  """The ti_stuck_guard event stays at most one per 10 s (the cumulative `bursts` already counts the unlogged ones and every sent
+  value is in sendcan); each record now also says how long the value had been held when the burst fired, in frames ("run") and by
+  the clock ("held_s"): run under STUCK_HOLD_FRAMES with held_s at the hold = the control loop was late (the real-time arm fired)."""
+  from openpilot.selfdrive.car.mazda.ti_stuck_guard import StuckGuard, STUCK_HOLD_FRAMES, STUCK_HOLD_S
+  g = StuckGuard()
+  for k in range(STUCK_HOLD_FRAMES + 2):
+    g.update(300, True, now=k * 0.01)
+    if g.burst_started:
+      break
+  assert g.burst_started and g.fired_run == STUCK_HOLD_FRAMES and abs(g.fired_s - STUCK_HOLD_FRAMES * 0.01) < 1e-6
+  g = StuckGuard()                                   # a late loop: 0.05 s per frame
+  for k in range(40):
+    g.update(-570, True, now=k * 0.05)
+    if g.burst_started:
+      break
+  assert g.burst_started and g.fired_run < STUCK_HOLD_FRAMES and g.fired_s >= STUCK_HOLD_S
+  g = StuckGuard()                                   # no clock: the frame count, no clock figure
+  for _ in range(STUCK_HOLD_FRAMES + 1):
+    g.update(300, True)
+  assert g.burst_started and g.fired_run == STUCK_HOLD_FRAMES and g.fired_s is None
+
+
+def test_controller_stuck_event_carries_run_and_held_s(monkeypatch):
+  from openpilot.selfdrive.car.mazda import carcontroller as ccm
+  from openpilot.selfdrive.car.tests import test_mazda_ti_stuck_guard as T
+  events = []
+  monkeypatch.setattr(ccm, "ti_stuck_log", lambda ev: events.append(ev))
+  mod, cc, sent, toggles = T._controller(650)
+  CC, CS = mod.inputs(45.0, 0.0, steer=1.0)
+  for k in range(1200):
+    cc.update(CC, CS, k * 10_000_000, toggles)
+  assert events and all("run" in e and "held_s" in e for e in events)
+  assert len(json.dumps(events[0])) <= 160

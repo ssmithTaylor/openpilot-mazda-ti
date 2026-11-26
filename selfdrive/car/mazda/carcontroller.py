@@ -101,7 +101,8 @@ TI_STUCK_LOG_EVERY_FRAMES = 1000
 
 
 def ti_stuck_log(event):
-  """A stuck-request guard nudge (ti_stuck_guard.py) into the log, rate limited by the caller: {kind, frame, value, sent, bursts}."""
+  """A stuck-request guard nudge (ti_stuck_guard.py) into the log, rate limited by the caller: {kind, frame, value, sent, bursts, run,
+  held_s} (run / held_s: how long the value had been held when the burst fired, frames / clock s)."""
   try:
     from openpilot.common.swaglog import cloudlog
     cloudlog.event("ti_stuck_guard", **event)
@@ -1311,7 +1312,8 @@ class CarController(CarControllerBase):
       if guard.burst_started and (self.ti_stuck_logged is None or self.frame - self.ti_stuck_logged >= TI_STUCK_LOG_EVERY_FRAMES):
         self.ti_stuck_logged = self.frame
         ti_stuck_log({"kind": "nudge", "frame": self.frame, "value": int(ti_unguarded), "sent": int(ti_apply_steer),
-                      "bursts": guard.bursts})
+                      "bursts": guard.bursts, "run": guard.fired_run,
+                      "held_s": None if guard.fired_s is None else round(guard.fired_s, 3)})
     self.apply_steer_last = apply_steer
     self.ti_apply_steer_last = ti_apply_steer
     if is_ti:
