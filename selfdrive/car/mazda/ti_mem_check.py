@@ -60,8 +60,21 @@ def _spread(xs):
   return (q[2] - q[0]) / med if med > 0 else 0.0
 
 
+def _settled_traced():
+  """Traced bytes after a full collection with DEBUG_SAVEALL. The collection frees nothing the code made: every unreachable object
+  (a cycle) is moved to gc.garbage, so it stays traced as growth and is counted as cyclic garbage. What it does return is the
+  interpreter's free lists (CPython 3.11, the comma's Python: up to 2000 freed tuples per size, 100 floats, 80 lists / dicts ...
+  keep their tracemalloc trace at the line that first allocated them). Those are bounded by the interpreter, yet fill one entry per
+  frame for a while (2026-11-25 install: 48 B 1-tuples at carcontroller.py:1485 from pycapnp 1.3's new_message; 88 B 6-tuples at
+  ti_curve_plan.py:1094 from tuple(genexpr), flat at 176,000 B after 2000 ticks) and read as growth in a one-period window."""
+  gc.set_debug(gc.DEBUG_SAVEALL)
+  gc.collect()
+  return tracemalloc.get_traced_memory()[0]
+
+
 def measure(step, warm, n, rate_hz, max_cycles=0, chunks=8):
-  """Run step(i) for i in [0, warm) (not measured), then two windows of n frames with gc off and tracemalloc on.
+  """Run step(i) for i in [0, warm) (not measured), then two windows of n frames with gc off and tracemalloc on; each window's
+  growth is read after _settled_traced (free lists emptied, cycles kept and counted).
   -> dict with the cyclic garbage, both windows' growth, per-frame growth, MB/h, the cost ratio and a list of failures."""
   was = gc.isenabled()
   gc.collect()
@@ -72,19 +85,20 @@ def measure(step, warm, n, rate_hz, max_cycles=0, chunks=8):
     for i in range(warm):
       step(i)
     gc.collect()                         # cycles made during the warm-up (start-up state, first config read) are not counted
+    gc.garbage.clear()
     if not tracing:
       tracemalloc.start(1)
-    m0 = tracemalloc.get_traced_memory()[0]
+    m0 = _settled_traced()
     chunk = max(1, n // chunks)
     t1 = _window(step, warm, n, chunk)
-    m1 = tracemalloc.get_traced_memory()[0]
+    m1 = _settled_traced()
     s1 = tracemalloc.take_snapshot()
     t2 = _window(step, warm + n, n, chunk)
-    m2 = tracemalloc.get_traced_memory()[0]
+    m2 = _settled_traced()
     s2 = tracemalloc.take_snapshot()
     top = [str(d) for d in s2.compare_to(s1, "lineno")[:5] if d.size_diff > 0]
-    gc.set_debug(gc.DEBUG_SAVEALL)
-    cyc = gc.collect()
+    gc.collect()
+    cyc = len(gc.garbage)                # every cycle made in either window (the settles above saved them all)
     if cyc:
       import collections
       where = collections.Counter()

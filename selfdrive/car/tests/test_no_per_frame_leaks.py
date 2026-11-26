@@ -68,6 +68,7 @@ def test_guard_catches_a_class_defined_per_call():
     return View.src
   r = MC.measure(step, 200, 2000, 100)
   assert r["cyclic"] > 0 and r["fails"]
+  assert any("retained growth" in f for f in r["fails"]), r   # the cycles stay counted as growth too (kept in gc.garbage)
 
 
 def test_guard_catches_an_append_without_a_trim():
@@ -77,6 +78,36 @@ def test_guard_catches_an_append_without_a_trim():
     hist.append((i, float(i)))
   r = MC.measure(step, 200, 4000, 100)
   assert r["cyclic"] == 0 and any("retained growth" in f for f in r["fails"])
+
+
+def test_guard_catches_a_slow_append_at_about_5_mb_per_hour_in_a_quick_window():
+  """A float kept every other frame: 16 B/frame, 5.8 MB/h at 100 Hz; 1500 frames is the device's quick card_tests window."""
+  hist = []
+
+  def step(i):
+    if i % 2:
+      hist.append(float(i))
+  r = MC.measure(step, 200, 1500, 100)
+  assert r["cyclic"] == 0 and any("retained growth" in f for f in r["fails"]), r
+
+
+def test_guard_does_not_count_memory_a_full_collection_returns_without_finding_garbage():
+  """Python 3.11 on the comma (2026-11-25 install: card_tests at carcontroller.py:1485, 48 B 1-tuples from pycapnp 1.3's new_message;
+  planner at ti_curve_plan.py:1094, 88 B 6-tuples from tuple(genexpr)): a freed tuple goes onto the interpreter's free list (at most
+  2000 per size) and keeps its tracemalloc trace until a full collection empties the lists. Bounded (176,000 B for the planner's
+  6-tuples, reached after 2000 ticks), but inside a one-period window it reads as growth. Simulated here by a cache that only a full
+  collection empties; real retention and cycles must still show (the tests above)."""
+  cache = []
+
+  def emptied_by_full_collection(phase, info):
+    if phase == "stop" and info["generation"] == 2:
+      cache.clear()
+  gc.callbacks.append(emptied_by_full_collection)
+  try:
+    r = MC.measure(lambda i: cache.append(bytes(100 + i % 2)), 200, 2000, 100)
+  finally:
+    gc.callbacks.remove(emptied_by_full_collection)
+  assert not r["fails"], r
 
 
 def test_guard_passes_a_bounded_history_and_restores_the_collector():
