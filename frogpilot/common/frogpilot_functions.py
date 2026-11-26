@@ -22,6 +22,7 @@ from openpilot.system.hardware import HARDWARE
 
 from openpilot.frogpilot.assets.model_manager import ModelManager
 from openpilot.frogpilot.assets.theme_manager import ThemeManager
+from openpilot.frogpilot.common.boot_jobs import wait_until_offroad
 from openpilot.frogpilot.common.frogpilot_utilities import delete_file, is_url_pingable, run_cmd, run_thread_with_lock, use_konik_server
 from openpilot.frogpilot.common.frogpilot_variables import (
   ERROR_LOGS_PATH, EXCLUDED_KEYS, FROGPILOT_API, HD_LOGS_PATH, KONIK_LOGS_PATH, MODELS_PATH, SCREEN_RECORDINGS_PATH,
@@ -208,6 +209,9 @@ def frogpilot_boot_functions(build_metadata, params_cache):
       if late_id not in (None, UNREGISTERED_DONGLE_ID):
         params.put("KonikDongleId", late_id)
         params.put("DongleId", late_id)
+
+    # The clock can become valid mid-drive (GPS time); backups and stats load disk / CPU, so they wait until off-road.
+    wait_until_offroad(params)
 
     backup_frogpilot(build_metadata)
     backup_toggles(params_cache)
