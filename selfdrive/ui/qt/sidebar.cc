@@ -2098,10 +2098,11 @@ void TestsWindow::drawHome(QPainter &p) {
            QString("STOP"), STOP_PX, QString("stops every test and the A/B relay"), START_SUB_PX);
 
   // Navigation at the screen edge: quieter cards, the label at the left, a chevron at the right; the same targets
-  const struct { int id; const char *label; bool back; } nav[] = {{CTL_BACK, "Exit", true}, {CTL_NAV_SETUP, "Plan details", false},
-                                                                  {CTL_NAV_PROGRESS, "Progress", false}};
+  const struct { QRect r; const char *label; bool back; } nav[] = {{ctlRect(CTL_BACK), "Exit", true},
+                                                                   {ctlRect(CTL_NAV_SETUP), "Plan details", false},
+                                                                   {ctlRect(CTL_NAV_PROGRESS), "Progress", false}};
   for (const auto &nv : nav) {
-    const QRect r = ctlRect(nv.id);
+    const QRect &r = nv.r;
     const bool off = nv.back && locked;
     card(r, 32, off ? QColor(0x14, 0x14, 0x16) : panel, hair, 3);
     p.setPen(off ? QColor(0x55, 0x55, 0x55) : white);
