@@ -110,7 +110,7 @@ def test_ribbon_marks_a_remembered_road_that_ends_inside_the_window():
 
 # ---- the planner tick end to end on a synthetic road -------------------------------------------------------------------------------
 def _drive(on=True, ticks=200, v=20.0, segments=((600.0, 0.0), (120.0, 0.03), (600.0, 0.0), (150.0, -0.012), (800.0, 0.0)),
-           floor=30, x0=1.0e5, y0=-2.0e5):
+           floor=30, x0=1.0e5, y0=-2.0e5, cruise_off=()):
   tr = M.synthetic_trace(list(segments), x0=x0, y0=y0)
   mem = M.synthetic([tr])
   pl = P.Planner(mem)
@@ -122,7 +122,7 @@ def _drive(on=True, ticks=200, v=20.0, segments=((600.0, 0.0), (120.0, 0.03), (6
     plan = pl.step(k * 0.2, P.Fix(True, float(tr["x"][j]), float(tr["y"][j]), float(tr["hdg"][j])), v, set_mph=45.0,
                    yaw_k=float(tr["kap"][j]), ref_mph=45.0, floor_mph=floor)
     s1, s2, side = D.stage_summary(pl)
-    p, ding, log = vw.step(pl, plan, k * 0.2, k, on, v / MPH, 45.0, floor, side)
+    p, ding, log = vw.step(pl, plan, k * 0.2, k, on, v / MPH, 45.0, floor, side, cruise=k not in cruise_off)
     out.append((s, plan, p, ding, log))
   return out, tr
 
@@ -185,6 +185,17 @@ def test_no_ding_below_19_mph():
   assert all(x[3] is None for x in out)
 
 
+def test_no_ding_while_cruise_is_cancelled_and_one_when_it_is_back_before_the_bend():
+  out, _ = _drive()
+  first = next(i for i, o in enumerate(out) if o[3] is not None)      # the red chip's onset with cruise active
+  off = set(range(first, first + 3))                                   # cruise cancelled at the onset for three ticks
+  out2, _ = _drive(cruise_off=off)
+  dings = [o[3] is not None for o in out2]
+  assert not any(dings[:first + 3])                                    # none while cancelled
+  assert dings[first + 3] and sum(dings) == sum(o[3] is not None for o in out)   # then one, when it is back and the chip shows
+  assert all(o[4][3] & 4 == (0 if k in off else 4) for k, o in enumerate(out2))   # cruise is in the tick record
+
+
 def test_a_second_red_bend_dings_again():
   out, _ = _drive(ticks=420, segments=((500.0, 0.0), (100.0, 0.03), (900.0, 0.0), (100.0, -0.03), (900.0, 0.0)))
   dings = [x[3] for x in out if x[3] is not None]
@@ -207,8 +218,24 @@ def test_without_trusted_memory_the_plans_corner_is_one_bend_without_a_ribbon():
 
   class _Pl:
     view, odo = None, 0.0
-  p, _, _ = V.View().step(_Pl(), plan, 1.0, 1, True, 45.0, 45, 30, 0)
+  p, _, log = V.View().step(_Pl(), plan, 1.0, 1, True, 45.0, 45, 30, 0)
   assert p["r"] == [] and len(p["b"]) == 1 and p["b"][0][3] == 0
+  assert p["src"] == V.SRC_MAP and log[3] & 3 == V.SRC_MAP          # map only: the chip shows "?" (owner, 2026-11-26); logged
+
+
+def test_the_bends_source_is_published_and_logged():
+  out, _ = _drive()
+  _, _, p, _, log = out[30]
+  assert p["src"] == V.SRC_RECORD and log[3] & 3 == V.SRC_RECORD     # the remembered road (ribbon): the chip keeps its mark
+  fc = P.Plan(40, 1.0, True, False, "", 150.0, 40, False, None, False, None, None, "corner", 200.0, False, None, 24, -1, -1, 2, "fc",
+              None, None, False, {}, None)
+
+  class _Pl:
+    view, odo = None, 0.0
+  p, _, log = V.View().step(_Pl(), fc, 1.0, 1, True, 45.0, 45, 30, -1)
+  assert p["src"] == V.SRC_OTHER and log[3] & 3 == V.SRC_OTHER and p["b"][0][3] == -1
+  p, _, _ = V.View().step(_Pl(), fc, 1.0, 1, False, 45.0, 45, 30, -1)
+  assert p["src"] == V.SRC_RECORD and p["b"] == []                   # off: nothing published
 
 
 # ---- stale handling and the ding reader (frogpilot_planner) --------------------------------------------------------------------------

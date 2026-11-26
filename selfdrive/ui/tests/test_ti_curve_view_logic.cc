@@ -53,18 +53,27 @@ static void parsing() {
 static void visibilityRules() {
   Payload p;
   parse(sample(100.0), p);
-  CHECK(visibility(p, 100.5, true, 45.0, false) == SHOWN);
-  CHECK(visibility(p, 101.01, true, 45.0, true) == STALE);              // older than 1 s: gone, chip included
-  CHECK(visibility(p, 99.5, true, 45.0, true) == STALE);                // from the future (another clock): never trusted
-  CHECK(visibility(p, 100.5, false, 45.0, true) == NOT_ENGAGED);
-  CHECK(visibility(p, 100.5, true, 18.9, false) == TOO_SLOW);           // appears only from 19 mph
-  CHECK(visibility(p, 100.5, true, 18.9, true) == SHOWN);               // ... and stays down to 18.5
-  CHECK(visibility(p, 100.5, true, 18.4, true) == TOO_SLOW);
+  CHECK(visibility(p, 100.5, true, true, 45.0, false) == SHOWN);
+  CHECK(visibility(p, 101.01, true, true, 45.0, true) == STALE);              // older than 1 s: gone, chip included
+  CHECK(visibility(p, 99.5, true, true, 45.0, true) == STALE);                // from the future (another clock): never trusted
+  CHECK(visibility(p, 100.5, false, true, 45.0, true) == NOT_ENGAGED);
+  CHECK(visibility(p, 100.5, true, true, 18.9, false) == TOO_SLOW);           // appears only from 19 mph
+  CHECK(visibility(p, 100.5, true, true, 18.9, true) == SHOWN);               // ... and stays down to 18.5
+  CHECK(visibility(p, 100.5, true, true, 18.4, true) == TOO_SLOW);
   Payload off;
   parse(sample(100.0, 0), off);
-  CHECK(visibility(off, 100.5, true, 45.0, true) == SWITCHED_OFF);
+  CHECK(visibility(off, 100.5, true, true, 45.0, true) == SWITCHED_OFF);
   Payload none;
-  CHECK(visibility(none, 100.5, true, 45.0, true) == NO_DATA);
+  CHECK(visibility(none, 100.5, true, true, 45.0, true) == NO_DATA);
+  // cruise cancelled while openpilot still steers (owner, 2026-11-26, "for now"): nothing at all, chip included
+  CHECK(visibility(p, 100.5, true, false, 45.0, true) == CRUISE_OFF);
+  CHECK(visibility(p, 100.5, false, false, 45.0, true) == CRUISE_OFF);
+  // ... and back as soon as cruise is active again (it was hidden: the 19 mph threshold to appear applies)
+  CHECK(visibility(p, 100.5, true, true, 45.0, false) == SHOWN);
+  CHECK(visibility(p, 100.5, true, true, 18.9, false) == TOO_SLOW);
+  // stale or switched off still say so first (what the log shows the planner published)
+  CHECK(visibility(p, 101.5, true, false, 45.0, true) == STALE);
+  CHECK(visibility(off, 100.5, true, false, 45.0, true) == SWITCHED_OFF);
 }
 
 static void chipTiming() {
@@ -99,9 +108,36 @@ static void chipTiming() {
   CHECK(b.x == 282 && b.y == 75 && b.w == RED_W && b.h == RED_H);
 }
 
+static Rect AREA;   // the default fit's area (the stock screen's ribbon rectangle less INK, screen coordinates)
+
+// the chip's mark (owner, 2026-11-26): "?" for a bend known from the map only, else the arrow (direction known) or "!"
+static void marks() {
+  Payload p;
+  parse(sample(), p);
+  CHECK(p.src == SRC_RECORD);                                             // no "src" key: the remembered road
+  Chip c = chipFor(p, 1.5);
+  CHECK(c.cls == RED && chipMark(p, c) == MARK_ARROW);
+  c.dir = 0;
+  CHECK(chipMark(p, c) == MARK_BANG);                                     // a recorded bend without a direction keeps "!"
+  const std::string map_only = "{\"v\":1,\"m\":1,\"seq\":1,\"on\":1,\"mph\":450,\"fl\":30,\"r\":[],\"re\":0,"
+                               "\"b\":[[150,150,200,0,24,30,2,150,230,135]],\"src\":1}";
+  CHECK(parse(map_only, p) && p.src == SRC_MAP && p.n == 0);
+  c = chipFor(p, 0.0);
+  CHECK(c.cls == RED && chipMark(p, c) == MARK_QUESTION);
+  c.dir = 1;
+  CHECK(chipMark(p, c) == MARK_QUESTION);                                 // map only: "?" whatever the direction
+  std::string other = map_only;
+  other.replace(other.find("\"src\":1"), 7, "\"src\":2");
+  CHECK(parse(other, p) && p.src == SRC_OTHER);
+  c = chipFor(p, 0.0);
+  CHECK(chipMark(p, c) == MARK_BANG);                                     // the forecast's corner without a side: "!" as before
+  other.replace(other.find("\"src\":2"), 7, "\"src\":9");
+  CHECK(parse(other, p) && p.src == SRC_RECORD);                          // an unknown source: as before
+}
+
 static bool allInside(const double *px, const double *py, int n) {
   for (int i = 0; i < n; i++) {
-    if (px[i] < AREA_X0 - 2 || px[i] > AREA_X1 + 2 || py[i] < AREA_Y0 - 2 || py[i] > AREA_Y1 + 2) return false;
+    if (px[i] < AREA.x0 - 2 || px[i] > AREA.x1 + 2 || py[i] < AREA.y0 - 2 || py[i] > AREA.y1 + 2) return false;
   }
   return true;
 }
@@ -128,7 +164,7 @@ static void fitRule() {
   // the bounding box fills the area in its tighter direction (0.94)
   double x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
   for (int i = 0; i < r.n; i++) { x0 = std::min(x0, px[i]); x1 = std::max(x1, px[i]); y0 = std::min(y0, py[i]); y1 = std::max(y1, py[i]); }
-  const double fill = std::max((x1 - x0) / (AREA_X1 - AREA_X0), (y1 - y0) / (AREA_Y1 - AREA_Y0));
+  const double fill = std::max((x1 - x0) / AREA.w(), (y1 - y0) / AREA.h());
   CHECK(std::fabs(fill - FIT_FILL) < 0.01);
   // through a drive: the bend moves nearer tick by tick (5 Hz data, 20 Hz frames); every frame stays inside, the size never collapses
   for (int t = 0; t < 400; t++) {
@@ -139,7 +175,7 @@ static void fitRule() {
     CHECK(allInside(px, py, r.n));
     x0 = 1e9; x1 = -1e9; y0 = 1e9; y1 = -1e9;
     for (int i = 0; i < r.n; i++) { x0 = std::min(x0, px[i]); x1 = std::max(x1, px[i]); y0 = std::min(y0, py[i]); y1 = std::max(y1, py[i]); }
-    CHECK(std::max((x1 - x0) / (AREA_X1 - AREA_X0), (y1 - y0) / (AREA_Y1 - AREA_Y0)) >= 0.5);
+    CHECK(std::max((x1 - x0) / AREA.w(), (y1 - y0) / AREA.h()) >= 0.5);
   }
   // smoothing: a different shape is approached over about a second, not at once, while it fits
   Fit f2;
@@ -172,6 +208,105 @@ static void fitRule() {
   f3.reset();
   f3.step(r, 0.05, px, py);
   CHECK(f3.init && allInside(px, py, r.n));
+}
+
+// ---- the layout (owner, 2026-11-26: "move the ribbon to the right-hand side and prevent it from overlapping") -------------------
+static bool clearOfAll(const Screen &s, const Rect &rr) {
+  Element obs[MAX_ELEMENTS];
+  const int n = obstacles(s, obs);
+  const Rect grown{rr.x0 - LAYOUT_GAP + 0.01, rr.y0 - LAYOUT_GAP + 0.01, rr.x1 + LAYOUT_GAP - 0.01, rr.y1 + LAYOUT_GAP - 0.01};
+  for (int i = 0; i < n; i++) {
+    if (overlaps(grown, obs[i].r)) {
+      std::printf("  overlaps %s\n", obs[i].name);
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool onScreen(const Screen &s, const Rect &rr) {
+  return within(rr, Rect{(double)UI_BORDER, (double)UI_BORDER, s.w - (double)UI_BORDER, s.h - (double)UI_BORDER}) &&
+         rr.x0 >= s.w / 2.0 + RIGHT_OF_SPEED && rr.w() >= RIBBON_MIN_W && rr.h() >= RIBBON_MIN_H && rr.w() <= RIBBON_MAX_W &&
+         rr.h() <= RIBBON_MAX_H;
+}
+
+static void layoutRules() {
+  // the stock screen (2100 x 1020 camera widget): right-hand side, full width, between the top-right buttons and the bottom row
+  Screen s;
+  Rect rr = ribbonRect(s);
+  CHECK(!rr.empty() && rr.x1 == s.w - UI_BORDER && rr.w() == RIBBON_MAX_W);
+  CHECK(rr.y0 >= UI_BORDER + BTN + LAYOUT_GAP && rr.y1 <= s.h - 2 * UI_BORDER - BTN - LAYOUT_GAP && rr.h() >= 500);
+  CHECK(clearOfAll(s, rr) && onScreen(s, rr));
+  // the old place (left, over the driver-monitoring icon and the distance button) is never chosen
+  CHECK(rr.x0 > s.w / 2.0);
+  // FrogPilot's pedal icons under the experimental button: the ribbon moves left of them (its full size fits there)
+  s.pedals = true;
+  rr = ribbonRect(s);
+  CHECK(!rr.empty() && rr.x1 <= s.w - UI_BORDER - BTN - LAYOUT_GAP && rr.w() == RIBBON_MAX_W && clearOfAll(s, rr));
+  // a mid alert: the ribbon ends above the banner (shorter)
+  s.alert = ALERT_MID;
+  rr = ribbonRect(s);
+  CHECK(!rr.empty() && rr.y1 <= s.h - ALERT_MID_H + ALERT_MARGIN - LAYOUT_GAP && clearOfAll(s, rr));
+  // ... and with a sweeping turn-signal image 250 px tall above the banner as well: only the top corner left of the buttons is free,
+  // the ribbon shrinks into it
+  s.signal = SIGNAL_SWEEP;
+  s.signal_h = 250;
+  s.alert_h = ALERT_MID_H - ALERT_MARGIN;
+  rr = ribbonRect(s);
+  CHECK(!rr.empty() && rr.y1 <= s.h - s.alert_h - s.signal_h - LAYOUT_GAP && rr.w() < RIBBON_MAX_W && clearOfAll(s, rr));
+  // ... taller still (400 px): no room anywhere, no ribbon (never drawn over)
+  s.signal_h = 400;
+  CHECK(ribbonRect(s).empty());
+  s.signal = SIGNAL_OFF;
+  s.pedals = false;
+  rr = ribbonRect(s);
+  CHECK(!rr.empty() && rr.y1 <= s.h - ALERT_MID_H + ALERT_MARGIN - LAYOUT_GAP && clearOfAll(s, rr));
+  // a full-screen alert: no ribbon and no chip
+  s.alert = ALERT_FULL;
+  CHECK(ribbonRect(s).empty() && !chipAllowed(s));
+  s.alert = ALERT_SMALL;
+  CHECK(chipAllowed(s) && !ribbonRect(s).empty());
+  // the sidebar open (the camera widget 300 px narrower): still on the right, still clear
+  Screen side;
+  side.w = SCREEN_W - 300 - 2 * BORDER;
+  rr = ribbonRect(side);
+  CHECK(!rr.empty() && rr.x1 == side.w - UI_BORDER && clearOfAll(side, rr) && onScreen(side, rr));
+  // the big map (camera a quarter of the width): no room on its right-hand side, no ribbon
+  Screen big;
+  big.w = SCREEN_W / 4 - BORDER;
+  CHECK(ribbonRect(big).empty());
+  // the drawing's reach beyond the points stays inside the rectangle: halo, car chevron (incl. its outline), rings
+  CHECK((WIDTH_NEAR + HALO_EXTRA + 8) / 2 <= INK);
+  CHECK(std::hypot(24.0, 26.0) + 1.5 <= INK && 30.0 + 1.5 <= INK);
+  CHECK(WIDTH_NEAR / 2 + RING_EXTRA + 3.5 <= INK);
+  // every state this fork can show: the ribbon is clear of every element and fully on screen, or there is none
+  int cases = 0, drawn = 0;
+  const int widths[] = {SCREEN_W - 2 * BORDER, SCREEN_W - 300 - 2 * BORDER, SCREEN_W / 2 - BORDER, SCREEN_W / 4 - BORDER};
+  const Rect boxes[] = {Rect{60, 45, 232, 249}, Rect{35, 45, 258, 447}, Rect{46, 45, 246, 437}};   // MAX; + US sign (3 digits); + EU
+  const Rect leads[] = {Rect(), Rect{700, 420, 1400, 480}, Rect{1500, 560, 2100, 620}, Rect{1200, 300, 1900, 360}};
+  const int sig_sizes[][2] = {{0, 0}, {150, 150}, {300, 250}, {450, 400}};
+  for (int w : widths) for (const Rect &mb : boxes) for (int alert = 0; alert <= 3; alert++) for (int ped = 0; ped <= 1; ped++)
+    for (int sig = 0; sig <= 2; sig++) for (const auto &ss : sig_sizes) for (const Rect &lt : leads) {
+      Screen t;
+      t.w = w;
+      t.max_box = mb;
+      t.alert = alert;
+      t.alert_h = alert == ALERT_SMALL ? ALERT_SMALL_H - ALERT_MARGIN : alert == ALERT_MID ? ALERT_MID_H - ALERT_MARGIN :
+                  alert == ALERT_FULL ? t.h : 0;
+      t.pedals = ped != 0;
+      t.signal = sig;
+      t.signal_w = ss[0];
+      t.signal_h = ss[1];
+      t.lead_text = lt;
+      const Rect r = ribbonRect(t);
+      cases++;
+      if (r.empty()) continue;
+      drawn++;
+      CHECK(clearOfAll(t, r));
+      CHECK(onScreen(t, r));
+    }
+  CHECK(cases == 4 * 3 * 4 * 2 * 3 * 4 * 4 && drawn > cases / 4);
+  std::printf("layout: %d states, ribbon drawn in %d\n", cases, drawn);
 }
 
 static void colours() {
@@ -217,11 +352,14 @@ static void colours() {
 }
 
 int main() {
+  AREA = Fit().area;
   parsing();
   visibilityRules();
   chipTiming();
   fitRule();
   colours();
+  layoutRules();
+  marks();
   if (failures) {
     std::printf("%d failure(s)\n", failures);
     return 1;

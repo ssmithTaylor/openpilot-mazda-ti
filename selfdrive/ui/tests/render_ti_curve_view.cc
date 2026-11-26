@@ -7,9 +7,15 @@
 // <moments dir>/<name>_<bg>.png: the background (camera + the HUD's MAX box and speed), <bg> = dark / bright.
 // Each moment is stepped through all its ticks at 20 frames per second (the UI's rate) so the fit is smoothed as on the car; the
 // last frame (age 0, as the mock-ups) is drawn on each background -> <out dir>/<name>_<bg>.png. Prints the draw time per frame.
+// <moments dir>/<name>.cfg (optional), "key value" lines for the screen around the element (ti_view::Screen): w h (the camera
+// widget), sidebar 1 (the widget starts 300 px right: the sidebar is drawn grey), alert 0-3, alert_h, pedals 0/1, signal 0-2, sw sh
+// (the signal images), lead x0 y0 x1 y1, engaged 0/1, cruise 0/1, outline 1 (every obstacle's rectangle drawn thin cyan with its
+// name, the ribbon's magenta).
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,7 +39,6 @@ int main(int argc, char **argv) {
   }
   const QString in_dir = argv[2], out_dir = argv[3];
   QDir().mkpath(out_dir);
-  const QRect max_box(60, 45, 172, 204);              // the HUD's MAX box in the onroad widget (annotated_camera.cc drawHud)
   const QPoint origin(ti_view::BORDER, ti_view::BORDER);
   std::vector<double> times;
   QImage scratch(ti_view::SCREEN_W, ti_view::SCREEN_H, QImage::Format_ARGB32_Premultiplied);
@@ -49,10 +54,45 @@ int main(int argc, char **argv) {
       ticks.emplace_back(std::stod(line.substr(0, sp)), line.substr(sp + 1));
     }
     if (ticks.empty()) continue;
+    std::map<std::string, std::vector<double>> cfg;
+    std::ifstream cf((in_dir + "/" + name + ".cfg").toStdString());
+    while (std::getline(cf, line)) {
+      std::istringstream ls(line);
+      std::string key;
+      double x;
+      ls >> key;
+      while (ls >> x) cfg[key].push_back(x);
+    }
+    auto get = [&](const char *key, double dflt) { return cfg.count(key) && !cfg[key].empty() ? cfg[key][0] : dflt; };
+    ti_view::Screen screen;
+    const bool sidebar = get("sidebar", 0) != 0;
+    screen.w = (int)get("w", sidebar ? ti_view::SCREEN_W - 300 - 2 * ti_view::BORDER : screen.w);
+    screen.h = (int)get("h", screen.h);
+    screen.alert = (int)get("alert", 0);
+    screen.alert_h = (int)get("alert_h", 0);
+    screen.pedals = get("pedals", 0) != 0;
+    screen.signal = (int)get("signal", 0);
+    screen.signal_w = (int)get("sw", 0);
+    screen.signal_h = (int)get("sh", 0);
+    if (cfg.count("lead") && cfg["lead"].size() == 4) {
+      screen.lead_text = ti_view::Rect{cfg["lead"][0], cfg["lead"][1], cfg["lead"][2], cfg["lead"][3]};
+    }
+    const bool engaged = get("engaged", 1) != 0;
+    const bool cruise = get("cruise", 1) != 0;
+    const bool outline = get("outline", 0) != 0;
+    const QPoint widget_at(sidebar ? 300 + ti_view::BORDER : ti_view::BORDER, ti_view::BORDER);   // the camera widget on the screen
     for (const char *bg : {"dark", "bright"}) {
       QImage img(in_dir + "/" + name + "_" + bg + ".png");
       if (img.isNull()) continue;
       img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+      if (sidebar) {   // the sidebar takes the screen's left 300 px; the onroad view (its border and camera) moves right
+        QImage shifted(img.size(), img.format());
+        shifted.fill(QColor(57, 57, 57));
+        QPainter sp(&shifted);
+        sp.drawImage(QRect(300, 0, img.width() - 300, img.height()), img, QRect(0, 0, img.width() - 300, img.height()));
+        sp.end();
+        img = shifted;
+      }
       TiCurveView view;
       for (size_t i = 0; i < ticks.size(); i++) {
         view.setPayload(ticks[i].second);
@@ -64,16 +104,37 @@ int main(int argc, char **argv) {
           QImage &target = final_frame ? img : scratch;
           if (!final_frame) scratch.fill(Qt::transparent);
           QPainter p(&target);
-          p.translate(origin);                         // the onroad widget's coordinates, as in AnnotatedCameraWidget::paintEvent
+          p.translate(widget_at);                      // the camera widget's coordinates, as in AnnotatedCameraWidget::paintEvent
           QElapsedTimer t;
           t.start();
-          view.draw(p, now, true, ticks[i].first, max_box, origin, 0.05);
+          view.draw(p, now, engaged, cruise, ticks[i].first, screen, origin, 0.05);
           times.push_back(t.nsecsElapsed() * 1e-6);
+          if (final_frame && outline) {
+            ti_view::Element obs[ti_view::MAX_ELEMENTS];
+            const int n = ti_view::obstacles(screen, obs);
+            QFont lf("Inter");
+            lf.setPixelSize(18);
+            p.setFont(lf);
+            p.setBrush(Qt::NoBrush);
+            for (int k = 0; k < n; k++) {
+              const ti_view::Rect &r = obs[k].r;
+              p.setPen(QPen(QColor(0, 230, 255), 2, Qt::DashLine));
+              p.drawRect(QRectF(r.x0, r.y0, r.w(), r.h()));
+              p.drawText(QPointF(std::max(0.0, r.x0) + 4, std::max(0.0, r.y0) + 18), QString(obs[k].name).left(44));
+            }
+            const ti_view::Rect rr = ti_view::ribbonRect(screen);
+            if (!rr.empty()) {
+              p.setPen(QPen(QColor(255, 0, 255), 3));
+              p.drawRect(QRectF(rr.x0, rr.y0, rr.w(), rr.h()));
+            }
+          }
           p.end();
         }
       }
       img.convertToFormat(QImage::Format_RGB32).save(out_dir + "/" + name + "_" + bg + ".png");
-      std::printf("%s_%s: %zu ticks, fit jumps %d\n", name.toStdString().c_str(), bg, ticks.size(), view.fit().jumps);
+      const ti_view::Rect &rr = view.lastRibbonRect();
+      std::printf("%s_%s: %zu ticks, fit jumps %d, ribbon rect %s%.0f %.0f %.0f %.0f\n", name.toStdString().c_str(), bg, ticks.size(),
+                  view.fit().jumps, rr.empty() ? "none " : "", rr.x0, rr.y0, rr.x1, rr.y1);
     }
   }
   if (!times.empty()) {

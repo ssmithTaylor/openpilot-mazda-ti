@@ -57,8 +57,10 @@ private:
   Params curve_params{"/dev/shm/params"};
   int curve_read_tick = 0;
   bool curve_engaged = false;
+  bool curve_cruise = false;      // carState.cruiseState.enabled: the element is hidden while cruise is cancelled
   double curve_mph = 0.0;
   double curve_draw_t = 0.0;
+  ti_view::Screen curve_screen;   // what else is on this widget, for the ribbon's layout (ti_curve_view_logic.h obstacles)
 
   // FrogPilot variables
   void paintEvent(QPaintEvent *event) override;

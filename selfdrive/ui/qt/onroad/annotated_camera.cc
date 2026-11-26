@@ -101,7 +101,25 @@ void AnnotatedCameraWidget::updateState(const UIState &s, const FrogPilotUIState
     curve_view.setPayload(curve_params.get(ti_view::PARAM_KEY));
   }
   curve_engaged = s.status == STATUS_ENGAGED || s.status == STATUS_OVERRIDE;
+  curve_cruise = cs_alive && car_state.getCruiseState().getEnabled();
   curve_mph = cs_alive ? std::max<float>(0.0, car_state.getVEgo()) * MS_TO_MPH : 0.0;
+  // ... and what else is on this widget, for where its ribbon may go (ti_view::obstacles): the alert's size (controlsState's, or the
+  // alerts widget's last painted height when larger: its own and FrogPilot's alerts), FrogPilot's pedal icons and turn-signal images
+  {
+    int alert = (int)cs.getAlertSize();
+    const int ah = frogpilot_nvg->alertHeight;
+    const int painted = ah <= 0 ? ti_view::ALERT_NONE : ah >= height() - 1 ? ti_view::ALERT_FULL :
+                        ah > ti_view::ALERT_SMALL_H - ti_view::ALERT_MARGIN ? ti_view::ALERT_MID : ti_view::ALERT_SMALL;
+    curve_screen.alert = std::clamp(std::max(alert, painted), (int)ti_view::ALERT_NONE, (int)ti_view::ALERT_FULL);
+    curve_screen.alert_h = std::max(0, ah);
+    curve_screen.pedals = frogpilot_toggles.value("pedals_on_ui").toBool() && !frogpilot_nvg->bigMapOpen;
+    const bool blinker = car_state.getLeftBlinker() || car_state.getRightBlinker();
+    const QString &style = frogpilot_nvg->signalStyle;
+    curve_screen.signal = (!blinker || frogpilot_nvg->bigMapOpen || style == "None") ? ti_view::SIGNAL_OFF :
+                          style == "static" ? ti_view::SIGNAL_STATIC : ti_view::SIGNAL_SWEEP;
+    curve_screen.signal_w = frogpilot_nvg->signalImageWidth();
+    curve_screen.signal_h = frogpilot_nvg->signalImageHeight();
+  }
 
   // update engageability/experimental mode button
   experimental_btn->updateState(s, fs, frogpilot_toggles);
@@ -604,12 +622,21 @@ void AnnotatedCameraWidget::paintEvent(QPaintEvent *event) {
 
   drawHud(painter, frogpilotPlan, *fs, frogpilot_toggles);
 
-  // curve slowing: the road-ahead ribbon and, on approach, the chip beside the MAX box (nothing when off / stale / not engaged / slow)
+  // curve slowing: the road-ahead ribbon on the right-hand side clear of every other element and, on approach, the chip beside the MAX
+  // box (nothing when off / stale / cruise cancelled / not engaged / slow)
   {
     const double now_mono = TiCurveView::monotonicNow();
     const double dt = curve_draw_t > 0 ? now_mono - curve_draw_t : 1.0 / UI_FREQ;
     curve_draw_t = now_mono;
-    curve_view.draw(painter, now_mono, curve_engaged, curve_mph, frogpilot_nvg->setSpeedRect, QPoint(UI_BORDER_SIZE, UI_BORDER_SIZE), dt);
+    curve_screen.w = width();
+    curve_screen.h = height();
+    const QRect &mb = frogpilot_nvg->setSpeedRect;              // drawHud's, this frame
+    curve_screen.max_box = ti_view::Rect{(double)mb.x(), (double)mb.y(), (double)(mb.x() + mb.width()), (double)(mb.y() + mb.height())};
+    const QRect &lt = frogpilot_nvg->leadTextRect;              // drawLead's, this frame (empty without a lead or the toggle)
+    curve_screen.lead_text = lt.isEmpty() ? ti_view::Rect() :
+                             ti_view::Rect{(double)lt.x(), (double)lt.y(), (double)(lt.x() + lt.width()), (double)(lt.y() + lt.height())};
+    curve_view.draw(painter, now_mono, curve_engaged, curve_cruise, curve_mph, curve_screen, QPoint(UI_BORDER_SIZE, UI_BORDER_SIZE),
+                    dt);
   }
 
   double cur_draw_t = millis_since_boot();

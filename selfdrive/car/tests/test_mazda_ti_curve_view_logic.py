@@ -56,7 +56,7 @@ def test_the_ui_decides_the_chip_as_the_planner_does_on_real_payloads():
   out, _ = _drive(ticks=260)
   lines, want = [], []
   for _, _, p, _, log in out:
-    lines.append(f"{p['m']:.2f} 1 {p['mph'] / 10:.1f} 1 {V.view_json(p)}")
+    lines.append(f"{p['m']:.2f} 1 1 {p['mph'] / 10:.1f} 1 {V.view_json(p)}")
     want.append(log[1])
   with tempfile.TemporaryDirectory() as d:
     exe = _build(ROOT / "selfdrive/ui/tests/curve_view_cli.cc", d)
@@ -77,7 +77,8 @@ def test_drawing_takes_its_numbers_from_the_header_and_reads_the_planners_param(
   cc = (ROOT / "selfdrive/ui/qt/onroad/ti_curve_view.cc").read_text(encoding="utf-8")
   assert '#include "selfdrive/ui/qt/onroad/ti_curve_view_logic.h"' in (ROOT / "selfdrive/ui/qt/onroad/ti_curve_view.h").read_text(
     encoding="utf-8")
-  for name in ("visibility(", "chipFor(", "ribbonRaw(", "styleFor(", "resumeRings(", "hatchMarks(", "carAngle(", "chipBox("):
+  for name in ("visibility(", "chipFor(", "ribbonRaw(", "styleFor(", "resumeRings(", "hatchMarks(", "carAngle(", "chipBox(",
+               "ribbonRect(", "pointsArea(", "chipAllowed("):
     assert name in cc, name
   assert 'PARAM_KEY = "' + V.PARAM_VIEW + '"' in HEADER.read_text(encoding="utf-8")
   cam = (ROOT / "selfdrive/ui/qt/onroad/annotated_camera.cc").read_text(encoding="utf-8")

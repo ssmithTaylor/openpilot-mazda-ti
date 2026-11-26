@@ -72,7 +72,8 @@ void curveArrow(QPainter &p, double cx, double cy, double s, int side, const QCo
   p.drawPolygon(head);
 }
 
-void diamond(QPainter &p, double cx, double cy, double r, const QColor &fill, const QColor &edge, int side, const QColor &arrow) {
+void diamond(QPainter &p, double cx, double cy, double r, const QColor &fill, const QColor &edge, Mark mark, int side,
+             const QColor &arrow) {
   QPolygonF outer, inner;
   outer << QPointF(cx, cy - r) << QPointF(cx + r, cy) << QPointF(cx, cy + r) << QPointF(cx - r, cy);
   const double ri = r - 9;
@@ -83,10 +84,10 @@ void diamond(QPainter &p, double cx, double cy, double r, const QColor &fill, co
   p.setBrush(Qt::NoBrush);
   p.setPen(QPen(edge, 5, Qt::SolidLine, Qt::FlatCap, Qt::MiterJoin));
   p.drawPolygon(inner);
-  if (side != 0) {
+  if (mark == MARK_ARROW) {
     curveArrow(p, cx, cy, r * 0.55, side, arrow);
-  } else {
-    textMm(p, cx, cy, "!", inter(r * 1.1), arrow);     // a map bend: the direction is not known (its curvature is unsigned)
+  } else {   // "?": known from the map only (no remembered record); "!": the direction is not known
+    textMm(p, cx, cy, mark == MARK_QUESTION ? "?" : "!", inter(r * 1.1), arrow);
   }
 }
 
@@ -127,14 +128,14 @@ void handsWheel(QPainter &p, double cx, double cy, double r, const QColor &col, 
 }
 
 // the sign row of both chips: curve sign, speed plaque, seconds to the bend
-void signRow(QPainter &p, double x, double y, const Chip &c, bool red, double scale) {
+void signRow(QPainter &p, double x, double y, const Chip &c, Mark mark, bool red, double scale) {
   const double r = 70 * scale;
   const QColor white(255, 255, 255), black(0, 0, 0);
   if (red) {
-    diamond(p, x + r + 6, y + r + 6, r, rgb(SIGN_RED), white, c.dir, white);
+    diamond(p, x + r + 6, y + r + 6, r, rgb(SIGN_RED), white, mark, c.dir, white);
     plaque(p, x + 2 * r + 30, y + 6, 128 * scale, 140 * scale, c.mph, white, rgb(SIGN_RED));
   } else {
-    diamond(p, x + r + 6, y + r + 6, r, rgb(SIGN_YELLOW), black, c.dir, black);
+    diamond(p, x + r + 6, y + r + 6, r, rgb(SIGN_YELLOW), black, mark, c.dir, black);
     plaque(p, x + 2 * r + 30, y + 6, 128 * scale, 140 * scale, c.mph, rgb(SIGN_YELLOW), black);
   }
   textLm(p, x + 2 * r + 30 + 128 * scale + 24, y + r + 6, QString("%1 s").arg(c.secs), inter(SECS_PX), white);
@@ -152,41 +153,48 @@ void TiCurveView::setPayload(const std::string &text) {
   parse(text_, payload_);
 }
 
-int TiCurveView::draw(QPainter &p, double now, bool engaged, double ui_mph, const QRect &max_box, const QPoint &origin, double dt) {
-  const Hidden vis = visibility(payload_, now, engaged, ui_mph, shown_);
+int TiCurveView::draw(QPainter &p, double now, bool engaged, bool cruise_active, double ui_mph, const Screen &screen,
+                      const QPoint &origin, double dt) {
+  const Hidden vis = visibility(payload_, now, engaged, cruise_active, ui_mph, shown_);
   shown_ = vis == SHOWN;
+  rect_ = Rect();
   if (!shown_) {
     fit_.reset();
     return vis;
   }
   p.save();
-  p.translate(-origin);                   // draw in screen coordinates (the logic's)
+  p.translate(-origin);                   // draw in screen coordinates (the logic's; the widget's moved by the onroad border)
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setRenderHint(QPainter::TextAntialiasing, true);
   ribbonRaw(payload_, ribbon_);
-  if (ribbon_.n >= 2) {
+  const Rect rr = ti_view::ribbonRect(screen);     // the right-hand side, clear of every other element; empty: no room, no ribbon
+  if (ribbon_.n >= 2 && !rr.empty()) {
+    rect_ = rr;
+    fit_.setArea(pointsArea(rr, origin.x(), origin.y()));
     fit_.step(ribbon_, dt, px_, py_);
     styleFor(payload_, ribbon_, style_);
-    drawRibbon(p);
+    drawRibbon(p, QRectF(rr.x0 + origin.x(), rr.y0 + origin.y(), rr.w(), rr.h()));
   } else {
     fit_.reset();
   }
   const Chip c = chipFor(payload_, now - payload_.m);
-  if (c.cls != NEUTRAL) {
-    drawChip(p, c, max_box.translated(origin));
+  if (c.cls != NEUTRAL && chipAllowed(screen)) {
+    const Rect &mb = screen.max_box;
+    drawChip(p, c, QRect((int)mb.x0, (int)mb.y0, (int)mb.w(), (int)mb.h()).translated(origin));
   }
   p.restore();
   return vis;
 }
 
-void TiCurveView::drawRibbon(QPainter &painter) {
+void TiCurveView::drawRibbon(QPainter &painter, const QRectF &clip) {
   const int n = ribbon_.n;
-  // one layer over the fixed area (with room for the halo and the car): strokes REPLACE its pixels, as the mock-ups' layer does,
-  // so translucent runs never darken where they meet; the layer is then blended onto the camera view once
-  const int margin = 60;
-  const QPoint lo((int)AREA_X0 - margin, (int)AREA_Y0 - margin);
-  if (layer_.isNull()) {
-    layer_ = QImage((int)(AREA_X1 - AREA_X0) + 2 * margin, (int)(AREA_Y1 - AREA_Y0) + 2 * margin, QImage::Format_ARGB32_Premultiplied);
+  // one layer over the ribbon's rectangle: strokes REPLACE its pixels, as the mock-ups' layer does, so translucent runs never
+  // darken where they meet; the layer is then blended onto the camera view once. The layer IS the rectangle: nothing is drawn
+  // outside it (the points sit INK inside it, so nothing is cut off either)
+  const QPoint lo((int)std::floor(clip.x()), (int)std::floor(clip.y()));
+  const QSize sz((int)std::ceil(clip.right()) - lo.x(), (int)std::ceil(clip.bottom()) - lo.y());
+  if (layer_.size() != sz) {
+    layer_ = QImage(sz, QImage::Format_ARGB32_Premultiplied);
   }
   layer_.fill(Qt::transparent);
   QPainter p(&layer_);
@@ -266,7 +274,7 @@ void TiCurveView::drawChip(QPainter &p, const Chip &c, const QRect &max_box) {
   const double X0 = b.x, Y0 = b.y;
   if (c.cls == YELLOW) {
     roundBox(p, QRectF(X0, Y0, b.w, b.h), 32, QColor(0, 0, 0, 166), rgb(SIGN_YELLOW, 230), 6);
-    signRow(p, X0 + 18, Y0 + 26, c, false, 1.0);
+    signRow(p, X0 + 18, Y0 + 26, c, chipMark(payload_, c), false, 1.0);
     return;
   }
   // red (v1): a two-line word band with the hands-on-wheel symbol over the red curve sign, the needed speed and the seconds
@@ -281,5 +289,5 @@ void TiCurveView::drawChip(QPainter &p, const Chip &c, const QRect &max_box) {
   handsWheel(p, X0 + 78, Y0 + 88, 50, QColor(255, 255, 255), band);
   textLm(p, X0 + 160, Y0 + 52, "HANDS ON", inter(BAND_TEXT_PX), QColor(255, 255, 255));
   textLm(p, X0 + 160, Y0 + 128, "HELP STEER", inter(BAND_TEXT_PX), QColor(255, 255, 255));
-  signRow(p, X0 + 24, Y0 + RED_BAND_H + 18, c, true, 0.8);
+  signRow(p, X0 + 24, Y0 + RED_BAND_H + 18, c, chipMark(payload_, c), true, 0.8);
 }

@@ -48,6 +48,10 @@ public:
   QPoint experimentalButtonPosition;
 
   QRect leadTextRect;
+
+  // the turn-signal images' size (curve slowing's ribbon keeps clear of them: ti_curve_view_logic.h obstacles)
+  int signalImageWidth() const { return signalWidth; }
+  int signalImageHeight() const { return signalHeight; }
   QRect newSpeedLimitRect;
   QRect setSpeedRect;
   QRect speedLimitRect;
