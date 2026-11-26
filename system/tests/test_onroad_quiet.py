@@ -124,3 +124,24 @@ def test_manager_logs_the_running_list_on_change_only():
     log_running(running, i * 0.5, state)
   assert len(logged) <= 4, logged                     # the start, the change, at most the minute heartbeats
   assert logged[0].endswith("b\u001b[0m") and any("\u001b[31mb" in s for s in logged)
+
+
+# ---- frogpilot/frogpilot_process.py -------------------------------------------------------------------------------------------------
+def test_frogpilot_network_checks_wait_for_the_drive_to_end():
+  """The hourly model / theme / map checks (github.com, api.github.com, raw.githubusercontent.com) ran on the hour whatever the
+  state; on-road they are now held until the car is parked (the offroad transition runs them anyway)."""
+  env = _load("frogpilot/frogpilot_process.py", ["update_checks_now"], {})
+  now = env["update_checks_now"]
+  assert now(True, started=False, time_validated=True)
+  assert not now(True, started=True, time_validated=True)
+  assert not now(True, started=False, time_validated=False)
+  assert not now(False, started=False, time_validated=True)
+  assert now(True, started=True, time_validated=True, manual=True)          # a manual request, as before
+
+
+def test_frogpilot_process_loop_uses_the_gate():
+  src = (REPO / "frogpilot/frogpilot_process.py").read_text(encoding="utf-8")
+  loop = src[src.index("def frogpilot_thread"):]
+  assert "update_checks_now(run_update_checks, started, time_validated, manual_update)" in loop
+  # the boot run (when the clock first becomes valid) is held on-road too
+  assert "run_update_checks = True      # the boot run, held until parked" in loop
