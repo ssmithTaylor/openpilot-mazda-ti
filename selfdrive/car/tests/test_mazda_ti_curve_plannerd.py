@@ -360,3 +360,115 @@ def test_model_name_read_from_the_param():
       return "dark-souls" if k == "Model" else None
   assert D.model_name(Pm()) == "dark-souls"
   assert D.model_name(object()) == ""
+
+
+# ---- 2026-11-25: the replay has every planner input (the car side's floor and the full map list are logged) ---------------------------
+def _replay_case():
+  """A synthetic drive (made-up coordinates, never a recorded position) with no road memory: a map list of nodes every 10 m along a
+  straight north-going line, its curvature field carrying a 120 m bend 900 m ahead that needs ~30 mph, rewritten every second with
+  its first node moving on (new lists); the car at 50 mph; the car side's floor_now 8 below the set speed (lead-aware: not the
+  planner's own rule, set - 15). Runs the planner as plannerd does and returns (the plans, the log records as JSON text, the inputs
+  plannerd does not log because they are in the rlog's own messages)."""
+  import numpy as np
+  from openpilot.selfdrive.car.tests.test_mazda_ti_curve_plan import k_needing
+  lat0, lon0 = 10.37, -71.73
+  deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
+  mph, setv = 50.0, 50
+  v = mph * TP.MPH
+  k_bend = abs(k_needing(30))
+  pl = TP.Planner(None)
+  plans, logs, rlog = [], [], []
+  raw, raw_t, last_id, last_map = None, -1e9, None, None
+  for i in range(int(60 / 0.2)):
+    t = i * 0.2
+    s = v * t
+    if t - raw_t >= 1.0:
+      first = 10.0 * math.floor((s - 40.0) / 10.0)
+      nodes = [first + 10.0 * j for j in range(160)]
+      raw = json.dumps([{"latitude": lat0 + q * deg, "longitude": lon0,
+                         "curvature": k_bend * (0.5 + 0.5 * math.cos(math.pi * (q - 960.0) / 60.0)) if 900.0 <= q <= 1020.0 else
+                         0.0004 * (1 + (int(q) // 10) % 3)} for q in nodes])
+      raw_t = t
+    map_k, ref = D.map_profile_ref(raw, t - raw_t, lat0 + s * deg, lon0, 0.0)
+    ref_mph, floor_mph, acting = setv, setv - 8, True
+    p = pl.step(t, TP.Fix(False), v, set_mph=setv, ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k)
+    plans.append(p)
+    pl.events.clear()
+    extras = {"seq": i, "v": mph, "set": setv, "cs": [ref_mph, floor_mph, int(acting)]}
+    mk = None if map_k is None else [[int(round(a)), int(round(b * 1e4))] for a, b in zip(*map_k) if a >= 0.0]
+    if mk is not None and len(mk) > D.TICK_MAP_N:
+      mk = [mk[int(round(q * (len(mk) - 1) / (D.TICK_MAP_N - 1)))] for q in range(D.TICK_MAP_N)]
+    if mk != last_map:
+      extras["map"], last_map = mk or [], mk
+    if ref is not None:
+      if ref[0][0] != last_id:
+        logs.append(json.dumps(D.map_list_log(ref[0])))
+        last_id = ref[0][0]
+      extras["mpr"] = [ref[0][0], ref[1]]
+    logs.append(json.dumps(D.log_payload(D.tick_log(p, extras), kind="tick")))
+    rlog.append((t, v, setv))
+  return plans, logs, rlog
+
+
+def _replay(logs, rlog, use_cs=True, use_list=True):
+  pl, out, lists, old_map = TP.Planner(None), [], {}, None
+  it = iter(rlog)
+  for line in logs:
+    m = json.loads(line)
+    if m["kind"] == "map_list":
+      lists[m["id"]] = m
+      continue
+    t, v, setv = next(it)
+    ref, floor, acting, map_k = D.logged_inputs(m, lists)
+    if "map" in m:
+      old_map = m["map"]
+    if not use_list:     # the replay of 2026-11-25: the tick's 12-point summary as the map list
+      map_k = ([float(a) for a, b in old_map], [float(b) * 1e-4 for a, b in old_map]) if old_map and len(old_map) >= 2 else None
+    if not use_cs:       # ... and no floor_now (the planner's own rule)
+      floor = None
+    out.append(pl.step(t, TP.Fix(False), v, set_mph=setv, ref_mph=ref, floor_mph=floor, acting=acting, map_k=map_k))
+    pl.events.clear()
+  return out
+
+
+def _decisions(plans):
+  return [(p.stage, p.src, p.ceil, p.kind, p.need_mph, p.alert_mph, p.corner_mph) for p in plans]
+
+
+def test_replay_from_the_logged_inputs_reproduces_the_planner_exactly():
+  plans, logs, rlog = _replay_case()
+  live = _decisions(plans)
+  assert any(p.src == "map" and p.kind == "corner" for p in plans)                 # the map stage acts in the case
+  assert min(p.ceil for p in plans if p.ceil is not None) < 50 - 8               # slowed below the floor_now set by the push
+  assert _decisions(_replay(logs, rlog)) == live                                  # every tick, every decision
+  # the case needs both: without the floor (the planner's own rule) or with the 12-point summary as the list, the replay differs
+  assert _decisions(_replay(logs, rlog, use_cs=False)) != live
+  assert _decisions(_replay(logs, rlog, use_list=False)) != live
+
+
+def test_map_list_record_bounded_and_position_free():
+  plans, logs, rlog = _replay_case()
+  recs = [json.loads(x) for x in logs]
+  lists = [r for r in recs if r["kind"] == "map_list"]
+  assert 2 <= len(lists) <= 70                                     # once per list used (the case rewrites it every second), not per tick
+  for r in lists:
+    assert set(r) == {"kind", "id", "n", "s", "k"} and len(r["s"]) == len(r["k"]) <= D.MAP_MAX_N
+    assert all(isinstance(x, int) for x in r["s"] + r["k"])
+    assert r["s"][0] == 0                                           # along the path from its first node: no coordinate
+  text = " ".join(logs)
+  assert "10.37" not in text and "71.73" not in text and "lat" not in text and "lon" not in text
+  # a list longer than MAP_MAX_N nodes: the first MAP_MAX_N are used and logged
+  deg = 1.0 / (D.EARTH_R * math.pi / 180.0)
+  raw = json.dumps([{"latitude": 10.37 + 5.0 * j * deg, "longitude": -71.73, "curvature": 0.001} for j in range(D.MAP_MAX_N + 50)])
+  mk, ref = D.map_profile_ref(raw, 0.5, 10.37 + 50.0 * deg, -71.73, 0.0)
+  assert mk is not None and ref[0][1] == D.MAP_MAX_N + 50 and len(D.map_list_log(ref[0])["s"]) == D.MAP_MAX_N
+  assert len(json.dumps(D.map_list_log(ref[0]))) <= 14 * D.MAP_MAX_N          # <= ~7 KB, once per list
+  # the replay fields: never dropped, never trimmed away, and they add at most TICK_REPLAY_MAX_B to the bounded record
+  for e0 in (_worst_extras(), dict(_worst_extras(), map=[[-99999, -99999]] * 40)):
+    base = D.tick_log(_worst_plan(), e0)
+    e = dict(e0, cs=[-99, -99, 1], mpr=[9999999, 99999999])
+    d = D.tick_log(_worst_plan(), e)
+    assert d["cs"] == [-99, -99, 1] and d["mpr"] == [9999999, 99999999]
+    assert {k: v for k, v in d.items() if k not in ("cs", "mpr")} == base     # nothing else dropped for them
+    assert len(json.dumps(d)) <= len(json.dumps(base)) + D.TICK_REPLAY_MAX_B
+  assert D.tick_log(_worst_plan(), dict(_worst_extras(), cs=[None, None, 0]))["cs"] == [None, None, 0]

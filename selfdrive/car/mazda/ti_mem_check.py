@@ -529,8 +529,8 @@ def _lap(n_bends, seed):
 
 
 def setup_planner():
-  """ti_curve_plannerd's tick (5 Hz): the car side's status read (car_side), the map list read (map_profile) from a list rewritten
-  every second, Planner.step, plan_json, the events and the tick log through log_payload / tick_log (JSON-dumped, as cloudlog would),
+  """ti_curve_plannerd's tick (5 Hz): the car side's status read (car_side), the map list read (map_profile_ref) from a list rewritten
+  every second, its `map_list` record once per list, Planner.step, plan_json, the events and the tick log through log_payload / tick_log (JSON-dumped, as cloudlog would),
   fresh_limit; over a lap whose first part is remembered and whose second part is known only from the map list, with lock lost and
   regained, the driver's set speed changing, cruise off and on, the forecast missing for a few seconds, and the car-side floor
   binding (alerts raised and cleared). One period is one lap; the position jumps back to the start (lock lost, re-lock)."""
@@ -579,7 +579,13 @@ def setup_planner():
                                           "longitude": math.degrees(float(np.interp(q, s_road, road["x"])) / R),
                                           "curvature": kat(q)} for q in qs])
       st["map_t"] = t
-    mk_map = D.map_profile(store.d.get(D.MAP_PARAM), t - st["map_t"], lat, lon, bearing)
+    mk_map, map_ref = D.map_profile_ref(store.d.get(D.MAP_PARAM), t - st["map_t"], lat, lon, bearing)
+    tick_x = {}
+    if map_ref is not None:                       # 2026-11-25: the list once per id (map_list_log) and [id, s0_dm] per tick
+      if map_ref[0][0] != st.get("list_id"):
+        json.dumps(D.log_payload(D.map_list_log(map_ref[0])))
+        st["list_id"] = map_ref[0][0]
+      tick_x["mpr"] = [map_ref[0][0], map_ref[1]]
     floor_binds = (lap_i // 60) % 4 == 1
     store.d[C.PARAM_STATUS] = json.dumps({"t": 1_800_000_000.0 + t, "state": "slowing" if floor_binds else "ready", "ref": st["set"],
                                           "floor": st["set"] - 2 if floor_binds else None, "floor_now": st["set"] - 4,
@@ -605,8 +611,8 @@ def setup_planner():
       _count(seen, "ev:" + str(ev.get("kind")))
       json.dumps(D.log_payload(ev, feature="act"), default=str)
     pl.events.clear()
-    json.dumps(D.log_payload(D.tick_log(p, {"mph": round(st["v"], 1), "map": list(zip(*mk_map)) if mk_map else []}), kind="tick"),
-               default=str)
+    json.dumps(D.log_payload(D.tick_log(p, dict(tick_x, mph=round(st["v"], 1), map=list(zip(*mk_map)) if mk_map else [],
+                                                cs=[ref, floor, int(bool(acting))])), kind="tick"), default=str)
     if lap_i % 200 == 150:
       st["set"] = 47 if st["set"] == 45 else 45       # the driver's own set-speed change
     goal = st["set"] if p.ceil is None else min(st["set"], p.ceil)

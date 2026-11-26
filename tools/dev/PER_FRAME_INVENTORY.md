@@ -31,7 +31,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 | controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314` | none (gap) |
 | frogpilot_process | FrogPilotEvents.update: LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch | `frogpilot_events.py:262` | frogpilot_events |
 | frogpilot_process | FrogPilotPlanner.update TI block: steer_authority predicted_drift_m / AdvisoryTrigger.update, ti_curve curve_alert_mph / read_curve_code | `frogpilot_planner.py:122-162` | frogpilot_events |
-| ti_curve_plannerd | tick: can_reads, car_side, map_input / map_profile, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |
+| ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |
 
 ## Modules
 

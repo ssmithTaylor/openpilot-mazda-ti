@@ -12,8 +12,16 @@ the owner has driven); without it the planner publishes "no road memory on the d
 
 Logs (`ti_curve_plan` channel): every change of the decision (ceiling, kind, trusted, reason) and the planner's events (lock, lock lost,
 road changed, corner start with the planned and actual speed and the grade, mode changes, corner passed), a summary every 5 s, and
-(plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed).
-Never a position: trace and point indices, distances, speeds and curvatures only.
+(plan T8) one `kind="tick"` record every tick (tick_log: <= TICK_MAX_B bytes, TICK_MAP_MAX_B on a tick whose map list changed), and
+one `kind="map_list"` record per map list the planner uses (map_list_log). Never a position: trace and point indices, distances,
+speeds and curvatures only.
+
+REPLAY (what a replay must read to give the planner exactly its inputs; logged_inputs below does it): from the rlog's messages as
+before (liveLocationKalman, carState, modelV2, frogpilotPlan, can: fix, speed, set speed, yaw, forecast, limit, blinker); from this
+channel: tick "cs" = [ref_mph, floor_mph, acting] as passed to Planner.step (NOT rebuilt from ti_curve `state` events: the car side's
+floor_now is in no other record), tick "mpr" = [list id, s0_dm] (absent: map_k None) with the `map_list` record of that id (keep the
+lists by id, reset them when "seq" restarts: plannerd restarted), map_k = map_k_from(s, k, s0_dm). The tick's "map" field is a
+12-point summary for reading, not the planner's input.
 """
 # RUNTIME: runs in ti_curve_plannerd at 5 Hz; gc frozen after load, collector on (see docs/RUNTIME_CONSTRAINTS.md).
 # Per tick: caches keyed by finite domains only; never a position in a log or param; tick budget 20 ms p99.
@@ -88,48 +96,70 @@ MAP_HDG_DEG = 45.0              # ... on a piece pointing within this of the car
 EARTH_R = 6371000.0
 
 
-_MAP_PARSED = [None, None]      # cost (perf 2026-11-25): (raw text, its parsed points) of the last list read
+_MAP_PARSED = [None, None]      # cost (perf 2026-11-25): (raw text, its parsed list) of the last list read
+_MAP_ID = [0]                   # the parsed lists' running number in this process (one int; restarts at 1 with plannerd)
+MAP_MAX_N = 500                 # nodes of one list used (and logged); a longer list: its first MAP_MAX_N (the comma's lists: ~150)
+MAP_S_Q = 10                    # path distances in whole 0.1 m (dm) ...
+MAP_K_Q = 1000000               # ... curvatures in whole 1e-6 1/m: the planner gets exactly what the log carries (replay: map_k_from)
+MAP_BEHIND_DM = -300            # nodes up to 30 m behind the car are kept (as before: d >= -30 m)
 
 
 def _map_points(raw):
-  """The map list's (latitudes, longitudes, |curvatures|), or None when unreadable, shorter than 2 or not finite. Cached on the raw
-  text: the map service writes ~1 Hz and the planner reads at 5 Hz, and the parse (JSON + checks) was ~1.5 ms a tick on the comma
-  for a 150-node list. Same text, same values."""
+  """The parsed map list: (id, nodes in the text, xs, ys, cum, s_dm, k_u), or None when unreadable, shorter than 2 or not finite.
+  xs / ys: metres east / north of the list's FIRST node (positions; never leave this module); cum: metres along the polyline from
+  it; s_dm / k_u: cum and |curvature| as whole dm / whole 1e-6 1/m (what the planner is given, and the `map_list` log record).
+  Cached on the raw text: the map service writes ~1 Hz and the planner reads at 5 Hz (the parse was ~1.5 ms a tick on the comma for
+  a 150-node list); a new text gets the next id. Same text, same values."""
   if _MAP_PARSED[0] is not None and _MAP_PARSED[0] == raw:
     return _MAP_PARSED[1]
   try:
     pts = json.loads(raw)
     out = None
     if isinstance(pts, list) and len(pts) >= 2:
+      n_raw = len(pts)
+      pts = pts[:MAP_MAX_N]
       la = [float(p["latitude"]) for p in pts]
       lo = [float(p["longitude"]) for p in pts]
       ks = [abs(float(p["curvature"])) for p in pts]
       if all(math.isfinite(a) and math.isfinite(b) and math.isfinite(c) for a, b, c in zip(la, lo, ks)):
-        out = (la, lo, ks)
+        la0, lo0 = la[0], lo[0]
+        cl = math.cos(math.radians(la0))
+        xs = [math.radians(b - lo0) * cl * EARTH_R for b in lo]
+        ys = [math.radians(a - la0) * EARTH_R for a in la]
+        cum = [0.0]
+        for i in range(len(xs) - 1):
+          cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+        _MAP_ID[0] += 1
+        out = (_MAP_ID[0], n_raw, (la0, lo0, cl), xs, ys, cum, [int(round(c * MAP_S_Q)) for c in cum],
+               [int(round(k * MAP_K_Q)) for k in ks])
   except Exception:
     out = None
   _MAP_PARSED[0], _MAP_PARSED[1] = raw, out
   return out
 
 
-def map_profile(raw, age_s, lat, lon, bearing_deg):
-  """The map service's curvature list as (metres along the road from the car, |curvature|), for the planner; None (no map opinion) when
-  missing, older than MAP_STALE_S, unreadable, or not matched to the car (no polyline piece within MAP_MATCH_M pointing its way).
-  Positions are used here only and never leave this function."""
+def map_k_from(s_dm, k_u, s0_dm):
+  """THE planner's map_k from a map list (s_dm, k_u: whole dm along the path, whole 1e-6 1/m) and the car's place on it (s0_dm, whole
+  dm along the same path): (metres from the car, |curvature|), nodes from 30 m behind the car on and strictly increasing along the
+  path; None with fewer than 2. Integer arithmetic: plannerd and a replay fed from the log get bit-identical lists."""
+  keep = [j for j in range(len(s_dm)) if s_dm[j] - s0_dm >= MAP_BEHIND_DM and (j == 0 or s_dm[j] > s_dm[j - 1])]
+  if len(keep) < 2:
+    return None
+  return [(s_dm[j] - s0_dm) / MAP_S_Q for j in keep], [k_u[j] / MAP_K_Q for j in keep]
+
+
+def map_match(raw, age_s, lat, lon, bearing_deg):
+  """(parsed list, s0_dm: the car's place along it in whole dm) when the map service's list is fresh, readable and matched to the car
+  (a polyline piece within MAP_MATCH_M pointing its way), else None. Positions are used here only and never leave this function."""
   try:
     if raw is None or age_s is None or not (0.0 <= age_s <= MAP_STALE_S):
       return None
     parsed = _map_points(raw)
     if parsed is None:
       return None
-    la, lo, ks = parsed
-    cl = math.cos(math.radians(lat))
-    xs = [math.radians(b - lon) * cl * EARTH_R for b in lo]
-    ys = [math.radians(a - lat) * EARTH_R for a in la]
+    (la0, lo0, cl), xs, ys, cum = parsed[2], parsed[3], parsed[4], parsed[5]
+    cx, cy = math.radians(lon - lo0) * cl * EARTH_R, math.radians(lat - la0) * EARTH_R
     hx, hy = math.sin(math.radians(bearing_deg)), math.cos(math.radians(bearing_deg))
-    cum = [0.0]
-    for i in range(len(xs) - 1):
-      cum.append(cum[-1] + math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
     best = None
     hdg_cos = math.cos(math.radians(MAP_HDG_DEG))     # once per call, not per piece (same value)
     for i in range(len(xs) - 1):
@@ -137,19 +167,39 @@ def map_profile(raw, age_s, lat, lon, bearing_deg):
       L = math.hypot(dx, dy)
       if L < 0.1 or (dx * hx + dy * hy) / L < hdg_cos:
         continue
-      tt = max(0.0, min(1.0, -(xs[i] * dx + ys[i] * dy) / (L * L)))
-      lat_m = math.hypot(xs[i] + tt * dx, ys[i] + tt * dy)
+      ax, ay = xs[i] - cx, ys[i] - cy
+      tt = max(0.0, min(1.0, -(ax * dx + ay * dy) / (L * L)))
+      lat_m = math.hypot(ax + tt * dx, ay + tt * dy)
       if lat_m <= MAP_MATCH_M and (best is None or lat_m < best[0]):
         best = (lat_m, cum[i] + tt * L)
     if best is None:
       return None
-    d = [c - best[1] for c in cum]
-    keep = [j for j in range(len(d)) if d[j] >= -30.0 and (j == 0 or cum[j] > cum[j - 1])]
-    if len(keep) < 2:
-      return None
-    return [d[j] for j in keep], [ks[j] for j in keep]
+    return parsed, int(round(best[1] * MAP_S_Q))
   except Exception:
     return None
+
+
+def map_profile_ref(raw, age_s, lat, lon, bearing_deg):
+  """(map_k, ref): map_k as map_profile; ref = (parsed list, s0_dm) of the match it came from (for the log), None with map_k."""
+  m = map_match(raw, age_s, lat, lon, bearing_deg)
+  if m is None:
+    return None, None
+  mk = map_k_from(m[0][6], m[0][7], m[1])
+  return (mk, m) if mk is not None else (None, None)
+
+
+def map_profile(raw, age_s, lat, lon, bearing_deg):
+  """The map service's curvature list as (metres along the road from the car, |curvature|), for the planner; None (no map opinion) when
+  missing, older than MAP_STALE_S, unreadable, or not matched to the car (no polyline piece within MAP_MATCH_M pointing its way).
+  Positions are used here only and never leave this function."""
+  return map_profile_ref(raw, age_s, lat, lon, bearing_deg)[0]
+
+
+def map_list_log(parsed):
+  """The `map_list` log record of one parsed list (once per list, the first tick the planner uses it): id, nodes in the text (n; more
+  than MAP_MAX_N: only the first MAP_MAX_N were used), s (whole dm along the path from its first node), k (whole 1e-6 1/m). No
+  position: distances along the path and curvatures only. <= MAP_MAX_N x 14 bytes (~7 KB), once per list."""
+  return {"kind": "map_list", "id": int(parsed[0]), "n": int(parsed[1]), "s": list(parsed[6]), "k": list(parsed[7])}
 
 
 def map_age_s(path=MAP_FILE, now=None):
@@ -160,18 +210,23 @@ def map_age_s(path=MAP_FILE, now=None):
     return None
 
 
-def map_input(params_memory, ok, lat, lon, bearing_deg, now=None, path=MAP_FILE):
-  """The planner's map_k (plan T6): map_profile of the map service's list when the position is valid (ok), else None. Absent, stale
-  (older than MAP_STALE_S) or unmatched: None (no map stage). Positions stay here and in map_profile."""
+def map_input_ref(params_memory, ok, lat, lon, bearing_deg, now=None, path=MAP_FILE):
+  """(map_k, ref) for the planner (plan T6) and the log: map_profile_ref of the map service's list when the position is valid (ok),
+  else (None, None). Absent, stale (older than MAP_STALE_S) or unmatched: (None, None). Positions stay here and in map_match."""
   if not ok:
-    return None
+    return None, None
   try:
     raw = params_memory.get(MAP_PARAM)
   except Exception:
-    return None
+    return None, None
   if isinstance(raw, bytes):
     raw = raw.decode("utf-8", "replace")
-  return map_profile(raw, map_age_s(path, now), lat, lon, bearing_deg)
+  return map_profile_ref(raw, map_age_s(path, now), lat, lon, bearing_deg)
+
+
+def map_input(params_memory, ok, lat, lon, bearing_deg, now=None, path=MAP_FILE):
+  """The planner's map_k (plan T6): map_input_ref's map_k."""
+  return map_input_ref(params_memory, ok, lat, lon, bearing_deg, now=now, path=path)[0]
 
 
 LIMIT_MAX_AGE_S = 2.0           # frogpilotPlan must have been received within this (it is published at 20 Hz)
@@ -233,7 +288,9 @@ CAR_HALF_WIDTH_M = 0.92
 # every key the tick log may carry (anything else given is dropped: a position can never pass through)
 TICK_KEYS = ("seq", "v", "set", "gap", "a", "dec", "st", "src", "ceil", "kind", "need", "cap", "side", "ahead", "alert", "rel", "beh",
              "mem", "map", "fc", "s1", "s2", "mon", "car", "lay", "lacc", "des", "rate", "cmd", "ti", "ln", "drv", "tq", "cpu", "lacc_ms", "ti_ms",
-             "fcx", "mdl", "step_us")
+             "fcx", "mdl", "step_us", "cs", "mpr")
+TICK_REPLAY_KEYS = ("cs", "mpr")     # the planner inputs no rlog message carries (see REPLAY above): never dropped
+TICK_REPLAY_MAX_B = 52              # what they add at most: `, "cs": [-99, -99, 1], "mpr": [9999999, 99999999]`
 DRV_PRESSED, DRV_BRAKE, DRV_GAS, DRV_BUTTON, DRV_LBLINK, DRV_RBLINK = 1, 2, 4, 8, 16, 32
 
 
@@ -373,9 +430,11 @@ def tick_log(plan, extras):
   """One tick's record (plan T8): the plan's decision and the inputs later analysis needs. extras: the plannerd-side figures (speed,
   set speed, gap, deceleration, memory / map / forecast summaries, stage 1 / 2, stage 3's alert, car side, lateral accelerations,
   lane clearance, driver flags, interceptor state, CPU). Only TICK_KEYS pass; bounded to TICK_MAX_B (TICK_MAP_MAX_B with a map list):
-  over it, the memory samples, then the forecast, then the map are dropped."""
+  over it, the memory samples, then the forecast, then the map are dropped. The replay inputs (TICK_REPLAY_KEYS: "cs", "mpr", ints
+  only) are never dropped and are added after the trim (at most TICK_REPLAY_MAX_B more): a replay needs them on every tick, and the
+  afternoon drive of 2026-11-25 had ~30 % of its ticks within 40 bytes of TICK_MAX_B (they would have lost their memory samples)."""
   e = dict(extras or {})
-  d = {k: e[k] for k in TICK_KEYS if k in e}
+  d = {k: e[k] for k in TICK_KEYS if k in e and k not in TICK_REPLAY_KEYS}
   d.update(st=plan.stage, src=plan.src, ceil=plan.ceil, kind=plan.kind, need=plan.need_mph, cap=_r(plan.cap, 2),
            ahead=_r(plan.ahead_la, 2), alert=plan.alert_mph, beh=int(bool(plan.behind)),
            rel=(plan.diag or {}).get("rel", int(bool(plan.released))))
@@ -398,6 +457,10 @@ def tick_log(plan, extras):
     else:
       d.pop(drop, None)
     bound = TICK_MAP_MAX_B if "map" in d else TICK_MAX_B
+  for k in TICK_REPLAY_KEYS:
+    x = e.get(k)
+    if isinstance(x, list) and len(x) <= 3:
+      d[k] = [None if y is None else int(y) for y in x]
   return d
 
 
@@ -418,6 +481,20 @@ def side_status(params_memory, now_wall, now_mono, tc):
   except Exception:
     mon = None
   return car, mon
+
+
+def logged_inputs(tick, lists):
+  """REPLAY: (ref_mph, floor_mph, acting, map_k) the planner was given on a logged tick, from its "cs" and "mpr" fields and the
+  `map_list` records kept by id in `lists` ({id: record}). (None, None, None, ...) without "cs" (a log from before these fields).
+  map_k is None without "mpr" and when the list of that id was not seen (a log cut before it)."""
+  cs = tick.get("cs")
+  ref, floor, acting = (cs[0], cs[1], bool(cs[2])) if isinstance(cs, list) and len(cs) == 3 else (None, None, None)
+  map_k = None
+  mpr = tick.get("mpr")
+  if isinstance(mpr, list) and len(mpr) == 2 and mpr[0] in lists:
+    ml = lists[mpr[0]]
+    map_k = map_k_from(ml["s"], ml["k"], int(mpr[1]))
+  return ref, floor, acting, map_k
 
 
 def keep_off_control_core():
@@ -475,6 +552,7 @@ def main():
   lacc, lacc_t, ti_fb, ti_t = None, -1e9, None, -1e9
   vhist = []                      # (t, m/s) over the last ~1.2 s: the measured deceleration (A10)
   last_map, cpu_us = None, None
+  last_list_id = None
   lim_state = {"t": None}
   cpu = []
   while True:
@@ -514,14 +592,14 @@ def main():
       except Exception:
         limit = None
       ref_mph, floor_mph, acting = car_side(params_memory, time.time(), tc)
-      map_k = None
+      map_k, map_ref = None, None
       if ok:
-        map_k = map_input(params_memory, ok, llk.positionGeodetic.value[0], llk.positionGeodetic.value[1],
-                          math.degrees(llk.calibratedOrientationNED.value[2]))     # plan T6: stage 1 where no memory is known
+        map_k, map_ref = map_input_ref(params_memory, ok, llk.positionGeodetic.value[0], llk.positionGeodetic.value[1],
+                                       math.degrees(llk.calibratedOrientationNED.value[2]))     # plan T6: stage 1 where no memory is known
       mk_, fcx = fresh_model(sm["modelV2"] if sm.alive["modelV2"] else None, sm.logMonoTime["modelV2"], t)
       s0 = time.perf_counter()
       plan = planner.step(t, fix, v, set_mph=set_mph, yaw_k=yaw_k, model_k=mk_, limit_mph=limit,
-                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k,
+                          ref_mph=ref_mph, floor_mph=floor_mph, acting=acting, map_k=map_k,     # = logged_inputs(tick, lists)
                           blinker=bool(cs.leftBlinker or cs.rightBlinker))     # stage 2 is off with a blinker (plan T5)
       step_us = int(round(1e6 * (time.perf_counter() - s0)))
       on = params_memory.get(tc.PARAM_ON) in (b"1", "1")
@@ -570,6 +648,15 @@ def main():
       if mk != last_map:
         extras["map"] = mk or []
         last_map = mk
+      # the planner's exact inputs that are not in the rlog's messages (2026-11-25: the replay disagreed on 998 of 38,599 ticks
+      # without them): the car side's (ref, floor, acting) as passed to step (floor: its floor while intervening, else floor_now),
+      # and the map list's id + the car's place along it (whole dm) whenever map_k was given; the list itself once, as `map_list`
+      extras["cs"] = [ref_mph, floor_mph, int(bool(acting))]
+      if map_ref is not None:
+        if map_ref[0][0] != last_list_id:
+          cloudlog.event("ti_curve_plan", **map_list_log(map_ref[0]))
+          last_list_id = map_ref[0][0]
+        extras["mpr"] = [map_ref[0][0], map_ref[1]]
       cloudlog.event("ti_curve_plan", **log_payload(tick_log(plan, extras), kind="tick"))
       cpu_us = int(round(1e6 * (time.process_time() - c0)))     # logged on the next tick (this tick's own cost, log included)
       cpu.append(time.process_time() - c0)
