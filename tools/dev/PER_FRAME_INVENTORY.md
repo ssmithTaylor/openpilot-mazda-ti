@@ -28,7 +28,7 @@ classified there). Code facts only. Constraints per process: `docs/RUNTIME_CONST
 | card | button_tests_step / cruise_check_step: ti_button_tests, ti_cruise_check | `carcontroller.py:783,862` | card_buttons |
 | card | CC.ti_lag_ctl set from controlsState | `card.py:217-220` | card_tests |
 | card | CarState.update_gen1 TI fields (needs the compiled CAN parser) | `carstate.py:64` | none (gap) |
-| controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314` | none (gap) |
+| controlsd | LatControlNNFF.update (NNFF toggle on only; changed by this fork) | `controlsd.py:303-314`, `:807` | nnff |
 | frogpilot_process | FrogPilotEvents.update: LaneDriftGate.update / lane_change_active, TI dropout, running wide, latch | `frogpilot_events.py:262` | frogpilot_events |
 | frogpilot_process | FrogPilotPlanner.update TI block: steer_authority predicted_drift_m / AdvisoryTrigger.update, ti_curve curve_alert_mph / read_curve_code | `frogpilot_planner.py:122-162` | frogpilot_events |
 | ti_curve_plannerd | tick: can_reads, car_side, map_input_ref / map_profile_ref, map_list_log, fresh_model, fresh_limit, Planner.step, plan_json, log_payload, tick_log | `ti_curve_plannerd.py:480-` | planner |

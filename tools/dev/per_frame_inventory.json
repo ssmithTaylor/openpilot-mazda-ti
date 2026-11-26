@@ -99,7 +99,7 @@
       "process": "controlsd",
       "call": "LatControlNNFF.update (only with the NNFF toggle on; this fork changed it)",
       "at": "selfdrive/controls/controlsd.py:303-314",
-      "test": null
+      "test": "nnff"
     }
   ],
   "per_frame": {

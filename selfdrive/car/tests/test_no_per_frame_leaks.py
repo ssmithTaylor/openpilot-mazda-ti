@@ -27,6 +27,7 @@ REQUIRED = {
   "card_buttons": ("buttons:running", "buttons:finished", "check:running", "check:finished", "frames sent"),
   "planner": ("ceiling", "ev:alert", "ev:lock_lost", "ev:lock"),
   "frogpilot_events": ("running wide", "gate latched", "ti dropout", "advisory", "latched", "curve alert", "curve code"),
+  "nnff": ("active", "inactive", "gain", "nnff model", "lite", "no fp state", "error blend"),
 }
 
 
